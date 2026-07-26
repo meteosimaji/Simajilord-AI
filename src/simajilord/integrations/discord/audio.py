@@ -1,0 +1,161 @@
+"""Discord implementation of the platform audio-output port."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import shlex
+
+import discord
+
+from simajilord.core.errors import ProviderError, UserError
+from simajilord.domain.audio import AudioItem
+
+log = logging.getLogger(__name__)
+
+
+class DiscordAudioOutput:
+    """One Discord voice connection for one guild-owned audio session."""
+
+    def __init__(self, bot: discord.Client, guild_id: int) -> None:
+        self.bot = bot
+        self.guild_id = guild_id
+        self.destination_id: int | None = None
+        self._voice: discord.VoiceClient | None = None
+
+    @property
+    def connected(self) -> bool:
+        voice = self._adopt_voice_client()
+        return voice is not None and voice.is_connected()
+
+    @property
+    def paused(self) -> bool:
+        voice = self._adopt_voice_client()
+        return voice is not None and voice.is_paused()
+
+    async def connect(self, destination_id: str) -> None:
+        try:
+            channel_id = int(destination_id)
+        except ValueError as exc:
+            raise UserError("The audio destination is invalid.") from exc
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is None:
+            raise UserError("The Discord server is unavailable.")
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            raise UserError("The configured voice channel no longer exists.")
+
+        voice = self._adopt_voice_client()
+        if voice is not None and voice.is_connected():
+            if voice.channel.id != channel.id:
+                await voice.move_to(channel)
+            self.destination_id = channel.id
+            return
+
+        if voice is not None:
+            try:
+                await voice.disconnect(force=True)
+            except discord.DiscordException:
+                log.warning("Could not discard a stale Discord voice client", exc_info=True)
+        try:
+            protocol: discord.VoiceProtocol = await channel.connect(
+                timeout=20.0,
+                reconnect=True,
+                self_deaf=True,
+            )
+        except (TimeoutError, discord.DiscordException) as exc:
+            raise UserError("Could not connect to the voice channel.") from exc
+        if not isinstance(protocol, discord.VoiceClient):
+            await protocol.disconnect(force=True)
+            raise ProviderError("Discord returned an unsupported voice protocol.")
+        self._voice = protocol
+        self.destination_id = channel.id
+
+    async def play(self, item: AudioItem) -> None:
+        voice = self._adopt_voice_client()
+        if voice is None or not voice.is_connected():
+            raise UserError("The bot is not connected to voice.")
+        if voice.is_playing() or voice.is_paused():
+            raise ProviderError("The Discord audio output is already busy.")
+
+        before_parts = ["-nostdin"]
+        if item.kind.value == "music":
+            before_parts.extend(
+                ("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+            )
+        header_value = _header_value(item.http_headers)
+        if header_value:
+            before_parts.extend(("-headers", header_value))
+
+        source = discord.FFmpegPCMAudio(
+            item.source,
+            before_options=shlex.join(before_parts),
+            options="-vn",
+        )
+        transformed = discord.PCMVolumeTransformer(source)
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[None] = loop.create_future()
+
+        def after(error: Exception | None) -> None:
+            def finish() -> None:
+                if completed.done():
+                    return
+                if error is None:
+                    completed.set_result(None)
+                else:
+                    completed.set_exception(error)
+
+            loop.call_soon_threadsafe(finish)
+
+        try:
+            voice.play(transformed, after=after)
+            await completed
+        finally:
+            transformed.cleanup()
+
+    def pause(self) -> None:
+        voice = self._adopt_voice_client()
+        if voice is None or not voice.is_playing():
+            raise UserError("Nothing is currently playing.")
+        voice.pause()
+
+    def resume(self) -> None:
+        voice = self._adopt_voice_client()
+        if voice is None or not voice.is_paused():
+            raise UserError("Playback is not paused.")
+        voice.resume()
+
+    def stop(self) -> None:
+        voice = self._adopt_voice_client()
+        if voice is not None and (voice.is_playing() or voice.is_paused()):
+            voice.stop()
+
+    async def disconnect(self) -> None:
+        voice = self._adopt_voice_client()
+        if voice is not None:
+            await voice.disconnect(force=True)
+        self._voice = None
+        self.destination_id = None
+
+    def _adopt_voice_client(self) -> discord.VoiceClient | None:
+        if self._voice is not None:
+            return self._voice
+        guild = self.bot.get_guild(self.guild_id)
+        if guild is None or guild.voice_client is None:
+            return None
+        if isinstance(guild.voice_client, discord.VoiceClient):
+            self._voice = guild.voice_client
+        return self._voice
+
+
+def _header_value(headers: dict[str, str] | None) -> str | None:
+    if not headers:
+        return None
+    lines = []
+    for key, value in headers.items():
+        if key.lower() in {"cookie", "authorization"}:
+            continue
+        safe_key = key.replace("\r", "").replace("\n", "")
+        safe_value = value.replace("\r", " ").replace("\n", " ")
+        lines.append(f"{safe_key}: {safe_value}")
+    return "\r\n".join(lines) + "\r\n" if lines else None

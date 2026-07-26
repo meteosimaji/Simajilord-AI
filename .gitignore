@@ -32,6 +32,8 @@ coverage/
 *.log
 tmp/
 temp/
+.coverage
+htmlcov/
 
 # Local models and large generated artifacts
 models/
@@ -39,3 +41,8 @@ artifacts/
 
 # Local-only research and planning notes
 notes/
+
+# Local media/session data
+cookies.txt
+*.session
+.data/
