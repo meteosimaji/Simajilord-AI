@@ -36,3 +36,6 @@ temp/
 # Local models and large generated artifacts
 models/
 artifacts/
+
+# Local-only research and planning notes
+notes/
