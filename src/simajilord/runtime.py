@@ -21,6 +21,7 @@ from simajilord.observability import EventJournal
 from simajilord.providers.speech import MacOSSayProvider
 from simajilord.services import (
     AudioSessionManager,
+    AudioStateStore,
     MediaService,
     ReadAloudService,
     SpeechService,
@@ -52,6 +53,8 @@ class SimajilordRuntime:
         audio = AudioSessionManager(
             max_active=settings.max_active_voice_guilds,
             max_pending_speech=settings.max_pending_speech,
+            resolver=media.resolve_audio,
+            state_store=AudioStateStore(settings.data_dir / "audio_sessions.json"),
         )
         speech = SpeechService(
             MacOSSayProvider(settings.tts_voice),

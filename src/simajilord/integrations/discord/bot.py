@@ -12,6 +12,7 @@ from discord.ext import commands
 from simajilord.config import CommandScope
 from simajilord.runtime import SimajilordRuntime
 
+from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import build_discord_endpoints
 from .cogs import setup_cogs
 
@@ -37,8 +38,10 @@ class SimajilordDiscordBot(commands.Bot):
             ...,
         ] = ()
         self._commands_synchronized = False
+        self._audio_restored = False
 
     async def setup_hook(self) -> None:
+        await verify_ffmpeg_opus()
         for item in build_discord_endpoints(self, self.runtime):
             self.runtime.registry.register(item)
         await setup_cogs(self, self.runtime)
@@ -86,6 +89,9 @@ class SimajilordDiscordBot(commands.Bot):
             self.user.id,
             len(self.guilds),
         )
+        if not self._audio_restored:
+            await self._restore_audio_sessions()
+            self._audio_restored = True
         if self._commands_synchronized:
             return
         if self.runtime.settings.command_scope is CommandScope.GUILD:
@@ -103,6 +109,61 @@ class SimajilordDiscordBot(commands.Bot):
             synced = await self.tree.sync()
             log.info("Synchronized %s global commands", len(synced))
         self._commands_synchronized = True
+
+    async def _restore_audio_sessions(self) -> None:
+        sessions = self.runtime.audio.restore(
+            lambda workspace_id: DiscordAudioOutput(self, int(workspace_id))
+        )
+        for session in sessions:
+            destination_id = session.destination_id
+            guild = self.get_guild(int(session.workspace_id))
+            if guild is None:
+                continue
+            if session.waiting_for_voice:
+                waiting_channel = next(
+                    (
+                        channel
+                        for channel in (*guild.voice_channels, *guild.stage_channels)
+                        if any(
+                            not member.bot and session.can_start_for(str(member.id))
+                            for member in channel.members
+                        )
+                    ),
+                    None,
+                )
+                if waiting_channel is None:
+                    log.info(
+                        "Audio queue %s restored waiting for a requester to join voice",
+                        session.workspace_id,
+                    )
+                    continue
+                destination_id = str(waiting_channel.id)
+            if destination_id is None:
+                continue
+            channel = guild.get_channel(int(destination_id))
+            if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                log.warning(
+                    "Cannot restore audio session %s: destination %s no longer exists",
+                    session.workspace_id,
+                    destination_id,
+                )
+                continue
+            if not any(not member.bot for member in channel.members):
+                log.info(
+                    "Audio queue %s restored in standby; destination has no listeners",
+                    session.workspace_id,
+                )
+                continue
+            try:
+                self.runtime.audio.assert_connection_capacity(session.workspace_id)
+                await session.connect(destination_id)
+                log.info(
+                    "Restored audio queue %s into voice channel %s",
+                    session.workspace_id,
+                    destination_id,
+                )
+            except Exception:
+                log.exception("Could not reconnect restored audio session %s", session.workspace_id)
 
     def _restore_global_templates(self) -> None:
         self.tree.clear_commands(guild=None)

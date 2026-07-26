@@ -34,12 +34,24 @@ def test_platform_layers_do_not_import_discord() -> None:
 
 def test_no_duplicate_top_level_definitions() -> None:
     collisions: list[str] = []
+
+    def inspect_scope(
+        nodes: list[ast.stmt],
+        *,
+        path: Path,
+        scope: str,
+    ) -> None:
+        seen: set[str] = set()
+        for node in nodes:
+            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name in seen:
+                collisions.append(f"{path}:{scope}:{node.name}")
+            seen.add(node.name)
+            if isinstance(node, ast.ClassDef):
+                inspect_scope(node.body, path=path, scope=f"{scope}.{node.name}")
+
     for path in Path("src/simajilord").rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        seen: set[str] = set()
-        for node in tree.body:
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name in seen:
-                    collisions.append(f"{path}:{node.name}")
-                seen.add(node.name)
+        inspect_scope(tree.body, path=path, scope="<module>")
     assert collisions == []

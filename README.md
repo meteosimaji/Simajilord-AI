@@ -40,8 +40,13 @@ timestamp; implementation labels and decorative footer text are intentionally om
 ## Current Discord capabilities
 
 - Health, uptime, and searchable capability discovery
-- Per-server music queues with structured queue inspection, play, pause, resume, skip, stop,
-  leave, and loop controls
+- Per-server durable music queues with play, pause, resume, seek, tuning, shuffle, removal,
+  skip, stop, leave, loop, and persistent button controls
+- Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
+  queue-preserving auto-leave
+- Voice-free queueing: add a track before joining, then start automatically when one of its
+  requesters enters voice
+- Durable requester attribution and a bounded recently-played history
 - Automatic channel read-aloud with persistent text-to-voice routing
 - Local, offline speech synthesis through the macOS `say` executable
 - Bounded YouTube and TikTok video/audio downloads
@@ -89,8 +94,10 @@ existing local file with mode `0600`. The platform never extracts cookies from a
 ## Commands
 
 - `/ping`, `/uptime`, `/about`, `/capabilities`
-- `/music play`, `/music queue`, `/music pause`, `/music resume`
+- `/play`, `/queue`, `/history` for the shortest everyday paths
+- `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
 - `/music skip`, `/music stop`, `/music leave`, `/music loop`
+- `/music remove`, `/music shuffle`, `/music seek`, `/music tune`, `/music autoleave`
 - `/readaloud setup`, `/readaloud status`, `/readaloud disable`
 - `/download`
 - `/serverinfo`, `/userinfo`, `/avatar`, `/poll`
@@ -107,13 +114,30 @@ and structured payload. Sensitive field names such as token, password, secret, a
 and cookie are redacted before storage. A future agent can read only the rows after its last
 cursor and reconcile user-driven state changes before acting.
 
+`.data/audio_sessions.json` stores only stable media page references, requester attribution,
+recent history, and queue policy. Signed stream URLs are deliberately excluded. A restart
+reloads the queue, resolves each stream again immediately before playback, and reconnects only
+when an eligible human listener is present.
+
 ## Verification
 
 ```bash
 uv run ruff check src tests
 uv run mypy src/simajilord
 uv run pytest
+uv run simajilord-audio-doctor
 uv run python -m compileall -q src
 ```
+
+The same gate runs automatically on every GitHub push and pull request. Startup also performs
+a real FFmpeg-to-Opus self-test before Discord commands become available.
+
+For a provider regression, test the complete resolver/transcoder path without joining a VC:
+
+```bash
+uv run simajilord-audio-doctor "https://www.youtube.com/watch?v=..."
+```
+
+This does not require a Discord token and never sends audio or messages to Discord.
 
 Third-party license information is in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

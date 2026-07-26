@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import tempfile
@@ -17,6 +18,8 @@ from simajilord.capabilities.audio import (
     AudioAction,
     AudioControlRequest,
     AudioControlResponse,
+    AudioHistoryRequest,
+    AudioHistoryResponse,
     AudioPlayRequest,
     AudioPlayResponse,
     AudioQueueRequest,
@@ -48,6 +51,7 @@ from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioKind, LoopMode
 from simajilord.domain.media import DownloadFormat
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.audio import AudioSession
 from simajilord.services.read_aloud import ReadAloudMode
 
 from .audio import DiscordAudioOutput
@@ -67,13 +71,23 @@ log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
 
 _ERROR_MESSAGES = {
+    "audio.auto_leave_value_required": "Choose whether automatic voice leave is enabled.",
     "audio.capacity_reached": "The active voice-server limit has been reached.",
+    "audio.history_limit_invalid": "History limit must be between 1 and 25.",
     "audio.loop_mode_required": "Choose a loop mode.",
     "audio.not_paused": "Playback is not paused.",
     "audio.nothing_playing": "Nothing is currently playing.",
     "audio.output_disconnected": "The audio output is disconnected.",
+    "audio.queue_position_invalid": "Choose a valid upcoming queue position.",
+    "audio.seek_position_required": "Provide a playback position.",
     "audio.session_closed": "The audio session is closed.",
     "audio.session_missing": "No audio session exists in this server.",
+    "audio.same_voice_required": "Join the Bot's voice channel to control its music.",
+    "audio.waiting_queue_restricted": (
+        "This waiting queue can be started or changed by one of its requesters."
+    ),
+    "audio.tune_range_invalid": "Speed and pitch must each be between 0.5 and 2.0.",
+    "audio.tune_values_required": "Provide both speed and pitch.",
     "media.reference_required": "Provide a media URL or search query.",
     "media.reference_too_long": "The media reference is too long.",
     "media.url_unsupported": (
@@ -111,6 +125,360 @@ _AUDIO_ACTION_MESSAGES = {
     AudioAction.STOP.value: "Playback stopped and the queue was cleared.",
     AudioAction.LEAVE.value: "Disconnected from voice.",
 }
+
+
+def _duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3_600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+    return f"{minutes}:{remaining_seconds:02d}"
+
+
+def _parse_position(value: str) -> tuple[float, bool]:
+    text = value.strip()
+    relative = text.startswith(("+", "-"))
+    sign = -1.0 if text.startswith("-") else 1.0
+    unsigned = text[1:] if relative else text
+    parts = unsigned.split(":")
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        raise UserError("Use a timestamp such as `1:23`, `+30`, or `-10`.")
+    numbers = [int(part) for part in parts]
+    seconds = 0
+    for number in numbers:
+        seconds = seconds * 60 + number
+    return sign * float(seconds), relative
+
+
+def _progress(position: float, duration: float, *, width: int = 16) -> str:
+    if duration <= 0:
+        return "─" * width
+    ratio = max(0.0, min(1.0, position / duration))
+    marker = min(width - 1, round(ratio * (width - 1)))
+    return "━" * marker + "●" + "─" * (width - marker - 1)
+
+
+def _requester(name: str | None) -> str:
+    return discord.utils.escape_markdown(name) if name else "Unknown"
+
+
+def music_added_embed(response: AudioPlayResponse) -> discord.Embed:
+    if response.playback_state == "playing":
+        playback = "Playing now"
+    elif response.playback_state == "waiting_for_voice":
+        playback = "Waiting for voice\nJoin a voice channel to start automatically."
+    else:
+        playback = f"Up next · #{response.queue_position}"
+    return command_embed(
+        "Added to queue",
+        description=f"### [{response.title}]({response.page_url})",
+        fields=(
+            EmbedField("Playback", playback, inline=False),
+            EmbedField("Duration", _duration(response.duration_seconds)),
+            EmbedField("Requested by", _requester(response.requested_by_name)),
+            EmbedField(
+                "Voice",
+                f"<#{response.destination_id}>"
+                if response.destination_id
+                else "Not connected yet",
+            ),
+        ),
+        tone=EmbedTone.SUCCESS,
+    )
+
+
+def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
+    fields: list[EmbedField] = []
+    if response.current is None:
+        description = "Nothing is playing."
+    else:
+        current = response.current
+        description = f"### [{current.title}]({current.page_url})"
+        elapsed = min(response.position_seconds, current.duration_seconds)
+        fields.append(
+            EmbedField(
+                "Progress",
+                f"`{_progress(elapsed, current.duration_seconds)}` "
+                f"`{_duration(elapsed)} / {_duration(current.duration_seconds)}`",
+                inline=False,
+            )
+        )
+        fields.append(
+            EmbedField("Requested by", _requester(current.requested_by_name))
+        )
+
+    upcoming = tuple(item for item in response.pending if item.kind == AudioKind.MUSIC.value)
+    if upcoming:
+        lines = [
+            f"`{index:02d}` [{item.title}]({item.page_url}) · "
+            f"`{_duration(item.duration_seconds)}` · {_requester(item.requested_by_name)}"
+            for index, item in enumerate(upcoming[:10], start=1)
+        ]
+        if len(upcoming) > 10:
+            lines.append(f"…and **{len(upcoming) - 10}** more")
+        fields.append(EmbedField("Up next", "\n".join(lines), inline=False))
+    else:
+        fields.append(EmbedField("Up next", "Queue empty", inline=False))
+
+    if response.waiting_for_voice:
+        state = "Waiting for voice"
+    elif response.paused:
+        state = "Paused"
+    elif response.current:
+        state = "Playing"
+    else:
+        state = "Ready"
+    fields.extend(
+        (
+            EmbedField("State", state),
+            EmbedField("Loop", response.loop_mode.title()),
+            EmbedField("Auto leave", "On" if response.auto_leave else "Off"),
+        )
+    )
+    if response.speed != 1.0 or response.pitch != 1.0:
+        fields.append(
+            EmbedField("Tuning", f"{response.speed:.2f}x speed · {response.pitch:.2f}x pitch")
+        )
+    if response.destination_id:
+        fields.append(EmbedField("Voice", f"<#{response.destination_id}>"))
+    elif response.waiting_for_voice:
+        fields.append(
+            EmbedField(
+                "Start",
+                "Join a voice channel or press **Start in VC** after joining.",
+                inline=False,
+            )
+        )
+    return command_embed("Music", description=description, fields=tuple(fields))
+
+
+def music_history_embed(response: AudioHistoryResponse) -> discord.Embed:
+    if not response.items:
+        return command_embed(
+            "Recently played",
+            description="No tracks have been played yet.",
+        )
+    lines = []
+    for index, item in enumerate(response.items, start=1):
+        when = f" · <t:{item.played_at_epoch}:R>" if item.played_at_epoch else ""
+        lines.append(
+            f"`{index:02d}` [{item.title}]({item.page_url}) · "
+            f"`{_duration(item.duration_seconds)}` · {_requester(item.requested_by_name)}{when}"
+        )
+    return command_embed("Recently played", description="\n".join(lines))
+
+
+def _discord_audio_session(
+    bot: commands.Bot,
+    runtime: SimajilordRuntime,
+    guild_id: int | None,
+) -> AudioSession:
+    if guild_id is None:
+        raise UserError("workspace.required")
+    return runtime.audio.get_or_create(
+        str(guild_id),
+        lambda: DiscordAudioOutput(bot, guild_id),
+    )
+
+
+def _member_voice_channel(
+    member: discord.abc.User,
+) -> discord.VoiceChannel | discord.StageChannel | None:
+    if not isinstance(member, discord.Member):
+        return None
+    state = member.voice
+    if state is None or not isinstance(
+        state.channel, (discord.VoiceChannel, discord.StageChannel)
+    ):
+        return None
+    return state.channel
+
+
+def _require_same_voice(session: AudioSession, member: discord.abc.User) -> None:
+    if not session.output.connected:
+        if session.waiting_for_voice and not session.can_control_while_waiting(
+            str(member.id)
+        ):
+            raise UserError("audio.waiting_queue_restricted")
+        return
+    channel = _member_voice_channel(member)
+    if (
+        channel is None
+        or session.destination_id is None
+        or str(channel.id) != session.destination_id
+    ):
+        raise UserError("audio.same_voice_required")
+
+
+class MusicControlsView(discord.ui.View):
+    """Persistent controls backed by the same capability API as commands and agents."""
+
+    def __init__(self, runtime: SimajilordRuntime) -> None:
+        super().__init__(timeout=None)
+        self.runtime = runtime
+
+    async def _run(
+        self,
+        interaction: discord.Interaction,
+        action: AudioAction,
+        *,
+        loop_mode: LoopMode | None = None,
+        position_seconds: float | None = None,
+        speed: float | None = None,
+        pitch: float | None = None,
+    ) -> None:
+        try:
+            workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
+            session = self.runtime.audio.require(workspace_id)
+            _require_same_voice(session, interaction.user)
+            await interaction.response.defer()
+            await self.runtime.registry.invoke(
+                "audio.control",
+                AudioControlRequest(
+                    action=action,
+                    loop_mode=loop_mode,
+                    position_seconds=position_seconds,
+                    speed=speed,
+                    pitch=pitch,
+                ),
+                invocation_context(interaction),
+            )
+            response = cast(
+                AudioQueueResponse,
+                await self.runtime.registry.invoke(
+                    "audio.queue",
+                    AudioQueueRequest(),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.edit_original_response(
+                embed=music_queue_embed(response),
+                view=self,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Start in VC",
+        style=discord.ButtonStyle.success,
+        custom_id="simajilord:music:start",
+        row=0,
+    )
+    async def start_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        try:
+            channel = _member_voice_channel(interaction.user)
+            if channel is None:
+                raise UserError("Join a voice channel first.")
+            workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
+            session = self.runtime.audio.require(workspace_id)
+            if session.output.connected:
+                _require_same_voice(session, interaction.user)
+            elif not session.can_start_for(str(interaction.user.id)):
+                raise UserError("audio.waiting_queue_restricted")
+            await interaction.response.defer()
+            await self.runtime.registry.invoke(
+                "discord.connect_voice",
+                DiscordConnectVoiceRequest(channel_id=str(channel.id)),
+                invocation_context(interaction),
+            )
+            response = cast(
+                AudioQueueResponse,
+                await self.runtime.registry.invoke(
+                    "audio.queue",
+                    AudioQueueRequest(),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.edit_original_response(
+                embed=music_queue_embed(response),
+                view=self,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @discord.ui.button(
+        label="Pause",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:music:pause",
+        row=0,
+    )
+    async def pause_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        await self._run(interaction, AudioAction.PAUSE)
+
+    @discord.ui.button(
+        label="Resume",
+        style=discord.ButtonStyle.success,
+        custom_id="simajilord:music:resume",
+        row=0,
+    )
+    async def resume_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        await self._run(interaction, AudioAction.RESUME)
+
+    @discord.ui.button(
+        label="Skip",
+        style=discord.ButtonStyle.primary,
+        custom_id="simajilord:music:skip",
+        row=0,
+    )
+    async def skip_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        await self._run(interaction, AudioAction.SKIP)
+
+    @discord.ui.button(
+        label="Loop",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:music:loop",
+        row=0,
+    )
+    async def loop_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        response = cast(
+            AudioQueueResponse,
+            await self.runtime.registry.invoke(
+                "audio.queue",
+                AudioQueueRequest(),
+                invocation_context(interaction),
+            ),
+        )
+        modes = (LoopMode.NONE, LoopMode.TRACK, LoopMode.QUEUE)
+        current = LoopMode(response.loop_mode)
+        await self._run(
+            interaction,
+            AudioAction.LOOP,
+            loop_mode=modes[(modes.index(current) + 1) % len(modes)],
+        )
+
+    @discord.ui.button(
+        label="Leave",
+        style=discord.ButtonStyle.danger,
+        custom_id="simajilord:music:leave",
+        row=1,
+    )
+    async def leave_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[MusicControlsView],
+    ) -> None:
+        await self._run(interaction, AudioAction.LEAVE)
 
 
 def invocation_context(interaction: discord.Interaction) -> InvocationContext:
@@ -295,59 +663,73 @@ class SystemCog(commands.Cog):
 
 
 class MusicCog(commands.Cog):
-    music = app_commands.Group(name="music", description="Play and control audio.")
+    music = app_commands.Group(
+        name="music",
+        description="Advanced music controls and grouped command aliases.",
+    )
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
         self.runtime = runtime
 
-    async def _connect_to_member(self, interaction: discord.Interaction) -> None:
-        if not isinstance(interaction.user, discord.Member):
-            raise UserError("Your voice state is unavailable.")
-        voice_state = interaction.user.voice
-        if voice_state is None or voice_state.channel is None:
-            raise UserError("Join a voice channel first.")
-        if interaction.guild_id is None:
-            raise UserError("Music commands require a Discord server.")
+    async def _prepare_play(self, interaction: discord.Interaction) -> None:
+        session = _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
+        channel = _member_voice_channel(interaction.user)
+        if session.output.connected:
+            _require_same_voice(session, interaction.user)
+            return
+        if channel is None:
+            return
         cast(
             DiscordConnectVoiceResponse,
             await self.runtime.registry.invoke(
                 "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=str(voice_state.channel.id)),
+                DiscordConnectVoiceRequest(channel_id=str(channel.id)),
                 invocation_context(interaction),
             ),
         )
 
-    @music.command(name="play", description="Resolve and queue a URL or search query.")
-    @app_commands.describe(reference="A YouTube/TikTok URL or a YouTube search query")
-    async def play(self, interaction: discord.Interaction, reference: str) -> None:
+    async def _send_play(self, interaction: discord.Interaction, reference: str) -> None:
         try:
             await interaction.response.defer(thinking=True)
-            await self._connect_to_member(interaction)
+            await self._prepare_play(interaction)
             response = cast(
                 AudioPlayResponse,
                 await self.runtime.registry.invoke(
                     "audio.play",
-                    AudioPlayRequest(reference=reference),
+                    AudioPlayRequest(
+                        reference=reference,
+                        requested_by_name=interaction.user.display_name,
+                    ),
                     invocation_context(interaction),
                 ),
             )
             await interaction.followup.send(
-                embed=command_embed(
-                    "Track queued",
-                    description=f"[{response.title}]({response.page_url})",
-                    fields=(
-                        EmbedField("Queue position", str(response.queue_position)),
-                    ),
-                    tone=EmbedTone.SUCCESS,
-                )
+                embed=music_added_embed(response),
+                view=MusicControlsView(self.runtime),
             )
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @music.command(name="queue", description="Show current and pending audio.")
-    async def queue(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(
+        name="play",
+        description="Add a YouTube/TikTok URL or search to the music queue.",
+    )
+    @app_commands.describe(reference="Paste a supported URL or type a song/video name")
+    async def quick_play(self, interaction: discord.Interaction, reference: str) -> None:
+        await self._send_play(interaction, reference)
+
+    @music.command(
+        name="play",
+        description="Add a URL or search to the music queue.",
+    )
+    @app_commands.describe(reference="Paste a supported URL or type a song/video name")
+    async def play(self, interaction: discord.Interaction, reference: str) -> None:
+        await self._send_play(interaction, reference)
+
+    async def _send_queue(self, interaction: discord.Interaction) -> None:
         try:
+            _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
             response = cast(
                 AudioQueueResponse,
                 await self.runtime.registry.invoke(
@@ -356,45 +738,109 @@ class MusicCog(commands.Cog):
                     invocation_context(interaction),
                 ),
             )
-            lines = [
-                f"Now: **{response.current.title}**"
-                if response.current
-                else "Now: nothing",
-                f"State: {'paused' if response.paused else 'playing/idle'} · "
-                f"Loop: `{response.loop_mode}`",
-            ]
-            lines.extend(
-                f"{index}. [{item.kind}] {item.title}"
-                for index, item in enumerate(response.pending[:10], start=1)
-            )
-            if len(response.pending) > 10:
-                lines.append(f"…and {len(response.pending) - 10} more.")
             await interaction.response.send_message(
-                embed=command_embed(
-                    "Audio queue",
-                    description="\n".join(lines),
-                )
+                embed=music_queue_embed(response),
+                view=MusicControlsView(self.runtime),
             )
         except Exception as exc:
             await send_error(interaction, exc)
+
+    @app_commands.command(
+        name="queue",
+        description="Show what is playing and what comes next.",
+    )
+    async def quick_queue(self, interaction: discord.Interaction) -> None:
+        await self._send_queue(interaction)
+
+    @music.command(
+        name="queue",
+        description="Show what is playing and what comes next.",
+    )
+    async def queue(self, interaction: discord.Interaction) -> None:
+        await self._send_queue(interaction)
+
+    async def _send_history(self, interaction: discord.Interaction, limit: int) -> None:
+        try:
+            _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
+            response = cast(
+                AudioHistoryResponse,
+                await self.runtime.registry.invoke(
+                    "audio.history",
+                    AudioHistoryRequest(limit=limit),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(embed=music_history_embed(response))
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @app_commands.command(
+        name="history",
+        description="Show recently played tracks and who requested them.",
+    )
+    async def quick_history(
+        self,
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 25] = 10,
+    ) -> None:
+        await self._send_history(interaction, int(limit))
+
+    @music.command(
+        name="history",
+        description="Show recently played tracks and who requested them.",
+    )
+    async def history(
+        self,
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 25] = 10,
+    ) -> None:
+        await self._send_history(interaction, int(limit))
 
     async def _control(
         self,
         interaction: discord.Interaction,
         action: AudioAction,
         loop_mode: LoopMode | None = None,
+        enabled: bool | None = None,
+        position_seconds: float | None = None,
+        speed: float | None = None,
+        pitch: float | None = None,
     ) -> None:
         try:
+            workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
+            session = self.runtime.audio.require(workspace_id)
+            _require_same_voice(session, interaction.user)
             response = cast(
                 AudioControlResponse,
                 await self.runtime.registry.invoke(
                     "audio.control",
-                    AudioControlRequest(action=action, loop_mode=loop_mode),
+                    AudioControlRequest(
+                        action=action,
+                        loop_mode=loop_mode,
+                        enabled=enabled,
+                        position_seconds=position_seconds,
+                        speed=speed,
+                        pitch=pitch,
+                    ),
                     invocation_context(interaction),
                 ),
             )
             if response.action == AudioAction.LOOP.value:
                 message = f"Loop mode set to `{response.loop_mode}`."
+            elif response.action == AudioAction.REMOVE.value:
+                message = f"Removed **{response.affected_title}** from the queue."
+            elif response.action == AudioAction.AUTO_LEAVE.value:
+                message = f"Auto leave is now **{'on' if response.enabled else 'off'}**."
+            elif response.action == AudioAction.SHUFFLE.value:
+                message = "Upcoming tracks shuffled."
+            elif response.action == AudioAction.SEEK.value:
+                message = f"Moved to `{_duration(response.position_seconds or 0)}`."
+            elif response.action == AudioAction.TUNE.value:
+                message = (
+                    f"Speed **{response.speed:.2f}x** · Pitch **{response.pitch:.2f}x**."
+                    if response.speed is not None and response.pitch is not None
+                    else "Playback tuning updated."
+                )
             else:
                 message = _AUDIO_ACTION_MESSAGES[response.action]
             await interaction.response.send_message(
@@ -434,6 +880,86 @@ class MusicCog(commands.Cog):
         mode: Literal["none", "track", "queue"],
     ) -> None:
         await self._control(interaction, AudioAction.LOOP, LoopMode(mode))
+
+    @music.command(name="remove", description="Remove one upcoming track by position.")
+    @app_commands.describe(position="The number shown under Up next")
+    async def remove(self, interaction: discord.Interaction, position: int) -> None:
+        try:
+            workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
+            session = self.runtime.audio.require(workspace_id)
+            _require_same_voice(session, interaction.user)
+            response = cast(
+                AudioControlResponse,
+                await self.runtime.registry.invoke(
+                    "audio.control",
+                    AudioControlRequest(
+                        action=AudioAction.REMOVE,
+                        position=position,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Removed from queue",
+                    description=f"**{response.affected_title}**",
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @music.command(
+        name="autoleave",
+        description="Leave when the last listener exits without losing the queue.",
+    )
+    async def autoleave(self, interaction: discord.Interaction, enabled: bool) -> None:
+        await self._control(
+            interaction,
+            AudioAction.AUTO_LEAVE,
+            enabled=enabled,
+        )
+
+    @music.command(name="shuffle", description="Shuffle upcoming music.")
+    async def shuffle(self, interaction: discord.Interaction) -> None:
+        await self._control(interaction, AudioAction.SHUFFLE)
+
+    @music.command(name="seek", description="Move within the current track.")
+    @app_commands.describe(position="Absolute 1:23 or relative +30 / -10")
+    async def seek(self, interaction: discord.Interaction, position: str) -> None:
+        try:
+            parsed, relative = _parse_position(position)
+            if relative:
+                snapshot = cast(
+                    AudioQueueResponse,
+                    await self.runtime.registry.invoke(
+                        "audio.queue",
+                        AudioQueueRequest(),
+                        invocation_context(interaction),
+                    ),
+                )
+                parsed += snapshot.position_seconds
+            await self._control(
+                interaction,
+                AudioAction.SEEK,
+                position_seconds=max(0.0, parsed),
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @music.command(name="tune", description="Adjust playback speed and pitch.")
+    async def tune(
+        self,
+        interaction: discord.Interaction,
+        speed: app_commands.Range[float, 0.5, 2.0] = 1.0,
+        pitch: app_commands.Range[float, 0.5, 2.0] = 1.0,
+    ) -> None:
+        await self._control(
+            interaction,
+            AudioAction.TUNE,
+            speed=float(speed),
+            pitch=float(pitch),
+        )
 
 
 class ReadAloudCog(commands.Cog):
@@ -613,6 +1139,102 @@ class ReadAloudCog(commands.Cog):
                 message.guild.id,
                 message.channel.id,
             )
+
+
+class VoiceLifecycleCog(commands.Cog):
+    """Keep voice presence aligned with listeners without losing the music queue."""
+
+    def __init__(self, runtime: SimajilordRuntime) -> None:
+        self.runtime = runtime
+        self._leave_tasks: dict[str, asyncio.Task[None]] = {}
+
+    async def cog_unload(self) -> None:
+        for task in self._leave_tasks.values():
+            task.cancel()
+        self._leave_tasks.clear()
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if member.bot:
+            return
+        workspace_id = str(member.guild.id)
+        session = self.runtime.audio.find(workspace_id)
+        if session is None:
+            return
+
+        destination_id = (
+            int(session.destination_id) if session.destination_id is not None else None
+        )
+        joined_expected_channel = (
+            after.channel is not None
+            and (
+                (session.waiting_for_voice and session.can_start_for(str(member.id)))
+                or after.channel.id == destination_id
+            )
+        )
+        if joined_expected_channel and after.channel is not None:
+            task = self._leave_tasks.pop(workspace_id, None)
+            if task is not None:
+                task.cancel()
+            if session.has_music and not session.output.connected:
+                try:
+                    self.runtime.audio.assert_connection_capacity(workspace_id)
+                    await session.connect(str(after.channel.id))
+                    log.info(
+                        "Resumed preserved audio queue after a listener joined guild=%s",
+                        workspace_id,
+                    )
+                except Exception:
+                    log.exception(
+                        "Could not resume preserved audio queue guild=%s",
+                        workspace_id,
+                    )
+            return
+
+        if destination_id is None:
+            return
+        if before.channel is None or before.channel.id != destination_id:
+            return
+        existing = self._leave_tasks.pop(workspace_id, None)
+        if existing is not None:
+            existing.cancel()
+
+        async def leave_if_lonely() -> None:
+            try:
+                await asyncio.sleep(10)
+                output = session.output
+                if not output.connected or not session.auto_leave:
+                    return
+                guild = member.guild
+                channel = guild.get_channel(destination_id)
+                if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                    await session.suspend()
+                    return
+                if any(not listener.bot for listener in channel.members):
+                    return
+                await session.suspend()
+                log.info(
+                    "Auto-left empty voice channel while preserving queue guild=%s channel=%s",
+                    workspace_id,
+                    destination_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Voice auto-leave failed guild=%s", workspace_id)
+            finally:
+                if self._leave_tasks.get(workspace_id) is asyncio.current_task():
+                    self._leave_tasks.pop(workspace_id, None)
+
+        self._leave_tasks[workspace_id] = asyncio.create_task(
+            leave_if_lonely(),
+            name=f"simajilord-auto-leave-{workspace_id}",
+        )
 
 
 class DownloadCog(commands.Cog):
@@ -927,15 +1549,23 @@ class PrefixCog(commands.Cog):
         self.bot = bot
         self.runtime = runtime
 
-    async def _connect(self, context: BotContext) -> None:
+    async def _prepare_play(self, context: BotContext) -> None:
         if context.guild is None or not isinstance(context.author, discord.Member):
             raise UserError("workspace.required")
-        state = context.author.voice
-        if state is None or state.channel is None:
-            raise UserError("Join a voice channel first.")
+        session = _discord_audio_session(
+            self.bot,
+            self.runtime,
+            context.guild.id,
+        )
+        channel = _member_voice_channel(context.author)
+        if session.output.connected:
+            _require_same_voice(session, context.author)
+            return
+        if channel is None:
+            return
         await self.runtime.registry.invoke(
             "discord.connect_voice",
-            DiscordConnectVoiceRequest(channel_id=str(state.channel.id)),
+            DiscordConnectVoiceRequest(channel_id=str(channel.id)),
             prefix_context(context),
         )
 
@@ -987,24 +1617,21 @@ class PrefixCog(commands.Cog):
     @commands.command(name="play")
     async def play(self, context: BotContext, *, reference: str) -> None:
         try:
-            await self._connect(context)
+            await self._prepare_play(context)
             response = cast(
                 AudioPlayResponse,
                 await self.runtime.registry.invoke(
                     "audio.play",
-                    AudioPlayRequest(reference=reference),
+                    AudioPlayRequest(
+                        reference=reference,
+                        requested_by_name=context.author.display_name,
+                    ),
                     prefix_context(context),
                 ),
             )
             await context.send(
-                embed=command_embed(
-                    "Track queued",
-                    description=f"[{response.title}]({response.page_url})",
-                    fields=(
-                        EmbedField("Queue position", str(response.queue_position)),
-                    ),
-                    tone=EmbedTone.SUCCESS,
-                )
+                embed=music_added_embed(response),
+                view=MusicControlsView(self.runtime),
             )
         except Exception as exc:
             await context.send(
@@ -1018,6 +1645,8 @@ class PrefixCog(commands.Cog):
     @commands.command(name="queue")
     async def queue(self, context: BotContext) -> None:
         try:
+            guild_id = context.guild.id if context.guild else None
+            _discord_audio_session(self.bot, self.runtime, guild_id)
             response = cast(
                 AudioQueueResponse,
                 await self.runtime.registry.invoke(
@@ -1026,18 +1655,33 @@ class PrefixCog(commands.Cog):
                     prefix_context(context),
                 ),
             )
-            lines = [
-                f"Now: **{response.current.title}**"
-                if response.current
-                else "Now: nothing"
-            ]
-            lines.extend(
-                f"{index}. [{item.kind}] {item.title}"
-                for index, item in enumerate(response.pending[:10], start=1)
-            )
             await context.send(
-                embed=command_embed("Audio queue", description="\n".join(lines))
+                embed=music_queue_embed(response),
+                view=MusicControlsView(self.runtime),
             )
+        except Exception as exc:
+            await context.send(
+                embed=command_embed(
+                    "Command failed",
+                    description=error_message(exc),
+                    tone=EmbedTone.ERROR,
+                )
+            )
+
+    @commands.command(name="history")
+    async def history(self, context: BotContext, limit: int = 10) -> None:
+        try:
+            guild_id = context.guild.id if context.guild else None
+            _discord_audio_session(self.bot, self.runtime, guild_id)
+            response = cast(
+                AudioHistoryResponse,
+                await self.runtime.registry.invoke(
+                    "audio.history",
+                    AudioHistoryRequest(limit=limit),
+                    prefix_context(context),
+                ),
+            )
+            await context.send(embed=music_history_embed(response))
         except Exception as exc:
             await context.send(
                 embed=command_embed(
@@ -1049,6 +1693,10 @@ class PrefixCog(commands.Cog):
 
     async def _control(self, context: BotContext, action: AudioAction) -> None:
         try:
+            if context.guild is None:
+                raise UserError("workspace.required")
+            session = self.runtime.audio.require(str(context.guild.id))
+            _require_same_voice(session, context.author)
             response = cast(
                 AudioControlResponse,
                 await self.runtime.registry.invoke(
@@ -1095,9 +1743,11 @@ class PrefixCog(commands.Cog):
 
 
 async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
+    bot.add_view(MusicControlsView(runtime))
     await bot.add_cog(SystemCog(bot, runtime))
     await bot.add_cog(MusicCog(bot, runtime))
     await bot.add_cog(ReadAloudCog(bot, runtime))
+    await bot.add_cog(VoiceLifecycleCog(runtime))
     await bot.add_cog(DownloadCog(runtime))
     await bot.add_cog(UtilityCog(runtime))
     await bot.add_cog(DiscordInfoCog(runtime))

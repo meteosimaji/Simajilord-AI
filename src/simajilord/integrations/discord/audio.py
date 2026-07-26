@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import shutil
 
 import discord
 
@@ -12,6 +13,43 @@ from simajilord.core.errors import ProviderError, UserError
 from simajilord.domain.audio import AudioItem
 
 log = logging.getLogger(__name__)
+
+
+async def verify_ffmpeg_opus() -> None:
+    """Fail fast when the host cannot produce the Opus packets Discord expects."""
+
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        raise ProviderError("FFmpeg is not installed or is not available on PATH.")
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=48000:cl=stereo",
+        "-t",
+        "0.05",
+        "-c:a",
+        "libopus",
+        "-f",
+        "opus",
+        "pipe:1",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
+    except TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise ProviderError("FFmpeg Opus self-test timed out.") from exc
+    if process.returncode != 0 or not stdout.startswith(b"OggS"):
+        detail = stderr.decode(errors="replace")[-500:]
+        raise ProviderError(f"FFmpeg Opus self-test failed: {detail or 'invalid output'}")
+    log.info("FFmpeg Opus self-test passed using %s", executable)
 
 
 class DiscordAudioOutput:
@@ -78,21 +116,7 @@ class DiscordAudioOutput:
         if voice.is_playing() or voice.is_paused():
             raise ProviderError("The Discord audio output is already busy.")
 
-        before_parts = ["-nostdin"]
-        if item.kind.value == "music":
-            before_parts.extend(
-                ("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
-            )
-        header_value = _header_value(item.http_headers)
-        if header_value:
-            before_parts.extend(("-headers", header_value))
-
-        source = discord.FFmpegPCMAudio(
-            item.source,
-            before_options=shlex.join(before_parts),
-            options="-vn",
-        )
-        transformed = discord.PCMVolumeTransformer(source)
+        source = build_discord_audio_source(item)
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[None] = loop.create_future()
 
@@ -108,10 +132,12 @@ class DiscordAudioOutput:
             loop.call_soon_threadsafe(finish)
 
         try:
-            voice.play(transformed, after=after)
+            # FFmpegOpusAudio reports is_opus=True, so discord.py sends the packets
+            # directly instead of constructing its native libopus PCM encoder.
+            voice.play(source, after=after)
             await completed
         finally:
-            transformed.cleanup()
+            source.cleanup()
 
     def pause(self) -> None:
         voice = self._adopt_voice_client()
@@ -146,6 +172,54 @@ class DiscordAudioOutput:
         if isinstance(guild.voice_client, discord.VoiceClient):
             self._voice = guild.voice_client
         return self._voice
+
+
+def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
+    """Create an Opus source without invoking discord.py's native PCM encoder."""
+
+    before_parts = ["-nostdin"]
+    if item.kind.value == "music":
+        before_parts.extend(
+            ("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
+        )
+    header_value = _header_value(item.http_headers)
+    if header_value:
+        before_parts.extend(("-headers", header_value))
+    if item.start_seconds > 0:
+        before_parts.extend(("-ss", f"{item.start_seconds:.3f}"))
+    filters: list[str] = []
+    if item.pitch != 1.0:
+        filters.extend(
+            (
+                "aresample=48000",
+                f"asetrate=48000*{item.pitch:.6f}",
+                "aresample=48000",
+            )
+        )
+    tempo = item.speed / item.pitch
+    filters.extend(_atempo_filters(tempo))
+    options = ["-vn"]
+    if filters:
+        options.extend(("-filter:a", ",".join(filters)))
+    return discord.FFmpegOpusAudio(
+        item.source,
+        before_options=shlex.join(before_parts),
+        options=shlex.join(options),
+    )
+
+
+def _atempo_filters(tempo: float) -> list[str]:
+    filters: list[str] = []
+    remaining = tempo
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    if abs(remaining - 1.0) > 1e-6:
+        filters.append(f"atempo={remaining:.6f}")
+    return filters
 
 
 def _header_value(headers: dict[str, str] | None) -> str | None:
