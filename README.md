@@ -51,6 +51,8 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - Durable requester attribution and a bounded recently-played history
 - Automatic read-aloud from text channels, threads, and voice-channel chats with persistent
   many-conversations-to-one-voice routing
+- Eager read-aloud voice preparation after `/join` and whenever a listener returns, avoiding
+  a first-message connection delay
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
   `say` fallback; long messages are sentence-chunked and joined without truncation
 - Speech-over-music sidechain ducking, followed by stream re-resolution and playback

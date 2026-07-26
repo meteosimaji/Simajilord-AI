@@ -1531,9 +1531,11 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 ephemeral=True,
             )
             return
+        configured: ReadAloudResponse | None = None
         try:
+            await interaction.response.defer()
             source_ids = tuple(str(channel.id) for channel in self.values)
-            response = cast(
+            configured = cast(
                 ReadAloudResponse,
                 await self.runtime.registry.invoke(
                     "discord.manage_read_aloud",
@@ -1545,9 +1547,14 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                     invocation_context(interaction),
                 ),
             )
-            await interaction.response.edit_message(
+            await self.runtime.registry.invoke(
+                "discord.connect_voice",
+                DiscordConnectVoiceRequest(channel_id=str(self.destination_id)),
+                invocation_context(interaction),
+            )
+            await interaction.edit_original_response(
                 embed=command_embed(
-                    "Read-aloud joined",
+                    "Read-aloud ready",
                     description=(
                         "The selected conversations were added. New messages there "
                         "will be read automatically."
@@ -1557,14 +1564,15 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                             "Conversation channels",
                             "\n".join(
                                 f"<#{channel_id}>"
-                                for channel_id in response.text_channel_ids
+                                for channel_id in configured.text_channel_ids
                             ),
                             inline=False,
                         ),
                         EmbedField(
                             "Voice channel",
-                            f"<#{response.audio_destination_id}>",
+                            f"<#{configured.audio_destination_id}>",
                         ),
+                        EmbedField("Connection", "Ready"),
                         EmbedField("Voice", _speech_voice_label(self.runtime)),
                     ),
                     tone=EmbedTone.SUCCESS,
@@ -1572,7 +1580,33 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 view=None,
             )
         except Exception as exc:
-            await send_error(interaction, exc)
+            if configured is None:
+                await send_error(interaction, exc)
+                return
+            log.exception(
+                "Read-aloud route was saved but eager voice connection failed "
+                "guild=%s channel=%s",
+                interaction.guild_id,
+                self.destination_id,
+            )
+            await interaction.edit_original_response(
+                embed=command_embed(
+                    "Read-aloud saved",
+                    description=(
+                        "The conversations are configured, but the voice connection "
+                        "is not ready yet. The next message will retry automatically."
+                    ),
+                    fields=(
+                        EmbedField(
+                            "Voice channel",
+                            f"<#{configured.audio_destination_id}>",
+                        ),
+                        EmbedField("Connection", error_message(exc)),
+                    ),
+                    tone=EmbedTone.WARNING,
+                ),
+                view=None,
+            )
 
 
 class ReadAloudChannelSelectView(discord.ui.View):
@@ -1904,7 +1938,8 @@ class ReadAloudCog(commands.Cog):
 class VoiceLifecycleCog(commands.Cog):
     """Keep voice presence aligned with listeners without losing the music queue."""
 
-    def __init__(self, runtime: SimajilordRuntime) -> None:
+    def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
+        self.bot = bot
         self.runtime = runtime
         self._leave_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -1923,7 +1958,18 @@ class VoiceLifecycleCog(commands.Cog):
         if member.bot:
             return
         workspace_id = str(member.guild.id)
+        route = self.runtime.read_aloud.get(workspace_id)
+        joined_read_aloud_destination = (
+            route is not None
+            and after.channel is not None
+            and str(after.channel.id) == route.audio_destination_id
+        )
         session = self.runtime.audio.find(workspace_id)
+        if session is None and joined_read_aloud_destination:
+            session = self.runtime.audio.get_or_create(
+                workspace_id,
+                lambda: DiscordAudioOutput(self.bot, member.guild.id),
+            )
         if session is None:
             return
 
@@ -1935,25 +1981,37 @@ class VoiceLifecycleCog(commands.Cog):
             and (
                 (session.waiting_for_voice and session.can_start_for(str(member.id)))
                 or after.channel.id == destination_id
+                or joined_read_aloud_destination
             )
         )
         if joined_expected_channel and after.channel is not None:
             task = self._leave_tasks.pop(workspace_id, None)
             if task is not None:
                 task.cancel()
-            if session.has_music and not session.output.connected:
+            music_targets_another_channel = (
+                session.has_music
+                and session.destination_id is not None
+                and str(after.channel.id) != session.destination_id
+            )
+            should_connect = (
+                session.has_music or joined_read_aloud_destination
+            ) and not music_targets_another_channel
+            if should_connect and not session.output.connected:
                 try:
                     await self.runtime.audio.connect(
                         workspace_id,
                         str(after.channel.id),
                     )
                     log.info(
-                        "Resumed preserved audio queue after a listener joined guild=%s",
+                        "Prepared audio after a listener joined guild=%s "
+                        "read_aloud=%s music=%s",
                         workspace_id,
+                        joined_read_aloud_destination,
+                        session.has_music,
                     )
                 except Exception:
                     log.exception(
-                        "Could not resume preserved audio queue guild=%s",
+                        "Could not prepare audio after a listener joined guild=%s",
                         workspace_id,
                     )
             return
@@ -3506,7 +3564,7 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     await bot.add_cog(SystemCog(bot, runtime))
     await bot.add_cog(MusicCog(bot, runtime))
     await bot.add_cog(ReadAloudCog(bot, runtime))
-    await bot.add_cog(VoiceLifecycleCog(runtime))
+    await bot.add_cog(VoiceLifecycleCog(bot, runtime))
     await bot.add_cog(WebCog(runtime))
     await bot.add_cog(ModerationCog(runtime))
     await bot.add_cog(DownloadCog(runtime))

@@ -97,6 +97,7 @@ class SimajilordDiscordBot(commands.Bot):
         )
         if not self._audio_restored:
             await self._restore_audio_sessions()
+            await self._prepare_read_aloud_presence()
             self._audio_restored = True
         await self._synchronize_initial_commands()
 
@@ -200,6 +201,61 @@ class SimajilordDiscordBot(commands.Bot):
                 )
             except Exception:
                 log.exception("Could not reconnect restored audio session %s", session.workspace_id)
+
+    async def _prepare_read_aloud_presence(self) -> None:
+        """Connect persisted read-aloud routes that already have listeners."""
+
+        for guild in self.guilds:
+            workspace_id = str(guild.id)
+            route = self.runtime.read_aloud.get(workspace_id)
+            if route is None:
+                continue
+            channel = guild.get_channel(int(route.audio_destination_id))
+            if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                log.warning(
+                    "Cannot prepare read-aloud route %s: destination %s no longer exists",
+                    workspace_id,
+                    route.audio_destination_id,
+                )
+                continue
+            if not any(not member.bot for member in channel.members):
+                continue
+
+            def create_output(guild_id: int = guild.id) -> DiscordAudioOutput:
+                return DiscordAudioOutput(self, guild_id)
+
+            session = self.runtime.audio.get_or_create(
+                workspace_id,
+                create_output,
+            )
+            if session.output.connected:
+                continue
+            if (
+                session.has_music
+                and session.destination_id is not None
+                and session.destination_id != route.audio_destination_id
+            ):
+                log.info(
+                    "Read-aloud route %s remains in standby while music targets %s",
+                    workspace_id,
+                    session.destination_id,
+                )
+                continue
+            try:
+                await self.runtime.audio.connect(
+                    workspace_id,
+                    route.audio_destination_id,
+                )
+                log.info(
+                    "Prepared read-aloud route %s for existing listeners in %s",
+                    workspace_id,
+                    route.audio_destination_id,
+                )
+            except Exception:
+                log.exception(
+                    "Could not prepare read-aloud route %s on startup",
+                    workspace_id,
+                )
 
     def _restore_global_templates(self) -> None:
         self.tree.clear_commands(guild=None)

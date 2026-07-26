@@ -24,6 +24,7 @@ from simajilord.capabilities.read_aloud import (
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
+from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
     _assert_agent_channel_scope,
     _assert_agent_update_scope,
@@ -40,6 +41,7 @@ from simajilord.integrations.discord.cogs import (
     MusicSearchChoiceView,
     ReadAloudChannelSelect,
     ReadAloudCog,
+    VoiceLifecycleCog,
     WebCog,
     WebFetchContinueView,
     _agent_error_text,
@@ -521,6 +523,115 @@ def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> No
     assert discord.ChannelType.text in selector.channel_types
     assert discord.ChannelType.voice in selector.channel_types
     assert discord.ChannelType.public_thread in selector.channel_types
+
+
+@pytest.mark.asyncio
+async def test_join_selection_connects_voice_before_reporting_ready() -> None:
+    configured = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50", "51"),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(side_effect=(configured, object()))
+    selector = ReadAloudChannelSelect(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    selected_one = Mock()
+    selected_one.id = 50
+    selected_two = Mock()
+    selected_two.id = 51
+    selector._values = [selected_one, selected_two]
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 90
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user.id = 7
+    interaction.response.defer = AsyncMock()
+    interaction.response.send_message = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await selector.callback(interaction)
+
+    assert [call.args[0] for call in runtime.registry.invoke.await_args_list] == [
+        "discord.manage_read_aloud",
+        "discord.connect_voice",
+    ]
+    interaction.response.defer.assert_awaited_once()
+    interaction.edit_original_response.assert_awaited_once()
+    embed = interaction.edit_original_response.await_args.kwargs["embed"]
+    assert embed.title == "Read-aloud ready"
+    assert any(
+        field.name == "Connection" and field.value == "Ready"
+        for field in embed.fields
+    )
+
+
+@pytest.mark.asyncio
+async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    route = Mock()
+    route.audio_destination_id = "55"
+    runtime.read_aloud.get.return_value = route
+    runtime.audio.find.return_value = None
+    session = Mock()
+    session.waiting_for_voice = False
+    session.has_music = False
+    session.destination_id = None
+    session.output.connected = False
+    runtime.audio.get_or_create.return_value = session
+    runtime.audio.connect = AsyncMock()
+    member = Mock(spec=discord.Member)
+    member.bot = False
+    member.id = 7
+    member.guild.id = 1
+    before = Mock(spec=discord.VoiceState)
+    before.channel = None
+    after = Mock(spec=discord.VoiceState)
+    after.channel = Mock(spec=discord.VoiceChannel)
+    after.channel.id = 55
+    cog = VoiceLifecycleCog(cast(commands.Bot, object()), runtime)
+
+    await cog.on_voice_state_update(member, before, after)
+
+    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.connect.assert_awaited_once_with("1", "55")
+
+
+@pytest.mark.asyncio
+async def test_startup_connects_read_aloud_when_listener_is_already_present() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    route = Mock()
+    route.audio_destination_id = "55"
+    runtime.read_aloud.get.return_value = route
+    session = Mock()
+    session.output.connected = False
+    session.has_music = False
+    session.destination_id = None
+    runtime.audio.get_or_create.return_value = session
+    runtime.audio.connect = AsyncMock()
+    listener = Mock(spec=discord.Member)
+    listener.bot = False
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.members = [listener]
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = channel
+    bot = Mock(spec=SimajilordDiscordBot)
+    bot.runtime = runtime
+    bot.guilds = [guild]
+
+    await SimajilordDiscordBot._prepare_read_aloud_presence(bot)
+
+    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.connect.assert_awaited_once_with("1", "55")
 
 
 def test_hive_analysis_is_one_direct_attachment_command() -> None:
