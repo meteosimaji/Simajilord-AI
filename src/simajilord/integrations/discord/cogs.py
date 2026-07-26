@@ -152,7 +152,20 @@ _ERROR_MESSAGES = {
         "Message chunks must contain between 1 and 1000 characters."
     ),
     "discord.message_offset_invalid": "Choose a valid message text offset.",
+    "discord.manage_guild_required": (
+        "Read-aloud is already assigned to another voice channel. "
+        "A server manager can move it with `/readaloud setup`."
+    ),
     "read_aloud.route_fields_required": "Choose both text and voice channels.",
+    "read_aloud.destination_conflict": (
+        "Read-aloud is already assigned to another voice channel."
+    ),
+    "read_aloud.source_channel_required": "Choose a conversation channel.",
+    "read_aloud.source_channel_limit": "Choose between 1 and 25 conversation channels.",
+    "read_aloud.source_channels_required": "Choose at least one conversation channel.",
+    "discord.message_channel_unavailable": (
+        "Every selected channel must be readable by both you and the Bot."
+    ),
     "speech.no_readable_text": "There is no readable text.",
     "speech.queue_full": "The read-aloud queue is full. Try again shortly.",
     "utility.dice_count_invalid": "Dice count must be between 1 and 20.",
@@ -961,6 +974,9 @@ def invocation_context(interaction: discord.Interaction) -> InvocationContext:
         workspace_id=str(interaction.guild_id) if interaction.guild_id else None,
         transport="discord",
         request_id=str(interaction.id),
+        origin_resource_id=(
+            str(interaction.channel_id) if interaction.channel_id is not None else None
+        ),
     )
 
 
@@ -970,6 +986,7 @@ def prefix_context(context: BotContext) -> InvocationContext:
         workspace_id=str(context.guild.id) if context.guild else None,
         transport="discord",
         request_id=str(context.message.id),
+        origin_resource_id=str(context.channel.id),
     )
 
 
@@ -1473,27 +1490,187 @@ class MusicCog(commands.Cog):
         )
 
 
+_READ_ALOUD_CHANNEL_TYPES = [
+    discord.ChannelType.text,
+    discord.ChannelType.news,
+    discord.ChannelType.voice,
+    discord.ChannelType.stage_voice,
+    discord.ChannelType.news_thread,
+    discord.ChannelType.public_thread,
+    discord.ChannelType.private_thread,
+]
+
+
+class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
+    """Commit a bounded set of conversation channels in one interaction."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        requester_id: int,
+        destination_id: int,
+        default_values: tuple[discord.abc.GuildChannel | discord.Thread, ...],
+    ) -> None:
+        self.runtime = runtime
+        self.requester_id = requester_id
+        self.destination_id = destination_id
+        super().__init__(
+            custom_id="simajilord:readaloud:channels",
+            channel_types=_READ_ALOUD_CHANNEL_TYPES,
+            placeholder="Select conversation channels",
+            min_values=1,
+            max_values=25,
+            default_values=default_values,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/join` can change this selection.",
+                ephemeral=True,
+            )
+            return
+        try:
+            source_ids = tuple(str(channel.id) for channel in self.values)
+            response = cast(
+                ReadAloudResponse,
+                await self.runtime.registry.invoke(
+                    "discord.manage_read_aloud",
+                    ReadAloudRequest(
+                        action=ReadAloudAction.ADD_SOURCES,
+                        text_channel_ids=source_ids,
+                        audio_destination_id=str(self.destination_id),
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.edit_message(
+                embed=command_embed(
+                    "Read-aloud joined",
+                    description=(
+                        "The selected conversations were added. New messages there "
+                        "will be read automatically."
+                    ),
+                    fields=(
+                        EmbedField(
+                            "Conversation channels",
+                            "\n".join(
+                                f"<#{channel_id}>"
+                                for channel_id in response.text_channel_ids
+                            ),
+                            inline=False,
+                        ),
+                        EmbedField(
+                            "Voice channel",
+                            f"<#{response.audio_destination_id}>",
+                        ),
+                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                view=None,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+
+class ReadAloudChannelSelectView(discord.ui.View):
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        requester_id: int,
+        destination_id: int,
+        default_values: tuple[discord.abc.GuildChannel | discord.Thread, ...],
+    ) -> None:
+        super().__init__(timeout=300)
+        self.add_item(
+            ReadAloudChannelSelect(
+                runtime,
+                requester_id=requester_id,
+                destination_id=destination_id,
+                default_values=default_values,
+            )
+        )
+
+
 class ReadAloudCog(commands.Cog):
     readaloud = app_commands.Group(
         name="readaloud",
-        description="Configure automatic text-channel speech.",
+        description="Configure automatic Discord message read-aloud.",
     )
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
         self.runtime = runtime
 
-    @readaloud.command(name="setup", description="Route a text channel into a voice channel.")
+    @app_commands.command(
+        name="join",
+        description="Read this channel aloud in the voice channel you joined.",
+    )
+    async def join(self, interaction: discord.Interaction) -> None:
+        try:
+            member = interaction.user
+            source = interaction.channel
+            if not isinstance(member, discord.Member):
+                raise UserError("Use this command in a server.")
+            if not isinstance(
+                source,
+                (
+                    discord.TextChannel,
+                    discord.Thread,
+                    discord.VoiceChannel,
+                    discord.StageChannel,
+                ),
+            ):
+                raise UserError("Use this command in a server message channel.")
+            destination = member.voice.channel if member.voice is not None else None
+            if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
+                raise UserError("Join a voice channel first.")
+            default_channels: list[discord.abc.GuildChannel | discord.Thread] = []
+            selected_source = member.guild.get_channel_or_thread(source.id)
+            if selected_source is not None:
+                default_channels.append(selected_source)
+            view = ReadAloudChannelSelectView(
+                self.runtime,
+                requester_id=member.id,
+                destination_id=destination.id,
+                default_values=tuple(default_channels[:25]),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Add conversations",
+                    description=(
+                        "Select up to 25 text channels, threads, or voice-channel "
+                        f"chats to add to {destination.mention}."
+                    ),
+                    fields=(
+                        EmbedField("Current channel", source.mention),
+                        EmbedField("Voice channel", destination.mention),
+                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                    ),
+                ),
+                view=view,
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="setup",
+        description="Replace the route with one message channel and voice channel.",
+    )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
-        text_channel="Messages from this channel are read automatically",
+        text_channel="Messages from this text or voice channel are read automatically",
         voice_channel="Audio is played in this channel",
         mode="Queue speech, or skip it while music is active",
     )
     async def setup(
         self,
         interaction: discord.Interaction,
-        text_channel: discord.TextChannel | None = None,
+        text_channel: discord.TextChannel | discord.VoiceChannel | None = None,
         voice_channel: discord.VoiceChannel | None = None,
         mode: Literal["queue", "skip_during_music"] = "queue",
     ) -> None:
@@ -1502,10 +1679,13 @@ class ReadAloudCog(commands.Cog):
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
                 raise UserError("Manage Server permission is required.")
             selected_text = text_channel
-            if selected_text is None and isinstance(interaction.channel, discord.TextChannel):
+            if selected_text is None and isinstance(
+                interaction.channel,
+                (discord.TextChannel, discord.VoiceChannel),
+            ):
                 selected_text = interaction.channel
             if selected_text is None:
-                raise UserError("Choose a server text channel.")
+                raise UserError("Choose a server text or voice channel.")
             selected_voice = voice_channel
             if selected_voice is None and member.voice is not None:
                 candidate = member.voice.channel
@@ -1531,7 +1711,7 @@ class ReadAloudCog(commands.Cog):
                 embed=command_embed(
                     "Read-aloud configured",
                     fields=(
-                        EmbedField("Text channel", selected_text.mention),
+                        EmbedField("Conversation channel", selected_text.mention),
                         EmbedField("Voice channel", selected_voice.mention),
                         EmbedField("Mode", _read_aloud_mode_label(response.mode)),
                         EmbedField("Voice", _speech_voice_label(self.runtime)),
@@ -1566,13 +1746,72 @@ class ReadAloudCog(commands.Cog):
                 embed=command_embed(
                     "Read-aloud status",
                     fields=(
-                        EmbedField("Text channel", f"<#{response.text_channel_id}>"),
+                        EmbedField(
+                            "Conversation channels",
+                            "\n".join(
+                                f"<#{channel_id}>"
+                                for channel_id in response.text_channel_ids
+                            ),
+                        ),
                         EmbedField(
                             "Voice channel",
                             f"<#{response.audio_destination_id}>",
                         ),
                         EmbedField("Mode", _read_aloud_mode_label(response.mode)),
                         EmbedField("Voice", _speech_voice_label(self.runtime)),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="remove",
+        description="Stop reading one conversation channel.",
+    )
+    @app_commands.describe(
+        channel="Conversation channel to remove; defaults to this channel",
+    )
+    async def remove(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | discord.VoiceChannel | None = None,
+    ) -> None:
+        try:
+            selected = channel
+            if selected is None and isinstance(
+                interaction.channel,
+                (discord.TextChannel, discord.VoiceChannel),
+            ):
+                selected = interaction.channel
+            if selected is None:
+                raise UserError("Choose a server text or voice channel.")
+            response = cast(
+                ReadAloudResponse,
+                await self.runtime.registry.invoke(
+                    "discord.manage_read_aloud",
+                    ReadAloudRequest(
+                        action=ReadAloudAction.REMOVE_SOURCE,
+                        text_channel_id=str(selected.id),
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Conversation removed",
+                    description=(
+                        "Read-aloud is now disabled."
+                        if not response.enabled
+                        else "Other configured conversation channels remain active."
+                    ),
+                    fields=(
+                        EmbedField("Channel", selected.mention),
+                        EmbedField(
+                            "Remaining channels",
+                            str(len(response.text_channel_ids)),
+                        ),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
@@ -2687,6 +2926,14 @@ class AgentCog(commands.Cog):
             trigger_channel_id=message.channel.id,
         )
         if str(message.channel.id) not in resource_ids:
+            log.info(
+                "Mention agent turn rejected by channel scope guild=%s channel=%s "
+                "channel_type=%s actor=%s",
+                message.guild.id,
+                message.channel.id,
+                type(message.channel).__name__,
+                message.author.id,
+            )
             return
         actor_id = str(message.author.id)
         grants = _agent_grants(self.runtime, actor_id=actor_id)
@@ -2884,7 +3131,15 @@ class AgentAutonomyCog(commands.Cog):
             if response.content.strip() == AGENT_NO_ACTION_CONTENT:
                 return
             channel = self.bot.get_channel(int(channel_id))
-            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            if not isinstance(
+                channel,
+                (
+                    discord.TextChannel,
+                    discord.Thread,
+                    discord.VoiceChannel,
+                    discord.StageChannel,
+                ),
+            ):
                 return
             messages = _agent_message_groups(response.content)
             if not messages:

@@ -16,7 +16,7 @@ from simajilord.domain.image import ImageGenerationJob, ImageJobStatus
 from simajilord.runtime import SimajilordRuntime
 
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
-from .capabilities import build_discord_endpoints
+from .capabilities import DiscordMessageChannel, build_discord_endpoints
 from .cogs import setup_cogs
 
 log = logging.getLogger(__name__)
@@ -217,7 +217,15 @@ class SimajilordDiscordBot(commands.Bot):
             log.error("Image job %s has an invalid delivery target", job.job_id)
             return
         channel = self.get_channel(channel_id)
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        if not isinstance(
+            channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
             log.error("Image job %s delivery channel is unavailable", job.job_id)
             return
 
@@ -271,7 +279,7 @@ class SimajilordDiscordBot(commands.Bot):
 
 
 async def _send_image_progress(
-    channel: discord.TextChannel | discord.Thread,
+    channel: DiscordMessageChannel,
     job: ImageGenerationJob,
     embed: discord.Embed,
 ) -> discord.Message:

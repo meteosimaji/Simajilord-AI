@@ -7,7 +7,7 @@ import base64
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import PurePath
-from typing import cast
+from typing import TypeAlias, cast
 
 import discord
 
@@ -43,6 +43,13 @@ from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import WorkspaceFileRecord
 
 from .audio import DiscordAudioOutput
+
+DiscordMessageChannel: TypeAlias = (
+    discord.TextChannel
+    | discord.Thread
+    | discord.VoiceChannel
+    | discord.StageChannel
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,7 +348,7 @@ def build_discord_endpoints(
     ) -> DiscordReadMessagesResponse:
         guild = _guild(client, context)
         _assert_agent_channel_scope(context, request.channel_id)
-        channel = _text_channel(guild, request.channel_id)
+        channel = _message_channel(guild, request.channel_id)
         if not 1 <= request.limit <= 25:
             raise UserError("discord.message_limit_invalid")
         before = (
@@ -365,7 +372,7 @@ def build_discord_endpoints(
     ) -> DiscordGetMessageResponse:
         guild = _guild(client, context)
         _assert_agent_channel_scope(context, request.channel_id)
-        channel = _text_channel(guild, request.channel_id)
+        channel = _message_channel(guild, request.channel_id)
         message_id = _snowflake(request.message_id, "message")
         if request.offset < 0:
             raise UserError("discord.message_offset_invalid")
@@ -427,7 +434,7 @@ def build_discord_endpoints(
     ) -> SyntheticMediaAnalyzeResponse:
         guild = _guild(client, context)
         _assert_agent_channel_scope(context, request.channel_id)
-        channel = _text_channel(guild, request.channel_id)
+        channel = _message_channel(guild, request.channel_id)
         if not 0 <= request.attachment_index <= 9:
             raise UserError("discord.attachment_index_invalid")
         try:
@@ -533,9 +540,17 @@ def build_discord_endpoints(
             channel_id = int(request.channel_id)
         except ValueError as exc:
             raise UserError("The channel ID is invalid.") from exc
-        channel = guild.get_channel(channel_id)
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            raise UserError("The target is not a writable text channel.")
+        channel = guild.get_channel_or_thread(channel_id)
+        if not isinstance(
+            channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            raise UserError("The target is not a writable Discord message channel.")
         message = await channel.send(
             request.content,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -557,7 +572,7 @@ def build_discord_endpoints(
         if len(request.caption) > 2_000:
             raise UserError("discord.file_caption_too_long")
         guild = _guild(client, context)
-        channel = _text_channel(guild, request.channel_id)
+        channel = _message_channel(guild, request.channel_id)
         path = runtime.files.path_for_delivery(context.workspace_id, request.path)
         if path.stat().st_size > 25 * 1024 * 1024:
             raise UserError("discord.file_too_large")
@@ -686,20 +701,83 @@ def build_discord_endpoints(
 
         guild = _guild(client, context)
         member = _actor_member(guild, context)
-        if (
-            request.action in {ReadAloudAction.CONFIGURE, ReadAloudAction.DISABLE}
-            and not member.guild_permissions.manage_guild
-        ):
-            raise UserError("discord.manage_guild_required")
-        if request.action is ReadAloudAction.CONFIGURE:
-            if request.text_channel_id is None or request.audio_destination_id is None:
+        mutating = request.action is not ReadAloudAction.STATUS
+        if mutating and not member.guild_permissions.manage_guild:
+            member_voice = _member_voice_channel(member)
+            if request.action is ReadAloudAction.ADD_SOURCES:
+                current_route = runtime.read_aloud.get(str(guild.id))
+                self_service_allowed = (
+                    bool(request.text_channel_ids)
+                    and request.audio_destination_id is not None
+                    and member_voice is not None
+                    and str(member_voice.id) == request.audio_destination_id
+                    and (
+                        current_route is None
+                        or current_route.audio_destination_id
+                        == request.audio_destination_id
+                    )
+                )
+            elif request.action in {
+                ReadAloudAction.CONFIGURE,
+                ReadAloudAction.ADD_SOURCE,
+            }:
+                self_service_allowed = (
+                    request.text_channel_id is not None
+                    and request.audio_destination_id is not None
+                    and context.origin_resource_id == request.text_channel_id
+                    and member_voice is not None
+                    and str(member_voice.id) == request.audio_destination_id
+                )
+            else:
+                route = runtime.read_aloud.get(str(guild.id))
+                self_service_allowed = (
+                    route is not None
+                    and member_voice is not None
+                    and str(member_voice.id) == route.audio_destination_id
+                    and (
+                        request.action is ReadAloudAction.DISABLE
+                        or (
+                            request.action is ReadAloudAction.REMOVE_SOURCE
+                            and request.text_channel_id is not None
+                            and context.origin_resource_id == request.text_channel_id
+                        )
+                    )
+                )
+            if not self_service_allowed:
+                raise UserError("discord.manage_guild_required")
+        if request.action is ReadAloudAction.ADD_SOURCES:
+            source_ids = tuple(dict.fromkeys(request.text_channel_ids))
+            if not 1 <= len(source_ids) <= 25:
+                raise UserError("read_aloud.source_channel_limit")
+            if request.audio_destination_id is None:
                 raise UserError("read_aloud.route_fields_required")
-            _text_channel(guild, request.text_channel_id)
+            for source_id in source_ids:
+                source = _message_channel(guild, source_id)
+                if not _can_read_messages(source, member):
+                    raise UserError("discord.message_channel_unavailable")
+                if guild.me is None or not _can_read_messages(source, guild.me):
+                    raise UserError("discord.message_channel_unavailable")
             voice = guild.get_channel(
                 _snowflake(request.audio_destination_id, "voice channel")
             )
             if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_required")
+        elif request.action in {
+            ReadAloudAction.CONFIGURE,
+            ReadAloudAction.ADD_SOURCE,
+        }:
+            if request.text_channel_id is None or request.audio_destination_id is None:
+                raise UserError("read_aloud.route_fields_required")
+            _message_channel(guild, request.text_channel_id)
+            voice = guild.get_channel(
+                _snowflake(request.audio_destination_id, "voice channel")
+            )
+            if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
+                raise UserError("discord.voice_channel_required")
+        elif request.action is ReadAloudAction.REMOVE_SOURCE:
+            if request.text_channel_id is None:
+                raise UserError("read_aloud.source_channel_required")
+            _message_channel(guild, request.text_channel_id)
         response = await runtime.registry.invoke(
             "speech.manage_read_aloud",
             request,
@@ -1052,6 +1130,24 @@ def _text_channel(
     return channel
 
 
+def _message_channel(
+    guild: discord.Guild,
+    channel_id: str,
+) -> DiscordMessageChannel:
+    channel = guild.get_channel_or_thread(_snowflake(channel_id, "channel"))
+    if not isinstance(
+        channel,
+        (
+            discord.TextChannel,
+            discord.Thread,
+            discord.VoiceChannel,
+            discord.StageChannel,
+        ),
+    ):
+        raise UserError("The target is not a Discord message channel.")
+    return channel
+
+
 def _message_record(
     message: discord.Message,
     *,
@@ -1100,7 +1196,7 @@ async def _attachment(
 ) -> tuple[discord.Message, discord.Attachment]:
     guild = _guild(client, context)
     _assert_agent_channel_scope(context, channel_id)
-    channel = _text_channel(guild, channel_id)
+    channel = _message_channel(guild, channel_id)
     if not 0 <= attachment_index <= 9:
         raise UserError("discord.attachment_index_invalid")
     try:
@@ -1133,7 +1229,7 @@ def _image_media_type(content: bytes) -> str | None:
 
 
 async def _reply_context(
-    channel: discord.TextChannel | discord.Thread,
+    channel: DiscordMessageChannel,
     message: discord.Message,
     *,
     max_depth: int,
@@ -1236,9 +1332,11 @@ def agent_readable_channel_ids(
         return ()
     use_bot_scope = trusted_guild or actor is None
     readable: list[str] = []
-    channels: tuple[discord.TextChannel | discord.Thread, ...] = (
+    channels: tuple[DiscordMessageChannel, ...] = (
         *guild.text_channels,
         *guild.threads,
+        *guild.voice_channels,
+        *guild.stage_channels,
     )
     for channel in channels:
         if not _can_read_messages(channel, bot_member):
@@ -1257,8 +1355,11 @@ def agent_readable_channel_ids(
 
 
 def _can_read_messages(
-    channel: discord.TextChannel | discord.Thread,
+    channel: DiscordMessageChannel,
     member: discord.Member,
 ) -> bool:
     permissions = channel.permissions_for(member)
-    return permissions.view_channel and permissions.read_message_history
+    can_read = permissions.view_channel and permissions.read_message_history
+    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        return can_read and permissions.connect
+    return can_read

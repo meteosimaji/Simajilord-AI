@@ -16,7 +16,11 @@ from simajilord.capabilities.audio import (
     AudioSearchReason,
     AudioSearchResponse,
 )
-from simajilord.capabilities.read_aloud import ReadAloudAction, ReadAloudRequest
+from simajilord.capabilities.read_aloud import (
+    ReadAloudAction,
+    ReadAloudRequest,
+    ReadAloudResponse,
+)
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
@@ -34,6 +38,8 @@ from simajilord.integrations.discord.cogs import (
     MusicCog,
     MusicControlsView,
     MusicSearchChoiceView,
+    ReadAloudChannelSelect,
+    ReadAloudCog,
     WebCog,
     WebFetchContinueView,
     _agent_error_text,
@@ -211,6 +217,176 @@ async def test_agent_read_aloud_mutation_requires_manage_server(
     runtime.registry.invoke.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_join_self_service_is_limited_to_current_channel_and_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCE.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=response)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    guild.get_channel_or_thread.return_value = source
+    guild.get_channel.return_value = voice
+    member = Mock(spec=discord.Member)
+    member.guild_permissions.manage_guild = False
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        lambda selected_guild, context: member,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._member_voice_channel",
+        lambda selected_member: voice,
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    request = ReadAloudRequest(
+        action=ReadAloudAction.ADD_SOURCE,
+        text_channel_id="50",
+        audio_destination_id="55",
+    )
+
+    result = await endpoint_by_name["discord.manage_read_aloud"].invoke(
+        request,
+        InvocationContext(
+            actor_id="7",
+            workspace_id="1",
+            transport="discord",
+            request_id="event",
+            origin_resource_id="50",
+        ),
+    )
+
+    assert result == response
+    runtime.registry.invoke.assert_awaited_once()
+    delegated_name, delegated_request, delegated_context = (
+        runtime.registry.invoke.await_args.args
+    )
+    assert delegated_name == "speech.manage_read_aloud"
+    assert delegated_request == request
+    assert delegated_context.origin_resource_id == "50"
+
+    runtime.registry.invoke.reset_mock()
+    with pytest.raises(UserError, match=r"discord\.manage_guild_required"):
+        await endpoint_by_name["discord.manage_read_aloud"].invoke(
+            request,
+            InvocationContext(
+                actor_id="7",
+                workspace_id="1",
+                transport="discord",
+                request_id="other-event",
+                origin_resource_id="51",
+            ),
+        )
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50", "51"),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=response)
+    runtime.read_aloud.get.return_value = None
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    source_one = Mock(spec=discord.TextChannel)
+    source_one.id = 50
+    source_two = Mock(spec=discord.VoiceChannel)
+    source_two.id = 51
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    bot_member = Mock(spec=discord.Member)
+    member = Mock(spec=discord.Member)
+    member.guild_permissions.manage_guild = False
+    guild.me = bot_member
+    guild.get_channel_or_thread.side_effect = lambda channel_id: {
+        50: source_one,
+        51: source_two,
+    }.get(channel_id)
+    guild.get_channel.return_value = voice
+    readable_text = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    readable_voice = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+        connect=True,
+    )
+    source_one.permissions_for.return_value = readable_text
+    source_two.permissions_for.return_value = readable_voice
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        lambda selected_guild, context: member,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._member_voice_channel",
+        lambda selected_member: voice,
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    request = ReadAloudRequest(
+        action=ReadAloudAction.ADD_SOURCES,
+        text_channel_ids=("50", "51"),
+        audio_destination_id="55",
+    )
+
+    result = await endpoint_by_name["discord.manage_read_aloud"].invoke(
+        request,
+        InvocationContext(
+            actor_id="7",
+            workspace_id="1",
+            transport="discord",
+            request_id="event",
+            origin_resource_id="50",
+        ),
+    )
+
+    assert result == response
+    delegated_request = runtime.registry.invoke.await_args.args[1]
+    assert delegated_request == request
+
+
 def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
     group = next(
         command
@@ -316,6 +492,35 @@ def test_web_commands_are_short_direct_paths() -> None:
     }
     assert set(commands) == {"search", "fetch", "find"}
     assert commands["search"].description.startswith("Search the web")
+
+
+def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
+    commands = {
+        command.name: command
+        for command in ReadAloudCog.__cog_app_commands__
+        if isinstance(command, app_commands.Command)
+    }
+    assert set(commands) == {"join"}
+    assert commands["join"].description == (
+        "Read this channel aloud in the voice channel you joined."
+    )
+    assert commands["join"].parameters == []
+
+
+def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> None:
+    selector = ReadAloudChannelSelect(
+        cast(SimajilordRuntime, object()),
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+
+    assert selector.custom_id == "simajilord:readaloud:channels"
+    assert selector.min_values == 1
+    assert selector.max_values == 25
+    assert discord.ChannelType.text in selector.channel_types
+    assert discord.ChannelType.voice in selector.channel_types
+    assert discord.ChannelType.public_thread in selector.channel_types
 
 
 def test_hive_analysis_is_one_direct_attachment_command() -> None:
@@ -430,6 +635,8 @@ def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
     hidden.id = 20
     guild.text_channels = [allowed, hidden]
     guild.threads = []
+    guild.voice_channels = []
+    guild.stage_channels = []
     readable = discord.Permissions(view_channel=True, read_message_history=True)
     denied = discord.Permissions.none()
     allowed.permissions_for.side_effect = lambda member: (
@@ -456,6 +663,8 @@ def test_trusted_guild_scope_uses_bot_visibility_without_model_self_report() -> 
     channel.id = 20
     guild.text_channels = [channel]
     guild.threads = []
+    guild.voice_channels = []
+    guild.stage_channels = []
     readable = discord.Permissions(view_channel=True, read_message_history=True)
     denied = discord.Permissions.none()
     channel.permissions_for.side_effect = lambda member: (
@@ -468,6 +677,44 @@ def test_trusted_guild_scope_uses_bot_visibility_without_model_self_report() -> 
         trusted_guild=True,
         trigger_channel_id=10,
     ) == ("20",)
+
+
+def test_voice_chat_requires_message_history_and_connect_permission() -> None:
+    guild = Mock(spec=discord.Guild)
+    bot_member = Mock(spec=discord.Member)
+    actor = Mock(spec=discord.Member)
+    guild.me = bot_member
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 30
+    guild.text_channels = []
+    guild.threads = []
+    guild.voice_channels = [voice]
+    guild.stage_channels = []
+    readable = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+        connect=True,
+    )
+    voice.permissions_for.return_value = readable
+
+    assert agent_readable_channel_ids(
+        guild,
+        actor,
+        trusted_guild=False,
+        trigger_channel_id=30,
+    ) == ("30",)
+
+    voice.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+        connect=False,
+    )
+    assert agent_readable_channel_ids(
+        guild,
+        actor,
+        trusted_guild=False,
+        trigger_channel_id=30,
+    ) == ()
 
 
 def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:

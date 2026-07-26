@@ -49,7 +49,8 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - Voice-free queueing: add a track before joining, then start automatically when one of its
   requesters enters voice
 - Durable requester attribution and a bounded recently-played history
-- Automatic channel read-aloud with persistent text-to-voice routing
+- Automatic read-aloud from text channels, threads, and voice-channel chats with persistent
+  many-conversations-to-one-voice routing
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
   `say` fallback; long messages are sentence-chunked and joined without truncation
 - Speech-over-music sidechain ducking, followed by stream re-resolution and playback
@@ -57,8 +58,8 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
 - Server, user, and avatar information
 - Native polls, dice, and bounded random choice
-- Bounded Discord channel listing, reply-chain retrieval, and message-history reads for the
-  agent without injecting entire messages into its initial context
+- Bounded Discord channel listing, reply-chain retrieval, and message-history reads—including
+  voice-channel chat—for the agent without injecting entire messages into its initial context
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
 - Plain message sending and voice connection as independently invokable Discord APIs
@@ -117,7 +118,9 @@ existing local file with mode `0600`. The platform never extracts cookies from a
 - `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
 - `/music skip`, `/music stop`, `/music leave`, `/music loop`
 - `/music remove`, `/music shuffle`, `/music seek`, `/music tune`, `/music autoleave`
-- `/readaloud setup`, `/readaloud status`, `/readaloud disable`
+- `/join` to select up to 25 conversations and read them in your current VC
+- `/readaloud setup`, `/readaloud status`, `/readaloud remove`, `/readaloud disable` for
+  advanced route management
 - `/download`
 - `/search`, `/fetch`, `/find`
 - `/serverinfo`, `/userinfo`, `/avatar`, `/poll`

@@ -26,6 +26,15 @@ class ReadAloudRoute:
     audio_destination_id: str
     mode: ReadAloudMode
     enabled: bool = True
+    additional_text_channel_ids: tuple[str, ...] = ()
+
+    @property
+    def text_channel_ids(self) -> tuple[str, ...]:
+        """Return the stable, de-duplicated set of message sources."""
+
+        return tuple(
+            dict.fromkeys((self.text_channel_id, *self.additional_text_channel_ids))
+        )
 
 
 class ReadAloudService:
@@ -44,6 +53,89 @@ class ReadAloudService:
             self._routes[route.workspace_id] = route
             await asyncio.to_thread(self._save)
 
+    async def add_sources(
+        self,
+        *,
+        workspace_id: str,
+        text_channel_ids: tuple[str, ...],
+        audio_destination_id: str,
+        mode: ReadAloudMode,
+    ) -> ReadAloudRoute:
+        """Atomically add a source set without discarding existing routes."""
+
+        channel_ids = tuple(dict.fromkeys(text_channel_ids))
+        if not channel_ids:
+            raise ValueError("read_aloud.source_channels_required")
+        async with self._lock:
+            current = self.get(workspace_id)
+            if current is None:
+                combined_ids = channel_ids
+                route_mode = mode
+            else:
+                if current.audio_destination_id != audio_destination_id:
+                    raise ValueError("read_aloud.destination_conflict")
+                combined_ids = tuple(
+                    dict.fromkeys((*current.text_channel_ids, *channel_ids))
+                )
+                route_mode = current.mode
+            route = ReadAloudRoute(
+                workspace_id=workspace_id,
+                text_channel_id=combined_ids[0],
+                audio_destination_id=audio_destination_id,
+                mode=route_mode,
+                additional_text_channel_ids=combined_ids[1:],
+            )
+            self._routes[workspace_id] = route
+            await asyncio.to_thread(self._save)
+            return route
+
+    async def add_source(
+        self,
+        *,
+        workspace_id: str,
+        text_channel_id: str,
+        audio_destination_id: str,
+        mode: ReadAloudMode,
+    ) -> ReadAloudRoute:
+        """Add one source without discarding existing sources for the same VC."""
+
+        return await self.add_sources(
+            workspace_id=workspace_id,
+            text_channel_ids=(text_channel_id,),
+            audio_destination_id=audio_destination_id,
+            mode=mode,
+        )
+
+    async def remove_source(
+        self,
+        *,
+        workspace_id: str,
+        text_channel_id: str,
+    ) -> ReadAloudRoute | None:
+        """Remove one source; deleting the last source disables the route."""
+
+        async with self._lock:
+            current = self.get(workspace_id)
+            if current is None or text_channel_id not in current.text_channel_ids:
+                return current
+            channel_ids = tuple(
+                item for item in current.text_channel_ids if item != text_channel_id
+            )
+            if not channel_ids:
+                self._routes.pop(workspace_id, None)
+                await asyncio.to_thread(self._save)
+                return None
+            route = ReadAloudRoute(
+                workspace_id=workspace_id,
+                text_channel_id=channel_ids[0],
+                audio_destination_id=current.audio_destination_id,
+                mode=current.mode,
+                additional_text_channel_ids=channel_ids[1:],
+            )
+            self._routes[workspace_id] = route
+            await asyncio.to_thread(self._save)
+            return route
+
     async def disable(self, workspace_id: str) -> bool:
         async with self._lock:
             existed = self._routes.pop(workspace_id, None) is not None
@@ -53,7 +145,7 @@ class ReadAloudService:
 
     def matches(self, workspace_id: str, text_channel_id: str) -> bool:
         route = self.get(workspace_id)
-        return route is not None and route.text_channel_id == text_channel_id
+        return route is not None and text_channel_id in route.text_channel_ids
 
     def _load(self) -> None:
         if not self.state_file.exists():
@@ -71,6 +163,10 @@ class ReadAloudService:
                     audio_destination_id=str(item["audio_destination_id"]),
                     mode=ReadAloudMode(str(item["mode"])),
                     enabled=bool(item.get("enabled", True)),
+                    additional_text_channel_ids=tuple(
+                        str(value)
+                        for value in item.get("additional_text_channel_ids", ())
+                    ),
                 )
                 self._routes[route.workspace_id] = route
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -80,7 +176,13 @@ class ReadAloudService:
         self.state_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = self.state_file.with_suffix(".tmp")
         payload = [
-            {**asdict(route), "mode": route.mode.value}
+            {
+                **asdict(route),
+                "mode": route.mode.value,
+                "additional_text_channel_ids": list(
+                    route.additional_text_channel_ids
+                ),
+            }
             for route in sorted(self._routes.values(), key=lambda value: value.workspace_id)
         ]
         temporary.write_text(
