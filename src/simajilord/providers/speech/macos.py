@@ -11,16 +11,19 @@ from simajilord.core.errors import ProviderError
 
 class MacOSSayProvider:
     def __init__(self, voice: str, *, timeout_seconds: float = 30.0) -> None:
-        executable = shutil.which("say")
-        if executable is None:
-            raise ProviderError("The macOS `say` executable is unavailable.")
-        self.executable = executable
+        # Provider construction must remain platform-neutral so the capability
+        # graph can be validated on Linux. Availability is checked only when
+        # speech is actually requested.
+        self.executable = shutil.which("say")
         self.voice = voice
         self.timeout_seconds = timeout_seconds
 
     async def synthesize(self, text: str, destination: Path) -> None:
+        executable = self.executable
+        if executable is None:
+            raise ProviderError("The macOS `say` executable is unavailable.")
         process = await asyncio.create_subprocess_exec(
-            self.executable,
+            executable,
             "-v",
             self.voice,
             "-o",

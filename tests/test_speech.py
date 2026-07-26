@@ -16,7 +16,7 @@ from simajilord.capabilities.speech import (
 from simajilord.core import InvocationContext
 from simajilord.core.errors import ProviderError
 from simajilord.domain.audio import AudioItem, AudioKind
-from simajilord.providers.speech import VoicevoxSpeechProvider
+from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.services.audio import AudioSessionManager
 from simajilord.services.audio_state import AudioStateStore
 from simajilord.services.speech import SpeechService, speech_chunks
@@ -216,6 +216,19 @@ async def test_voicevox_provider_reports_unavailable_engine(tmp_path: Path) -> N
             await provider.synthesize("hello", tmp_path / "speech.wav")
     finally:
         await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_macos_provider_defers_platform_check_until_use(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("simajilord.providers.speech.macos.shutil.which", lambda _: None)
+
+    provider = MacOSSayProvider("Samantha")
+
+    with pytest.raises(ProviderError, match="unavailable"):
+        await provider.synthesize("hello", tmp_path / "speech.aiff")
 
 
 def _wave_bytes() -> bytes:
