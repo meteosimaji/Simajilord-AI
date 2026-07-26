@@ -16,6 +16,17 @@ class MediaReference:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaCandidate:
+    """Stable, lightweight media metadata safe to show before resolving a stream."""
+
+    reference: str
+    title: str
+    duration_seconds: float
+    uploader: str | None = None
+    thumbnail_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DownloadArtifact:
     path: Path
     title: str

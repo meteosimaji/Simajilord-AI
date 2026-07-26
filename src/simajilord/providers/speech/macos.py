@@ -42,3 +42,6 @@ class MacOSSayProvider:
         if process.returncode != 0 or not destination.is_file():
             detail = stderr.decode(errors="replace").strip()[:300]
             raise ProviderError(f"Local speech synthesis failed: {detail or 'unknown error'}")
+
+    async def close(self) -> None:
+        """The macOS provider does not own a persistent process."""

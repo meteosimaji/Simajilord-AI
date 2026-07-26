@@ -118,6 +118,7 @@ class AudioSession:
     async def enqueue(self, item: AudioItem) -> int:
         """Queue an item, prioritizing speech ahead of waiting music."""
 
+        interrupt_music = False
         async with self._lock:
             if self._closed:
                 item.cleanup()
@@ -131,11 +132,23 @@ class AudioSession:
                     raise UserError("speech.queue_full")
                 self._speech.append(item)
                 position = pending_speech + 1
+                current = self._current
+                if (
+                    current is not None
+                    and current.kind is AudioKind.MUSIC
+                    and current.speech_overlay_source is None
+                    and not self._restart_requested
+                ):
+                    current.start_seconds = self._position_seconds()
+                    self._restart_requested = True
+                    interrupt_music = True
             else:
                 self._music.append(item)
                 position = len(self._music)
             self._wake.set()
             self._ensure_worker()
+        if interrupt_music:
+            self.output.stop()
         await self._state_changed()
         return position
 
@@ -335,6 +348,8 @@ class AudioSession:
                 requested_by_id=item.requested_by_id,
                 requested_by_name=item.requested_by_name,
                 played_at_epoch=item.played_at_epoch,
+                uploader=item.uploader,
+                thumbnail_url=item.thumbnail_url,
             )
             for item in state.items
         )
@@ -348,6 +363,8 @@ class AudioSession:
                 requested_by_id=item.requested_by_id,
                 requested_by_name=item.requested_by_name,
                 played_at_epoch=item.played_at_epoch,
+                uploader=item.uploader,
+                thumbnail_url=item.thumbnail_url,
             )
             for item in state.history[-_MAX_HISTORY_ITEMS:]
         )
@@ -382,6 +399,8 @@ class AudioSession:
                         requested_by_id=item.requested_by_id,
                         requested_by_name=item.requested_by_name,
                         played_at_epoch=item.played_at_epoch,
+                        uploader=item.uploader,
+                        thumbnail_url=item.thumbnail_url,
                     )
                 )
             stored_items = tuple(stored_items_list)
@@ -394,6 +413,8 @@ class AudioSession:
                     requested_by_id=item.requested_by_id,
                     requested_by_name=item.requested_by_name,
                     played_at_epoch=item.played_at_epoch,
+                    uploader=item.uploader,
+                    thumbnail_url=item.thumbnail_url,
                 )
                 for item in self._history
                 if item.resolver_reference or item.page_url
@@ -422,14 +443,30 @@ class AudioSession:
     async def _next_item(self) -> AudioItem | None:
         async with self._lock:
             if self._speech:
-                return self._speech.popleft()
-            now = monotonic()
-            for _ in range(len(self._music)):
-                item = self._music.popleft()
-                if item.retry_after <= now:
-                    return item
-                self._music.append(item)
-            return None
+                speech = self._speech.popleft()
+                music = self._pop_ready_music()
+                if music is not None and speech.duration_seconds > 0:
+                    music.speech_overlay_source = speech.source
+                    music.speech_overlay_owned_file = speech.owned_file
+                    music.speech_overlay_duration_seconds = speech.duration_seconds
+                    speech.owned_file = None
+                    speech.cleanup()
+                    return music
+                if music is not None:
+                    self._music.appendleft(music)
+                return speech
+            return self._pop_ready_music()
+
+    def _pop_ready_music(self) -> AudioItem | None:
+        """Pop one playable music item while the caller owns ``self._lock``."""
+
+        now = monotonic()
+        for _ in range(len(self._music)):
+            item = self._music.popleft()
+            if item.retry_after <= now:
+                return item
+            self._music.append(item)
+        return None
 
     async def _next_retry_delay(self) -> float | None:
         async with self._lock:
@@ -491,7 +528,7 @@ class AudioSession:
                 skipped = self._skip_requested
                 discarded = self._discard_requested
                 suspended = self._suspend_requested
-                restarted = self._restart_requested
+                restarted = self._restart_requested or playable.resume_after_overlay
                 self._current = None
                 self._skip_requested = False
                 self._discard_requested = False
@@ -578,9 +615,11 @@ class AudioSession:
                     item.title,
                     type(exc).__name__,
                 )
-                playable = playable.unresolved_copy(
+                unresolved = playable.unresolved_copy(
                     failure_count=playable.failure_count
                 )
+                _move_speech_overlay(playable, unresolved)
+                playable = unresolved
         if last_error is None:
             raise RuntimeError("Audio playback failed without an error.")
         raise last_error
@@ -606,6 +645,9 @@ class AudioSession:
         resolved.pitch = item.pitch
         resolved.requested_by_id = item.requested_by_id
         resolved.requested_by_name = item.requested_by_name
+        resolved.uploader = resolved.uploader or item.uploader
+        resolved.thumbnail_url = resolved.thumbnail_url or item.thumbnail_url
+        _move_speech_overlay(item, resolved)
         return resolved
 
     def _position_seconds(self) -> float:
@@ -637,6 +679,15 @@ class AudioSession:
             log.exception("Could not persist audio state for %s", self.workspace_id)
 
 
+def _move_speech_overlay(source: AudioItem, destination: AudioItem) -> None:
+    """Transfer ephemeral overlay ownership without persisting or duplicating it."""
+
+    destination.speech_overlay_source = source.speech_overlay_source
+    destination.speech_overlay_owned_file = source.speech_overlay_owned_file
+    destination.speech_overlay_duration_seconds = source.speech_overlay_duration_seconds
+    source.speech_overlay_owned_file = None
+
+
 class AudioSessionManager:
     """Own one independent, recoverable audio session per workspace."""
 
@@ -653,6 +704,7 @@ class AudioSessionManager:
         self._resolver = resolver
         self._state_store = state_store
         self._sessions: dict[str, AudioSession] = {}
+        self._connection_lock = asyncio.Lock()
 
     @property
     def session_count(self) -> int:
@@ -719,6 +771,15 @@ class AudioSessionManager:
         )
         if active_other_sessions >= self.max_active:
             raise UserError("audio.capacity_reached")
+
+    async def connect(self, workspace_id: str, destination_id: str) -> None:
+        """Atomically enforce the process voice limit and connect one session."""
+
+        async with self._connection_lock:
+            session = self.require(workspace_id)
+            if not session.output.connected:
+                self.assert_connection_capacity(workspace_id)
+            await session.connect(destination_id)
 
     async def close(self) -> None:
         await asyncio.gather(*(session.shutdown() for session in self._sessions.values()))

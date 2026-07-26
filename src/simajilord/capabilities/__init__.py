@@ -7,13 +7,37 @@ from .audio import (
     AudioPlayResponse,
     AudioQueueRequest,
     AudioQueueResponse,
+    AudioSearchItem,
+    AudioSearchReason,
+    AudioSearchRequest,
+    AudioSearchResponse,
     build_audio_endpoints,
 )
+from .files import build_file_endpoints
+from .image import (
+    ImageGenerateRequest,
+    ImageGenerateResponse,
+    ImageStatusRequest,
+    ImageStatusResponse,
+    build_image_endpoints,
+)
 from .media import DownloadRequest, DownloadResponse, build_download_endpoint
+from .moderation import (
+    ModerationStatusRequest,
+    ModerationStatusResponse,
+    SyntheticMediaAnalyzeRequest,
+    SyntheticMediaAnalyzeResponse,
+    build_moderation_endpoints,
+)
 from .read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
     build_read_aloud_endpoint,
+)
+from .speech import (
+    SpeechSpeakRequest,
+    SpeechSpeakResponse,
+    build_speech_endpoint,
 )
 from .system import (
     CapabilitySearchRequest,
@@ -31,6 +55,17 @@ from .utility import (
     RollResponse,
     build_utility_endpoints,
 )
+from .web import (
+    WebFetchRequest,
+    WebFetchResponse,
+    WebFindRequest,
+    WebFindResponse,
+    WebSearchRequest,
+    WebSearchResponse,
+    WebStatusRequest,
+    WebStatusResponse,
+    build_web_endpoints,
+)
 
 __all__ = [
     "AudioControlRequest",
@@ -39,23 +74,50 @@ __all__ = [
     "AudioPlayResponse",
     "AudioQueueRequest",
     "AudioQueueResponse",
+    "AudioSearchItem",
+    "AudioSearchReason",
+    "AudioSearchRequest",
+    "AudioSearchResponse",
     "CapabilitySearchRequest",
     "CapabilitySearchResponse",
     "ChooseRequest",
     "ChooseResponse",
     "DownloadRequest",
     "DownloadResponse",
+    "ImageGenerateRequest",
+    "ImageGenerateResponse",
+    "ImageStatusRequest",
+    "ImageStatusResponse",
+    "ModerationStatusRequest",
+    "ModerationStatusResponse",
     "PingRequest",
     "PingResponse",
     "ReadAloudRequest",
     "ReadAloudResponse",
     "RollRequest",
     "RollResponse",
+    "SpeechSpeakRequest",
+    "SpeechSpeakResponse",
+    "SyntheticMediaAnalyzeRequest",
+    "SyntheticMediaAnalyzeResponse",
     "UptimeRequest",
     "UptimeResponse",
+    "WebFetchRequest",
+    "WebFetchResponse",
+    "WebFindRequest",
+    "WebFindResponse",
+    "WebSearchRequest",
+    "WebSearchResponse",
+    "WebStatusRequest",
+    "WebStatusResponse",
     "build_audio_endpoints",
     "build_download_endpoint",
+    "build_file_endpoints",
+    "build_image_endpoints",
+    "build_moderation_endpoints",
     "build_read_aloud_endpoint",
+    "build_speech_endpoint",
     "build_system_endpoints",
     "build_utility_endpoints",
+    "build_web_endpoints",
 ]

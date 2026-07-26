@@ -6,25 +6,51 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
 
+from simajilord.agent import (
+    AGENT_AUDIO_GRANT,
+    AGENT_FILE_GRANT,
+    AGENT_IMAGE_GRANT,
+    AGENT_MESSAGE_GRANT,
+    AGENT_MODERATION_GRANT,
+    AGENT_WEB_GRANT,
+)
+from simajilord.agent.providers import CodexAppServerProvider
+from simajilord.agent.service import AgentLimits, AgentService
+from simajilord.agent.store import AgentConversationStore
+from simajilord.agent.tools import AgentToolCatalog
 from simajilord.capabilities import (
     build_audio_endpoints,
     build_download_endpoint,
+    build_file_endpoints,
+    build_image_endpoints,
+    build_moderation_endpoints,
     build_read_aloud_endpoint,
+    build_speech_endpoint,
     build_system_endpoints,
     build_utility_endpoints,
+    build_web_endpoints,
 )
 from simajilord.capabilities.status import build_status_endpoint
-from simajilord.config import Settings
+from simajilord.config import AgentFeatureAccess, Settings
 from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.media.providers import YtDlpProvider
 from simajilord.observability import EventJournal
-from simajilord.providers.speech import MacOSSayProvider
+from simajilord.providers.image import IdeogramMlxProvider
+from simajilord.providers.moderation import HiveSyntheticMediaProvider
+from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
+from simajilord.providers.web import AiohttpPublicWebFetcher, SearxngSearchProvider
 from simajilord.services import (
+    AgentFileSandbox,
     AudioSessionManager,
     AudioStateStore,
+    ImageGenerationService,
+    ImageGenerationStore,
     MediaService,
+    ModerationService,
+    ModerationStore,
     ReadAloudService,
     SpeechService,
+    WebService,
 )
 
 
@@ -38,7 +64,12 @@ class SimajilordRuntime:
     audio: AudioSessionManager
     speech: SpeechService
     read_aloud: ReadAloudService
+    web: WebService
+    moderation: ModerationService
+    image: ImageGenerationService
+    files: AgentFileSandbox | None
     journal: EventJournal
+    agent: AgentService | None
     started_at: datetime
     started_monotonic: float
 
@@ -56,15 +87,208 @@ class SimajilordRuntime:
             resolver=media.resolve_audio,
             state_store=AudioStateStore(settings.data_dir / "audio_sessions.json"),
         )
+        speech_provider = (
+            VoicevoxSpeechProvider(
+                base_url=settings.voicevox_base_url,
+                speaker_id=settings.voicevox_speaker_id,
+                timeout_seconds=settings.voicevox_timeout_seconds,
+                engine_path=settings.voicevox_engine_path,
+                auto_start=settings.voicevox_auto_start,
+            )
+            if settings.tts_provider == "voicevox"
+            else MacOSSayProvider(settings.tts_voice)
+        )
         speech = SpeechService(
-            MacOSSayProvider(settings.tts_voice),
+            speech_provider,
             output_dir=settings.data_dir / "speech",
-            max_characters=settings.max_read_aloud_characters,
+            chunk_characters=settings.read_aloud_chunk_characters,
             max_concurrent=settings.max_concurrent_tts,
+            file_suffix=".wav" if settings.tts_provider == "voicevox" else ".aiff",
         )
         read_aloud = ReadAloudService(settings.data_dir / "read_aloud.json")
+        web = WebService(
+            search_provider=SearxngSearchProvider(
+                base_url=settings.web_search_base_url,
+                timeout_seconds=settings.web_request_timeout_seconds,
+                shared_secret=settings.web_search_shared_secret,
+            ),
+            page_fetcher=AiohttpPublicWebFetcher(
+                timeout_seconds=settings.web_request_timeout_seconds,
+            ),
+            max_fetch_bytes=settings.web_fetch_max_bytes,
+        )
+        moderation_provider = (
+            HiveSyntheticMediaProvider(
+                api_key=settings.hive_api_key,
+                timeout_seconds=settings.hive_timeout_seconds,
+            )
+            if settings.hive_api_key is not None
+            else None
+        )
+        moderation = ModerationService(
+            provider=moderation_provider,
+            store=ModerationStore(settings.data_dir / "moderation.sqlite3"),
+            daily_limit=settings.hive_daily_limit,
+            max_media_bytes=settings.hive_max_media_bytes,
+            threshold=settings.hive_threshold,
+        )
+        image_provider = (
+            IdeogramMlxProvider(
+                model_path=settings.image_model_path,
+                mflux_source=settings.image_mflux_source,
+                timeout_seconds=settings.image_timeout_seconds,
+                mlx_cache_limit_gb=settings.image_mlx_cache_limit_gb,
+            )
+            if settings.image_model_path is not None
+            else None
+        )
         journal = EventJournal(settings.data_dir / "events.sqlite3")
+        image = ImageGenerationService(
+            provider=image_provider,
+            store=ImageGenerationStore(settings.data_dir / "image_generation.sqlite3"),
+            journal=journal,
+            output_dir=settings.data_dir / "generated_images",
+            per_user_requests=settings.image_per_user_requests,
+            per_user_window_seconds=settings.image_per_user_window_seconds,
+            per_workspace_requests=settings.image_per_workspace_requests,
+            per_workspace_window_seconds=settings.image_per_workspace_window_seconds,
+            max_pending_jobs=settings.image_max_pending_jobs,
+            rate_limit_exempt_actor_ids=settings.agent_rate_limit_exempt_user_ids,
+        )
+        files = (
+            AgentFileSandbox(settings.data_dir / "agent_files")
+            if settings.agent_file_sandbox_enabled
+            else None
+        )
         registry = CapabilityRegistry(journal=journal)
+        agent: AgentService | None = None
+        if settings.agent_enabled:
+            agent_capabilities = [
+                "audio.history",
+                "audio.queue",
+                "audio.search",
+                "discord.get_message",
+                "discord.list_channels",
+                "discord.manage_read_aloud",
+                "discord.play_audio",
+                "discord.control_audio",
+                "discord.read_messages",
+                "discord.send_message",
+                "discord.speak",
+            ]
+            required_grants: dict[str, str] = {
+                "audio.history": AGENT_AUDIO_GRANT,
+                "audio.queue": AGENT_AUDIO_GRANT,
+                "audio.search": AGENT_AUDIO_GRANT,
+                "discord.play_audio": AGENT_AUDIO_GRANT,
+                "discord.control_audio": AGENT_AUDIO_GRANT,
+                "discord.manage_read_aloud": AGENT_AUDIO_GRANT,
+                "discord.speak": AGENT_AUDIO_GRANT,
+                "discord.send_message": AGENT_MESSAGE_GRANT,
+            }
+            if settings.hive_api_key is not None:
+                capability_name = "discord.analyze_attachment"
+                agent_capabilities.append(capability_name)
+                required_grants[capability_name] = AGENT_MODERATION_GRANT
+            if settings.agent_web_search_access is not AgentFeatureAccess.DISABLED:
+                for capability_name in ("web.search", "web.fetch", "web.find"):
+                    agent_capabilities.append(capability_name)
+                    required_grants[capability_name] = AGENT_WEB_GRANT
+            if (
+                image.provider is not None
+                and settings.image_generation_access is not AgentFeatureAccess.DISABLED
+            ):
+                for capability_name in ("image.generate", "image.status"):
+                    agent_capabilities.append(capability_name)
+                    required_grants[capability_name] = AGENT_IMAGE_GRANT
+            if files is not None:
+                file_capabilities = (
+                    "files.list",
+                    "files.read",
+                    "files.write_text",
+                    "files.replace_text",
+                    "discord.import_attachment",
+                    "discord.view_image_attachment",
+                    "discord.send_file",
+                )
+                agent_capabilities.extend(file_capabilities)
+                required_grants.update(
+                    {name: AGENT_FILE_GRANT for name in file_capabilities}
+                )
+            agent_tools = AgentToolCatalog(
+                registry,
+                tuple(agent_capabilities),
+                required_grants=required_grants,
+                eager_capabilities=(
+                    "discord.get_message",
+                    "discord.read_messages",
+                    "discord.send_message",
+                    *(
+                        ("discord.view_image_attachment",)
+                        if files is not None
+                        else ()
+                    ),
+                ),
+                write_capabilities=(
+                    (
+                        "discord.send_message",
+                        "discord.play_audio",
+                        "discord.control_audio",
+                        "discord.manage_read_aloud",
+                        "discord.speak",
+                    )
+                    + (
+                        ("image.generate",)
+                        if "image.generate" in agent_capabilities
+                        else ()
+                    )
+                    + (
+                        (
+                            "files.write_text",
+                            "files.replace_text",
+                            "discord.import_attachment",
+                            "discord.send_file",
+                        )
+                        if files is not None
+                        else ()
+                    )
+                ),
+                image_output_capabilities=(
+                    ("discord.view_image_attachment",)
+                    if files is not None
+                    else ()
+                ),
+            )
+            agent = AgentService(
+                provider=CodexAppServerProvider(
+                    executable=settings.codex_executable,
+                    model=settings.agent_model,
+                    workspace_dir=settings.data_dir / "agent_workspace",
+                    timeout_seconds=settings.agent_timeout_seconds,
+                    reasoning_effort=settings.agent_reasoning_effort,
+                    tools=agent_tools,
+                    max_tool_calls=settings.agent_max_tool_calls,
+                    max_tool_output_characters=settings.agent_max_tool_output_characters,
+                ),
+                store=AgentConversationStore(
+                    settings.data_dir / "agent_conversations.sqlite3"
+                ),
+                journal=journal,
+                limits=AgentLimits(
+                    per_user_requests=settings.agent_per_user_requests,
+                    per_user_window_seconds=settings.agent_per_user_window_seconds,
+                    per_workspace_requests=settings.agent_per_workspace_requests,
+                    per_workspace_window_seconds=settings.agent_per_workspace_window_seconds,
+                    max_tokens_per_24_hours=settings.agent_max_tokens_per_24_hours,
+                    max_conversation_turns=settings.agent_max_conversation_turns,
+                    max_context_ratio=settings.agent_max_context_ratio,
+                    max_response_characters=settings.agent_max_response_characters,
+                    max_pending_turns=settings.agent_max_pending_turns,
+                    rate_limit_exempt_actor_ids=(
+                        settings.agent_rate_limit_exempt_user_ids
+                    ),
+                ),
+            )
         started_at = datetime.now(UTC)
         started_monotonic = monotonic()
         runtime = cls(
@@ -74,7 +298,12 @@ class SimajilordRuntime:
             audio=audio,
             speech=speech,
             read_aloud=read_aloud,
+            web=web,
+            moderation=moderation,
+            image=image,
+            files=files,
             journal=journal,
+            agent=agent,
             started_at=started_at,
             started_monotonic=started_monotonic,
         )
@@ -88,10 +317,35 @@ class SimajilordRuntime:
             *build_audio_endpoints(media, audio),
             build_download_endpoint(media),
             build_read_aloud_endpoint(read_aloud),
+            build_speech_endpoint(speech, audio),
+            *build_web_endpoints(web),
+            *build_moderation_endpoints(moderation),
+            *build_image_endpoints(image),
+            *(build_file_endpoints(files) if files is not None else ()),
         ):
             registry.register(item)
-        registry.register(build_status_endpoint(registry, journal, audio))
+        registry.register(
+            build_status_endpoint(
+                registry,
+                journal,
+                audio,
+                web,
+                agent_enabled=settings.agent_enabled,
+                speech_provider=settings.tts_provider,
+                speech_voice=(
+                    f"style {settings.voicevox_speaker_id}"
+                    if settings.tts_provider == "voicevox"
+                    else settings.tts_voice
+                ),
+            )
+        )
         return runtime
 
     async def close(self) -> None:
+        if self.agent is not None:
+            await self.agent.close()
+        await self.image.close()
+        await self.moderation.close()
+        await self.web.close()
         await self.audio.close()
+        await self.speech.close()

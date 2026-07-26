@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shlex
 import shutil
+from time import monotonic
 
 import discord
 
@@ -135,7 +136,32 @@ class DiscordAudioOutput:
             # FFmpegOpusAudio reports is_opus=True, so discord.py sends the packets
             # directly instead of constructing its native libopus PCM encoder.
             voice.play(source, after=after)
-            await completed
+            started_at = monotonic()
+            item.cleanup_speech_overlay()
+            overlay_duration = item.speech_overlay_duration_seconds
+            if item.speech_overlay_source is None or overlay_duration <= 0:
+                await completed
+            else:
+                overlay_finished = asyncio.create_task(
+                    asyncio.sleep(overlay_duration + 0.35),
+                    name="simajilord-speech-overlay",
+                )
+                try:
+                    done, _ = await asyncio.wait(
+                        (completed, overlay_finished),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if overlay_finished in done and not completed.done():
+                        elapsed = max(0.0, monotonic() - started_at)
+                        voice.stop()
+                        await completed
+                        item.start_seconds += elapsed * item.speed
+                        item.resume_after_overlay = True
+                    else:
+                        await completed
+                finally:
+                    overlay_finished.cancel()
+                    await asyncio.gather(overlay_finished, return_exceptions=True)
         finally:
             source.cleanup()
 
@@ -178,7 +204,9 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
     """Create an Opus source without invoking discord.py's native PCM encoder."""
 
     before_parts = ["-nostdin"]
-    if item.kind.value == "music":
+    if item.speech_overlay_source is not None:
+        before_parts.extend(("-i", item.speech_overlay_source))
+    if item.kind.value == "music" and item.source.startswith(("http://", "https://")):
         before_parts.extend(
             ("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5")
         )
@@ -198,9 +226,22 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
         )
     tempo = item.speed / item.pitch
     filters.extend(_atempo_filters(tempo))
-    options = ["-vn"]
-    if filters:
-        options.extend(("-filter:a", ",".join(filters)))
+    options: list[str]
+    if item.speech_overlay_source is not None:
+        music_filter = ",".join(filters) if filters else "anull"
+        filter_graph = (
+            "[0:a]aresample=48000,asplit=2[speech_sc][speech_mix];"
+            f"[1:a]{music_filter}[music];"
+            "[music][speech_sc]sidechaincompress="
+            "threshold=0.015:ratio=8:attack=20:release=350[ducked];"
+            "[ducked][speech_mix]amix="
+            "inputs=2:duration=longest:dropout_transition=0:normalize=0[mixed]"
+        )
+        options = ["-filter_complex", filter_graph, "-map", "[mixed]", "-vn"]
+    else:
+        options = ["-vn"]
+        if filters:
+            options.extend(("-filter:a", ",".join(filters)))
     return discord.FFmpegOpusAudio(
         item.source,
         before_options=shlex.join(before_parts),

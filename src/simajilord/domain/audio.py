@@ -43,11 +43,24 @@ class AudioItem:
     requested_by_id: str | None = None
     requested_by_name: str | None = None
     played_at_epoch: int | None = None
+    uploader: str | None = None
+    thumbnail_url: str | None = None
+    speech_overlay_source: str | None = None
+    speech_overlay_owned_file: Path | None = None
+    speech_overlay_duration_seconds: float = 0.0
+    resume_after_overlay: bool = False
 
     def clone_for_loop(self) -> AudioItem:
         """Return a loopable item without duplicating temporary-file ownership."""
 
-        return replace(self, owned_file=None)
+        return replace(
+            self,
+            owned_file=None,
+            speech_overlay_source=None,
+            speech_overlay_owned_file=None,
+            speech_overlay_duration_seconds=0.0,
+            resume_after_overlay=False,
+        )
 
     def unresolved_copy(self, *, failure_count: int | None = None) -> AudioItem:
         """Keep durable metadata but discard an expiring provider stream URL."""
@@ -60,19 +73,38 @@ class AudioItem:
             owned_file=None,
             failure_count=self.failure_count if failure_count is None else failure_count,
             retry_after=0.0,
+            speech_overlay_source=None,
+            speech_overlay_owned_file=None,
+            speech_overlay_duration_seconds=0.0,
+            resume_after_overlay=False,
         )
 
     def cleanup(self) -> None:
         """Remove a temporary source owned by this item."""
 
-        if self.owned_file is None:
+        self.cleanup_speech_overlay()
+        owned_file = self.owned_file
+        if owned_file is None:
             return
         try:
-            self.owned_file.unlink(missing_ok=True)
+            owned_file.unlink(missing_ok=True)
         except OSError:
-            log.warning("Could not remove temporary audio file: %s", self.owned_file)
+            log.warning("Could not remove temporary audio file: %s", owned_file)
         finally:
             self.owned_file = None
+
+    def cleanup_speech_overlay(self) -> None:
+        """Remove only the temporary read-aloud overlay after FFmpeg opens it."""
+
+        owned_file = self.speech_overlay_owned_file
+        if owned_file is None:
+            return
+        try:
+            owned_file.unlink(missing_ok=True)
+        except OSError:
+            log.warning("Could not remove temporary speech overlay: %s", owned_file)
+        finally:
+            self.speech_overlay_owned_file = None
 
 
 @dataclass(frozen=True, slots=True)

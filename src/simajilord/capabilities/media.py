@@ -53,9 +53,9 @@ def build_download_endpoint(media: MediaService) -> CapabilityEndpoint:
     return endpoint(
         CapabilityDescriptor(
             name="media.download",
-            summary="Download one supported public media URL into a bounded directory.",
+            summary="Download one provider-supported public media URL into a bounded directory.",
             risk=RiskLevel.EXTERNAL,
-            keywords=("youtube", "tiktok", "video", "audio", "save"),
+            keywords=("media", "download", "video", "audio", "save", "attachment"),
             side_effects=("Uses a media site.", "Creates a temporary local file."),
         ),
         DownloadRequest,

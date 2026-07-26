@@ -12,6 +12,7 @@ from simajilord.observability import EventJournal
 class SecretRequest:
     token: str
     content: str
+    binary: bytes = b""
 
 
 @pytest.mark.asyncio
@@ -20,7 +21,11 @@ async def test_journal_records_cursor_and_redacts_secrets(tmp_path) -> None:
     await journal.record_invocation(
         capability_name="test.secret",
         context=InvocationContext("actor", "workspace", "test", "request"),
-        request=SecretRequest(token="do-not-store", content="visible"),
+        request=SecretRequest(
+            token="do-not-store",
+            content="visible",
+            binary=b"never-store-these-bytes",
+        ),
         response={"ok": True},
         error=None,
         duration_ms=1.5,
@@ -32,4 +37,6 @@ async def test_journal_records_cursor_and_redacts_secrets(tmp_path) -> None:
     assert isinstance(request, dict)
     assert request["token"] == "[REDACTED]"
     assert request["content"] == "visible"
+    assert request["binary"] == {"binary_bytes": 23}
+    assert "never-store" not in str(records[0].payload)
     assert (tmp_path / "events.sqlite3").stat().st_mode & 0o077 == 0

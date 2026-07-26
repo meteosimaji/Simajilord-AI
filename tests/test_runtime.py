@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import cast
+
+import discord
+import pytest
+
+from simajilord.agent import AGENT_AUDIO_GRANT
+from simajilord.agent.providers import CodexAppServerProvider
+from simajilord.config import load_settings
+from simajilord.core import InvocationContext
+from simajilord.integrations.discord.capabilities import build_discord_endpoints
+from simajilord.runtime import SimajilordRuntime
+
+
+def test_runtime_composes_before_discord_starts_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "false")
+
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+
+    capability_names = tuple(
+        endpoint.descriptor.name for endpoint in runtime.registry.all()
+    )
+    assert len(capability_names) == len(set(capability_names))
+    assert {
+        "web.search",
+        "web.fetch",
+        "web.find",
+        "web.status",
+        "moderation.detect_synthetic_media",
+        "moderation.status",
+        "image.generate",
+        "image.status",
+    } <= set(capability_names)
+    asyncio.run(runtime.close())
+
+
+def test_agent_discovers_only_permission_guarded_audio_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_GENERATION_ACCESS", "disabled")
+    monkeypatch.setenv("AGENT_WEB_SEARCH_ACCESS", "disabled")
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+    for item in build_discord_endpoints(
+        cast(discord.Client, object()),
+        runtime,
+    ):
+        runtime.registry.register(item)
+    assert runtime.agent is not None
+    provider = cast(CodexAppServerProvider, runtime.agent.provider)
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({AGENT_AUDIO_GRANT}),
+    )
+
+    async def run() -> None:
+        output = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "music voice play speak", "limit": 5},
+            context=context,
+            max_output_characters=10_000,
+        )
+        assert "discord.play_audio" in output.text
+        assert "discord.speak" in output.text
+        assert '"name":"audio.play"' not in output.text
+        assert '"name":"speech.speak"' not in output.text
+        await runtime.close()
+
+    asyncio.run(run())

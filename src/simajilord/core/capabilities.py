@@ -25,7 +25,7 @@ class RiskLevel(StrEnum):
 
 
 class ApprovalMode(StrEnum):
-    """Whether a future agent must obtain approval before invocation."""
+    """Whether an agent must obtain approval before invocation."""
 
     NEVER = "never"
     WHEN_REQUESTED = "when_requested"
@@ -40,6 +40,9 @@ class InvocationContext:
     workspace_id: str | None
     transport: str
     request_id: str
+    resource_ids: tuple[str, ...] = ()
+    grants: frozenset[str] = frozenset()
+    origin_resource_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

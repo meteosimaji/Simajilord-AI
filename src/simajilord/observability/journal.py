@@ -14,7 +14,14 @@ from pathlib import Path
 
 from simajilord.core.capabilities import InvocationContext
 
-_SENSITIVE_PARTS = ("token", "secret", "password", "cookie", "authorization")
+_SENSITIVE_PARTS = (
+    "token",
+    "secret",
+    "password",
+    "cookie",
+    "authorization",
+    "data_url",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +37,7 @@ class EventRecord:
 
 
 class EventJournal:
-    """Store capability and transport events for audit and future agent reconciliation."""
+    """Store capability and transport events for audit and agent reconciliation."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -223,6 +230,8 @@ class EventJournal:
 def _safe_value(value: object, *, key: str = "") -> object:
     if any(part in key.lower() for part in _SENSITIVE_PARTS):
         return "[REDACTED]"
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"binary_bytes": len(value)}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {
             field.name: _safe_value(getattr(value, field.name), key=field.name)

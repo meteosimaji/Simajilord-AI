@@ -29,3 +29,28 @@ class MediaError(ProviderError):
         super().__init__(technical_detail or category)
         self.category = category
         self.technical_detail = technical_detail
+
+
+class WebError(ProviderError):
+    """A web capability failed with a stable provider-neutral category."""
+
+    def __init__(self, category: str, technical_detail: str = "") -> None:
+        super().__init__(technical_detail or category)
+        self.category = category
+        self.technical_detail = technical_detail
+
+
+class ModerationError(ProviderError):
+    """A media-analysis provider failed with a stable provider-neutral category."""
+
+    def __init__(
+        self,
+        category: str,
+        technical_detail: str = "",
+        *,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(technical_detail or category)
+        self.category = category
+        self.technical_detail = technical_detail
+        self.http_status = http_status

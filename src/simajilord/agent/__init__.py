@@ -1,5 +1,59 @@
-"""Contracts for a future local, event-driven agent runtime."""
+"""Event-driven agent runtime contracts."""
 
-from .contracts import ActionProposal, AgentEvent, AgentGoal
+from .contracts import (
+    AGENT_AUDIO_GRANT,
+    AGENT_AUTONOMY_ACTOR_ID,
+    AGENT_FILE_GRANT,
+    AGENT_IMAGE_GRANT,
+    AGENT_MESSAGE_BREAK,
+    AGENT_MESSAGE_GRANT,
+    AGENT_MODERATION_GRANT,
+    AGENT_NO_ACTION_CONTENT,
+    AGENT_WEB_GRANT,
+    ActionProposal,
+    AgentEvent,
+    AgentGoal,
+    AgentProgressStage,
+    AgentRequest,
+    AgentResponse,
+    AgentResponseStatus,
+    AgentTokenUsage,
+    AgentTrigger,
+)
+from .errors import (
+    AgentBusyError,
+    AgentError,
+    AgentProviderError,
+    AgentRateLimitError,
+    AgentThreadError,
+    AgentToolError,
+    AgentUnavailableError,
+)
 
-__all__ = ["ActionProposal", "AgentEvent", "AgentGoal"]
+__all__ = [
+    "AGENT_AUDIO_GRANT",
+    "AGENT_AUTONOMY_ACTOR_ID",
+    "AGENT_FILE_GRANT",
+    "AGENT_IMAGE_GRANT",
+    "AGENT_MESSAGE_BREAK",
+    "AGENT_MESSAGE_GRANT",
+    "AGENT_MODERATION_GRANT",
+    "AGENT_NO_ACTION_CONTENT",
+    "AGENT_WEB_GRANT",
+    "ActionProposal",
+    "AgentBusyError",
+    "AgentError",
+    "AgentEvent",
+    "AgentGoal",
+    "AgentProgressStage",
+    "AgentProviderError",
+    "AgentRateLimitError",
+    "AgentRequest",
+    "AgentResponse",
+    "AgentResponseStatus",
+    "AgentThreadError",
+    "AgentTokenUsage",
+    "AgentToolError",
+    "AgentTrigger",
+    "AgentUnavailableError",
+]

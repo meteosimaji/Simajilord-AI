@@ -9,17 +9,24 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode, urlsplit
 
-from simajilord.core.errors import MediaError
+from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioItem
-from simajilord.domain.media import DownloadArtifact, DownloadFormat
-from simajilord.media.security import normalize_media_reference, validate_media_url
+from simajilord.domain.media import DownloadArtifact, DownloadFormat, MediaCandidate
+from simajilord.media.security import (
+    normalize_media_query,
+    normalize_media_reference,
+    validate_media_url,
+    validate_public_media_url,
+)
 
 # The vendored source is trusted; unreviewed discovery from user plugin folders is not.
 os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 import yt_dlp  # type: ignore[import-untyped]
 
 log = logging.getLogger(__name__)
+_ALLOWED_EXTRACTORS = ["default", "-generic"]
 
 
 class YtDlpProvider:
@@ -36,9 +43,12 @@ class YtDlpProvider:
 
     async def resolve_audio(self, reference: str) -> AudioItem:
         normalized = normalize_media_reference(reference)
+        if normalized.startswith("https://"):
+            normalized = await validate_public_media_url(normalized)
 
         def extract() -> AudioItem:
             options: dict[str, Any] = {
+                "allowed_extractors": _ALLOWED_EXTRACTORS,
                 "format": "bestaudio/best",
                 "quiet": True,
                 "no_warnings": True,
@@ -54,14 +64,16 @@ class YtDlpProvider:
                 source = str(info.get("url") or "")
                 if not source:
                     raise MediaError("unavailable", "The media has no playable audio stream.")
-                page_url = str(info.get("webpage_url") or reference)
+                page_url = _safe_page_url(info.get("webpage_url"), fallback=reference)
                 return AudioItem(
                     source=source,
                     title=str(info.get("title") or "Untitled media"),
-                    duration_seconds=float(info.get("duration") or 0),
+                    duration_seconds=_safe_duration(info.get("duration")),
                     page_url=page_url,
                     http_headers=_safe_headers(info.get("http_headers")),
                     resolver_reference=page_url,
+                    uploader=_optional_text(info.get("uploader") or info.get("channel")),
+                    thumbnail_url=_safe_https_url(info.get("thumbnail")),
                 )
             except MediaError:
                 raise
@@ -74,6 +86,48 @@ class YtDlpProvider:
         except TimeoutError as exc:
             raise MediaError("timeout", "Media resolution timed out.") from exc
 
+    async def search_audio(
+        self,
+        query: str,
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
+        normalized = normalize_media_query(query)
+        if not 1 <= limit <= 25:
+            raise ValueError("limit must be between 1 and 25")
+
+        def extract() -> tuple[MediaCandidate, ...]:
+            options: dict[str, Any] = {
+                "allowed_extractors": _ALLOWED_EXTRACTORS,
+                "extract_flat": True,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "plugin_dirs": [],
+            }
+            if self.cookie_file is not None:
+                options["cookiefile"] = str(self.cookie_file)
+            try:
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    info = downloader.extract_info(
+                        f"ytsearch{limit}:{normalized}",
+                        download=False,
+                    )
+                candidates = _search_candidates(info, limit=limit)
+                if not candidates:
+                    raise MediaError("unavailable", "No media result was found.")
+                return candidates
+            except MediaError:
+                raise
+            except yt_dlp.utils.DownloadError as exc:
+                raise classify_yt_dlp_error(str(exc)) from exc
+
+        try:
+            async with asyncio.timeout(60):
+                return await asyncio.to_thread(extract)
+        except TimeoutError as exc:
+            raise MediaError("timeout", "Media search timed out.") from exc
+
     async def download(
         self,
         url: str,
@@ -82,13 +136,15 @@ class YtDlpProvider:
         *,
         max_bytes: int,
     ) -> DownloadArtifact:
-        source_url = validate_media_url(url)
+        source_url = await validate_public_media_url(url)
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         command = [
             sys.executable,
             "-m",
             "yt_dlp",
             "--no-plugin-dirs",
+            "--use-extractors",
+            "default,-generic",
             "--no-playlist",
             "--no-progress",
             "--no-warnings",
@@ -163,6 +219,105 @@ def _first_entry(info: Mapping[str, Any] | None) -> Mapping[str, Any]:
             raise MediaError("unavailable", "No media result was found.")
         return first
     return info
+
+
+def _search_candidates(
+    info: Mapping[str, Any] | None,
+    *,
+    limit: int,
+) -> tuple[MediaCandidate, ...]:
+    if not info:
+        return ()
+    raw_entries = info.get("entries")
+    if raw_entries is None:
+        raw_entries = (info,)
+    candidates: list[MediaCandidate] = []
+    seen: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        reference = _candidate_reference(raw_entry)
+        if reference is None or reference in seen:
+            continue
+        seen.add(reference)
+        candidates.append(
+            MediaCandidate(
+                reference=reference,
+                title=str(raw_entry.get("title") or "Untitled media"),
+                duration_seconds=_safe_duration(raw_entry.get("duration")),
+                uploader=_optional_text(
+                    raw_entry.get("uploader") or raw_entry.get("channel")
+                ),
+                thumbnail_url=_safe_https_url(raw_entry.get("thumbnail")),
+            )
+        )
+        if len(candidates) >= limit:
+            break
+    return tuple(candidates)
+
+
+def _candidate_reference(info: Mapping[str, Any]) -> str | None:
+    for key in ("webpage_url", "original_url", "url"):
+        value = info.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            try:
+                return validate_media_url(value)
+            except UserError:
+                continue
+    video_id = info.get("id")
+    if not isinstance(video_id, str) or not video_id:
+        return None
+    reference = "https://www.youtube.com/watch?" + urlencode({"v": video_id})
+    try:
+        return validate_media_url(reference)
+    except UserError:
+        return None
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split()).strip()
+    return normalized or None
+
+
+def _safe_duration(value: object) -> float:
+    if not isinstance(value, (int, float, str)):
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (OverflowError, TypeError, ValueError):
+        return 0.0
+
+
+def _safe_https_url(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 2_048:
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in (None, 443)
+        ):
+            return None
+    except ValueError:
+        return None
+    return value
+
+
+def _safe_page_url(value: object, *, fallback: str) -> str:
+    if isinstance(value, str):
+        try:
+            return validate_media_url(value)
+        except UserError:
+            pass
+    try:
+        return validate_media_url(fallback)
+    except UserError as exc:
+        raise MediaError("unsafe_path", "The media provider returned an unsafe page URL.") from exc
 
 
 def _safe_headers(value: object) -> dict[str, str] | None:

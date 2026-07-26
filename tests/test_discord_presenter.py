@@ -6,11 +6,32 @@ from simajilord.capabilities.audio import (
     AudioPlayResponse,
     AudioQueueItem,
     AudioQueueResponse,
+    AudioSearchItem,
+    AudioSearchReason,
+    AudioSearchResponse,
 )
+from simajilord.capabilities.moderation import SyntheticMediaAnalyzeResponse
+from simajilord.capabilities.web import (
+    WebFetchResponse,
+    WebSearchResponse,
+)
+from simajilord.domain.image import (
+    ImageGenerationJob,
+    ImageGenerationPrompt,
+    ImageJobStatus,
+    ImageRendering,
+)
+from simajilord.domain.moderation import SyntheticMediaModality, SyntheticMediaVerdict
+from simajilord.domain.web import WebSource
+from simajilord.integrations.discord.bot import _image_result_embed
 from simajilord.integrations.discord.cogs import (
     music_added_embed,
     music_history_embed,
     music_queue_embed,
+    music_search_embed,
+    synthetic_media_embed,
+    web_fetch_embed,
+    web_search_embed,
 )
 from simajilord.integrations.discord.presenter import (
     EmbedField,
@@ -32,6 +53,80 @@ def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
     assert embed.fields[0].value == "ok"
 
 
+def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
+    job = ImageGenerationJob(
+        job_id="job",
+        actor_id="actor",
+        workspace_id="workspace",
+        delivery_target_id="channel",
+        reply_to_message_id=None,
+        prompt=ImageGenerationPrompt(
+            subject="Exactly one orange cat with amber eyes",
+            scene="A rainy apartment window and a low walnut table",
+            composition="Landscape portrait with the cat on the left third",
+            style="Natural editorial pet photography",
+            lighting="Cool window light with a warm lamp rim",
+            rendering=ImageRendering.PHOTO,
+        ),
+        caption_json="{}",
+        status=ImageJobStatus.COMPLETED,
+        output_path=None,
+        width=768,
+        height=512,
+        seed=42,
+        created_at_iso="2026-07-27T00:00:00+00:00",
+        generation_seconds=153.0,
+    )
+
+    embed = _image_result_embed(job, filename="image.png")
+
+    assert "Exactly one orange cat" in (embed.description or "")
+    assert "rainy apartment window" in (embed.description or "")
+    assert "Natural editorial pet photography" in (embed.description or "")
+    assert "Cool window light" in (embed.description or "")
+
+
+def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
+    embed = synthetic_media_embed(
+        SyntheticMediaAnalyzeResponse(
+            sha256="a" * 64,
+            filename="sample.png",
+            content_type="image/png",
+            modality=SyntheticMediaModality.IMAGE,
+            ai_generated_score=0.999987,
+            not_ai_generated_score=0.000013,
+            deepfake_score=0.0002827,
+            deepfake_likely=False,
+            sample_count=1,
+            model="hive/ai-generated-and-deepfake-content-detection",
+            threshold=0.9,
+            top_source="stablediffusionxl",
+            top_source_score=0.99166,
+            verdict=SyntheticMediaVerdict.AI_GENERATED,
+            version="1",
+            cached=False,
+            quota_used=4,
+            quota_remaining=96,
+            quota_limit=100,
+            quota_reset_at_epoch=1_800_000_000,
+        ),
+        attachment_url="https://cdn.example.com/sample.png",
+    )
+
+    assert embed.title == "HIVE analysis"
+    assert embed.description == (
+        "**High AI-generated image likelihood**\nLow deepfake likelihood"
+    )
+    assert " or " not in (embed.description or "")
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["AI-generated visual"] == "**100.0%** · High"
+    assert fields["Deepfake"] == "**0.0%** · Low"
+    assert fields["Likely generator"] == "**Stable Diffusion XL** · 99.2%"
+    assert fields["Daily HIVE API budget"].startswith("**4 / 100 used**")
+    assert "HIVE Moderation" in embed.footer.text
+    assert embed.thumbnail.url == "https://cdn.example.com/sample.png"
+
+
 def test_music_embed_contains_track_progress_queue_and_operational_state() -> None:
     embed = music_queue_embed(
         AudioQueueResponse(
@@ -41,6 +136,8 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
                 kind="music",
                 duration_seconds=180,
                 requested_by_name="Alice",
+                uploader="Current Artist",
+                thumbnail_url="https://img.example.com/current.jpg",
             ),
             pending=(
                 AudioQueueItem(
@@ -73,7 +170,9 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert fields["Voice"] == "<#123>"
     assert "1.25x speed" in fields["Tuning"]
     assert fields["Requested by"] == "Alice"
+    assert fields["Source"] == "Current Artist"
     assert "Bob" in fields["Up next"]
+    assert embed.thumbnail.url == "https://img.example.com/current.jpg"
 
 
 def test_waiting_play_embed_explains_that_no_reentry_is_needed() -> None:
@@ -86,13 +185,17 @@ def test_waiting_play_embed_explains_that_no_reentry_is_needed() -> None:
             destination_id=None,
             playback_state="waiting_for_voice",
             requested_by_name="Alice",
+            uploader="Artist",
+            thumbnail_url="https://img.example.com/queued.jpg",
         )
     )
     fields = {field.name: field.value for field in embed.fields}
-    assert embed.title == "Added to queue"
-    assert "Join a voice channel to start automatically" in fields["Playback"]
+    assert embed.title == "Queued · waiting for voice"
+    assert "automatically" in fields["Status"]
     assert fields["Requested by"] == "Alice"
-    assert fields["Voice"] == "Not connected yet"
+    assert fields["Voice"] == "Connects when the requester joins"
+    assert fields["Source"] == "Artist"
+    assert embed.thumbnail.url == "https://img.example.com/queued.jpg"
 
 
 def test_music_history_embed_shows_requester_and_played_time() -> None:
@@ -112,3 +215,84 @@ def test_music_history_embed_shows_requester_and_played_time() -> None:
     assert embed.title == "Recently played"
     assert "Alice" in (embed.description or "")
     assert "<t:1700000000:R>" in (embed.description or "")
+
+
+def test_ambiguous_search_embed_is_compact_and_actionable() -> None:
+    embed = music_search_embed(
+        AudioSearchResponse(
+            query="Hello",
+            candidates=(
+                AudioSearchItem(
+                    "https://example.com/one",
+                    "Artist One - Hello",
+                    180,
+                    uploader="Artist One",
+                    thumbnail_url="https://img.example.com/one.jpg",
+                ),
+                AudioSearchItem(
+                    "https://example.com/two",
+                    "Artist Two - Hello",
+                    190,
+                    uploader="Artist Two",
+                ),
+            ),
+            selected_index=None,
+            selection_required=True,
+            reason=AudioSearchReason.AMBIGUOUS_TITLE,
+        )
+    )
+    assert embed.title == "Choose the right track"
+    assert len(embed.fields) == 2
+    assert embed.fields[0].name == "1 · 3:00"
+    assert "Artist One" in embed.fields[0].value
+    assert "automatically next time" in (embed.description or "")
+    assert embed.thumbnail.url == "https://img.example.com/one.jpg"
+
+
+def test_web_search_embed_shows_sources_coverage_and_timestamp() -> None:
+    embed = web_search_embed(
+        WebSearchResponse(
+            query="example",
+            backend="searxng",
+            sources=(
+                WebSource(
+                    source_id="S1",
+                    title="Example result",
+                    url="https://example.com/page",
+                    host="example.com",
+                    snippet="A concise source excerpt.",
+                    category="general",
+                ),
+            ),
+            raw_candidate_count=37,
+            candidate_count=37,
+            maybe_more=True,
+            warnings=("one provider failed",),
+        )
+    )
+    assert embed.title == "Search results"
+    assert embed.timestamp is not None
+    assert "Example result" in (embed.description or "")
+    fields = {field.name: field.value for field in embed.fields}
+    assert "37 candidates" in fields["Coverage"]
+    assert "broader set retained" in fields["Coverage"]
+    assert "1 upstream" in fields["Provider health"]
+
+
+def test_web_fetch_embed_preserves_continuation_offset() -> None:
+    embed = web_fetch_embed(
+        WebFetchResponse(
+            title="Opened page",
+            url="https://example.com/page",
+            content_type="text/html",
+            text="Readable text",
+            offset=200,
+            total_characters=900,
+            next_offset=213,
+            links=(),
+        )
+    )
+    fields = {field.name: field.value for field in embed.fields}
+    assert embed.title == "Opened page"
+    assert fields["Next offset"] == "213"
+    assert "213 / 900" in fields["Text"]

@@ -25,6 +25,8 @@ class StoredAudioItem:
     requested_by_id: str | None = None
     requested_by_name: str | None = None
     played_at_epoch: int | None = None
+    uploader: str | None = None
+    thumbnail_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +178,8 @@ def _decode_item(value: dict[str, Any]) -> StoredAudioItem:
     requested_by_id = value.get("requested_by_id")
     requested_by_name = value.get("requested_by_name")
     played_at_epoch = value.get("played_at_epoch")
+    uploader = value.get("uploader")
+    thumbnail_url = value.get("thumbnail_url")
     return StoredAudioItem(
         reference=_required_text(value, "reference"),
         title=_required_text(value, "title"),
@@ -196,6 +200,12 @@ def _decode_item(value: dict[str, Any]) -> StoredAudioItem:
         played_at_epoch=(
             max(0, int(played_at_epoch))
             if isinstance(played_at_epoch, (int, float, str))
+            else None
+        ),
+        uploader=uploader if isinstance(uploader, str) and uploader else None,
+        thumbnail_url=(
+            thumbnail_url
+            if isinstance(thumbnail_url, str) and thumbnail_url.startswith("https://")
             else None
         ),
     )

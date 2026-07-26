@@ -29,7 +29,11 @@ async def run_audio_doctor(
         cookie_file=cookie_file,
         download_timeout_seconds=180.0,
     )
-    item = await provider.resolve_audio(reference)
+    selected_reference = reference
+    if "://" not in reference:
+        candidates = await provider.search_audio(reference, limit=1)
+        selected_reference = candidates[0].reference
+    item = await provider.resolve_audio(selected_reference)
     source = build_discord_audio_source(item)
     try:
         packets = await asyncio.to_thread(lambda: tuple(source.read() for _ in range(5)))
@@ -51,7 +55,7 @@ def main() -> None:
     parser.add_argument(
         "reference",
         nargs="?",
-        help="Optional YouTube/TikTok URL or supported search query.",
+        help="Optional provider-supported public media URL or search query.",
     )
     parser.add_argument(
         "--cookie-file",

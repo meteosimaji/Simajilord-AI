@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+from simajilord.capabilities.image import (
+    ImageGenerateRequest,
+    ImageGenerateResponse,
+    build_image_endpoints,
+)
+from simajilord.core import CapabilityRegistry, InvocationContext
+from simajilord.core.errors import UserError
+from simajilord.domain.image import (
+    ImageGenerationPrompt,
+    ImageJobStatus,
+    ImageRendering,
+)
+from simajilord.observability import EventJournal
+from simajilord.providers.image import ImageProviderResult
+from simajilord.services.image import (
+    ImageGenerationService,
+    ImageGenerationStore,
+    build_ideogram_caption,
+)
+
+
+class FakeImageProvider:
+    async def generate(
+        self,
+        *,
+        caption_json: str,
+        destination: Path,
+        width: int,
+        height: int,
+        seed: int,
+        on_progress: object = None,
+    ) -> ImageProviderResult:
+        del caption_json, width, height, seed
+        if callable(on_progress):
+            await on_progress(6, 12)
+            await on_progress(12, 12)
+        destination.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        return ImageProviderResult(generation_seconds=0.01, model="fake")
+
+
+def _service(
+    tmp_path: Path,
+    *,
+    exempt: frozenset[str] = frozenset(),
+) -> ImageGenerationService:
+    return ImageGenerationService(
+        provider=FakeImageProvider(),
+        store=ImageGenerationStore(tmp_path / "image.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        output_dir=tmp_path / "output",
+        per_user_requests=1,
+        per_user_window_seconds=3_600,
+        per_workspace_requests=1,
+        per_workspace_window_seconds=3_600,
+        max_pending_jobs=10,
+        rate_limit_exempt_actor_ids=exempt,
+    )
+
+
+def _prompt(subject: str = "a cat") -> ImageGenerationPrompt:
+    return ImageGenerationPrompt(
+        subject=subject,
+        scene="a quiet sunlit room",
+        composition="eye-level portrait, centered subject",
+        style="clean editorial illustration",
+        lighting="soft window light",
+        rendering=ImageRendering.ILLUSTRATION,
+    )
+
+
+def test_ideogram_caption_uses_rendering_specific_canonical_key_order() -> None:
+    illustration = json.loads(build_ideogram_caption(_prompt()))
+    assert tuple(illustration["style_description"]) == (
+        "aesthetics",
+        "lighting",
+        "medium",
+        "art_style",
+    )
+
+    photo = json.loads(
+        build_ideogram_caption(
+            ImageGenerationPrompt(
+                subject="a cat",
+                scene="a studio",
+                composition="centered",
+                style="editorial photography",
+                lighting="softbox",
+                rendering=ImageRendering.PHOTO,
+            )
+        )
+    )
+    assert tuple(photo["style_description"]) == (
+        "aesthetics",
+        "lighting",
+        "photo",
+        "medium",
+    )
+
+
+def test_ideogram_caption_preserves_full_production_brief() -> None:
+    prompt = ImageGenerationPrompt(
+        subject="Exactly one orange cat sitting upright with amber eyes",
+        scene="A rainy apartment window with a low walnut table and city bokeh",
+        composition="Landscape eye-level portrait with the cat on the left third",
+        style="Natural editorial pet photography with realistic fur texture",
+        lighting="Cool window light from the right and a warm lamp rim from the left",
+        details="Four coherent paws, two ears, one tail, sharp eyes, blue blanket",
+        avoid="extra animals, extra limbs, cropped tail, text, logos, watermarks",
+        rendering=ImageRendering.PHOTO,
+    )
+
+    caption = json.loads(build_ideogram_caption(prompt))
+
+    assert prompt.subject in caption["high_level_description"]
+    assert prompt.scene in caption["high_level_description"]
+    assert prompt.composition in caption["high_level_description"]
+    element = caption["compositional_deconstruction"]["elements"][0]["desc"]
+    assert prompt.details in element
+    assert prompt.avoid in element
+
+
+@pytest.mark.asyncio
+async def test_image_worker_persists_progress_and_terminal_delivery(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    delivered: list[ImageJobStatus] = []
+
+    async def delivery(job: object) -> None:
+        delivered.append(job.status)  # type: ignore[attr-defined]
+
+    await service.start(delivery)
+    job = await service.submit(
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt(),
+    )
+    for _ in range(100):
+        current = service.store.require(job.job_id)
+        if current.status is ImageJobStatus.COMPLETED:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("image worker did not complete")
+
+    current = service.store.require(job.job_id)
+    assert current.output_path is not None and current.output_path.is_file()
+    assert current.progress_step == 12
+    assert ImageJobStatus.RUNNING in delivered
+    assert ImageJobStatus.COMPLETED in delivered
+    await service.set_delivery_message(job.job_id, "progress-message")
+    assert service.store.require(job.job_id).delivery_message_id == "progress-message"
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_limits_exempt_only_configured_actor(tmp_path: Path) -> None:
+    service = _service(tmp_path, exempt=frozenset({"admin"}))
+    for subject in ("one", "two"):
+        await service.submit(
+            actor_id="admin",
+            workspace_id="guild",
+            delivery_target_id="channel",
+            reply_to_message_id="message",
+            prompt=_prompt(subject),
+        )
+    await service.submit(
+        actor_id="user",
+        workspace_id="other-guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt("first"),
+    )
+    with pytest.raises(UserError, match=r"image\.user_limit_reached"):
+        await service.submit(
+            actor_id="user",
+            workspace_id="other-guild-2",
+            delivery_target_id="channel",
+            reply_to_message_id="message",
+            prompt=_prompt("second"),
+        )
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_capability_enforces_agent_delivery_scope(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    registry = CapabilityRegistry()
+    for item in build_image_endpoints(service):
+        registry.register(item)
+    request = ImageGenerateRequest(
+        delivery_target_id="forbidden-channel",
+        reply_to_event_id="123",
+        subject="a friendly shiba inu",
+        scene="a park",
+        composition="full-body portrait",
+        style="polished animation still",
+        lighting="golden hour",
+    )
+    context = InvocationContext(
+        actor_id="actor",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:123",
+        resource_ids=("allowed-channel",),
+    )
+    with pytest.raises(UserError, match=r"image\.delivery_target_forbidden"):
+        await registry.invoke("image.generate", request, context)
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_capability_normalizes_exact_agent_event_id(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    registry = CapabilityRegistry()
+    for item in build_image_endpoints(service):
+        registry.register(item)
+    response = cast(
+        ImageGenerateResponse,
+        await registry.invoke(
+            "image.generate",
+            ImageGenerateRequest(
+                delivery_target_id="channel",
+                reply_to_event_id="discord:message:123",
+                subject="a friendly shiba inu",
+                scene="a park",
+                composition="full-body portrait",
+                style="polished animation still",
+                lighting="golden hour",
+            ),
+            InvocationContext(
+                actor_id="actor",
+                workspace_id="guild",
+                transport="agent",
+                request_id="discord:message:123",
+                resource_ids=("channel",),
+            ),
+        ),
+    )
+    job = service.store.require(response.job_id)
+    assert job.reply_to_message_id == "123"
+    await service.close()
