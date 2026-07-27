@@ -143,7 +143,7 @@ class AgentToolCatalog:
         for alias, capability_name in sorted(self._aliases.items()):
             if not self._is_available(capability_name, context):
                 continue
-            endpoint = self._validated_endpoint(capability_name)
+            endpoint = self._validated_endpoint(capability_name, context)
             if capability_name not in self._eager_capabilities:
                 hidden_available = True
                 continue
@@ -295,7 +295,7 @@ class AgentToolCatalog:
     ) -> AgentToolOutput:
         if not self._is_available(capability_name, context):
             raise AgentToolError("The dynamic tool grant is not present for this turn.")
-        endpoint = self._validated_endpoint(capability_name)
+        endpoint = self._validated_endpoint(capability_name, context)
         request = _build_dataclass(endpoint.request_type, arguments)
         result = await self._registry.invoke(capability_name, request, context)
         if capability_name in self._image_output_capabilities:
@@ -326,17 +326,36 @@ class AgentToolCatalog:
         context: InvocationContext | None,
     ) -> bool:
         required_grant = self._required_grants.get(capability_name)
-        return required_grant is None or (
+        has_grant = required_grant is None or (
             context is not None and required_grant in context.grants
         )
+        if not has_grant:
+            return False
+        descriptor = self._registry.endpoint(capability_name).descriptor
+        if descriptor.approval is ApprovalMode.NEVER:
+            return True
+        if descriptor.approval is ApprovalMode.WHEN_REQUESTED:
+            return context is not None and capability_name in context.approvals
+        return False
 
-    def _validated_endpoint(self, capability_name: str) -> Any:
+    def _validated_endpoint(
+        self,
+        capability_name: str,
+        context: InvocationContext | None,
+    ) -> Any:
         endpoint = self._registry.endpoint(capability_name)
         descriptor = endpoint.descriptor
         required_grant = self._required_grants.get(capability_name)
-        if descriptor.approval is not ApprovalMode.NEVER:
+        if descriptor.approval is ApprovalMode.ALWAYS:
             raise AgentToolError(
-                f"Agent catalog cannot expose approval-gated {capability_name}."
+                f"Agent catalog cannot expose always-approved {capability_name}."
+            )
+        if (
+            descriptor.approval is ApprovalMode.WHEN_REQUESTED
+            and (context is None or capability_name not in context.approvals)
+        ):
+            raise AgentToolError(
+                f"Agent catalog lacks turn approval for {capability_name}."
             )
         if descriptor.risk is RiskLevel.DESTRUCTIVE:
             raise AgentToolError(

@@ -74,6 +74,8 @@ skills, sub-agents, computer use, or hidden reasoning. If a needed capability is
 use capability_search, read only its schema, then capability_invoke. Describe abilities only
 from search results. View images directly; import PDF/ZIP/text into the isolated workspace,
 keep edits and returned files there, and verify writes by SHA-256.
+Before any write capability, read the exact triggering Discord event message. Invoke a
+write only when that message explicitly requests the action; never infer approval from context.
 For image generation, preserve requested facts, then art-direct every unspecified visible
 choice: subject, scene, composition, style, lighting, required details, and avoid-list.
 Never echo the short request or use generic quality slogans as tool fields.
@@ -144,7 +146,10 @@ class CodexAppServerProvider:
         self._turn_lock = asyncio.Lock()
         self._notifications: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
         self._active_threads: set[str] = set()
-        self._active_thread_grants: dict[str, frozenset[str]] = {}
+        self._active_thread_permissions: dict[
+            str,
+            tuple[frozenset[str], frozenset[str]],
+        ] = {}
         self._active_tool_budget: _ToolTurnBudget | None = None
         self._usage_by_turn: dict[str, AgentTokenUsage] = {}
 
@@ -300,7 +305,7 @@ class CodexAppServerProvider:
                 future.set_exception(AgentProviderError("Codex app-server closed."))
         self._pending.clear()
         self._active_threads.clear()
-        self._active_thread_grants.clear()
+        self._active_thread_permissions.clear()
 
     async def _ensure_started(self) -> None:
         if self._process is not None and self._process.returncode is None:
@@ -386,7 +391,8 @@ class CodexAppServerProvider:
         }
         if provider_thread_id is not None:
             if provider_thread_id in self._active_threads:
-                if self._active_thread_grants.get(provider_thread_id) != context.grants:
+                permissions = (context.grants, context.approvals)
+                if self._active_thread_permissions.get(provider_thread_id) != permissions:
                     raise AgentThreadError(
                         "The active agent thread has a different capability profile."
                     )
@@ -402,7 +408,10 @@ class CodexAppServerProvider:
             thread = _object(result.get("thread"), "thread/resume thread")
             thread_id = _text(thread.get("id"), "thread id")
             self._active_threads.add(thread_id)
-            self._active_thread_grants[thread_id] = context.grants
+            self._active_thread_permissions[thread_id] = (
+                context.grants,
+                context.approvals,
+            )
             return thread_id
 
         response = await self._request(
@@ -418,7 +427,10 @@ class CodexAppServerProvider:
         thread = _object(result.get("thread"), "thread/start thread")
         thread_id = _text(thread.get("id"), "thread id")
         self._active_threads.add(thread_id)
-        self._active_thread_grants[thread_id] = context.grants
+        self._active_thread_permissions[thread_id] = (
+            context.grants,
+            context.approvals,
+        )
         return thread_id
 
     async def _await_turn(
@@ -674,6 +686,23 @@ class CodexAppServerProvider:
             tool_name=tool_name,
             arguments=raw_params.get("arguments"),
         )
+        if (
+            write_capability is not None
+            and budget.required_message_id is not None
+            and not budget.event_message_read
+        ):
+            budget.write_failures.append(
+                (write_capability, "agent.event_message_not_read")
+            )
+            await self._tool_response(
+                request_id,
+                success=False,
+                text=(
+                    "Read the exact Discord event message before invoking a "
+                    "write capability."
+                ),
+            )
+            return
         try:
             output = await self.tools.invoke(
                 namespace=namespace if isinstance(namespace, str) else None,

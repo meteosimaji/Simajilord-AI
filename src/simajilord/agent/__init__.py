@@ -2,6 +2,7 @@
 
 from .contracts import (
     AGENT_AUDIO_GRANT,
+    AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_AUTONOMY_ACTOR_ID,
     AGENT_FILE_GRANT,
     AGENT_IMAGE_GRANT,
@@ -32,6 +33,7 @@ from .errors import (
 
 __all__ = [
     "AGENT_AUDIO_GRANT",
+    "AGENT_AUDIO_WRITE_CAPABILITIES",
     "AGENT_AUTONOMY_ACTOR_ID",
     "AGENT_FILE_GRANT",
     "AGENT_IMAGE_GRANT",

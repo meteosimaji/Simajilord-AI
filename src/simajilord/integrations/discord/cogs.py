@@ -19,6 +19,7 @@ from discord.ext import commands
 
 from simajilord.agent import (
     AGENT_AUDIO_GRANT,
+    AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_AUTONOMY_ACTOR_ID,
     AGENT_FILE_GRANT,
     AGENT_IMAGE_GRANT,
@@ -2717,11 +2718,17 @@ def _agent_grants(
     runtime: SimajilordRuntime,
     *,
     actor_id: str,
+    autonomous: bool = False,
 ) -> frozenset[str]:
     settings = runtime.settings
     grants: set[str] = {AGENT_AUDIO_GRANT}
-    grants.add(AGENT_MESSAGE_GRANT)
-    if settings.agent_file_sandbox_enabled and runtime.files is not None:
+    if not autonomous:
+        grants.add(AGENT_MESSAGE_GRANT)
+    if (
+        not autonomous
+        and settings.agent_file_sandbox_enabled
+        and runtime.files is not None
+    ):
         grants.add(AGENT_FILE_GRANT)
     web_access = settings.agent_web_search_access
     if web_access is AgentFeatureAccess.EVERYONE or (
@@ -2732,7 +2739,7 @@ def _agent_grants(
     if runtime.moderation.provider is not None:
         grants.add(AGENT_MODERATION_GRANT)
     image_access = settings.image_generation_access
-    if runtime.image.provider is not None and (
+    if not autonomous and runtime.image.provider is not None and (
         image_access is AgentFeatureAccess.EVERYONE
         or (
             image_access is AgentFeatureAccess.ADMINS
@@ -2995,6 +3002,7 @@ class AgentCog(commands.Cog):
             return
         actor_id = str(message.author.id)
         grants = _agent_grants(self.runtime, actor_id=actor_id)
+        approvals = frozenset(AGENT_AUDIO_WRITE_CAPABILITIES)
         request = AgentRequest(
             conversation_id=discord_conversation_id(
                 guild_id=message.guild.id if message.guild else None,
@@ -3011,6 +3019,7 @@ class AgentCog(commands.Cog):
             occurred_at=message.created_at,
             resource_ids=resource_ids,
             grants=grants,
+            approvals=approvals,
         )
         progress = _AgentProgressMessage(message)
         try:
@@ -3166,6 +3175,7 @@ class AgentAutonomyCog(commands.Cog):
         grants = _agent_grants(
             self.runtime,
             actor_id=AGENT_AUTONOMY_ACTOR_ID,
+            autonomous=True,
         )
         request = AgentRequest(
             conversation_id=discord_conversation_id(

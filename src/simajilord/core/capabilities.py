@@ -43,6 +43,7 @@ class InvocationContext:
     resource_ids: tuple[str, ...] = ()
     grants: frozenset[str] = frozenset()
     origin_resource_id: str | None = None
+    approvals: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

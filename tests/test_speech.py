@@ -19,7 +19,7 @@ from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.services.audio import AudioSessionManager
 from simajilord.services.audio_state import AudioStateStore
-from simajilord.services.speech import SpeechService, speech_chunks
+from simajilord.services.speech import SpeechService, normalize_speech, speech_chunks
 
 
 class WaveSpeechProvider:
@@ -117,6 +117,15 @@ def test_speech_chunks_preserve_all_text_at_natural_boundaries() -> None:
 
     assert all(len(chunk) <= 10 for chunk in chunks)
     assert "".join(chunks) == "今日は晴れです。明日も晴れるでしょう。終わり"
+
+
+def test_speech_normalization_replaces_discord_markup_and_urls() -> None:
+    normalized = normalize_speech(
+        "See https://example.com/a <@123456789> <#987654321> "
+        "<:dragon:456789123> <a:dance:987123456>"
+    )
+
+    assert normalized == "See link mention channel emoji emoji"
 
 
 @pytest.mark.asyncio

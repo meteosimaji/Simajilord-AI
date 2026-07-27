@@ -8,6 +8,7 @@ from time import monotonic
 
 from simajilord.agent import (
     AGENT_AUDIO_GRANT,
+    AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_FILE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MESSAGE_GRANT,
@@ -232,10 +233,7 @@ class SimajilordRuntime:
                 write_capabilities=(
                     (
                         "discord.send_message",
-                        "discord.play_audio",
-                        "discord.control_audio",
-                        "discord.manage_read_aloud",
-                        "discord.speak",
+                        *AGENT_AUDIO_WRITE_CAPABILITIES,
                     )
                     + (
                         ("image.generate",)

@@ -8,7 +8,15 @@ import pytest
 from discord import app_commands
 from discord.ext import commands
 
-from simajilord.agent import AGENT_WEB_GRANT, AgentRateLimitError
+from simajilord.agent import (
+    AGENT_AUDIO_GRANT,
+    AGENT_FILE_GRANT,
+    AGENT_IMAGE_GRANT,
+    AGENT_MESSAGE_GRANT,
+    AGENT_MODERATION_GRANT,
+    AGENT_WEB_GRANT,
+    AgentRateLimitError,
+)
 from simajilord.capabilities.audio import (
     AudioPlayRequest,
     AudioPlayResponse,
@@ -22,6 +30,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudResponse,
 )
 from simajilord.capabilities.web import WebFetchResponse
+from simajilord.config import AgentFeatureAccess
 from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
@@ -45,12 +54,43 @@ from simajilord.integrations.discord.cogs import (
     WebCog,
     WebFetchContinueView,
     _agent_error_text,
+    _agent_grants,
     _agent_message_groups,
     _discord_message_chunks,
     _retry_after_text,
     discord_conversation_id,
 )
 from simajilord.runtime import SimajilordRuntime
+
+
+def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings.agent_file_sandbox_enabled = True
+    runtime.settings.agent_web_search_access = AgentFeatureAccess.EVERYONE
+    runtime.settings.agent_admin_user_ids = frozenset()
+    runtime.settings.image_generation_access = AgentFeatureAccess.EVERYONE
+    runtime.files = object()
+    runtime.moderation.provider = object()
+    runtime.image.provider = object()
+
+    requested = _agent_grants(runtime, actor_id="7")
+    autonomous = _agent_grants(runtime, actor_id="simajilord:autonomy", autonomous=True)
+
+    assert {
+        AGENT_AUDIO_GRANT,
+        AGENT_WEB_GRANT,
+        AGENT_MODERATION_GRANT,
+    } <= autonomous
+    assert {
+        AGENT_MESSAGE_GRANT,
+        AGENT_FILE_GRANT,
+        AGENT_IMAGE_GRANT,
+    } <= requested
+    assert not {
+        AGENT_MESSAGE_GRANT,
+        AGENT_FILE_GRANT,
+        AGENT_IMAGE_GRANT,
+    } & autonomous
 
 
 def test_common_music_actions_have_short_top_level_commands() -> None:

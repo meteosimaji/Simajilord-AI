@@ -54,7 +54,8 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - Eager read-aloud voice preparation after `/join` and whenever a listener returns, avoiding
   a first-message connection delay
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
-  `say` fallback; long messages are sentence-chunked and joined without truncation
+  `say` fallback; long messages are sentence-chunked and joined without truncation, while
+  raw URLs and Discord mention markup are normalized before synthesis
 - Speech-over-music sidechain ducking, followed by stream re-resolution and playback
   resumption from the saved position
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
@@ -66,10 +67,14 @@ timestamp; implementation labels and decorative footer text are intentionally om
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
-  third parties outside the active VC cannot control playback
+  third parties outside the active VC cannot control playback. Capability scope and
+  per-turn write approval are separate, and the exact triggering message must be read before
+  any approved write
 - A bounded FIFO AI-turn queue with durable conversation IDs, context-budget rotation,
   exact-message verification, progressive status updates, and corrective retries after
   failed writes
+- Autonomous turns retain bounded audio inspection but receive no audio-write approval,
+  Discord-message write scope, image-generation scope, or file-write scope
 - Structured, append-only local command/capability/message events in SQLite
 
 One independent audio session is created per Discord server. Different servers may use voice

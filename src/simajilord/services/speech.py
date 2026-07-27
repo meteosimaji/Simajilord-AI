@@ -93,10 +93,10 @@ class SpeechService:
 def normalize_speech(text: str) -> str:
     """Produce short, predictable speech without reading raw URLs."""
 
-    value = re.sub(r"https?://\\S+", " link ", text)
-    value = re.sub(r"<@!?\\d+>", " mention ", value)
-    value = re.sub(r"<#\\d+>", " channel ", value)
-    value = re.sub(r"<a?:[^:>]+:\\d+>", " emoji ", value)
+    value = re.sub(r"https?://\S+", " link ", text)
+    value = re.sub(r"<@!?\d+>", " mention ", value)
+    value = re.sub(r"<#\d+>", " channel ", value)
+    value = re.sub(r"<a?:[^:>]+:\d+>", " emoji ", value)
     return " ".join(value.split()).strip()
 
 

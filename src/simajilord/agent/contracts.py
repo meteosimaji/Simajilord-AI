@@ -15,6 +15,12 @@ AGENT_IMAGE_GRANT = "image"
 AGENT_MESSAGE_GRANT = "discord_message"
 AGENT_MODERATION_GRANT = "moderation"
 AGENT_WEB_GRANT = "web"
+AGENT_AUDIO_WRITE_CAPABILITIES = (
+    "discord.play_audio",
+    "discord.control_audio",
+    "discord.manage_read_aloud",
+    "discord.speak",
+)
 
 
 class GoalState(StrEnum):
@@ -98,6 +104,7 @@ class AgentRequest:
     occurred_at: datetime
     resource_ids: tuple[str, ...]
     grants: frozenset[str] = frozenset()
+    approvals: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

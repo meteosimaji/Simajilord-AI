@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -19,6 +21,7 @@ from simajilord.agent import (
 )
 from simajilord.agent.providers import ProviderTurnResult
 from simajilord.agent.providers.codex import (
+    CodexAppServerProvider,
     _base_instructions,
     _last_write_failure,
     _tool_read_exact_event,
@@ -28,6 +31,7 @@ from simajilord.agent.service import AgentLimits, AgentService
 from simajilord.agent.store import AgentConversationStore
 from simajilord.agent.tools import AgentToolCatalog
 from simajilord.core import (
+    ApprovalMode,
     CapabilityDescriptor,
     CapabilityRegistry,
     InvocationContext,
@@ -652,6 +656,155 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         max_output_characters=2_000,
     )
     assert '"job_id":"image:cat"' in result
+
+
+@pytest.mark.asyncio
+async def test_when_requested_tool_requires_capability_specific_turn_approval() -> None:
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: WriteRequest,
+        _: InvocationContext,
+    ) -> WriteResponse:
+        return WriteResponse(job_id=f"write:{request.subject}")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "test.write",
+                "Perform a requested test write.",
+                RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+            ),
+            WriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("test.write",),
+        required_grants={"test.write": "write-scope"},
+        write_capabilities=("test.write",),
+    )
+    scope_only = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "scope-only",
+        grants=frozenset({"write-scope"}),
+    )
+    approved = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "approved",
+        grants=frozenset({"write-scope"}),
+        approvals=frozenset({"test.write"}),
+    )
+
+    assert catalog.dynamic_specs(scope_only) == ()
+    assert catalog.dynamic_specs(approved)
+    with pytest.raises(AgentToolError, match="grant"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="test_write",
+            arguments={"subject": "blocked"},
+            context=scope_only,
+            max_output_characters=1_000,
+        )
+    output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="test_write",
+        arguments={"subject": "allowed"},
+        context=approved,
+        max_output_characters=1_000,
+    )
+    assert '"job_id":"write:allowed"' in output
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_write_before_exact_event_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: WriteRequest,
+        _: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.subject)
+        return WriteResponse(job_id="done")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "test.write",
+                "Perform one requested write.",
+                RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+            ),
+            WriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("test.write",),
+        required_grants={"test.write": "write-scope"},
+        write_capabilities=("test.write",),
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        timeout_seconds=10,
+        reasoning_effort="low",
+        tools=catalog,
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    context = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "event",
+        grants=frozenset({"write-scope"}),
+        approvals=frozenset({"test.write"}),
+    )
+    provider._active_tool_budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=4,
+        output_characters_remaining=4_000,
+        on_progress=None,
+        required_message_id="123",
+    )
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+    request = {
+        "namespace": "simajilord",
+        "tool": "test_write",
+        "arguments": {"subject": "requested"},
+    }
+
+    await provider._handle_dynamic_tool(1, request)
+
+    assert invoked == []
+    first_response = response.await_args
+    assert first_response is not None
+    assert first_response.kwargs["success"] is False
+    assert provider._active_tool_budget.write_failures == [
+        ("test.write", "agent.event_message_not_read")
+    ]
+    provider._active_tool_budget.event_message_read = True
+    await provider._handle_dynamic_tool(2, request)
+    assert invoked == ["requested"]
+    second_response = response.await_args
+    assert second_response is not None
+    assert second_response.kwargs["success"] is True
 
 
 def test_base_instructions_are_short_and_use_runtime_identity() -> None:

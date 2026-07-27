@@ -128,6 +128,7 @@ class AgentService:
                     resource_ids=request.resource_ids,
                     grants=request.grants,
                     origin_resource_id=request.channel_id,
+                    approvals=request.approvals,
                 )
                 if on_progress is not None:
                     await on_progress(AgentProgressStage.STARTING)

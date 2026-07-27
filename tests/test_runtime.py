@@ -7,7 +7,7 @@ from typing import cast
 import discord
 import pytest
 
-from simajilord.agent import AGENT_AUDIO_GRANT
+from simajilord.agent import AGENT_AUDIO_GRANT, AGENT_AUDIO_WRITE_CAPABILITIES
 from simajilord.agent.providers import CodexAppServerProvider
 from simajilord.config import load_settings
 from simajilord.core import InvocationContext
@@ -63,26 +63,46 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         runtime.registry.register(item)
     assert runtime.agent is not None
     provider = cast(CodexAppServerProvider, runtime.agent.provider)
-    context = InvocationContext(
+    autonomous_context = InvocationContext(
         actor_id="7",
         workspace_id="1",
         transport="agent",
         request_id="event",
         grants=frozenset({AGENT_AUDIO_GRANT}),
     )
+    requested_context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({AGENT_AUDIO_GRANT}),
+        approvals=frozenset(AGENT_AUDIO_WRITE_CAPABILITIES),
+    )
 
     async def run() -> None:
+        assert provider.tools.dynamic_specs(autonomous_context)
+        autonomous = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "music voice play speak", "limit": 5},
+            context=autonomous_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.play_audio" not in autonomous.text
+        assert "discord.speak" not in autonomous.text
+        assert "audio.search" in autonomous.text
         output = await provider.tools.invoke(
             namespace="simajilord",
             tool_name="capability_search",
             arguments={"query": "music voice play speak", "limit": 5},
-            context=context,
+            context=requested_context,
             max_output_characters=10_000,
         )
         assert "discord.play_audio" in output.text
         assert "discord.speak" in output.text
         assert '"name":"audio.play"' not in output.text
         assert '"name":"speech.speak"' not in output.text
+        assert provider.tools.dynamic_specs(requested_context)
         await runtime.close()
 
     asyncio.run(run())
