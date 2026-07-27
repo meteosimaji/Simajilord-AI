@@ -52,6 +52,7 @@ _BOLD_FONT_CANDIDATES = (
 _EMOJI_FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Apple Color Emoji.ttc"),
     Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
 )
 _QUOTE_FONT_CANDIDATES = (
     Path("/System/Library/Fonts/Supplemental/Georgia Bold.ttf"),
