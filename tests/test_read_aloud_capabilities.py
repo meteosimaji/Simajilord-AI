@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+import pytest
+
+from simajilord.capabilities.read_aloud import (
+    ReadAloudAddSourcesRequest,
+    ReadAloudAnnouncementsSetRequest,
+    ReadAloudDictionarySetRequest,
+    ReadAloudExclusionSetRequest,
+    ReadAloudExclusionTarget,
+    ReadAloudPolicyResponse,
+    ReadAloudResponse,
+    ReadAloudStatusRequest,
+    build_read_aloud_policy_endpoints,
+    build_read_aloud_route_endpoints,
+)
+from simajilord.core import ApprovalMode, InvocationContext, RiskLevel
+from simajilord.services.read_aloud import ReadAloudMode, ReadAloudService
+
+
+def _context() -> InvocationContext:
+    return InvocationContext(
+        actor_id="user",
+        workspace_id="guild",
+        transport="test",
+        request_id="request",
+    )
+
+
+@pytest.mark.asyncio
+async def test_split_route_capabilities_have_one_action_per_schema(tmp_path) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_read_aloud_route_endpoints(service)
+    }
+
+    added = await endpoints["speech.read_aloud_add_sources"].invoke(
+        ReadAloudAddSourcesRequest(
+            text_channel_ids=("one", "two"),
+            audio_destination_id="voice",
+            mode=ReadAloudMode.QUEUE,
+        ),
+        _context(),
+    )
+    status = await endpoints["speech.read_aloud_status"].invoke(
+        ReadAloudStatusRequest(),
+        _context(),
+    )
+
+    assert isinstance(added, ReadAloudResponse)
+    assert added.text_channel_ids == ("one", "two")
+    assert status == ReadAloudResponse(
+        action="status",
+        enabled=True,
+        text_channel_id="one",
+        text_channel_ids=("one", "two"),
+        audio_destination_id="voice",
+        mode="queue",
+    )
+    assert endpoints["speech.read_aloud_status"].descriptor.risk is RiskLevel.READ
+    assert (
+        endpoints["speech.read_aloud_add_sources"].descriptor.approval
+        is ApprovalMode.WHEN_REQUESTED
+    )
+
+
+@pytest.mark.asyncio
+async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_read_aloud_policy_endpoints(service)
+    }
+    context = _context()
+
+    await endpoints["speech.read_aloud_dictionary_set"].invoke(
+        ReadAloudDictionarySetRequest("IUT", "あいゆーてぃー"),
+        context,
+    )
+    await endpoints["speech.read_aloud_exclusion_set"].invoke(
+        ReadAloudExclusionSetRequest(
+            target=ReadAloudExclusionTarget.USER,
+            target_id="user-two",
+            ignored=True,
+        ),
+        context,
+    )
+    response = await endpoints["speech.read_aloud_announcements_set"].invoke(
+        ReadAloudAnnouncementsSetRequest(join=True, leave=True),
+        context,
+    )
+
+    assert isinstance(response, ReadAloudPolicyResponse)
+    assert response.dictionary[0].surface == "IUT"
+    assert response.ignored_user_ids == ("user-two",)
+    assert response.announce_join is True
+    assert response.announce_leave is True
+    assert response.announce_move is False
+    assert ReadAloudService(service.state_file).policy("guild") == service.policy(
+        "guild"
+    )
+
+
+def test_split_capability_names_are_unique_and_non_shadowing(tmp_path) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    endpoints = (
+        *build_read_aloud_route_endpoints(service),
+        *build_read_aloud_policy_endpoints(service),
+    )
+    names = [item.descriptor.name for item in endpoints]
+
+    assert len(names) == len(set(names))
+    assert all(name.startswith("speech.read_aloud_") for name in names)

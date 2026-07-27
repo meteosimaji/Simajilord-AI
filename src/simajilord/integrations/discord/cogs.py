@@ -58,8 +58,17 @@ from simajilord.capabilities.moderation import (
 )
 from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
+    ReadAloudAnnouncementsSetRequest,
+    ReadAloudDictionaryListRequest,
+    ReadAloudDictionaryRemoveRequest,
+    ReadAloudDictionarySetRequest,
+    ReadAloudExclusionSetRequest,
+    ReadAloudExclusionTarget,
+    ReadAloudPolicyResponse,
     ReadAloudRequest,
     ReadAloudResponse,
+    ReadAloudSemanticsSetRequest,
+    ReadAloudStatusRequest,
 )
 from simajilord.capabilities.speech import SpeechSpeakRequest
 from simajilord.capabilities.status import StatusRequest, StatusResponse
@@ -117,6 +126,7 @@ from .presenter import (
     EmbedTone,
     command_embed,
 )
+from .read_aloud import ReadAloudMessageFormatter
 
 log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
@@ -197,8 +207,8 @@ _ERROR_MESSAGES = {
         "引用画像を描画できませんでした。メッセージ内容を確認してください。"
     ),
     "discord.manage_guild_required": (
-        "読み上げは別のボイスチャンネルに設定されています。"
-        "移動するには、サーバー管理者が `/readaloud setup` を実行してください。"
+        "この操作には「サーバー管理」権限が必要です。"
+        "読み上げ先を変更する場合は、管理者が `/readaloud setup` を実行してください。"
     ),
     "read_aloud.route_fields_required": (
         "読み上げる会話チャンネルと、音声を流すボイスチャンネルを選んでください。"
@@ -209,6 +219,14 @@ _ERROR_MESSAGES = {
     "read_aloud.source_channel_required": "読み上げる会話チャンネルを選んでください。",
     "read_aloud.source_channel_limit": "会話チャンネルは1〜25個まで選べます。",
     "read_aloud.source_channels_required": "会話チャンネルを1つ以上選んでください。",
+    "read_aloud.dictionary_surface_required": "辞書へ登録する表記を入力してください。",
+    "read_aloud.dictionary_surface_too_long": "辞書の表記は100文字以内で入力してください。",
+    "read_aloud.dictionary_reading_required": "表記の読み方を入力してください。",
+    "read_aloud.dictionary_reading_too_long": "読み方は200文字以内で入力してください。",
+    "read_aloud.announcement_value_required": "変更する入退室通知を1つ以上選んでください。",
+    "read_aloud.semantic_value_required": "変更する読み上げ項目を1つ以上選んでください。",
+    "read_aloud.ignore_bot_unnecessary": "BOTのメッセージは最初から読み上げません。",
+    "read_aloud.role_not_found": "指定したロールがこのサーバーに見つかりません。",
     "discord.message_channel_unavailable": (
         "選択したすべてのチャンネルを、あなたとBOTの両方が閲覧できる必要があります。"
     ),
@@ -298,6 +316,10 @@ def _read_aloud_mode_label(mode: str | None) -> str:
     if mode == ReadAloudMode.SKIP_DURING_MUSIC.value:
         return "音楽の再生中は読み上げない"
     return "すべて読み上げる・読み上げ中は音楽を自動調整"
+
+
+def _on_off(enabled: bool) -> str:
+    return "オン" if enabled else "オフ"
 
 
 def _speech_voice_label(runtime: SimajilordRuntime) -> str:
@@ -1730,6 +1752,25 @@ class ReadAloudCog(commands.Cog):
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
         self.runtime = runtime
+        self._message_formatter = ReadAloudMessageFormatter(runtime.read_aloud)
+        self._voice_transitions: dict[
+            tuple[int, int],
+            tuple[
+                discord.Member,
+                discord.VoiceChannel | discord.StageChannel | None,
+                discord.VoiceChannel | discord.StageChannel | None,
+            ],
+        ] = {}
+        self._announcement_tasks: dict[
+            tuple[int, int],
+            asyncio.Task[None],
+        ] = {}
+
+    async def cog_unload(self) -> None:
+        for task in self._announcement_tasks.values():
+            task.cancel()
+        self._announcement_tasks.clear()
+        self._voice_transitions.clear()
 
     @app_commands.command(
         name="join",
@@ -1851,40 +1892,383 @@ class ReadAloudCog(commands.Cog):
     @readaloud.command(name="status", description="現在の読み上げ設定を表示します。")
     async def status(self, interaction: discord.Interaction) -> None:
         try:
-            response = cast(
-                ReadAloudResponse,
-                await self.runtime.registry.invoke(
-                    "discord.manage_read_aloud",
-                    ReadAloudRequest(action=ReadAloudAction.STATUS),
-                    invocation_context(interaction),
+            context = invocation_context(interaction)
+            route_result, policy_result = await asyncio.gather(
+                self.runtime.registry.invoke(
+                    "discord.read_aloud_status",
+                    ReadAloudStatusRequest(),
+                    context,
+                ),
+                self.runtime.registry.invoke(
+                    "discord.read_aloud_policy_status",
+                    ReadAloudStatusRequest(),
+                    context,
                 ),
             )
-            if not response.enabled:
-                await interaction.response.send_message(
-                    embed=command_embed(
-                        "読み上げ設定",
-                        description="現在、読み上げは無効です。",
-                        tone=EmbedTone.WARNING,
-                    )
+            response = cast(ReadAloudResponse, route_result)
+            policy = cast(ReadAloudPolicyResponse, policy_result)
+            route_fields: tuple[EmbedField, ...] = ()
+            if response.enabled:
+                route_fields = (
+                    EmbedField(
+                        "読み上げるチャンネル",
+                        "\n".join(
+                            f"<#{channel_id}>"
+                            for channel_id in response.text_channel_ids
+                        ),
+                    ),
+                    EmbedField(
+                        "音声を流すVC",
+                        f"<#{response.audio_destination_id}>",
+                    ),
+                    EmbedField("動作", _read_aloud_mode_label(response.mode)),
                 )
-                return
             await interaction.response.send_message(
                 embed=command_embed(
                     "読み上げ設定",
+                    description=(
+                        None
+                        if response.enabled
+                        else "現在、読み上げ経路は無効です。辞書などの設定は保持されています。"
+                    ),
                     fields=(
+                        *route_fields,
                         EmbedField(
-                            "読み上げるチャンネル",
-                            "\n".join(
-                                f"<#{channel_id}>"
-                                for channel_id in response.text_channel_ids
+                            "入退室通知",
+                            (
+                                f"参加 {_on_off(policy.announce_join)} · "
+                                f"退出 {_on_off(policy.announce_leave)} · "
+                                f"移動 {_on_off(policy.announce_move)}"
                             ),
                         ),
                         EmbedField(
-                            "音声を流すVC",
-                            f"<#{response.audio_destination_id}>",
+                            "メッセージの読み方",
+                            (
+                                f"投稿者名 {_on_off(policy.read_author_names)} · "
+                                f"返信先 {_on_off(policy.read_replies)} · "
+                                f"添付 {_on_off(policy.read_attachments)}"
+                            ),
                         ),
-                        EmbedField("動作", _read_aloud_mode_label(response.mode)),
+                        EmbedField(
+                            "辞書と除外",
+                            (
+                                f"辞書 {len(policy.dictionary)}件 · "
+                                f"ユーザー除外 {len(policy.ignored_user_ids)}人 · "
+                                f"ロール除外 {len(policy.ignored_role_ids)}件"
+                            ),
+                        ),
                         EmbedField("音声", _speech_voice_label(self.runtime)),
+                    ),
+                    tone=(
+                        EmbedTone.SUCCESS
+                        if response.enabled
+                        else EmbedTone.WARNING
+                    ),
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="dictionary",
+        description="このサーバーの読み上げ辞書を表示します。",
+    )
+    async def dictionary(self, interaction: discord.Interaction) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_dictionary_list",
+                    ReadAloudDictionaryListRequest(),
+                    invocation_context(interaction),
+                ),
+            )
+            entries = policy.dictionary[:20]
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "読み上げ辞書",
+                    description=(
+                        "\n".join(
+                            f"`{item.surface}` → {item.reading}"
+                            for item in entries
+                        )
+                        if entries
+                        else "登録されている単語はありません。"
+                    ),
+                    fields=(
+                        EmbedField(
+                            "登録数",
+                            (
+                                f"{len(policy.dictionary)}件"
+                                + (
+                                    "、先頭20件を表示"
+                                    if len(policy.dictionary) > 20
+                                    else ""
+                                )
+                            ),
+                        ),
+                    ),
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="dictionary-add",
+        description="単語の読み方をこのサーバーの辞書へ登録します。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        word="メッセージに現れる表記",
+        reading="VOICEVOXに読ませる読み方",
+    )
+    async def dictionary_add(
+        self,
+        interaction: discord.Interaction,
+        word: str,
+        reading: str,
+    ) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_dictionary_set",
+                    ReadAloudDictionarySetRequest(
+                        surface=word,
+                        reading=reading,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "読み方を登録しました",
+                    fields=(
+                        EmbedField("表記", word.strip()),
+                        EmbedField("読み", reading.strip()),
+                        EmbedField("辞書", f"{len(policy.dictionary)}件"),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="dictionary-remove",
+        description="登録済みの表記を読み上げ辞書から削除します。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(word="辞書から削除する表記")
+    async def dictionary_remove(
+        self,
+        interaction: discord.Interaction,
+        word: str,
+    ) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_dictionary_remove",
+                    ReadAloudDictionaryRemoveRequest(surface=word),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "読み方の登録を解除しました",
+                    fields=(
+                        EmbedField("表記", word.strip()),
+                        EmbedField("辞書", f"{len(policy.dictionary)}件"),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="mute",
+        description="自分のメッセージを読み上げるか選びます。",
+    )
+    @app_commands.describe(ignored="オンにすると、自分のメッセージを読み上げません")
+    async def mute(
+        self,
+        interaction: discord.Interaction,
+        ignored: bool,
+    ) -> None:
+        try:
+            await self.runtime.registry.invoke(
+                "discord.read_aloud_exclusion_set",
+                ReadAloudExclusionSetRequest(
+                    target=ReadAloudExclusionTarget.USER,
+                    target_id=str(interaction.user.id),
+                    ignored=ignored,
+                ),
+                invocation_context(interaction),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "自分の読み上げ設定を変更しました",
+                    description=(
+                        "あなたのメッセージは読み上げません。"
+                        if ignored
+                        else "あなたのメッセージを読み上げます。"
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="ignore-user",
+        description="指定したユーザーを読み上げ対象から外すか選びます。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        user="読み上げ設定を変更するユーザー",
+        ignored="オンにすると読み上げません",
+    )
+    async def ignore_user(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        ignored: bool = True,
+    ) -> None:
+        try:
+            await self.runtime.registry.invoke(
+                "discord.read_aloud_exclusion_set",
+                ReadAloudExclusionSetRequest(
+                    target=ReadAloudExclusionTarget.USER,
+                    target_id=str(user.id),
+                    ignored=ignored,
+                ),
+                invocation_context(interaction),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "ユーザーの読み上げ設定を変更しました",
+                    fields=(
+                        EmbedField("ユーザー", user.mention),
+                        EmbedField("読み上げ", "しない" if ignored else "する"),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="ignore-role",
+        description="指定したロールを読み上げ対象から外すか選びます。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        role="読み上げ設定を変更するロール",
+        ignored="オンにすると、このロールのメンバーを読み上げません",
+    )
+    async def ignore_role(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        ignored: bool = True,
+    ) -> None:
+        try:
+            await self.runtime.registry.invoke(
+                "discord.read_aloud_exclusion_set",
+                ReadAloudExclusionSetRequest(
+                    target=ReadAloudExclusionTarget.ROLE,
+                    target_id=str(role.id),
+                    ignored=ignored,
+                ),
+                invocation_context(interaction),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "ロールの読み上げ設定を変更しました",
+                    fields=(
+                        EmbedField("ロール", role.mention),
+                        EmbedField("読み上げ", "しない" if ignored else "する"),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="announcements",
+        description="VCへの参加・退出・移動を読み上げるか選びます。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def announcements(
+        self,
+        interaction: discord.Interaction,
+        join: bool | None = None,
+        leave: bool | None = None,
+        move: bool | None = None,
+    ) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_announcements_set",
+                    ReadAloudAnnouncementsSetRequest(
+                        join=join,
+                        leave=leave,
+                        move=move,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "入退室通知を変更しました",
+                    fields=(
+                        EmbedField("参加", _on_off(policy.announce_join)),
+                        EmbedField("退出", _on_off(policy.announce_leave)),
+                        EmbedField("移動", _on_off(policy.announce_move)),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="message-style",
+        description="投稿者名・返信先・添付を読み上げるか選びます。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def message_style(
+        self,
+        interaction: discord.Interaction,
+        author_names: bool | None = None,
+        replies: bool | None = None,
+        attachments: bool | None = None,
+    ) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_semantics_set",
+                    ReadAloudSemanticsSetRequest(
+                        author_names=author_names,
+                        replies=replies,
+                        attachments=attachments,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "メッセージの読み方を変更しました",
+                    fields=(
+                        EmbedField("投稿者名", _on_off(policy.read_author_names)),
+                        EmbedField("返信先", _on_off(policy.read_replies)),
+                        EmbedField("添付", _on_off(policy.read_attachments)),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
@@ -1957,6 +2341,8 @@ class ReadAloudCog(commands.Cog):
                 ReadAloudRequest(action=ReadAloudAction.DISABLE),
                 invocation_context(interaction),
             )
+            if interaction.guild_id is not None:
+                self._message_formatter.forget_workspace(str(interaction.guild_id))
             await interaction.response.send_message(
                 embed=command_embed(
                     "読み上げを停止しました",
@@ -1969,13 +2355,29 @@ class ReadAloudCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or message.guild is None or not message.content.strip():
+        if message.guild is None:
             return
         workspace_id = str(message.guild.id)
         if not self.runtime.read_aloud.matches(workspace_id, str(message.channel.id)):
             return
         route = self.runtime.read_aloud.get(workspace_id)
         if route is None:
+            return
+        role_ids = (
+            tuple(str(role.id) for role in message.author.roles)
+            if isinstance(message.author, discord.Member)
+            else ()
+        )
+        if not self.runtime.read_aloud.allows_message(
+            workspace_id=workspace_id,
+            author_id=str(message.author.id),
+            role_ids=role_ids,
+            is_bot=message.author.bot,
+            is_webhook=message.webhook_id is not None,
+        ):
+            return
+        prepared = await self._message_formatter.format(message)
+        if prepared is None:
             return
         guild_id = message.guild.id
         session = self.runtime.audio.get_or_create(
@@ -2009,8 +2411,8 @@ class ReadAloudCog(commands.Cog):
             await self.runtime.registry.invoke(
                 "speech.speak",
                 SpeechSpeakRequest(
-                    text=message.content,
-                    title=f"{message.author.display_name}さんのメッセージ",
+                    text=prepared.text,
+                    title=prepared.title,
                 ),
                 InvocationContext(
                     actor_id=str(message.author.id),
@@ -2025,6 +2427,135 @@ class ReadAloudCog(commands.Cog):
                 message.guild.id,
                 message.channel.id,
             )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Debounce voice transitions before adding an announcement."""
+
+        if member.bot or before.channel == after.channel:
+            return
+        workspace_id = str(member.guild.id)
+        route = self.runtime.read_aloud.get(workspace_id)
+        if route is None:
+            return
+        destination_id = int(route.audio_destination_id)
+        before_relevant = (
+            before.channel is not None and before.channel.id == destination_id
+        )
+        after_relevant = (
+            after.channel is not None and after.channel.id == destination_id
+        )
+        if not before_relevant and not after_relevant:
+            return
+
+        key = (member.guild.id, member.id)
+        previous = self._voice_transitions.get(key)
+        initial_channel = previous[1] if previous is not None else before.channel
+        self._voice_transitions[key] = (member, initial_channel, after.channel)
+        existing = self._announcement_tasks.get(key)
+        if existing is not None:
+            existing.cancel()
+        self._announcement_tasks[key] = asyncio.create_task(
+            self._flush_voice_transition(key),
+            name=f"simajilord-read-aloud-voice-{member.guild.id}-{member.id}",
+        )
+
+    async def _flush_voice_transition(self, key: tuple[int, int]) -> None:
+        try:
+            await asyncio.sleep(0.7)
+            transition = self._voice_transitions.get(key)
+            if transition is None:
+                return
+            member, before_channel, after_channel = transition
+            await self._announce_voice_transition(
+                member,
+                before_channel=before_channel,
+                after_channel=after_channel,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Voice read-aloud announcement failed guild=%s member=%s",
+                key[0],
+                key[1],
+            )
+        finally:
+            if self._announcement_tasks.get(key) is asyncio.current_task():
+                self._announcement_tasks.pop(key, None)
+                self._voice_transitions.pop(key, None)
+
+    async def _announce_voice_transition(
+        self,
+        member: discord.Member,
+        *,
+        before_channel: discord.VoiceChannel | discord.StageChannel | None,
+        after_channel: discord.VoiceChannel | discord.StageChannel | None,
+    ) -> None:
+        workspace_id = str(member.guild.id)
+        route = self.runtime.read_aloud.get(workspace_id)
+        if route is None or before_channel == after_channel:
+            return
+        policy = self.runtime.read_aloud.policy(workspace_id)
+        destination_id = int(route.audio_destination_id)
+        before_id = before_channel.id if before_channel is not None else None
+        after_id = after_channel.id if after_channel is not None else None
+        name = member.display_name.strip() or member.name
+
+        if before_channel is not None and after_channel is not None:
+            if not policy.announce_move or destination_id not in (before_id, after_id):
+                return
+            text = (
+                f"{name}さんが、{before_channel.name}から"
+                f"{after_channel.name}へ移動しました"
+            )
+        elif after_id == destination_id:
+            if not policy.announce_join:
+                return
+            text = f"{name}さんがボイスチャンネルに参加しました"
+        elif before_id == destination_id:
+            if not policy.announce_leave:
+                return
+            text = f"{name}さんがボイスチャンネルから退出しました"
+        else:
+            return
+
+        destination = member.guild.get_channel(destination_id)
+        if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
+            return
+        if not any(not listener.bot for listener in destination.members):
+            return
+
+        session = self.runtime.audio.get_or_create(
+            workspace_id,
+            lambda: DiscordAudioOutput(self.bot, member.guild.id),
+        )
+        if (
+            session.has_music
+            and session.destination_id is not None
+            and session.destination_id != route.audio_destination_id
+        ):
+            return
+        if not session.output.connected:
+            await self.runtime.audio.connect(workspace_id, route.audio_destination_id)
+        await self.runtime.registry.invoke(
+            "speech.speak",
+            SpeechSpeakRequest(
+                text=self.runtime.read_aloud.apply_dictionary(workspace_id, text),
+                title="VCの入退室通知",
+            ),
+            InvocationContext(
+                actor_id=str(member.id),
+                workspace_id=workspace_id,
+                transport="discord",
+                request_id=f"read-aloud-voice:{member.id}:{time.time_ns()}",
+            ),
+        )
 
 
 class VoiceLifecycleCog(commands.Cog):

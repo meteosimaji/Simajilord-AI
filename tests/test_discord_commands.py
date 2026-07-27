@@ -29,6 +29,10 @@ from simajilord.capabilities.audio import (
 )
 from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
+    ReadAloudDictionarySetRequest,
+    ReadAloudExclusionSetRequest,
+    ReadAloudExclusionTarget,
+    ReadAloudPolicyResponse,
     ReadAloudRequest,
     ReadAloudResponse,
 )
@@ -308,6 +312,118 @@ async def test_agent_read_aloud_mutation_requires_manage_server(
                 actor_id="7",
                 workspace_id="1",
                 transport="agent",
+                request_id="event",
+            ),
+        )
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_self_mute_is_allowed_but_other_user_requires_admin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=("7",),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=response)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    member = Mock(spec=discord.Member)
+    member.id = 7
+    member.bot = False
+    member.guild_permissions.manage_guild = False
+    guild.get_member.return_value = member
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="discord",
+        request_id="event",
+    )
+
+    own = await endpoint_by_name["discord.read_aloud_exclusion_set"].invoke(
+        ReadAloudExclusionSetRequest(
+            target=ReadAloudExclusionTarget.USER,
+            target_id="7",
+            ignored=True,
+        ),
+        context,
+    )
+
+    assert own == response
+    assert runtime.registry.invoke.await_args.args[0] == (
+        "speech.read_aloud_exclusion_set"
+    )
+    runtime.registry.invoke.reset_mock()
+    with pytest.raises(UserError, match=r"discord\.manage_guild_required"):
+        await endpoint_by_name["discord.read_aloud_exclusion_set"].invoke(
+            ReadAloudExclusionSetRequest(
+                target=ReadAloudExclusionTarget.USER,
+                target_id="8",
+                ignored=True,
+            ),
+            context,
+        )
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_dictionary_write_requires_manage_guild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    guild = Mock(spec=discord.Guild)
+    member = Mock(spec=discord.Member)
+    member.guild_permissions.manage_guild = False
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    with pytest.raises(UserError, match=r"discord\.manage_guild_required"):
+        await endpoints["discord.read_aloud_dictionary_set"].invoke(
+            ReadAloudDictionarySetRequest("IUT", "あいゆーてぃー"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="1",
+                transport="discord",
                 request_id="event",
             ),
         )

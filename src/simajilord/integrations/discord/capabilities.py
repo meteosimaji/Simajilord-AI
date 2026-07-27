@@ -27,8 +27,20 @@ from simajilord.capabilities.moderation import (
 )
 from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
+    ReadAloudAddSourcesRequest,
+    ReadAloudAnnouncementsSetRequest,
+    ReadAloudDictionaryListRequest,
+    ReadAloudDictionaryRemoveRequest,
+    ReadAloudDictionarySetRequest,
+    ReadAloudDisableRequest,
+    ReadAloudExclusionSetRequest,
+    ReadAloudExclusionTarget,
+    ReadAloudPolicyResponse,
+    ReadAloudRemoveSourceRequest,
     ReadAloudRequest,
     ReadAloudResponse,
+    ReadAloudSemanticsSetRequest,
+    ReadAloudStatusRequest,
 )
 from simajilord.capabilities.speech import (
     SpeechSpeakRequest,
@@ -1271,7 +1283,11 @@ def build_discord_endpoints(
         }:
             if request.text_channel_id is None or request.audio_destination_id is None:
                 raise UserError("read_aloud.route_fields_required")
-            _message_channel(guild, request.text_channel_id)
+            source = _message_channel(guild, request.text_channel_id)
+            if not _can_read_messages(source, member):
+                raise UserError("discord.message_channel_unavailable")
+            if guild.me is None or not _can_read_messages(source, guild.me):
+                raise UserError("discord.message_channel_unavailable")
             voice = guild.get_channel(
                 _snowflake(request.audio_destination_id, "voice channel")
             )
@@ -1287,6 +1303,155 @@ def build_discord_endpoints(
             context,
         )
         return cast(ReadAloudResponse, response)
+
+    async def read_aloud_status(
+        _request: ReadAloudStatusRequest,
+        context: InvocationContext,
+    ) -> ReadAloudResponse:
+        return await manage_read_aloud(
+            ReadAloudRequest(action=ReadAloudAction.STATUS),
+            context,
+        )
+
+    async def read_aloud_add_sources(
+        request: ReadAloudAddSourcesRequest,
+        context: InvocationContext,
+    ) -> ReadAloudResponse:
+        return await manage_read_aloud(
+            ReadAloudRequest(
+                action=ReadAloudAction.ADD_SOURCES,
+                text_channel_ids=request.text_channel_ids,
+                audio_destination_id=request.audio_destination_id,
+                mode=request.mode,
+            ),
+            context,
+        )
+
+    async def read_aloud_remove_source(
+        request: ReadAloudRemoveSourceRequest,
+        context: InvocationContext,
+    ) -> ReadAloudResponse:
+        return await manage_read_aloud(
+            ReadAloudRequest(
+                action=ReadAloudAction.REMOVE_SOURCE,
+                text_channel_id=request.text_channel_id,
+            ),
+            context,
+        )
+
+    async def read_aloud_disable(
+        _request: ReadAloudDisableRequest,
+        context: InvocationContext,
+    ) -> ReadAloudResponse:
+        return await manage_read_aloud(
+            ReadAloudRequest(action=ReadAloudAction.DISABLE),
+            context,
+        )
+
+    async def read_aloud_policy_status(
+        _request: ReadAloudStatusRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        _guild(client, context)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_policy_status",
+            ReadAloudStatusRequest(),
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_dictionary_list(
+        _request: ReadAloudDictionaryListRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        _guild(client, context)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_dictionary_list",
+            ReadAloudDictionaryListRequest(),
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_dictionary_set(
+        request: ReadAloudDictionarySetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        member = await _actor_member(_guild(client, context), context)
+        _require_manage_guild(member)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_dictionary_set",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_dictionary_remove(
+        request: ReadAloudDictionaryRemoveRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        member = await _actor_member(_guild(client, context), context)
+        _require_manage_guild(member)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_dictionary_remove",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_exclusion_set(
+        request: ReadAloudExclusionSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        guild = _guild(client, context)
+        member = await _actor_member(guild, context)
+        target_id = _snowflake(request.target_id, request.target.value)
+        if request.target is ReadAloudExclusionTarget.USER:
+            if target_id != member.id:
+                _require_manage_guild(member)
+            target_member = guild.get_member(target_id)
+            if target_member is None:
+                try:
+                    target_member = await guild.fetch_member(target_id)
+                except discord.DiscordException as exc:
+                    raise UserError("discord.member_lookup_failed") from exc
+            if target_member.bot:
+                raise UserError("read_aloud.ignore_bot_unnecessary")
+        else:
+            _require_manage_guild(member)
+            if guild.get_role(target_id) is None:
+                raise UserError("read_aloud.role_not_found")
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_exclusion_set",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_announcements_set(
+        request: ReadAloudAnnouncementsSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        member = await _actor_member(_guild(client, context), context)
+        _require_manage_guild(member)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_announcements_set",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
+    async def read_aloud_semantics_set(
+        request: ReadAloudSemanticsSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        member = await _actor_member(_guild(client, context), context)
+        _require_manage_guild(member)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_semantics_set",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
 
     return (
         endpoint(
@@ -1616,6 +1781,143 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
+                name="discord.read_aloud_status",
+                summary="現在のDiscord読み上げ経路だけを確認します。",
+                risk=RiskLevel.READ,
+                keywords=("discord", "read aloud", "status", "route", "tts"),
+            ),
+            ReadAloudStatusRequest,
+            ReadAloudResponse,
+            read_aloud_status,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_add_sources",
+                summary="指定した会話チャンネルを参加中VCの読み上げ対象へ追加します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "add", "channel", "tts"),
+                side_effects=("読み上げ対象チャンネルを永続設定へ追加します。",),
+            ),
+            ReadAloudAddSourcesRequest,
+            ReadAloudResponse,
+            read_aloud_add_sources,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_remove_source",
+                summary="指定した会話チャンネルを読み上げ対象から外します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "remove", "channel", "tts"),
+                side_effects=("読み上げ対象チャンネルを永続設定から外します。",),
+            ),
+            ReadAloudRemoveSourceRequest,
+            ReadAloudResponse,
+            read_aloud_remove_source,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_disable",
+                summary="このDiscordサーバーの読み上げ経路を停止します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "disable", "stop", "tts"),
+                side_effects=("このサーバーの読み上げ経路を削除します。",),
+            ),
+            ReadAloudDisableRequest,
+            ReadAloudResponse,
+            read_aloud_disable,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_policy_status",
+                summary="読み上げ辞書・除外・入退室通知の現在値を確認します。",
+                risk=RiskLevel.READ,
+                keywords=("discord", "read aloud", "policy", "settings", "tts"),
+            ),
+            ReadAloudStatusRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_policy_status,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_dictionary_list",
+                summary="このDiscordサーバーの読み上げ辞書を一覧表示します。",
+                risk=RiskLevel.READ,
+                keywords=("discord", "read aloud", "dictionary", "pronunciation"),
+            ),
+            ReadAloudDictionaryListRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_dictionary_list,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_dictionary_set",
+                summary="表記と読みをDiscordサーバー別読み上げ辞書へ登録します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "dictionary", "pronunciation"),
+                side_effects=("サーバー別読み上げ辞書を更新します。",),
+            ),
+            ReadAloudDictionarySetRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_dictionary_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_dictionary_remove",
+                summary="表記をDiscordサーバー別読み上げ辞書から削除します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "dictionary", "remove"),
+                side_effects=("サーバー別読み上げ辞書を更新します。",),
+            ),
+            ReadAloudDictionaryRemoveRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_dictionary_remove,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_exclusion_set",
+                summary="ユーザーまたはロールの読み上げ除外を設定・解除します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "ignore", "mute", "role"),
+                side_effects=("読み上げ除外設定を更新します。",),
+            ),
+            ReadAloudExclusionSetRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_exclusion_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_announcements_set",
+                summary="VCへの参加・退出・移動の読み上げを設定します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "join", "leave", "move"),
+                side_effects=("VC入退室通知の読み上げ設定を更新します。",),
+            ),
+            ReadAloudAnnouncementsSetRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_announcements_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_semantics_set",
+                summary="投稿者名・返信先・添付の意味的な読み上げを設定します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "author", "reply", "attachment"),
+                side_effects=("意味的な読み上げ設定を更新します。",),
+            ),
+            ReadAloudSemanticsSetRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_semantics_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
                 name="discord.manage_read_aloud",
                 summary=(
                     "読み上げ経路を確認します。サーバー管理権限があれば設定・無効化も行えます。"
@@ -1685,6 +1987,11 @@ def _assert_same_voice(
 ) -> None:
     if channel is None or destination_id is None or str(channel.id) != destination_id:
         raise UserError("audio.same_voice_required")
+
+
+def _require_manage_guild(member: discord.Member) -> None:
+    if not member.guild_permissions.manage_guild:
+        raise UserError("discord.manage_guild_required")
 
 
 async def _prepare_actor_audio(

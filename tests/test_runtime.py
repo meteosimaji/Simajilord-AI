@@ -102,6 +102,27 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         assert "discord.speak" in output.text
         assert '"name":"audio.play"' not in output.text
         assert '"name":"speech.speak"' not in output.text
+        autonomous_read_aloud = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "read aloud dictionary settings", "limit": 5},
+            context=autonomous_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.read_aloud_dictionary_set" not in autonomous_read_aloud.text
+        assert (
+            "discord.read_aloud_dictionary_list" in autonomous_read_aloud.text
+            or "discord.read_aloud_policy_status" in autonomous_read_aloud.text
+        )
+        requested_read_aloud = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "read aloud dictionary register", "limit": 5},
+            context=requested_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.read_aloud_dictionary_set" in requested_read_aloud.text
+        assert "discord.manage_read_aloud" not in requested_read_aloud.text
         media_output = await provider.tools.invoke(
             namespace="simajilord",
             tool_name="capability_search",

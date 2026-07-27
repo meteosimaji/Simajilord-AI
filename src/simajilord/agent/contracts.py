@@ -20,7 +20,14 @@ AGENT_WEB_GRANT = "web"
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",
     "discord.control_audio",
-    "discord.manage_read_aloud",
+    "discord.read_aloud_add_sources",
+    "discord.read_aloud_remove_source",
+    "discord.read_aloud_disable",
+    "discord.read_aloud_dictionary_set",
+    "discord.read_aloud_dictionary_remove",
+    "discord.read_aloud_exclusion_set",
+    "discord.read_aloud_announcements_set",
+    "discord.read_aloud_semantics_set",
     "discord.speak",
 )
 

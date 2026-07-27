@@ -33,6 +33,8 @@ from .read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
     build_read_aloud_endpoint,
+    build_read_aloud_policy_endpoints,
+    build_read_aloud_route_endpoints,
 )
 from .speech import (
     SpeechSpeakRequest,
@@ -116,6 +118,8 @@ __all__ = [
     "build_image_endpoints",
     "build_moderation_endpoints",
     "build_read_aloud_endpoint",
+    "build_read_aloud_policy_endpoints",
+    "build_read_aloud_route_endpoints",
     "build_speech_endpoint",
     "build_system_endpoints",
     "build_utility_endpoints",

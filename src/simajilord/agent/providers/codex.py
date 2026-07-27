@@ -765,7 +765,7 @@ class CodexAppServerProvider:
             "discord.control_audio",
             "discord.speak",
             "discord.manage_read_aloud",
-        }:
+        } or selected.startswith("discord.read_aloud_"):
             await self._emit_progress(AgentProgressStage.USING_AUDIO)
         elif selected.startswith("image."):
             await self._emit_progress(AgentProgressStage.GENERATING_IMAGE)
