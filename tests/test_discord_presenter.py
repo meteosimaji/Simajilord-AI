@@ -26,6 +26,7 @@ from simajilord.domain.web import WebSource
 from simajilord.integrations.discord.bot import _image_result_embed
 from simajilord.integrations.discord.capabilities import (
     DiscordExpandedAttachmentRecord,
+    DiscordExpandedEmbedRecord,
     DiscordExpandMessageResponse,
 )
 from simajilord.integrations.discord.cogs import (
@@ -43,6 +44,7 @@ from simajilord.integrations.discord.presenter import (
     command_embed,
     expanded_message_embeds,
     expanded_message_view,
+    quote_message_view,
 )
 
 
@@ -93,12 +95,61 @@ def test_expanded_message_keeps_jump_and_bounds_visible_images() -> None:
     embeds = expanded_message_embeds(response)
     view = expanded_message_view(response.jump_url)
     assert len(embeds) == 4
-    assert embeds[0].title == "元のメッセージへ"
-    assert embeds[0].url == response.jump_url
+    assert embeds[0].title is None
+    assert embeds[0].url is None
+    assert embeds[0].author.name == "Alice"
+    assert embeds[0].author.url is None
     assert embeds[0].image.url == "https://proxy.example.com/0.png"
     button = view.children[0]
     assert getattr(button, "label", None) == "Jump"
     assert getattr(button, "url", None) == response.jump_url
+
+
+def test_quote_jump_is_optional_and_enabled_by_default() -> None:
+    jump_url = "https://discord.com/channels/1/2/3"
+    default_view = quote_message_view(jump_url)
+
+    assert default_view is not None
+    assert getattr(default_view.children[0], "label", None) == "Jump"
+    assert quote_message_view(jump_url, include_jump=False) is None
+
+
+def test_expanded_embed_only_message_preserves_original_title_and_description() -> None:
+    response = DiscordExpandMessageResponse(
+        guild_id="1",
+        channel_id="2",
+        channel_name="general",
+        message_id="3",
+        jump_url="https://discord.com/channels/1/2/3",
+        author_id="4",
+        author_name="Alice",
+        author_avatar_url="https://cdn.example.com/avatar.png",
+        author_is_bot=True,
+        content="",
+        created_at_iso="2026-07-27T00:00:00+00:00",
+        edited_at_iso=None,
+        attachments=(),
+        embeds=(
+            DiscordExpandedEmbedRecord(
+                title="Generated image",
+                description="A fluffy cat",
+                url="https://example.com/result",
+                image_url="https://example.com/cat.png",
+                thumbnail_url=None,
+            ),
+        ),
+        sticker_names=(),
+        poll=None,
+        reply_author_name=None,
+        reply_content_preview=None,
+    )
+
+    embed = expanded_message_embeds(response)[0]
+
+    assert embed.title == "Generated image"
+    assert embed.description == "A fluffy cat"
+    assert embed.url == "https://example.com/result"
+    assert embed.author.name == "Alice"
 
 
 def test_generated_image_embed_shows_the_actual_creative_brief() -> None:

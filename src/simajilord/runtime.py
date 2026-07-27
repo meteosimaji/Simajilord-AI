@@ -13,6 +13,7 @@ from simajilord.agent import (
     AGENT_IMAGE_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
+    AGENT_QUOTE_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
 )
@@ -50,6 +51,7 @@ from simajilord.services import (
     MediaService,
     ModerationService,
     ModerationStore,
+    QuoteImageService,
     ReadAloudService,
     SpeechService,
     WebService,
@@ -69,6 +71,7 @@ class SimajilordRuntime:
     web: WebService
     moderation: ModerationService
     image: ImageGenerationService
+    quote: QuoteImageService
     files: AgentFileSandbox | None
     journal: EventJournal
     agent: AgentService | None
@@ -157,6 +160,7 @@ class SimajilordRuntime:
             max_pending_jobs=settings.image_max_pending_jobs,
             rate_limit_exempt_actor_ids=settings.agent_rate_limit_exempt_user_ids,
         )
+        quote = QuoteImageService()
         files = (
             AgentFileSandbox(settings.data_dir / "agent_files")
             if settings.agent_file_sandbox_enabled
@@ -178,6 +182,7 @@ class SimajilordRuntime:
                 "discord.send_message",
                 "discord.speak",
                 "discord.post_expanded_message",
+                "discord.create_quote_image",
                 "discord.view_custom_emoji",
                 "discord.view_sticker",
             ]
@@ -191,6 +196,7 @@ class SimajilordRuntime:
                 "discord.speak": AGENT_AUDIO_GRANT,
                 "discord.send_message": AGENT_MESSAGE_GRANT,
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
+                "discord.create_quote_image": AGENT_QUOTE_GRANT,
             }
             if settings.hive_api_key is not None:
                 capability_name = "discord.analyze_attachment"
@@ -239,6 +245,7 @@ class SimajilordRuntime:
                     (
                         "discord.send_message",
                         "discord.post_expanded_message",
+                        "discord.create_quote_image",
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                     )
                     + (
@@ -308,6 +315,7 @@ class SimajilordRuntime:
             web=web,
             moderation=moderation,
             image=image,
+            quote=quote,
             files=files,
             journal=journal,
             agent=agent,

@@ -27,6 +27,7 @@ from simajilord.agent import (
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_NO_ACTION_CONTENT,
+    AGENT_QUOTE_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
     AgentBusyError,
@@ -98,6 +99,7 @@ from simajilord.services.read_aloud import ReadAloudMode
 from .audio import DiscordAudioOutput
 from .capabilities import (
     DiscordConnectVoiceRequest,
+    DiscordCreateQuoteImageRequest,
     DiscordPollRequest,
     DiscordPollResponse,
     DiscordPostExpandedMessageRequest,
@@ -108,6 +110,7 @@ from .capabilities import (
     DiscordUserResponse,
     agent_readable_channel_ids,
     parse_discord_message_link,
+    quote_message_has_animation,
 )
 from .presenter import (
     EmbedField,
@@ -117,6 +120,7 @@ from .presenter import (
 
 log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
+_QUOTE_CONTEXT_MENU_NAME = "Quote"
 
 _ERROR_MESSAGES = {
     "audio.auto_leave_value_required": "自動退出を有効にするか選んでください。",
@@ -163,6 +167,12 @@ _ERROR_MESSAGES = {
         "メッセージの取得文字数は1〜1000文字で指定してください。"
     ),
     "discord.message_offset_invalid": "有効なメッセージ開始位置を指定してください。",
+    "discord.member_lookup_failed": (
+        "Discordからユーザー情報を取得できませんでした。少し待ってから試してください。"
+    ),
+    "discord.member_required": (
+        "サーバー上のユーザー情報を確認できませんでした。もう一度お試しください。"
+    ),
     "discord.expand_cross_guild_forbidden": (
         "別のサーバーにあるメッセージは展開できません。"
     ),
@@ -175,6 +185,16 @@ _ERROR_MESSAGES = {
     ),
     "discord.expand_failed": (
         "Discordから元のメッセージを取得できませんでした。時間を空けて試してください。"
+    ),
+    "discord.quote_destination_unavailable": (
+        "このチャンネルへ引用画像を投稿できません。"
+        "BOTのメッセージ送信・ファイル添付権限を確認してください。"
+    ),
+    "discord.quote_failed": (
+        "引用画像をDiscordへ送信できませんでした。少し待ってから試してください。"
+    ),
+    "discord.quote_render_failed": (
+        "引用画像を描画できませんでした。メッセージ内容を確認してください。"
     ),
     "discord.manage_guild_required": (
         "読み上げは別のボイスチャンネルに設定されています。"
@@ -2827,6 +2847,242 @@ class MessageExpandCog(commands.Cog):
             )
 
 
+class QuoteCog(commands.Cog):
+    """Create one local quote image from Discord's message context menu."""
+
+    def __init__(self, runtime: SimajilordRuntime) -> None:
+        self.runtime = runtime
+
+    async def create_quote(
+        self,
+        interaction: discord.Interaction,
+        message: discord.Message,
+    ) -> None:
+        if interaction.guild_id is None or interaction.channel_id is None:
+            await send_error(
+                interaction,
+                UserError("この操作はサーバー内のメッセージで使用してください。"),
+            )
+            return
+        view = QuoteComposerView(
+            self.runtime,
+            requester_id=interaction.user.id,
+            source_channel_id=message.channel.id,
+            source_message_id=message.id,
+            destination_channel_id=interaction.channel_id,
+            has_animation=quote_message_has_animation(message),
+        )
+        await interaction.response.send_message(
+            embed=view.embed(),
+            view=view,
+            ephemeral=True,
+        )
+
+
+class QuoteComposerView(discord.ui.View):
+    """Private, short-lived quote options without cluttering the result message."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        requester_id: int,
+        source_channel_id: int,
+        source_message_id: int,
+        destination_channel_id: int,
+        has_animation: bool = False,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.runtime = runtime
+        self.requester_id = requester_id
+        self.source_channel_id = source_channel_id
+        self.source_message_id = source_message_id
+        self.destination_channel_id = destination_channel_id
+        self.color = False
+        self.vertical = False
+        self.bold = False
+        self.flip = False
+        self.has_animation = has_animation
+        self.animate = False
+        self.include_jump = True
+        if not has_animation:
+            self.remove_item(self.animation_button)
+        self._sync_labels()
+
+    def embed(self) -> discord.Embed:
+        layout = "Vertical · 4:5" if self.vertical else "Landscape · 40:21"
+        appearance = "Color" if self.color else "Black / White"
+        enabled = [
+            label
+            for label, active in (
+                ("Bold", self.bold),
+                ("Flip", self.flip),
+                ("Animation", self.animate),
+                ("Jump", self.include_jump),
+            )
+            if active
+        ]
+        return discord.Embed(
+            title="Quote",
+            description="スタイルを選び、Generateで投稿します。",
+            color=discord.Colour.green(),
+        ).add_field(
+            name="Preview settings",
+            value=f"{layout}\n{appearance}\n{' · '.join(enabled) or 'Standard'}",
+            inline=False,
+        )
+
+    def request(self) -> DiscordCreateQuoteImageRequest:
+        return DiscordCreateQuoteImageRequest(
+            source_channel_id=str(self.source_channel_id),
+            source_message_id=str(self.source_message_id),
+            destination_channel_id=str(self.destination_channel_id),
+            color=self.color,
+            vertical=self.vertical,
+            bold=self.bold,
+            flip=self.flip,
+            animate=self.animate,
+            include_jump=self.include_jump,
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "このQuoteメニューは、開いた本人だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+    def _sync_labels(self) -> None:
+        self.color_button.label = f"Color {'On' if self.color else 'Off'}"
+        self.vertical_button.label = "Vertical" if self.vertical else "Landscape"
+        self.bold_button.label = f"Bold {'On' if self.bold else 'Off'}"
+        self.flip_button.label = f"Flip {'On' if self.flip else 'Off'}"
+        self.jump_button.label = f"Jump {'On' if self.include_jump else 'Off'}"
+        self.animation_button.label = (
+            f"Animation {'On' if self.animate else 'Off'}"
+        )
+        self.color_button.style = (
+            discord.ButtonStyle.primary
+            if self.color
+            else discord.ButtonStyle.secondary
+        )
+        self.vertical_button.style = (
+            discord.ButtonStyle.primary
+            if self.vertical
+            else discord.ButtonStyle.secondary
+        )
+        self.bold_button.style = (
+            discord.ButtonStyle.primary
+            if self.bold
+            else discord.ButtonStyle.secondary
+        )
+        self.flip_button.style = (
+            discord.ButtonStyle.primary
+            if self.flip
+            else discord.ButtonStyle.secondary
+        )
+        self.jump_button.style = (
+            discord.ButtonStyle.primary
+            if self.include_jump
+            else discord.ButtonStyle.secondary
+        )
+        self.animation_button.style = (
+            discord.ButtonStyle.primary
+            if self.animate
+            else discord.ButtonStyle.secondary
+        )
+
+    async def _refresh_composer(self, interaction: discord.Interaction) -> None:
+        self._sync_labels()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Color Off", emoji="🎨", row=0)
+    async def color_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.color = not self.color
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Landscape", emoji="↔️", row=0)
+    async def vertical_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.vertical = not self.vertical
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Bold Off", emoji="🅱️", row=0)
+    async def bold_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.bold = not self.bold
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Flip Off", emoji="🔄", row=0)
+    async def flip_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.flip = not self.flip
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Jump On", emoji="↗️", row=0)
+    async def jump_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.include_jump = not self.include_jump
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Animation Off", emoji="🎞️", row=1)
+    async def animation_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self.animate = not self.animate
+        await self._refresh_composer(interaction)
+
+    @discord.ui.button(
+        label="Generate",
+        emoji="✨",
+        style=discord.ButtonStyle.success,
+        row=1,
+    )
+    async def generate_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            await self.runtime.registry.invoke(
+                "discord.create_quote_image",
+                self.request(),
+                invocation_context(interaction),
+            )
+            await interaction.delete_original_response()
+            self.stop()
+        except Exception as exc:
+            await interaction.edit_original_response(
+                embed=command_embed(
+                    "生成できませんでした",
+                    description=error_message(exc),
+                    tone=EmbedTone.ERROR,
+                ),
+                view=self,
+            )
+
+
 def discord_conversation_id(
     *,
     guild_id: int | None,
@@ -2850,7 +3106,11 @@ def _agent_grants(
     autonomous: bool = False,
 ) -> frozenset[str]:
     settings = runtime.settings
-    grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_REPOST_GRANT}
+    grants: set[str] = {
+        AGENT_AUDIO_GRANT,
+        AGENT_QUOTE_GRANT,
+        AGENT_REPOST_GRANT,
+    }
     if not autonomous:
         grants.add(AGENT_MESSAGE_GRANT)
     if (
@@ -2986,6 +3246,13 @@ class _AgentProgressMessage:
     async def finish(self, content: str) -> None:
         self._closed = True
         await self._cancel_pending()
+        if content.strip() == AGENT_NO_ACTION_CONTENT:
+            async with self._lock:
+                if self.message is not None:
+                    with suppress(discord.DiscordException):
+                        await self.message.delete()
+                    self.message = None
+            return
         messages = _agent_message_groups(content)
         if not messages:
             return
@@ -3712,6 +3979,14 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     await bot.add_cog(DiscordInfoCog(runtime))
     await bot.add_cog(DiscordActionCog(runtime))
     await bot.add_cog(MessageExpandCog(runtime))
+    quote_cog = QuoteCog(runtime)
+    await bot.add_cog(quote_cog)
+    bot.tree.add_command(
+        app_commands.ContextMenu(
+            name=_QUOTE_CONTEXT_MENU_NAME,
+            callback=quote_cog.create_quote,
+        )
+    )
     await bot.add_cog(AgentCog(bot, runtime))
     await bot.add_cog(ObservationCog(bot, runtime))
     await bot.add_cog(AgentAutonomyCog(bot, runtime))

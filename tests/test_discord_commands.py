@@ -42,6 +42,7 @@ from simajilord.integrations.discord.capabilities import (
     DiscordViewCustomEmojiResponse,
     DiscordViewStickerRequest,
     DiscordViewStickerResponse,
+    _actor_member,
     _assert_agent_channel_scope,
     _assert_agent_update_scope,
     _bounded_event_message,
@@ -55,10 +56,13 @@ from simajilord.integrations.discord.capabilities import (
     parse_discord_message_link,
 )
 from simajilord.integrations.discord.cogs import (
+    _QUOTE_CONTEXT_MENU_NAME,
     ModerationCog,
     MusicCog,
     MusicControlsView,
     MusicSearchChoiceView,
+    QuoteCog,
+    QuoteComposerView,
     ReadAloudChannelSelect,
     ReadAloudCog,
     VoiceLifecycleCog,
@@ -67,11 +71,50 @@ from simajilord.integrations.discord.cogs import (
     _agent_error_text,
     _agent_grants,
     _agent_message_groups,
+    _AgentProgressMessage,
     _discord_message_chunks,
     _retry_after_text,
     discord_conversation_id,
+    error_message,
 )
 from simajilord.runtime import SimajilordRuntime
+
+
+@pytest.mark.asyncio
+async def test_actor_member_fetches_exact_member_when_cache_is_empty() -> None:
+    guild = Mock(spec=discord.Guild)
+    guild.get_member.return_value = None
+    member = Mock(spec=discord.Member)
+    member.id = 7
+    guild.fetch_member = AsyncMock(return_value=member)
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="discord",
+        request_id="message",
+    )
+
+    assert await _actor_member(guild, context) is member
+    guild.fetch_member.assert_awaited_once_with(7)
+
+
+@pytest.mark.asyncio
+async def test_agent_no_action_sentinel_is_never_published() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    published = Mock(spec=discord.Message)
+    published.delete = AsyncMock()
+    progress = _AgentProgressMessage(source)
+    progress.message = published
+
+    await progress.finish("<simajilord:no-action>")
+
+    published.delete.assert_awaited_once_with()
+    assert progress.message is None
+
+
+def test_member_lookup_error_is_localized() -> None:
+    assert "ユーザー情報" in error_message(UserError("discord.member_required"))
 
 
 def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
@@ -149,7 +192,7 @@ async def test_agent_audio_adapter_rebinds_requester_identity(
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._actor_member",
-        lambda selected_guild, context: member,
+        AsyncMock(return_value=member),
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._member_voice_channel",
@@ -203,7 +246,7 @@ async def test_agent_audio_adapter_rejects_remote_voice_control(
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._actor_member",
-        lambda selected_guild, context: member,
+        AsyncMock(return_value=member),
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._member_voice_channel",
@@ -248,7 +291,7 @@ async def test_agent_read_aloud_mutation_requires_manage_server(
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._actor_member",
-        lambda selected_guild, context: member,
+        AsyncMock(return_value=member),
     )
     endpoint_by_name = {
         item.descriptor.name: item
@@ -302,7 +345,7 @@ async def test_join_self_service_is_limited_to_current_channel_and_voice(
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._actor_member",
-        lambda selected_guild, context: member,
+        AsyncMock(return_value=member),
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._member_voice_channel",
@@ -406,7 +449,7 @@ async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._actor_member",
-        lambda selected_guild, context: member,
+        AsyncMock(return_value=member),
     )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._member_voice_channel",
@@ -548,6 +591,10 @@ def test_web_commands_are_short_direct_paths() -> None:
     assert commands["search"].description.startswith("Simajilordのローカル検索")
 
 
+def test_quote_context_menu_uses_a_short_native_label() -> None:
+    assert _QUOTE_CONTEXT_MENU_NAME == "Quote"
+
+
 def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
     commands = {
         command.name: command
@@ -622,6 +669,63 @@ async def test_join_selection_connects_voice_before_reporting_ready() -> None:
         field.name == "接続" and field.value == "準備完了"
         for field in embed.fields
     )
+
+
+@pytest.mark.asyncio
+async def test_quote_context_menu_opens_private_options_without_posting() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=object())
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 90
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user.id = 7
+    interaction.response.send_message = AsyncMock()
+    message = Mock(spec=discord.Message)
+    message.id = 60
+    message.channel.id = 50
+    message.content = ""
+    message.stickers = []
+
+    await QuoteCog(runtime).create_quote(interaction, message)
+
+    interaction.response.send_message.assert_awaited_once()
+    assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True
+    assert isinstance(
+        interaction.response.send_message.await_args.kwargs["view"],
+        QuoteComposerView,
+    )
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quote_composer_preserves_combinable_styles_and_jump_choice() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=object())
+    view = QuoteComposerView(
+        runtime,
+        requester_id=7,
+        source_channel_id=50,
+        source_message_id=60,
+        destination_channel_id=50,
+        has_animation=True,
+    )
+    view.color = True
+    view.vertical = True
+    view.bold = True
+    view.flip = True
+    view.animate = True
+    view.include_jump = False
+
+    request = view.request()
+    assert request.color is True
+    assert request.vertical is True
+    assert request.bold is True
+    assert request.flip is True
+    assert request.animate is True
+    assert request.include_jump is False
 
 
 @pytest.mark.asyncio

@@ -45,9 +45,18 @@ from simajilord.core import (
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import WorkspaceFileRecord
+from simajilord.services.quote import (
+    QuoteCustomEmojiAsset,
+    QuoteRenderRequest,
+    QuoteStickerAsset,
+)
 
 from .audio import DiscordAudioOutput
-from .presenter import expanded_message_embeds, expanded_message_view
+from .presenter import (
+    expanded_message_embeds,
+    expanded_message_view,
+    quote_message_view,
+)
 
 DiscordMessageChannel: TypeAlias = (
     discord.TextChannel
@@ -60,6 +69,7 @@ _CUSTOM_EMOJI_PATTERN = re.compile(
 )
 _CUSTOM_EMOJI_PREVIEW_LIMIT = 25
 _CUSTOM_EMOJI_MEDIA_MAX_BYTES = 5_000_000
+_QUOTE_AVATAR_MAX_BYTES = 8_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +296,35 @@ class DiscordPostExpandedMessageResponse:
     message_id: str
     channel_id: str
     source_jump_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordCreateQuoteImageRequest:
+    source_channel_id: str
+    source_message_id: str
+    destination_channel_id: str
+    color: bool = False
+    light: bool = False
+    flip: bool = False
+    bold: bool = False
+    vertical: bool = False
+    animate: bool = False
+    include_jump: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordCreateQuoteImageResponse:
+    message_id: str
+    channel_id: str
+    source_message_id: str
+    source_jump_url: str
+    filename: str
+    width: int
+    height: int
+    rendered_custom_emojis: int
+    rendered_stickers: int
+    text_truncated: bool
+    animated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,7 +690,7 @@ def build_discord_endpoints(
         if context.transport == "agent":
             _assert_agent_channel_scope(context, request.destination_channel_id)
         else:
-            actor = _actor_member(guild, context)
+            actor = await _actor_member(guild, context)
             if not _can_read_messages(
                 destination, actor
             ) or not _can_read_private_thread(destination, actor):
@@ -674,6 +713,94 @@ def build_discord_endpoints(
             message_id=str(posted.id),
             channel_id=str(destination.id),
             source_jump_url=response.jump_url,
+        )
+
+    async def create_quote_image(
+        request: DiscordCreateQuoteImageRequest,
+        context: InvocationContext,
+    ) -> DiscordCreateQuoteImageResponse:
+        guild = _guild(client, context)
+        _, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.source_channel_id,
+            message_id=request.source_message_id,
+            context=context,
+        )
+        destination = _message_channel(guild, request.destination_channel_id)
+        if context.transport == "agent":
+            _assert_agent_channel_scope(context, request.destination_channel_id)
+        else:
+            actor = await _actor_member(guild, context)
+            if not _can_read_messages(
+                destination, actor
+            ) or not _can_read_private_thread(destination, actor):
+                raise UserError("discord.quote_destination_unavailable")
+        bot_member = guild.me
+        if bot_member is None or not _can_post_quote_image(destination, bot_member):
+            raise UserError("discord.quote_destination_unavailable")
+        avatar, custom_emojis, stickers = await asyncio.gather(
+            _quote_avatar(client, message),
+            _quote_custom_emojis(client, message.content),
+            _quote_stickers(client, message),
+        )
+        try:
+            rendered = await asyncio.to_thread(
+                runtime.quote.render,
+                QuoteRenderRequest(
+                    text=_quote_text(message),
+                    display_name=message.author.display_name,
+                    username=message.author.name,
+                    avatar=avatar,
+                    custom_emojis=custom_emojis,
+                    stickers=stickers,
+                    color=request.color,
+                    light=request.light,
+                    flip=request.flip,
+                    bold=request.bold,
+                    vertical=request.vertical,
+                    animate=request.animate,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            raise UserError("discord.quote_render_failed") from exc
+        extension = "gif" if rendered.animated else "png"
+        filename = f"quote-{message.id}.{extension}"
+        try:
+            image_file = discord.File(
+                io.BytesIO(rendered.content),
+                filename=filename,
+            )
+            if request.include_jump:
+                jump_view = quote_message_view(message.jump_url)
+                assert jump_view is not None
+                posted = await destination.send(
+                    file=image_file,
+                    view=jump_view,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    silent=True,
+                )
+            else:
+                posted = await destination.send(
+                    file=image_file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    silent=True,
+                )
+        except discord.Forbidden as exc:
+            raise UserError("discord.quote_destination_unavailable") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.quote_failed") from exc
+        return DiscordCreateQuoteImageResponse(
+            message_id=str(posted.id),
+            channel_id=str(destination.id),
+            source_message_id=str(message.id),
+            source_jump_url=message.jump_url,
+            filename=filename,
+            width=rendered.width,
+            height=rendered.height,
+            rendered_custom_emojis=rendered.rendered_custom_emojis,
+            rendered_stickers=rendered.rendered_stickers,
+            text_truncated=rendered.text_truncated,
+            animated=rendered.animated,
         )
 
     async def view_custom_emoji(
@@ -1017,7 +1144,7 @@ def build_discord_endpoints(
         """Enforce Discord voice scope before entering the shared audio API."""
 
         guild = _guild(client, context)
-        member = _actor_member(guild, context)
+        member = await _actor_member(guild, context)
         await _prepare_actor_audio(client, runtime, guild, member)
         response = await runtime.registry.invoke(
             "audio.play",
@@ -1036,7 +1163,7 @@ def build_discord_endpoints(
         """Enforce requester ownership before mutating a Discord audio session."""
 
         guild = _guild(client, context)
-        member = _actor_member(guild, context)
+        member = await _actor_member(guild, context)
         session = runtime.audio.require(str(guild.id))
         if session.output.connected:
             _assert_same_voice(
@@ -1057,7 +1184,7 @@ def build_discord_endpoints(
         """Prepare the requester's voice route before shared speech synthesis."""
 
         guild = _guild(client, context)
-        member = _actor_member(guild, context)
+        member = await _actor_member(guild, context)
         await _prepare_actor_audio(client, runtime, guild, member)
         response = await runtime.registry.invoke(
             "speech.speak",
@@ -1076,7 +1203,7 @@ def build_discord_endpoints(
         """Protect persistent read-aloud mutations with Discord permissions."""
 
         guild = _guild(client, context)
-        member = _actor_member(guild, context)
+        member = await _actor_member(guild, context)
         mutating = request.action is not ReadAloudAction.STATUS
         if mutating and not member.guild_permissions.manage_guild:
             member_voice = _member_voice_channel(member)
@@ -1249,6 +1376,30 @@ def build_discord_endpoints(
             DiscordPostExpandedMessageRequest,
             DiscordPostExpandedMessageResponse,
             post_expanded_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.create_quote_image",
+                summary=(
+                    "閲覧可能なDiscordメッセージを、投稿者・アバター・絵文字を保った"
+                    "引用画像としてローカル描画し、元投稿へのリンク付きで送信します。"
+                ),
+                risk=RiskLevel.WRITE,
+                keywords=(
+                    "discord",
+                    "message",
+                    "quote",
+                    "quote image",
+                    "引用画像",
+                    "画像化",
+                ),
+                side_effects=(
+                    "指定したDiscordチャンネルへ引用画像を1件投稿します。",
+                ),
+            ),
+            DiscordCreateQuoteImageRequest,
+            DiscordCreateQuoteImageResponse,
+            create_quote_image,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -1494,7 +1645,7 @@ def _guild(client: discord.Client, context: InvocationContext) -> discord.Guild:
     return guild
 
 
-def _actor_member(
+async def _actor_member(
     guild: discord.Guild,
     context: InvocationContext,
 ) -> discord.Member:
@@ -1503,7 +1654,15 @@ def _actor_member(
     except ValueError as exc:
         raise UserError("discord.member_required") from exc
     member = guild.get_member(actor_id)
-    if member is None:
+    if member is not None:
+        return member
+    try:
+        member = await guild.fetch_member(actor_id)
+    except (discord.NotFound, discord.Forbidden) as exc:
+        raise UserError("discord.member_required") from exc
+    except discord.DiscordException as exc:
+        raise UserError("discord.member_lookup_failed") from exc
+    if member.id != actor_id:
         raise UserError("discord.member_required")
     return member
 
@@ -2012,7 +2171,7 @@ async def _fetch_readable_message(
     if context.transport == "agent":
         _assert_agent_channel_scope(context, channel_id)
     else:
-        actor = _actor_member(guild, context)
+        actor = await _actor_member(guild, context)
         if not _can_read_messages(channel, actor) or not _can_read_private_thread(
             channel, actor
         ):
@@ -2061,3 +2220,142 @@ def _can_post_expanded_message(
         else True
     )
     return permissions.view_channel and can_send and permissions.embed_links and can_connect
+
+
+def _can_post_quote_image(
+    channel: DiscordMessageChannel,
+    member: discord.Member,
+) -> bool:
+    permissions = channel.permissions_for(member)
+    can_send = (
+        permissions.send_messages_in_threads
+        if isinstance(channel, discord.Thread)
+        else permissions.send_messages
+    )
+    can_connect = (
+        permissions.connect
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        else True
+    )
+    return (
+        permissions.view_channel
+        and can_send
+        and permissions.attach_files
+        and can_connect
+    )
+
+
+def _quote_text(message: discord.Message) -> str:
+    """Resolve Discord mentions while retaining custom emoji tokens for rendering."""
+
+    text = message.content
+    for member in message.mentions:
+        replacement = f"@{member.display_name}"
+        text = text.replace(f"<@{member.id}>", replacement)
+        text = text.replace(f"<@!{member.id}>", replacement)
+    for role in message.role_mentions:
+        text = text.replace(f"<@&{role.id}>", f"@{role.name}")
+    for channel in message.channel_mentions:
+        text = text.replace(f"<#{channel.id}>", f"#{channel.name}")
+    if text.strip():
+        return text
+    if message.stickers:
+        return ""
+    if message.attachments:
+        image_count = sum(
+            1
+            for attachment in message.attachments
+            if (attachment.content_type or "").startswith("image/")
+        )
+        if image_count == len(message.attachments):
+            return f"画像を{image_count}件送信"
+        return f"添付ファイルを{len(message.attachments)}件送信"
+    if message.embeds:
+        return "埋め込みメッセージ"
+    return "…"
+
+
+async def _quote_avatar(
+    client: discord.Client,
+    message: discord.Message,
+) -> bytes | None:
+    asset = message.author.display_avatar.with_static_format("png").with_size(512)
+    try:
+        content = await client.http.get_from_cdn(str(asset))
+    except discord.DiscordException:
+        return None
+    if not content or len(content) > _QUOTE_AVATAR_MAX_BYTES:
+        return None
+    return content
+
+
+async def _quote_custom_emojis(
+    client: discord.Client,
+    content: str,
+) -> tuple[QuoteCustomEmojiAsset, ...]:
+    async def fetch(record: DiscordCustomEmojiRecord) -> QuoteCustomEmojiAsset | None:
+        extension = "gif" if record.animated else "png"
+        url = (
+            f"https://cdn.discordapp.com/emojis/{record.emoji_id}.{extension}"
+            "?size=128&quality=lossless"
+        )
+        try:
+            payload = await client.http.get_from_cdn(url)
+        except discord.DiscordException:
+            return None
+        if not payload or len(payload) > _CUSTOM_EMOJI_MEDIA_MAX_BYTES:
+            return None
+        return QuoteCustomEmojiAsset(
+            emoji_id=record.emoji_id,
+            name=record.name,
+            content=payload,
+        )
+
+    records = _custom_emoji_records(content)
+    if not records:
+        return ()
+    fetched = await asyncio.gather(*(fetch(record) for record in records))
+    return tuple(item for item in fetched if item is not None)
+
+
+async def _quote_stickers(
+    client: discord.Client,
+    message: discord.Message,
+) -> tuple[QuoteStickerAsset, ...]:
+    async def fetch(sticker: discord.StickerItem) -> QuoteStickerAsset | None:
+        url = (
+            f"https://media.discordapp.net/stickers/{sticker.id}.png"
+            if sticker.format is discord.StickerFormatType.lottie
+            else str(sticker.url)
+        )
+        try:
+            payload = await client.http.get_from_cdn(url)
+        except discord.DiscordException:
+            return None
+        if not payload or len(payload) > _CUSTOM_EMOJI_MEDIA_MAX_BYTES:
+            return None
+        return QuoteStickerAsset(
+            sticker_id=str(sticker.id),
+            name=sticker.name,
+            content=payload,
+        )
+
+    fetched = await asyncio.gather(
+        *(fetch(sticker) for sticker in message.stickers[:3])
+    )
+    return tuple(item for item in fetched if item is not None)
+
+
+def quote_message_has_animation(message: discord.Message) -> bool:
+    """Return whether Quote can preserve at least one animated source asset."""
+
+    if any(record.animated for record in _custom_emoji_records(message.content)):
+        return True
+    return any(
+        sticker.format
+        in {
+            discord.StickerFormatType.apng,
+            discord.StickerFormatType.gif,
+        }
+        for sticker in message.stickers
+    )

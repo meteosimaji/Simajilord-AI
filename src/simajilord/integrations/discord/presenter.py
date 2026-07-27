@@ -60,14 +60,9 @@ def expanded_message_embeds(
 ) -> tuple[discord.Embed, ...]:
     """Render a bounded quote without allowing the source message to mention users."""
 
-    content = response.content.strip()
+    source_content = response.content.strip()
+    content = source_content
     original_embed = response.embeds[0] if response.embeds else None
-    if not content and original_embed is not None:
-        content = "\n".join(
-            value
-            for value in (original_embed.title, original_embed.description)
-            if value
-        )
     if not content and not (
         response.attachments
         or response.embeds
@@ -75,19 +70,25 @@ def expanded_message_embeds(
         or response.poll
     ):
         content = "表示できる本文や添付はありません。"
-    description = _bounded_quote_text(content, maximum=3_200)
+    title: str | None = None
+    description: str | None = _bounded_quote_text(content, maximum=3_200)
+    if not source_content and original_embed is not None:
+        title = _bounded_quote_text(original_embed.title or "", maximum=240) or None
+        description = (
+            _bounded_quote_text(original_embed.description or "", maximum=3_200)
+            or None
+        )
     timestamp = discord.utils.parse_time(response.created_at_iso)
     embed = discord.Embed(
-        title="元のメッセージへ",
+        title=title,
         description=description or None,
-        url=response.jump_url,
+        url=original_embed.url if title and original_embed is not None else None,
         colour=discord.Colour.blurple(),
         timestamp=timestamp,
     )
     embed.set_author(
         name=response.author_name,
         icon_url=response.author_avatar_url,
-        url=response.jump_url,
     )
     if response.reply_author_name is not None:
         reply_text = response.reply_content_preview or "本文なし"
@@ -138,7 +139,7 @@ def expanded_message_embeds(
             )[:900],
             inline=False,
         )
-    if original_embed is not None and response.content.strip():
+    if original_embed is not None and source_content:
         rich_text = "\n".join(
             value
             for value in (original_embed.title, original_embed.description)
@@ -174,6 +175,27 @@ def expanded_message_embeds(
 
 
 def expanded_message_view(jump_url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Jump",
+            emoji="↗️",
+            style=discord.ButtonStyle.link,
+            url=jump_url,
+        )
+    )
+    return view
+
+
+def quote_message_view(
+    jump_url: str,
+    *,
+    include_jump: bool = True,
+) -> discord.ui.View | None:
+    """Keep provenance one click away without adding explanatory filler."""
+
+    if not include_jump:
+        return None
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
