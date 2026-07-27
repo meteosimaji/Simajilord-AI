@@ -229,9 +229,8 @@ def build_image_endpoints(
             CapabilityDescriptor(
                 name="image.generate",
                 summary=(
-                    "Art-direct, generate, and asynchronously deliver one local image. "
-                    "Supply concrete production-ready visual fields rather than echoing "
-                    "the user's short request."
+                    "構図や演出を具体化し、ローカルで画像を1枚生成して非同期で届けます。"
+                    "短い依頼文を繰り返すのではなく、制作に使える視覚情報を指定します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -246,8 +245,8 @@ def build_image_endpoints(
                     "写真",
                 ),
                 side_effects=(
-                    "Queues local MLX compute.",
-                    "Posts progress and a generated image to the authorized channel.",
+                    "ローカルMLXで画像生成を開始します。",
+                    "許可されたチャンネルへ進捗と生成画像を投稿します。",
                 ),
             ),
             ImageGenerateRequest,
@@ -257,7 +256,7 @@ def build_image_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="image.status",
-                summary="Read the status of one image job submitted by this actor.",
+                summary="このユーザーが依頼した画像生成ジョブの状態を確認します。",
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=("image", "progress", "job", "status", "進捗"),

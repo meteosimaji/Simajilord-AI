@@ -64,7 +64,7 @@ def build_status_endpoint(
     return endpoint(
         CapabilityDescriptor(
             name="system.status",
-            summary="Return structured platform, journal, audio, and model-runtime status.",
+            summary="基盤・イベント記録・音声・AI実行環境の状態をまとめて返します。",
             risk=RiskLevel.READ,
             keywords=("status", "health", "events", "model", "sessions"),
         ),

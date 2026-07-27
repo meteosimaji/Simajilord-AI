@@ -358,34 +358,37 @@ async def _send_image_progress(
 
 def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
     if job.status is ImageJobStatus.FAILED:
-        return discord.Embed(
-            title="Image generation stopped",
+        embed = discord.Embed(
+            title="画像を生成できませんでした",
             description=(
-                "The local generator could not finish this request. "
-                "The job was recorded and can be retried after the runtime is checked."
+                "ローカル生成処理が途中で停止しました。ジョブと生成条件は保存されているため、"
+                "実行環境を確認したあと同じ条件で再試行できます。"
             ),
             colour=discord.Colour.red(),
             timestamp=datetime.now(UTC),
         )
+        if job.error_code:
+            embed.add_field(name="エラーコード", value=f"`{job.error_code}`")
+        return embed
     complete = job.status is ImageJobStatus.COMPLETED
     step = job.progress_total if complete else job.progress_step
     percentage = round(step / max(1, job.progress_total) * 100)
     return discord.Embed(
-        title="Image ready" if complete else "Creating your image",
+        title="画像が完成しました" if complete else "画像を生成しています",
         description=(
-            "Generation finished. Preparing the image for delivery…"
+            "生成が終わりました。投稿の準備をしています…"
             if complete
-            else "Local generation is running in the background. You can keep chatting."
+            else "バックグラウンドで生成中です。そのまま会話を続けられます。"
         ),
         colour=discord.Colour.green() if complete else discord.Colour.blurple(),
         timestamp=datetime.now(UTC),
     ).add_field(
-        name="Progress",
+        name="進捗",
         value=f"{step}/{job.progress_total} · {percentage}%",
         inline=True,
     ).add_field(
-        name="Size",
-        value=f"{job.width} x {job.height}",
+        name="サイズ",
+        value=f"幅 {job.width}・高さ {job.height}",
         inline=True,
     )
 
@@ -396,19 +399,19 @@ def _image_result_embed(
     filename: str,
 ) -> discord.Embed:
     duration = (
-        f"{job.generation_seconds:.1f}s"
+        f"{job.generation_seconds:.1f}秒"
         if job.generation_seconds is not None
-        else "Completed"
+        else "完了"
     )
     embed = discord.Embed(
-        title="Generated image",
+        title="生成した画像",
         description=_image_prompt_preview(job),
         colour=discord.Colour.green(),
         timestamp=datetime.now(UTC),
     )
-    embed.add_field(name="Model", value="Ideogram 4 · Local MLX", inline=True)
-    embed.add_field(name="Time", value=duration, inline=True)
-    embed.add_field(name="Seed", value=str(job.seed), inline=True)
+    embed.add_field(name="モデル", value="Ideogram 4・ローカルMLX", inline=True)
+    embed.add_field(name="生成時間", value=duration, inline=True)
+    embed.add_field(name="シード", value=str(job.seed), inline=True)
     embed.set_image(url=f"attachment://{filename}")
     return embed
 

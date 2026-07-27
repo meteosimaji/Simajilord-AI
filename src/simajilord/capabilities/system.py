@@ -102,7 +102,7 @@ def build_system_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="system.ping",
-                summary="Check platform health and optional transport latency.",
+                summary="基盤の稼働状態と、必要に応じて通信遅延を確認します。",
                 risk=RiskLevel.READ,
                 keywords=("health", "online", "latency"),
             ),
@@ -113,7 +113,7 @@ def build_system_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="system.discover_capabilities",
-                summary="Find a small relevant set of actions before loading their schemas.",
+                summary="詳細な入力形式を読む前に、目的に合う少数の機能を探します。",
                 risk=RiskLevel.READ,
                 keywords=("help", "features", "tools", "what can you do"),
             ),
@@ -124,7 +124,7 @@ def build_system_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="system.uptime",
-                summary="Report when the current platform process started.",
+                summary="現在の基盤プロセスが起動した日時を表示します。",
                 risk=RiskLevel.READ,
                 keywords=("uptime", "started", "runtime"),
             ),

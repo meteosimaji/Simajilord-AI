@@ -122,13 +122,13 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
     return endpoint(
         CapabilityDescriptor(
             name="speech.manage_read_aloud",
-            summary="Configure, inspect, or disable automatic channel read-aloud routing.",
+            summary="チャンネルの自動読み上げ経路を設定・確認・無効化します。",
             risk=RiskLevel.WRITE,
             approval=ApprovalMode.WHEN_REQUESTED,
             keywords=("tts", "speech", "messages", "channel", "voice"),
             side_effects=(
-                "Persists workspace routing.",
-                "May cause future messages to play audio.",
+                "ワークスペースの読み上げ経路を保存します。",
+                "今後届くメッセージの音声が再生される場合があります。",
             ),
         ),
         ReadAloudRequest,

@@ -62,7 +62,7 @@ def build_utility_endpoints() -> tuple[CapabilityEndpoint, CapabilityEndpoint]:
         endpoint(
             CapabilityDescriptor(
                 name="utility.roll",
-                summary="Roll bounded virtual dice using the host secure random source.",
+                summary="ホストの安全な乱数を使って、指定範囲の仮想サイコロを振ります。",
                 risk=RiskLevel.READ,
                 keywords=("dice", "random", "roll", "game"),
             ),
@@ -73,7 +73,7 @@ def build_utility_endpoints() -> tuple[CapabilityEndpoint, CapabilityEndpoint]:
         endpoint(
             CapabilityDescriptor(
                 name="utility.choose",
-                summary="Choose one item from a bounded list.",
+                summary="指定された候補から1つ選びます。",
                 risk=RiskLevel.READ,
                 keywords=("choose", "pick", "random", "decision"),
             ),

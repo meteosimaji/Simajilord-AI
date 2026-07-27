@@ -110,7 +110,7 @@ def build_file_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="files.list",
-                summary="List files in this Discord server's isolated agent workspace.",
+                summary="このDiscordサーバー専用の隔離ワークスペース内にあるファイルを一覧表示します。",
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=("files", "workspace", "attachments", "documents"),
@@ -123,8 +123,8 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.read",
                 summary=(
-                    "Read text or inspect a PDF/ZIP inside the isolated workspace "
-                    "with bounded continuation offsets."
+                    "隔離ワークスペース内のテキストを読み、PDF・ZIPを調べます。"
+                    "長い内容は開始位置を指定して続きを取得できます。"
                 ),
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
@@ -138,13 +138,13 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.write_text",
                 summary=(
-                    "Atomically create or update a UTF-8 text file in the isolated "
-                    "workspace, optionally requiring the previous SHA-256."
+                    "隔離ワークスペース内のUTF-8テキストファイルを安全に作成・更新します。"
+                    "必要に応じて更新前のSHA-256を照合します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("file", "write", "create", "edit", "document", "code"),
-                side_effects=("Creates or replaces one sandbox text file.",),
+                side_effects=("隔離ワークスペース内のテキストファイルを作成・更新します。",),
             ),
             FileWriteTextRequest,
             WorkspaceFileRecord,
@@ -154,13 +154,12 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.replace_text",
                 summary=(
-                    "Replace one unique text occurrence with mandatory SHA-256 "
-                    "conflict protection."
+                    "SHA-256で競合を防ぎながら、一意に一致する文章を1か所置換します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("file", "edit", "replace", "patch"),
-                side_effects=("Atomically edits one sandbox text file.",),
+                side_effects=("隔離ワークスペース内のテキストファイルを安全に編集します。",),
             ),
             FileReplaceTextRequest,
             WorkspaceFileRecord,

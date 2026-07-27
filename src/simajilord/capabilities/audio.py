@@ -328,7 +328,7 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.search",
-                summary="Search music and identify whether one candidate needs confirmation.",
+                summary="音楽を検索し、候補を自動選択できるか確認します。",
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
                     "music",
@@ -338,7 +338,7 @@ def build_audio_endpoints(
                     "candidate",
                     "disambiguate",
                 ),
-                side_effects=("Uses a media search provider.",),
+                side_effects=("メディア検索サービスへ接続します。",),
             ),
             AudioSearchRequest,
             AudioSearchResponse,
@@ -347,7 +347,7 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.history",
-                summary="Inspect recently played music for one workspace.",
+                summary="このワークスペースで最近再生した音楽を確認します。",
                 risk=RiskLevel.READ,
                 keywords=("music", "history", "recent", "played", "karaoke"),
             ),
@@ -358,7 +358,7 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.queue",
-                summary="Inspect current and pending audio for one workspace.",
+                summary="このワークスペースで再生中・待機中の音声を確認します。",
                 risk=RiskLevel.READ,
                 keywords=("music", "speech", "queue", "playing", "now"),
             ),
@@ -369,10 +369,10 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.play",
-                summary="Resolve a public media reference and enqueue its audio.",
+                summary="公開メディアを解決し、音声を再生キューへ追加します。",
                 risk=RiskLevel.EXTERNAL,
                 keywords=("music", "media", "song", "track", "stream", "queue"),
-                side_effects=("Uses a media site.", "Plays audio in the active output."),
+                side_effects=("メディアサイトへ接続します。", "現在の出力先で音声を再生します。"),
             ),
             AudioPlayRequest,
             AudioPlayResponse,
@@ -381,10 +381,10 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.control",
-                summary="Pause, resume, skip, stop, leave, or change looping.",
+                summary="一時停止・再開・スキップ・停止・退出・ループ変更などを行います。",
                 risk=RiskLevel.WRITE,
                 keywords=("music", "voice", "pause", "skip", "loop"),
-                side_effects=("Changes playback state.",),
+                side_effects=("再生状態を変更します。",),
             ),
             AudioControlRequest,
             AudioControlResponse,

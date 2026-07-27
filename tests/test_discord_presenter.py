@@ -113,16 +113,14 @@ def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
         attachment_url="https://cdn.example.com/sample.png",
     )
 
-    assert embed.title == "HIVE analysis"
-    assert embed.description == (
-        "**High AI-generated image likelihood**\nLow deepfake likelihood"
-    )
-    assert " or " not in (embed.description or "")
+    assert embed.title == "HIVE AIコンテンツ解析"
+    assert embed.description == "**AI生成画像の可能性: 高**"
+    assert "ディープフェイク" not in (embed.description or "")
     fields = {field.name: field.value for field in embed.fields}
-    assert fields["AI-generated visual"] == "**100.0%** · High"
-    assert fields["Deepfake"] == "**0.0%** · Low"
-    assert fields["Likely generator"] == "**Stable Diffusion XL** · 99.2%"
-    assert fields["Daily HIVE API budget"].startswith("**4 / 100 used**")
+    assert fields["AI生成"] == "**100.0%**・可能性 高"
+    assert fields["ディープフェイク"] == "**0.0%**・可能性 低"
+    assert fields["推定生成モデル"] == "**Stable Diffusion XL** · 99.2%"
+    assert "本日のHIVE API利用枠" not in fields
     assert "HIVE Moderation" in embed.footer.text
     assert embed.thumbnail.url == "https://cdn.example.com/sample.png"
 
@@ -158,20 +156,20 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
             waiting_for_voice=False,
         )
     )
-    assert embed.title == "Music"
+    assert embed.title == "音楽"
     assert embed.timestamp is not None
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
-    assert "0:45 / 3:00" in fields["Progress"]
-    assert "Next" in fields["Up next"]
-    assert fields["State"] == "Playing"
-    assert fields["Loop"] == "Queue"
-    assert fields["Auto leave"] == "On"
-    assert fields["Voice"] == "<#123>"
-    assert "1.25x speed" in fields["Tuning"]
-    assert fields["Requested by"] == "Alice"
-    assert fields["Source"] == "Current Artist"
-    assert "Bob" in fields["Up next"]
+    assert "0:45 / 3:00" in fields["再生位置"]
+    assert "Next" in fields["次に再生"]
+    assert fields["状態"] == "再生中"
+    assert fields["ループ"] == "キュー全体"
+    assert fields["自動退出"] == "オン"
+    assert fields["再生先"] == "<#123>"
+    assert "速度 1.25倍" in fields["再生調整"]
+    assert fields["追加した人"] == "Alice"
+    assert fields["投稿者"] == "Current Artist"
+    assert "Bob" in fields["次に再生"]
     assert embed.thumbnail.url == "https://img.example.com/current.jpg"
 
 
@@ -190,11 +188,11 @@ def test_waiting_play_embed_explains_that_no_reentry_is_needed() -> None:
         )
     )
     fields = {field.name: field.value for field in embed.fields}
-    assert embed.title == "Queued · waiting for voice"
-    assert "automatically" in fields["Status"]
-    assert fields["Requested by"] == "Alice"
-    assert fields["Voice"] == "Connects when the requester joins"
-    assert fields["Source"] == "Artist"
+    assert embed.title == "キューに追加しました"
+    assert "自動で再生" in fields["状態"]
+    assert fields["追加した人"] == "Alice"
+    assert fields["再生先"] == "追加したユーザーがVCに入ると接続"
+    assert fields["投稿者"] == "Artist"
     assert embed.thumbnail.url == "https://img.example.com/queued.jpg"
 
 
@@ -212,7 +210,7 @@ def test_music_history_embed_shows_requester_and_played_time() -> None:
             )
         )
     )
-    assert embed.title == "Recently played"
+    assert embed.title == "再生履歴"
     assert "Alice" in (embed.description or "")
     assert "<t:1700000000:R>" in (embed.description or "")
 
@@ -241,11 +239,11 @@ def test_ambiguous_search_embed_is_compact_and_actionable() -> None:
             reason=AudioSearchReason.AMBIGUOUS_TITLE,
         )
     )
-    assert embed.title == "Choose the right track"
+    assert embed.title == "再生する曲を選んでください"
     assert len(embed.fields) == 2
     assert embed.fields[0].name == "1 · 3:00"
     assert "Artist One" in embed.fields[0].value
-    assert "automatically next time" in (embed.description or "")
+    assert "次回から自動で選びやすく" in (embed.description or "")
     assert embed.thumbnail.url == "https://img.example.com/one.jpg"
 
 
@@ -270,13 +268,13 @@ def test_web_search_embed_shows_sources_coverage_and_timestamp() -> None:
             warnings=("one provider failed",),
         )
     )
-    assert embed.title == "Search results"
+    assert embed.title == "検索結果"
     assert embed.timestamp is not None
     assert "Example result" in (embed.description or "")
     fields = {field.name: field.value for field in embed.fields}
-    assert "37 candidates" in fields["Coverage"]
-    assert "broader set retained" in fields["Coverage"]
-    assert "1 upstream" in fields["Provider health"]
+    assert "候補 37件" in fields["検索範囲"]
+    assert "ほかにも候補あり" in fields["検索範囲"]
+    assert "1件の情報源" in fields["検索サービスの状態"]
 
 
 def test_web_fetch_embed_preserves_continuation_offset() -> None:
@@ -294,5 +292,5 @@ def test_web_fetch_embed_preserves_continuation_offset() -> None:
     )
     fields = {field.name: field.value for field in embed.fields}
     assert embed.title == "Opened page"
-    assert fields["Next offset"] == "213"
-    assert "213 / 900" in fields["Text"]
+    assert fields["続きの開始位置"] == "213"
+    assert "213 / 900文字" in fields["本文"]

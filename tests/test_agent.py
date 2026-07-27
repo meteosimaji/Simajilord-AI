@@ -814,3 +814,4 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "gpt-5.6-luna" in instructions
     assert "generic Codex/OpenAI Assistant" in instructions
     assert "capability_search" in instructions
+    assert "natural, concise Japanese by default" in instructions

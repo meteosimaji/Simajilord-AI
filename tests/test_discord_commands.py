@@ -100,10 +100,10 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert {"play", "queue", "history"} <= commands.keys()
-    assert commands["play"].description == "Play a public media URL or search for a track."
-    assert commands["queue"].description == "Show what is playing and what comes next."
+    assert commands["play"].description == "URLまたは曲名から音楽を再生します。"
+    assert commands["queue"].description == "再生中の曲とキューを表示します。"
     assert commands["history"].description == (
-        "Show recently played tracks and who requested them."
+        "最近再生した曲と、追加したユーザーを表示します。"
     )
 
 
@@ -461,12 +461,12 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         child for child in view.children if isinstance(child, discord.ui.Button)
     ]
     assert [button.label for button in buttons] == [
-        "Start in VC",
-        "Pause",
-        "Resume",
-        "Skip",
-        "Loop",
-        "Leave",
+        "VCで開始",
+        "一時停止",
+        "再開",
+        "スキップ",
+        "ループ",
+        "退出",
     ]
     assert sum(button.row == 0 for button in buttons) == 5
     assert sum(button.row == 1 for button in buttons) == 1
@@ -533,7 +533,7 @@ def test_web_commands_are_short_direct_paths() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"search", "fetch", "find"}
-    assert commands["search"].description.startswith("Search the web")
+    assert commands["search"].description.startswith("Simajilordのローカル検索")
 
 
 def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
@@ -543,9 +543,7 @@ def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"join"}
-    assert commands["join"].description == (
-        "Read this channel aloud in the voice channel you joined."
-    )
+    assert commands["join"].description == "選んだ会話チャンネルを、参加中のVCで読み上げます。"
     assert commands["join"].parameters == []
 
 
@@ -607,9 +605,9 @@ async def test_join_selection_connects_voice_before_reporting_ready() -> None:
     interaction.response.defer.assert_awaited_once()
     interaction.edit_original_response.assert_awaited_once()
     embed = interaction.edit_original_response.await_args.kwargs["embed"]
-    assert embed.title == "Read-aloud ready"
+    assert embed.title == "読み上げを開始しました"
     assert any(
-        field.name == "Connection" and field.value == "Ready"
+        field.name == "接続" and field.value == "準備完了"
         for field in embed.fields
     )
 
@@ -681,9 +679,7 @@ def test_hive_analysis_is_one_direct_attachment_command() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"detectai"}
-    assert commands["detectai"].description == (
-        "Analyze an image or video with HIVE AI-content detection."
-    )
+    assert commands["detectai"].description == "画像・動画がAI生成かどうかをHIVEで解析します。"
 
 
 def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
@@ -703,7 +699,7 @@ def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
     buttons = [
         child for child in view.children if isinstance(child, discord.ui.Button)
     ]
-    assert [button.label for button in buttons] == ["Continue"]
+    assert [button.label for button in buttons] == ["続きを読む"]
     assert buttons[0].custom_id == "simajilord:web:fetch:continue"
     assert view.next_offset == 3_500
 
@@ -771,8 +767,8 @@ def test_agent_rate_limit_message_includes_exact_retry_time() -> None:
         "limited",
         retry_after_seconds=125,
     )
-    assert _agent_error_text(error).endswith("Try again in 2m 5s.")
-    assert _retry_after_text(3_661) == "1h 1m 1s"
+    assert _agent_error_text(error).endswith("あと2分5秒ほどお待ちください。")
+    assert _retry_after_text(3_661) == "1時間1分1秒"
 
 
 def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
@@ -877,7 +873,7 @@ def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:
         resource_ids=("50",),
     )
     _assert_agent_channel_scope(context, "50")
-    with pytest.raises(UserError, match="not authorized"):
+    with pytest.raises(UserError, match="閲覧する権限"):
         _assert_agent_channel_scope(context, "60")
 
 

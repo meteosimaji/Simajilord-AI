@@ -69,12 +69,12 @@ def build_speech_endpoint(
         CapabilityDescriptor(
             name="speech.speak",
             summary=(
-                "Synthesize a spoken message and enqueue it in the shared audio "
-                "session, ducking active music automatically."
+                "文章を音声合成して共通音声セッションのキューへ追加します。"
+                "音楽の再生中は聞き取りやすいよう自動調整します。"
             ),
             risk=RiskLevel.WRITE,
             keywords=("speech", "voice", "tts", "say", "speak", "voicevox"),
-            side_effects=("Synthesizes and plays audible speech.",),
+            side_effects=("合成音声を生成して再生します。",),
         ),
         SpeechSpeakRequest,
         SpeechSpeakResponse,

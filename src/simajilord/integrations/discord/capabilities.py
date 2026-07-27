@@ -294,14 +294,14 @@ def build_discord_endpoints(
         try:
             user_id = int(request.user_id)
         except ValueError as exc:
-            raise UserError("The user ID is invalid.") from exc
+            raise UserError("ユーザーIDが正しくありません。") from exc
         member = guild.get_member(user_id)
         user = member or client.get_user(user_id)
         if user is None:
             try:
                 user = await client.fetch_user(user_id)
             except discord.DiscordException as exc:
-                raise UserError("The Discord user could not be found.") from exc
+                raise UserError("Discordユーザーが見つかりませんでした。") from exc
         return DiscordUserResponse(
             user_id=str(user.id),
             display_name=member.display_name if member else user.display_name,
@@ -387,9 +387,9 @@ def build_discord_endpoints(
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound as exc:
-            raise UserError("The Discord message could not be found.") from exc
+            raise UserError("Discordメッセージが見つかりませんでした。") from exc
         except discord.DiscordException as exc:
-            raise UserError("The Discord message could not be retrieved.") from exc
+            raise UserError("Discordメッセージを取得できませんでした。") from exc
         content_length = len(message.content)
         if request.offset > content_length:
             raise UserError("discord.message_offset_invalid")
@@ -442,9 +442,9 @@ def build_discord_endpoints(
                 _snowflake(request.message_id, "message")
             )
         except discord.NotFound as exc:
-            raise UserError("The Discord message could not be found.") from exc
+            raise UserError("Discordメッセージが見つかりませんでした。") from exc
         except discord.DiscordException as exc:
-            raise UserError("The Discord message could not be retrieved.") from exc
+            raise UserError("Discordメッセージを取得できませんでした。") from exc
         try:
             attachment = message.attachments[request.attachment_index]
         except IndexError as exc:
@@ -535,11 +535,11 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         _assert_agent_update_scope(context, request.channel_id)
         if not 1 <= len(request.content) <= 2_000:
-            raise UserError("Discord messages must contain between 1 and 2000 characters.")
+            raise UserError("Discordへ送るメッセージは1〜2000文字にしてください。")
         try:
             channel_id = int(request.channel_id)
         except ValueError as exc:
-            raise UserError("The channel ID is invalid.") from exc
+            raise UserError("チャンネルIDが正しくありません。") from exc
         channel = guild.get_channel_or_thread(channel_id)
         if not isinstance(
             channel,
@@ -550,7 +550,7 @@ def build_discord_endpoints(
                 discord.StageChannel,
             ),
         ):
-            raise UserError("The target is not a writable Discord message channel.")
+            raise UserError("指定先はメッセージを送信できるDiscordチャンネルではありません。")
         message = await channel.send(
             request.content,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -597,13 +597,13 @@ def build_discord_endpoints(
         question = request.question.strip()
         options = tuple(option.strip() for option in request.options if option.strip())
         if not 1 <= len(question) <= 300:
-            raise UserError("The poll question must contain between 1 and 300 characters.")
+            raise UserError("投票の質問は1〜300文字にしてください。")
         if not 2 <= len(options) <= 10:
-            raise UserError("A poll requires between 2 and 10 options.")
+            raise UserError("投票の選択肢は2〜10個にしてください。")
         if any(len(option) > 55 for option in options):
-            raise UserError("Each poll option must be at most 55 characters.")
+            raise UserError("投票の選択肢は1つ55文字以内にしてください。")
         if not 1 <= request.duration_hours <= 168:
-            raise UserError("Poll duration must be between 1 and 168 hours.")
+            raise UserError("投票期間は1〜168時間で指定してください。")
         poll = discord.Poll(
             question,
             duration=timedelta(hours=request.duration_hours),
@@ -621,7 +621,7 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         channel = guild.get_channel(_snowflake(request.channel_id, "voice channel"))
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            raise UserError("The target is not a voice channel.")
+            raise UserError("指定先はボイスチャンネルではありません。")
         workspace_id = str(guild.id)
         session = runtime.audio.get_or_create(
             workspace_id,
@@ -630,7 +630,7 @@ def build_discord_endpoints(
         if session.current is not None:
             output = session.output
             if isinstance(output, DiscordAudioOutput) and output.destination_id != channel.id:
-                raise UserError("Audio is active in another voice channel.")
+                raise UserError("別のボイスチャンネルで音声を再生しています。")
         await runtime.audio.connect(workspace_id, str(channel.id))
         return DiscordConnectVoiceResponse(channel_id=str(channel.id), connected=True)
 
@@ -687,7 +687,7 @@ def build_discord_endpoints(
             "speech.speak",
             SpeechSpeakRequest(
                 text=request.text,
-                title=f"Spoken by request of {member.display_name}",
+                title=f"{member.display_name}さんの依頼",
             ),
             context,
         )
@@ -789,7 +789,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.inspect_server",
-                summary="Inspect cached structure and identifiers for the current Discord server.",
+                summary="現在のDiscordサーバーの構成とIDを確認します。",
                 risk=RiskLevel.READ,
                 keywords=("server", "guild", "channels", "roles", "members"),
             ),
@@ -800,7 +800,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.inspect_user",
-                summary="Inspect one Discord user's public account and server membership data.",
+                summary="Discordユーザーの公開アカウント情報とサーバー参加情報を確認します。",
                 risk=RiskLevel.READ,
                 keywords=("user", "member", "avatar", "role"),
             ),
@@ -811,7 +811,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.list_channels",
-                summary="List channels and identifiers in the current Discord server.",
+                summary="現在のDiscordサーバーにあるチャンネルとIDを一覧表示します。",
                 risk=RiskLevel.READ,
                 keywords=("discord", "channels", "threads", "where"),
             ),
@@ -822,7 +822,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.read_messages",
-                summary="Read a bounded page of messages from an allowed Discord channel.",
+                summary="許可されたDiscordチャンネルから、一定件数のメッセージを読み取ります。",
                 risk=RiskLevel.READ,
                 keywords=("discord", "messages", "history", "conversation", "moderation"),
             ),
@@ -834,9 +834,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.get_message",
                 summary=(
-                    "Read one bounded contiguous chunk of a Discord message by ID. "
-                    "By default, also reads a bounded same-channel reply chain. "
-                    "Continue with next_offset only when more text is necessary."
+                    "IDを指定してDiscordメッセージを一定文字数ずつ読み取ります。"
+                    "必要に応じて同じチャンネル内の返信元も確認できます。"
                 ),
                 risk=RiskLevel.READ,
                 keywords=("discord", "message", "chunk", "mention", "content"),
@@ -849,8 +848,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.analyze_attachment",
                 summary=(
-                    "Analyze one attachment from an allowed Discord message with HIVE "
-                    "without exposing its bytes or signed URL to the model."
+                    "許可されたDiscordメッセージの添付ファイルを、バイト列や署名付きURLを"
+                    "モデルへ渡さずにHIVEで解析します。"
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
@@ -863,8 +862,8 @@ def build_discord_endpoints(
                     "hive",
                 ),
                 side_effects=(
-                    "Downloads one allowed Discord attachment.",
-                    "Consumes one HIVE request when no cached result exists.",
+                    "許可されたDiscord添付ファイルを1件取得します。",
+                    "保存済みの解析結果がない場合、HIVE APIを1回使用します。",
                 ),
             ),
             DiscordAnalyzeAttachmentRequest,
@@ -875,13 +874,13 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.import_attachment",
                 summary=(
-                    "Import one Discord attachment into this server's isolated agent "
-                    "workspace and return its SHA-256."
+                    "Discord添付ファイルを、このサーバー専用の隔離ワークスペースへ"
+                    "取り込み、SHA-256を返します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("discord", "attachment", "import", "file", "pdf", "zip"),
-                side_effects=("Creates or replaces one isolated workspace file.",),
+                side_effects=("隔離ワークスペース内のファイルを作成または置換します。",),
             ),
             DiscordImportAttachmentRequest,
             WorkspaceFileRecord,
@@ -891,8 +890,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.view_image_attachment",
                 summary=(
-                    "View one bounded PNG, JPEG, GIF, or WebP attachment as model "
-                    "visual input without exposing a signed Discord URL."
+                    "PNG・JPEG・GIF・WebP添付画像を、署名付きDiscord URLを公開せず"
+                    "モデルの視覚入力として表示します。"
                 ),
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
@@ -905,7 +904,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.send_message",
-                summary="Post one agent-chosen progress or follow-up message.",
+                summary="AIが判断した進捗または追加連絡をDiscordへ1件投稿します。",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
@@ -916,7 +915,7 @@ def build_discord_endpoints(
                     "follow-up",
                     "notify",
                 ),
-                side_effects=("Creates a visible message in a Discord channel.",),
+                side_effects=("Discordチャンネルにユーザーから見えるメッセージを作成します。",),
             ),
             DiscordSendMessageRequest,
             DiscordSendMessageResponse,
@@ -925,11 +924,11 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.send_file",
-                summary="Send one isolated workspace file back to the current channel.",
+                summary="隔離ワークスペース内のファイルを現在のチャンネルへ送信します。",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("discord", "file", "attachment", "send", "deliver", "export"),
-                side_effects=("Creates a Discord message with one file attachment.",),
+                side_effects=("添付ファイル付きDiscordメッセージを1件作成します。",),
             ),
             DiscordSendFileRequest,
             DiscordSendFileResponse,
@@ -938,11 +937,11 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.create_poll",
-                summary="Create a bounded native poll in one Discord text channel.",
+                summary="Discordテキストチャンネルに投票を作成します。",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "poll", "vote", "question"),
-                side_effects=("Creates a visible poll in a Discord channel.",),
+                side_effects=("Discordチャンネルにユーザーから見える投票を作成します。",),
             ),
             DiscordPollRequest,
             DiscordPollResponse,
@@ -951,11 +950,11 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.connect_voice",
-                summary="Connect the platform audio output to one Discord voice channel.",
+                summary="Simajilordの音声出力をDiscordボイスチャンネルへ接続します。",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "voice", "join", "connect", "vc"),
-                side_effects=("Joins or moves the bot's server voice connection.",),
+                side_effects=("BOTがボイスチャンネルへ参加または移動します。",),
             ),
             DiscordConnectVoiceRequest,
             DiscordConnectVoiceResponse,
@@ -965,15 +964,15 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.play_audio",
                 summary=(
-                    "Play a resolved public media reference in the requester's voice "
-                    "channel, or retain it until that requester joins voice."
+                    "公開メディアを依頼者のボイスチャンネルで再生します。"
+                    "依頼者がVCにいない場合は、参加するまでキューに保持します。"
                 ),
                 risk=RiskLevel.EXTERNAL,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "music", "audio", "play", "queue", "voice"),
                 side_effects=(
-                    "May join the requester's voice channel.",
-                    "Adds one track to the persistent server queue.",
+                    "依頼者のボイスチャンネルへ参加する場合があります。",
+                    "サーバーの永続キューへ曲を1件追加します。",
                 ),
             ),
             AudioPlayRequest,
@@ -984,13 +983,13 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.control_audio",
                 summary=(
-                    "Control server audio only when the requester shares the bot's "
-                    "voice channel or owns its waiting queue."
+                    "依頼者がBOTと同じVCにいる場合、または待機中キューの所有者である場合に"
+                    "サーバーの音声を操作します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "music", "pause", "resume", "skip", "stop", "loop"),
-                side_effects=("Changes the persistent server audio session.",),
+                side_effects=("サーバーの永続音声セッションを変更します。",),
             ),
             AudioControlRequest,
             AudioControlResponse,
@@ -1000,15 +999,15 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.speak",
                 summary=(
-                    "Speak a short message in the requester's voice channel through "
-                    "VOICEVOX, automatically ducking active music."
+                    "VOICEVOXで短い文章を依頼者のVCへ読み上げます。"
+                    "読み上げ中は再生中の音楽を自動調整します。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "voice", "tts", "speak", "say", "voicevox"),
                 side_effects=(
-                    "May join the requester's voice channel.",
-                    "Creates audible synthesized speech.",
+                    "依頼者のボイスチャンネルへ参加する場合があります。",
+                    "合成音声を再生します。",
                 ),
             ),
             SpeechSpeakRequest,
@@ -1019,13 +1018,12 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.manage_read_aloud",
                 summary=(
-                    "Inspect read-aloud routing, or configure and disable it when the "
-                    "requester has Manage Server permission."
+                    "読み上げ経路を確認します。サーバー管理権限があれば設定・無効化も行えます。"
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "read aloud", "tts", "route", "voicevox"),
-                side_effects=("May change persistent automatic read-aloud routing.",),
+                side_effects=("自動読み上げの永続設定を変更する場合があります。",),
             ),
             ReadAloudRequest,
             ReadAloudResponse,
@@ -1036,14 +1034,14 @@ def build_discord_endpoints(
 
 def _guild(client: discord.Client, context: InvocationContext) -> discord.Guild:
     if context.workspace_id is None:
-        raise UserError("This Discord capability requires a server.")
+        raise UserError("このDiscord機能はサーバー内で使用してください。")
     try:
         guild_id = int(context.workspace_id)
     except ValueError as exc:
-        raise UserError("The Discord server ID is invalid.") from exc
+        raise UserError("DiscordサーバーIDが正しくありません。") from exc
     guild = client.get_guild(guild_id)
     if guild is None:
-        raise UserError("The Discord server is unavailable.")
+        raise UserError("Discordサーバーを利用できません。")
     return guild
 
 
@@ -1104,7 +1102,12 @@ def _snowflake(value: str, label: str) -> int:
     try:
         return int(value)
     except ValueError as exc:
-        raise UserError(f"The {label} ID is invalid.") from exc
+        display_label = {
+            "message": "メッセージ",
+            "channel": "チャンネル",
+            "voice channel": "ボイスチャンネル",
+        }.get(label, label)
+        raise UserError(f"{display_label}IDが正しくありません。") from exc
 
 
 def _assert_agent_update_scope(
@@ -1126,7 +1129,7 @@ def _text_channel(
 ) -> discord.TextChannel | discord.Thread:
     channel = guild.get_channel_or_thread(_snowflake(channel_id, "channel"))
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        raise UserError("The target is not a writable text channel.")
+        raise UserError("指定先は書き込み可能なテキストチャンネルではありません。")
     return channel
 
 
@@ -1144,7 +1147,7 @@ def _message_channel(
             discord.StageChannel,
         ),
     ):
-        raise UserError("The target is not a Discord message channel.")
+        raise UserError("指定先はDiscordのメッセージチャンネルではありません。")
     return channel
 
 
@@ -1202,9 +1205,9 @@ async def _attachment(
     try:
         message = await channel.fetch_message(_snowflake(message_id, "message"))
     except discord.NotFound as exc:
-        raise UserError("The Discord message could not be found.") from exc
+        raise UserError("Discordメッセージが見つかりませんでした。") from exc
     except discord.DiscordException as exc:
-        raise UserError("The Discord message could not be retrieved.") from exc
+        raise UserError("Discordメッセージを取得できませんでした。") from exc
     try:
         attachment = message.attachments[attachment_index]
     except IndexError as exc:
@@ -1309,7 +1312,7 @@ def _assert_agent_channel_scope(
     channel_id: str,
 ) -> None:
     if context.transport == "agent" and channel_id not in context.resource_ids:
-        raise UserError("The agent is not authorized to inspect that Discord channel.")
+        raise UserError("AIにはこのDiscordチャンネルを閲覧する権限がありません。")
 
 
 def agent_readable_channel_ids(

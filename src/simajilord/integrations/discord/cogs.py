@@ -111,132 +111,136 @@ log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
 
 _ERROR_MESSAGES = {
-    "audio.auto_leave_value_required": "Choose whether automatic voice leave is enabled.",
-    "audio.capacity_reached": "The active voice-server limit has been reached.",
-    "audio.history_limit_invalid": "History limit must be between 1 and 25.",
-    "audio.loop_mode_required": "Choose a loop mode.",
-    "audio.not_paused": "Playback is not paused.",
-    "audio.nothing_playing": "Nothing is currently playing.",
-    "audio.output_disconnected": "The audio output is disconnected.",
-    "audio.queue_position_invalid": "Choose a valid upcoming queue position.",
-    "audio.seek_position_required": "Provide a playback position.",
-    "audio.search_empty": "No matching track was found.",
-    "audio.search_limit_invalid": "Search limit must be between 1 and 10.",
-    "audio.session_closed": "The audio session is closed.",
-    "audio.session_missing": "No audio session exists in this server.",
-    "audio.same_voice_required": "Join the Bot's voice channel to control its music.",
-    "audio.waiting_queue_restricted": (
-        "This waiting queue can be started or changed by one of its requesters."
+    "audio.auto_leave_value_required": "自動退出を有効にするか選んでください。",
+    "audio.capacity_reached": "同時に接続できる音声サーバー数の上限に達しています。",
+    "audio.history_limit_invalid": "履歴の表示件数は1〜25件で指定してください。",
+    "audio.loop_mode_required": "ループ方法を選んでください。",
+    "audio.not_paused": "現在、一時停止していません。",
+    "audio.nothing_playing": "現在再生している曲はありません。",
+    "audio.output_disconnected": "ボイスチャンネルに接続されていません。",
+    "audio.queue_position_invalid": "キューに表示されている有効な番号を指定してください。",
+    "audio.seek_position_required": "移動先の再生位置を指定してください。",
+    "audio.search_empty": "一致する曲が見つかりませんでした。",
+    "audio.search_limit_invalid": "検索件数は1〜10件で指定してください。",
+    "audio.session_closed": "この音声セッションは終了しています。",
+    "audio.session_missing": "このサーバーには音声セッションがありません。",
+    "audio.same_voice_required": (
+        "音楽を操作するには、BOTと同じボイスチャンネルに参加してください。"
     ),
-    "audio.tune_range_invalid": "Speed and pitch must each be between 0.5 and 2.0.",
-    "audio.tune_values_required": "Provide both speed and pitch.",
-    "media.reference_required": "Provide a media URL or search query.",
-    "media.reference_too_long": "The media reference is too long.",
-    "media.query_url_not_allowed": "Search text must not contain a URL.",
-    "media.url_private": "Private and local network addresses are not allowed.",
-    "media.url_unresolvable": "The media host could not be resolved.",
+    "audio.waiting_queue_restricted": (
+        "待機中のキューを開始・変更できるのは、曲を追加したユーザーだけです。"
+    ),
+    "audio.tune_range_invalid": "再生速度とピッチは、それぞれ0.5〜2.0で指定してください。",
+    "audio.tune_values_required": "再生速度とピッチの両方を指定してください。",
+    "media.reference_required": "メディアのURLまたは検索キーワードを入力してください。",
+    "media.reference_too_long": "URLまたは検索キーワードが長すぎます。",
+    "media.query_url_not_allowed": "検索キーワードにURLは含められません。",
+    "media.url_private": "非公開・ローカルネットワークのアドレスは使用できません。",
+    "media.url_unresolvable": "メディアの配信元へ接続できませんでした。",
     "media.url_unsupported": (
-        "Use a public HTTPS media URL without credentials or a custom port."
+        "認証情報や独自ポートを含まない、公開HTTPS URLを指定してください。"
     ),
     "moderation.daily_limit_reached": (
-        "Today's HIVE API budget has been used. It resets at 00:00 UTC."
+        "本日分のHIVE API利用枠を使い切りました。日本時間の午前9時にリセットされます。"
     ),
-    "moderation.filename_invalid": "The attachment filename is invalid.",
-    "moderation.media_empty": "The attachment is empty.",
-    "moderation.media_too_large": "The attachment is too large for HIVE analysis.",
+    "moderation.filename_invalid": "添付ファイル名を読み取れませんでした。",
+    "moderation.media_empty": "添付ファイルが空です。",
+    "moderation.media_too_large": "添付ファイルが大きすぎるため、HIVEで解析できません。",
     "moderation.media_type_unsupported": (
-        "HIVE analysis supports common image and video attachments."
+        "HIVEで解析できるのは、一般的な画像・動画ファイルです。"
     ),
-    "moderation.not_configured": "HIVE Moderation is not configured on this host yet.",
-    "discord.message_limit_invalid": "Message history limit must be between 1 and 100.",
+    "moderation.not_configured": "この環境ではHIVE Moderationがまだ設定されていません。",
+    "discord.message_limit_invalid": "メッセージ履歴の取得件数は1〜100件で指定してください。",
     "discord.message_chunk_limit_invalid": (
-        "Message chunks must contain between 1 and 1000 characters."
+        "メッセージの取得文字数は1〜1000文字で指定してください。"
     ),
-    "discord.message_offset_invalid": "Choose a valid message text offset.",
+    "discord.message_offset_invalid": "有効なメッセージ開始位置を指定してください。",
     "discord.manage_guild_required": (
-        "Read-aloud is already assigned to another voice channel. "
-        "A server manager can move it with `/readaloud setup`."
+        "読み上げは別のボイスチャンネルに設定されています。"
+        "移動するには、サーバー管理者が `/readaloud setup` を実行してください。"
     ),
-    "read_aloud.route_fields_required": "Choose both text and voice channels.",
+    "read_aloud.route_fields_required": (
+        "読み上げる会話チャンネルと、音声を流すボイスチャンネルを選んでください。"
+    ),
     "read_aloud.destination_conflict": (
-        "Read-aloud is already assigned to another voice channel."
+        "読み上げは別のボイスチャンネルに設定されています。"
     ),
-    "read_aloud.source_channel_required": "Choose a conversation channel.",
-    "read_aloud.source_channel_limit": "Choose between 1 and 25 conversation channels.",
-    "read_aloud.source_channels_required": "Choose at least one conversation channel.",
+    "read_aloud.source_channel_required": "読み上げる会話チャンネルを選んでください。",
+    "read_aloud.source_channel_limit": "会話チャンネルは1〜25個まで選べます。",
+    "read_aloud.source_channels_required": "会話チャンネルを1つ以上選んでください。",
     "discord.message_channel_unavailable": (
-        "Every selected channel must be readable by both you and the Bot."
+        "選択したすべてのチャンネルを、あなたとBOTの両方が閲覧できる必要があります。"
     ),
-    "speech.no_readable_text": "There is no readable text.",
-    "speech.queue_full": "The read-aloud queue is full. Try again shortly.",
-    "utility.dice_count_invalid": "Dice count must be between 1 and 20.",
-    "utility.dice_sides_invalid": "Sides must be between 2 and 1000.",
-    "utility.option_count_invalid": "Provide between 2 and 20 options.",
-    "utility.option_too_long": "Each option must be at most 100 characters.",
-    "web.chunk_limit_invalid": "Page chunks must contain between 200 and 6000 characters.",
-    "web.context_limit_invalid": "Find context must contain between 40 and 300 characters.",
-    "web.match_limit_invalid": "Find can return between 1 and 10 matches.",
-    "web.offset_invalid": "Choose a valid page-text offset.",
-    "web.pattern_required": "Provide the phrase to find on the page.",
-    "web.pattern_too_long": "The phrase to find must be at most 300 characters.",
-    "web.query_required": "Provide a web search query.",
-    "web.query_too_long": "The web search query must be at most 500 characters.",
-    "web.safesearch_invalid": "Safe Search must be 0, 1, or 2.",
-    "web.time_range_invalid": "Time range must be day, month, or year.",
-    "workspace.required": "This action requires a Discord server.",
+    "speech.no_readable_text": "読み上げられる文章がありません。",
+    "speech.queue_full": "読み上げが混み合っています。少し待ってから試してください。",
+    "utility.dice_count_invalid": "サイコロの個数は1〜20個で指定してください。",
+    "utility.dice_sides_invalid": "サイコロの面数は2〜1000面で指定してください。",
+    "utility.option_count_invalid": "選択肢は2〜20個入力してください。",
+    "utility.option_too_long": "選択肢は1つ100文字以内にしてください。",
+    "web.chunk_limit_invalid": "ページの取得文字数は200〜6000文字で指定してください。",
+    "web.context_limit_invalid": "検索箇所の前後は40〜300文字で指定してください。",
+    "web.match_limit_invalid": "ページ内検索の表示件数は1〜10件で指定してください。",
+    "web.offset_invalid": "ページ本文の有効な開始位置を指定してください。",
+    "web.pattern_required": "ページ内で探す語句を入力してください。",
+    "web.pattern_too_long": "検索語句は300文字以内にしてください。",
+    "web.query_required": "検索キーワードを入力してください。",
+    "web.query_too_long": "検索キーワードは500文字以内にしてください。",
+    "web.safesearch_invalid": "セーフサーチは0・1・2のいずれかを指定してください。",
+    "web.time_range_invalid": "期間はday・month・yearのいずれかを指定してください。",
+    "workspace.required": "この操作はDiscordサーバー内で実行してください。",
 }
 
 _MEDIA_ERROR_MESSAGES = {
     "cookie_required": (
-        "This media requires authentication. Configure a private cookie file on the host."
+        "このメディアの取得にはログインが必要です。ホスト側でCookieを設定してください。"
     ),
-    "geo_restricted": "This media is unavailable in the host region.",
-    "rate_limited": "The media site is rate-limiting requests.",
-    "timeout": "The media operation timed out.",
-    "too_large": "The media exceeds this server's upload limit.",
-    "unavailable": "This media is unavailable or private.",
-    "unsafe_path": "The media provider returned an unsafe result.",
-    "unsupported": "This media URL is not supported.",
-    "unknown": "The media provider could not complete the request.",
+    "geo_restricted": "この地域からはメディアを利用できません。",
+    "rate_limited": "配信元の利用制限に達しました。時間を空けて試してください。",
+    "timeout": "メディアの処理が時間内に終わりませんでした。",
+    "too_large": "ファイルがこのサーバーのアップロード上限を超えています。",
+    "unavailable": "メディアが非公開、削除済み、または利用できない状態です。",
+    "unsafe_path": "配信元から安全でない処理結果が返されました。",
+    "unsupported": "このメディアURLには対応していません。",
+    "unknown": "メディアの処理を完了できませんでした。",
 }
 
 _WEB_ERROR_MESSAGES = {
-    "content_empty": "The page contains no extractable text.",
-    "content_invalid": "The page could not be read.",
-    "content_type_unsupported": "This page type cannot be read yet.",
-    "fetch_failed": "The page could not be fetched.",
-    "redirect_invalid": "The page returned an invalid redirect.",
-    "request_too_broad": "The requested search is too broad.",
-    "response_too_large": "The page is too large to read safely.",
-    "search_backend_error": "The local search provider returned an error.",
-    "search_invalid_response": "The local search provider returned invalid data.",
-    "search_response_too_large": "The local search response was too large.",
-    "search_unavailable": "The local search provider is temporarily unavailable.",
-    "timeout": "The web operation timed out.",
-    "too_many_redirects": "The page redirected too many times.",
-    "upstream_unavailable": "The website is temporarily unavailable.",
-    "url_invalid": "Provide a valid public HTTP or HTTPS URL.",
-    "url_private": "Private and local network addresses cannot be opened.",
-    "url_rejected": "The website rejected the request.",
-    "url_unresolvable": "The web host could not be reached.",
+    "content_empty": "ページ内に読み取れる文章がありません。",
+    "content_invalid": "ページ本文を読み取れませんでした。",
+    "content_type_unsupported": "この種類のページにはまだ対応していません。",
+    "fetch_failed": "ページを取得できませんでした。",
+    "redirect_invalid": "ページの転送先が無効です。",
+    "request_too_broad": "検索範囲が広すぎます。キーワードを絞ってください。",
+    "response_too_large": "ページが大きすぎるため、安全に読み取れません。",
+    "search_backend_error": "ローカル検索サービスでエラーが発生しました。",
+    "search_invalid_response": "ローカル検索サービスから不正な応答が返されました。",
+    "search_response_too_large": "検索結果が大きすぎます。キーワードを絞ってください。",
+    "search_unavailable": "ローカル検索サービスを一時的に利用できません。",
+    "timeout": "Web処理が時間内に終わりませんでした。",
+    "too_many_redirects": "ページの転送回数が多すぎます。",
+    "upstream_unavailable": "Webサイトを一時的に利用できません。",
+    "url_invalid": "公開されているHTTPまたはHTTPS URLを指定してください。",
+    "url_private": "非公開・ローカルネットワークのアドレスは開けません。",
+    "url_rejected": "Webサイトからアクセスを拒否されました。",
+    "url_unresolvable": "Webサイトへ接続できませんでした。",
 }
 
 _MODERATION_ERROR_MESSAGES = {
-    "authentication_failed": "HIVE authentication failed. Check the host API key.",
-    "invalid_response": "HIVE returned an invalid detection result.",
-    "media_rejected": "HIVE could not analyze this attachment.",
-    "provider_unavailable": "HIVE is temporarily unavailable.",
-    "rate_limited": "HIVE is currently rate-limiting requests.",
-    "response_too_large": "HIVE returned an unexpectedly large result.",
-    "timeout": "HIVE analysis timed out.",
+    "authentication_failed": "HIVEの認証に失敗しました。ホスト側のAPIキーを確認してください。",
+    "invalid_response": "HIVEから正しくない解析結果が返されました。",
+    "media_rejected": "HIVEでこの添付ファイルを解析できませんでした。",
+    "provider_unavailable": "HIVEを一時的に利用できません。",
+    "rate_limited": "HIVEの利用制限に達しています。時間を空けて試してください。",
+    "response_too_large": "HIVEの解析結果が想定上限を超えました。",
+    "timeout": "HIVEの解析が時間内に終わりませんでした。",
 }
 
 _AUDIO_ACTION_MESSAGES = {
-    AudioAction.PAUSE.value: "Playback paused.",
-    AudioAction.RESUME.value: "Playback resumed.",
-    AudioAction.SKIP.value: "Skipped the current item.",
-    AudioAction.STOP.value: "Playback stopped and the queue was cleared.",
-    AudioAction.LEAVE.value: "Disconnected from voice.",
+    AudioAction.PAUSE.value: "一時停止しました。",
+    AudioAction.RESUME.value: "再生を再開しました。",
+    AudioAction.SKIP.value: "再生中の曲をスキップしました。",
+    AudioAction.STOP.value: "再生を停止し、キューを空にしました。",
+    AudioAction.LEAVE.value: "ボイスチャンネルから退出しました。",
 }
 
 
@@ -251,14 +255,14 @@ def _duration(seconds: float) -> str:
 
 def _read_aloud_mode_label(mode: str | None) -> str:
     if mode == ReadAloudMode.SKIP_DURING_MUSIC.value:
-        return "Skip messages while music is playing"
-    return "Read every message · duck music automatically"
+        return "音楽の再生中は読み上げない"
+    return "すべて読み上げる・読み上げ中は音楽を自動調整"
 
 
 def _speech_voice_label(runtime: SimajilordRuntime) -> str:
     settings = runtime.settings
     if settings.tts_provider == "voicevox":
-        return f"VOICEVOX · style {settings.voicevox_speaker_id}"
+        return f"VOICEVOX・スタイルID {settings.voicevox_speaker_id}"
     return f"macOS · {settings.tts_voice}"
 
 
@@ -269,7 +273,7 @@ def _parse_position(value: str) -> tuple[float, bool]:
     unsigned = text[1:] if relative else text
     parts = unsigned.split(":")
     if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
-        raise UserError("Use a timestamp such as `1:23`, `+30`, or `-10`.")
+        raise UserError("`1:23`、`+30`、`-10` のように再生位置を入力してください。")
     numbers = [int(part) for part in parts]
     seconds = 0
     for number in numbers:
@@ -286,7 +290,32 @@ def _progress(position: float, duration: float, *, width: int = 16) -> str:
 
 
 def _requester(name: str | None) -> str:
-    return discord.utils.escape_markdown(name) if name else "Unknown"
+    return discord.utils.escape_markdown(name) if name else "不明"
+
+
+def _loop_mode_label(mode: str) -> str:
+    return {
+        LoopMode.NONE.value: "オフ",
+        LoopMode.TRACK.value: "1曲",
+        LoopMode.QUEUE.value: "キュー全体",
+    }.get(mode, mode)
+
+
+def _risk_label(risk: str) -> str:
+    return {
+        "read": "参照",
+        "write": "変更",
+        "external": "外部通信",
+        "destructive": "破壊的",
+    }.get(risk, risk)
+
+
+def _approval_label(approval: str) -> str:
+    return {
+        "never": "不要",
+        "when_requested": "依頼時",
+        "always": "常に必要",
+    }.get(approval, approval)
 
 
 def _search_candidate_line(candidate: AudioSearchItem) -> str:
@@ -301,27 +330,27 @@ def _search_candidate_line(candidate: AudioSearchItem) -> str:
 
 def music_added_embed(response: AudioPlayResponse) -> discord.Embed:
     if response.playback_state == "playing":
-        title = "Now playing"
-        playback = "Playing now"
+        title = "再生を始めました"
+        playback = "再生中"
     elif response.playback_state == "waiting_for_voice":
-        title = "Queued · waiting for voice"
-        playback = "Starts automatically when the requester joins voice."
+        title = "キューに追加しました"
+        playback = "追加したユーザーがVCに入ると、自動で再生します。"
     else:
-        title = "Added to queue"
-        playback = f"Up next · #{response.queue_position}"
+        title = "キューに追加しました"
+        playback = f"再生待ち・{response.queue_position}番目"
     fields = [
-        EmbedField("Status", playback, inline=False),
-        EmbedField("Length", _duration(response.duration_seconds)),
-        EmbedField("Requested by", _requester(response.requested_by_name)),
+        EmbedField("状態", playback, inline=False),
+        EmbedField("長さ", _duration(response.duration_seconds)),
+        EmbedField("追加した人", _requester(response.requested_by_name)),
     ]
     if response.uploader:
-        fields.append(EmbedField("Source", discord.utils.escape_markdown(response.uploader)))
+        fields.append(EmbedField("投稿者", discord.utils.escape_markdown(response.uploader)))
     fields.append(
         EmbedField(
-            "Voice",
+            "再生先",
             f"<#{response.destination_id}>"
             if response.destination_id
-            else "Connects when the requester joins",
+            else "追加したユーザーがVCに入ると接続",
         )
     )
     embed = command_embed(
@@ -338,25 +367,25 @@ def music_added_embed(response: AudioPlayResponse) -> discord.Embed:
 def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
     fields: list[EmbedField] = []
     if response.current is None:
-        description = "Nothing is playing."
+        description = "現在再生している曲はありません。"
     else:
         current = response.current
         description = f"### [{current.title}]({current.page_url})"
         elapsed = min(response.position_seconds, current.duration_seconds)
         fields.append(
             EmbedField(
-                "Progress",
+                "再生位置",
                 f"`{_progress(elapsed, current.duration_seconds)}` "
                 f"`{_duration(elapsed)} / {_duration(current.duration_seconds)}`",
                 inline=False,
             )
         )
         fields.append(
-            EmbedField("Requested by", _requester(current.requested_by_name))
+            EmbedField("追加した人", _requester(current.requested_by_name))
         )
         if current.uploader:
             fields.append(
-                EmbedField("Source", discord.utils.escape_markdown(current.uploader))
+                EmbedField("投稿者", discord.utils.escape_markdown(current.uploader))
             )
 
     upcoming = tuple(item for item in response.pending if item.kind == AudioKind.MUSIC.value)
@@ -367,41 +396,44 @@ def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
             for index, item in enumerate(upcoming[:10], start=1)
         ]
         if len(upcoming) > 10:
-            lines.append(f"…and **{len(upcoming) - 10}** more")
-        fields.append(EmbedField("Up next", "\n".join(lines), inline=False))
+            lines.append(f"…ほか **{len(upcoming) - 10}曲**")
+        fields.append(EmbedField("次に再生", "\n".join(lines), inline=False))
     else:
-        fields.append(EmbedField("Up next", "Queue empty", inline=False))
+        fields.append(EmbedField("次に再生", "キューは空です", inline=False))
 
     if response.waiting_for_voice:
-        state = "Waiting for voice"
+        state = "VC参加待ち"
     elif response.paused:
-        state = "Paused"
+        state = "一時停止中"
     elif response.current:
-        state = "Playing"
+        state = "再生中"
     else:
-        state = "Ready"
+        state = "待機中"
     fields.extend(
         (
-            EmbedField("State", state),
-            EmbedField("Loop", response.loop_mode.title()),
-            EmbedField("Auto leave", "On" if response.auto_leave else "Off"),
+            EmbedField("状態", state),
+            EmbedField("ループ", _loop_mode_label(response.loop_mode)),
+            EmbedField("自動退出", "オン" if response.auto_leave else "オフ"),
         )
     )
     if response.speed != 1.0 or response.pitch != 1.0:
         fields.append(
-            EmbedField("Tuning", f"{response.speed:.2f}x speed · {response.pitch:.2f}x pitch")
+            EmbedField(
+                "再生調整",
+                f"速度 {response.speed:.2f}倍・ピッチ {response.pitch:.2f}倍",
+            )
         )
     if response.destination_id:
-        fields.append(EmbedField("Voice", f"<#{response.destination_id}>"))
+        fields.append(EmbedField("再生先", f"<#{response.destination_id}>"))
     elif response.waiting_for_voice:
         fields.append(
             EmbedField(
-                "Start",
-                "Join a voice channel or press **Start in VC** after joining.",
+                "再生方法",
+                "VCに参加すると自動で始まります。参加後に **VCで開始** を押しても再生できます。",
                 inline=False,
             )
         )
-    embed = command_embed("Music", description=description, fields=tuple(fields))
+    embed = command_embed("音楽", description=description, fields=tuple(fields))
     if response.current and response.current.thumbnail_url:
         embed.set_thumbnail(url=response.current.thumbnail_url)
     return embed
@@ -417,11 +449,10 @@ def music_search_embed(response: AudioSearchResponse) -> discord.Embed:
         for index, candidate in enumerate(response.candidates, start=1)
     )
     embed = command_embed(
-        "Choose the right track",
+        "再生する曲を選んでください",
         description=(
-            "Several close matches were found for "
-            f"**{discord.utils.escape_markdown(response.query)}**. "
-            "Choose once; the durable listening history helps select it automatically next time."
+            f"**{discord.utils.escape_markdown(response.query)}** に近い候補が"
+            "複数見つかりました。一度選ぶと履歴に残り、次回から自動で選びやすくなります。"
         ),
         fields=fields,
         tone=EmbedTone.WARNING,
@@ -434,8 +465,8 @@ def music_search_embed(response: AudioSearchResponse) -> discord.Embed:
 def music_history_embed(response: AudioHistoryResponse) -> discord.Embed:
     if not response.items:
         return command_embed(
-            "Recently played",
-            description="No tracks have been played yet.",
+            "再生履歴",
+            description="まだ再生履歴はありません。",
         )
     lines = []
     for index, item in enumerate(response.items, start=1):
@@ -444,7 +475,7 @@ def music_history_embed(response: AudioHistoryResponse) -> discord.Embed:
             f"`{index:02d}` [{item.title}]({item.page_url}) · "
             f"`{_duration(item.duration_seconds)}` · {_requester(item.requested_by_name)}{when}"
         )
-    return command_embed("Recently played", description="\n".join(lines))
+    return command_embed("再生履歴", description="\n".join(lines))
 
 
 def _safe_markdown_url(value: str) -> str:
@@ -462,15 +493,15 @@ def _web_source_text(index: int, source: WebSource) -> str:
 def web_search_embed(response: WebSearchResponse) -> discord.Embed:
     if not response.sources:
         return command_embed(
-            "No search results",
+            "検索結果が見つかりませんでした",
             description=(
-                f"No sources were found for **{discord.utils.escape_markdown(response.query)}**. "
-                "The local provider may be degraded; the request is already logged, so "
-                "repeating it immediately is unlikely to help."
+                f"**{discord.utils.escape_markdown(response.query)}** に一致する情報源を"
+                "取得できませんでした。検索サービス側の一時的な不調も考えられます。"
+                "同じ検索をすぐ繰り返すより、少し待つかキーワードを変えてみてください。"
             ),
             fields=(
-                EmbedField("Backend", response.backend),
-                EmbedField("Provider warnings", str(len(response.warnings))),
+                EmbedField("検索エンジン", response.backend),
+                EmbedField("警告", str(len(response.warnings))),
             ),
             tone=EmbedTone.WARNING,
         )
@@ -482,22 +513,20 @@ def web_search_embed(response: WebSearchResponse) -> discord.Embed:
             break
         lines.append(line)
         used += len(line) + 2
-    coverage = (
-        f"{response.candidate_count} candidates · {len(response.sources)} shown"
-    )
+    coverage = f"候補 {response.candidate_count}件・表示 {len(response.sources)}件"
     if response.maybe_more:
-        coverage += " · broader set retained"
-    fields = [EmbedField("Coverage", coverage, inline=False)]
+        coverage += "・ほかにも候補あり"
+    fields = [EmbedField("検索範囲", coverage, inline=False)]
     if response.warnings:
         fields.append(
             EmbedField(
-                "Provider health",
-                f"{len(response.warnings)} upstream source(s) reported a problem.",
+                "検索サービスの状態",
+                f"{len(response.warnings)}件の情報源で問題が報告されました。",
                 inline=False,
             )
         )
     return command_embed(
-        "Search results",
+        "検索結果",
         description="\n\n".join(lines),
         fields=tuple(fields),
         tone=EmbedTone.SUCCESS,
@@ -507,17 +536,17 @@ def web_search_embed(response: WebSearchResponse) -> discord.Embed:
 def web_fetch_embed(response: WebFetchResponse) -> discord.Embed:
     excerpt = discord.utils.escape_markdown(response.text[:3_500])
     if not excerpt:
-        excerpt = "No readable text was found in this chunk."
+        excerpt = "この範囲には読み取れる文章がありませんでした。"
     fields = [
-        EmbedField("Source", f"[Open page]({_safe_markdown_url(response.url)})"),
-        EmbedField("Type", response.content_type),
+        EmbedField("出典", f"[元のページを開く]({_safe_markdown_url(response.url)})"),
+        EmbedField("形式", response.content_type),
         EmbedField(
-            "Text",
-            f"{response.offset + len(response.text):,} / {response.total_characters:,} characters",
+            "本文",
+            f"{response.offset + len(response.text):,} / {response.total_characters:,}文字",
         ),
     ]
     if response.next_offset is not None:
-        fields.append(EmbedField("Next offset", str(response.next_offset)))
+        fields.append(EmbedField("続きの開始位置", str(response.next_offset)))
     return command_embed(
         response.title[:256],
         description=excerpt,
@@ -540,7 +569,7 @@ class WebFetchContinueView(discord.ui.View):
         self.next_offset = response.next_offset
 
     @discord.ui.button(
-        label="Continue",
+        label="続きを読む",
         style=discord.ButtonStyle.primary,
         custom_id="simajilord:web:fetch:continue",
     )
@@ -578,7 +607,7 @@ class WebFetchContinueView(discord.ui.View):
         except Exception as exc:
             await interaction.followup.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 ),
@@ -596,12 +625,12 @@ def _web_match_text(index: int, match: WebTextMatch) -> str:
 def web_find_embed(response: WebFindResponse) -> discord.Embed:
     if not response.matches:
         description = (
-            f"No matches for **{discord.utils.escape_markdown(response.pattern)}** "
-            f"were found in [{discord.utils.escape_markdown(response.title)}]"
-            f"({_safe_markdown_url(response.url)})."
+            f"[{discord.utils.escape_markdown(response.title)}]"
+            f"({_safe_markdown_url(response.url)}) 内に "
+            f"**{discord.utils.escape_markdown(response.pattern)}** は見つかりませんでした。"
         )
         return command_embed(
-            "No page matches",
+            "ページ内に見つかりませんでした",
             description=description,
             tone=EmbedTone.WARNING,
         )
@@ -610,14 +639,14 @@ def web_find_embed(response: WebFindResponse) -> discord.Embed:
         for index, match in enumerate(response.matches, start=1)
     )
     return command_embed(
-        f"Found in {response.title}"[:256],
+        f"{response.title} 内の検索結果"[:256],
         description="\n\n".join(lines)[:3_800],
         fields=(
             EmbedField(
-                "Matches",
-                f"{response.total_matches} total · {len(response.matches)} shown",
+                "一致",
+                f"全{response.total_matches}件・{len(response.matches)}件を表示",
             ),
-            EmbedField("Source", f"[Open page]({_safe_markdown_url(response.url)})"),
+            EmbedField("出典", f"[元のページを開く]({_safe_markdown_url(response.url)})"),
         ),
         tone=EmbedTone.SUCCESS,
     )
@@ -735,8 +764,8 @@ class MusicSearchChoiceView(discord.ui.View):
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
                 embed=command_embed(
-                    "This choice belongs to another listener",
-                    description="Run `/play` to start your own request.",
+                    "ほかのユーザーが検索した候補です",
+                    description="自分で曲を追加するには `/play` を実行してください。",
                     tone=EmbedTone.WARNING,
                 ),
                 ephemeral=True,
@@ -746,8 +775,8 @@ class MusicSearchChoiceView(discord.ui.View):
             if self._selected:
                 await interaction.response.send_message(
                     embed=command_embed(
-                        "Track already selected",
-                        description="The request is already being processed.",
+                        "選択済みです",
+                        description="選んだ曲をキューへ追加しています。",
                         tone=EmbedTone.WARNING,
                     ),
                     ephemeral=True,
@@ -758,8 +787,8 @@ class MusicSearchChoiceView(discord.ui.View):
             except IndexError:
                 await interaction.response.send_message(
                     embed=command_embed(
-                        "Selection expired",
-                        description="Run `/play` again to refresh the results.",
+                        "候補の有効期限が切れました",
+                        description="もう一度 `/play` を実行して検索し直してください。",
                         tone=EmbedTone.ERROR,
                     ),
                     ephemeral=True,
@@ -848,7 +877,7 @@ class MusicControlsView(discord.ui.View):
             await send_error(interaction, exc)
 
     @discord.ui.button(
-        label="Start in VC",
+        label="VCで開始",
         style=discord.ButtonStyle.success,
         custom_id="simajilord:music:start",
         row=0,
@@ -861,7 +890,7 @@ class MusicControlsView(discord.ui.View):
         try:
             channel = _member_voice_channel(interaction.user)
             if channel is None:
-                raise UserError("Join a voice channel first.")
+                raise UserError("先にボイスチャンネルへ参加してください。")
             workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
             session = self.runtime.audio.require(workspace_id)
             if session.output.connected:
@@ -890,7 +919,7 @@ class MusicControlsView(discord.ui.View):
             await send_error(interaction, exc)
 
     @discord.ui.button(
-        label="Pause",
+        label="一時停止",
         style=discord.ButtonStyle.secondary,
         custom_id="simajilord:music:pause",
         row=0,
@@ -903,7 +932,7 @@ class MusicControlsView(discord.ui.View):
         await self._run(interaction, AudioAction.PAUSE)
 
     @discord.ui.button(
-        label="Resume",
+        label="再開",
         style=discord.ButtonStyle.success,
         custom_id="simajilord:music:resume",
         row=0,
@@ -916,7 +945,7 @@ class MusicControlsView(discord.ui.View):
         await self._run(interaction, AudioAction.RESUME)
 
     @discord.ui.button(
-        label="Skip",
+        label="スキップ",
         style=discord.ButtonStyle.primary,
         custom_id="simajilord:music:skip",
         row=0,
@@ -929,7 +958,7 @@ class MusicControlsView(discord.ui.View):
         await self._run(interaction, AudioAction.SKIP)
 
     @discord.ui.button(
-        label="Loop",
+        label="ループ",
         style=discord.ButtonStyle.secondary,
         custom_id="simajilord:music:loop",
         row=0,
@@ -956,7 +985,7 @@ class MusicControlsView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Leave",
+        label="退出",
         style=discord.ButtonStyle.danger,
         custom_id="simajilord:music:leave",
         row=1,
@@ -997,22 +1026,22 @@ def error_message(error: Exception) -> str:
     if isinstance(error, WebError):
         return _WEB_ERROR_MESSAGES.get(
             error.category,
-            "The web operation could not be completed.",
+            "Web処理を完了できませんでした。",
         )
     if isinstance(error, ModerationError):
         return _MODERATION_ERROR_MESSAGES.get(
             error.category,
-            "HIVE analysis could not be completed.",
+            "HIVEの解析を完了できませんでした。",
         )
     if isinstance(error, UserError):
         return _ERROR_MESSAGES.get(error.code, error.code)
     log.exception("Unhandled Discord command error", exc_info=error)
-    return "The request failed unexpectedly. Check the host logs."
+    return "予期しないエラーが発生しました。ホスト側のログを確認してください。"
 
 
 async def send_error(interaction: discord.Interaction, error: Exception) -> None:
     embed = command_embed(
-        "Command failed",
+        "処理できませんでした",
         description=error_message(error),
         tone=EmbedTone.ERROR,
     )
@@ -1028,7 +1057,7 @@ async def edit_deferred_error(
 ) -> None:
     await interaction.edit_original_response(
         embed=command_embed(
-            "Command failed",
+            "処理できませんでした",
             description=error_message(error),
             tone=EmbedTone.ERROR,
         )
@@ -1040,7 +1069,10 @@ class SystemCog(commands.Cog):
         self.bot = bot
         self.runtime = runtime
 
-    @app_commands.command(name="ping", description="Check platform health and Discord latency.")
+    @app_commands.command(
+        name="ping",
+        description="BOTの稼働状態とDiscordへの応答速度を確認します。",
+    )
     async def ping(self, interaction: discord.Interaction) -> None:
         response = cast(
             PingResponse,
@@ -1052,11 +1084,11 @@ class SystemCog(commands.Cog):
         )
         await interaction.response.send_message(
             embed=command_embed(
-                "Platform health",
+                "稼働状況",
                 fields=(
-                    EmbedField("Status", response.status),
+                    EmbedField("状態", "正常" if response.status == "ok" else response.status),
                     EmbedField(
-                        "Discord latency",
+                        "Discord応答時間",
                         f"{response.transport_latency_ms:.1f} ms",
                     ),
                 ),
@@ -1066,9 +1098,9 @@ class SystemCog(commands.Cog):
 
     @app_commands.command(
         name="capabilities",
-        description="Find a small relevant set of available capabilities.",
+        description="目的に合うSimajilordの機能を探します。",
     )
-    @app_commands.describe(query="What do you want the platform to do?")
+    @app_commands.describe(query="やりたいことを入力してください")
     async def capabilities(self, interaction: discord.Interaction, query: str = "") -> None:
         response = cast(
             CapabilitySearchResponse,
@@ -1081,38 +1113,43 @@ class SystemCog(commands.Cog):
         if not response.capabilities:
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Capabilities",
-                    description="No matching capabilities were found.",
+                    "利用できる機能",
+                    description="条件に合う機能は見つかりませんでした。",
                     tone=EmbedTone.WARNING,
                 )
             )
             return
         lines = [
-            f"• `{item.name}` — {item.summary} (`{item.risk}`, approval: `{item.approval}`)"
+            f"• `{item.name}` — {item.summary} "
+            f"— 危険度: **{_risk_label(item.risk)}** / "
+            f"承認: **{_approval_label(item.approval)}**"
             for item in response.capabilities
         ]
         await interaction.response.send_message(
             embed=command_embed(
-                "Capabilities",
+                "利用できる機能",
                 description="\n".join(lines),
-                fields=(EmbedField("Query", query or "all", inline=False),),
+                fields=(EmbedField("検索内容", query or "すべて", inline=False),),
             )
         )
 
-    @app_commands.command(name="about", description="Explain this adapter's role.")
+    @app_commands.command(
+        name="about",
+        description="Simajilord AIとDiscord BOTの役割を表示します。",
+    )
     async def about(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             embed=command_embed(
-                "About Simajilord AI",
+                "Simajilord AIについて",
                 description=(
-                    "Simajilord AI is a capability platform. Discord is one transport "
-                    "adapter; media, speech, audio policy, and agent decisions live "
-                    "outside this bot."
+                    "Simajilord AIは、AIと各種機能を共通APIでつなぐ基盤です。"
+                    "このBOTはDiscordへの窓口であり、音楽・読み上げ・メディア処理・"
+                    "AIの判断はDiscordに依存しないSimajilord基盤上で動作します。"
                 ),
             )
         )
 
-    @app_commands.command(name="uptime", description="Show process start time and uptime.")
+    @app_commands.command(name="uptime", description="BOTの起動時刻と連続稼働時間を表示します。")
     async def uptime(self, interaction: discord.Interaction) -> None:
         response = cast(
             UptimeResponse,
@@ -1128,16 +1165,16 @@ class SystemCog(commands.Cog):
         minutes, seconds = divmod(remainder, 60)
         await interaction.response.send_message(
             embed=command_embed(
-                "Process uptime",
+                "稼働時間",
                 fields=(
                     EmbedField(
-                        "Started",
+                        "起動日時",
                         f"<t:{int(response.started_at.timestamp())}:F>",
                         inline=False,
                     ),
                     EmbedField(
-                        "Uptime",
-                        f"{days}d {hours}h {minutes}m {seconds}s",
+                        "連続稼働",
+                        f"{days}日 {hours}時間 {minutes}分 {seconds}秒",
                         inline=False,
                     ),
                 ),
@@ -1145,7 +1182,7 @@ class SystemCog(commands.Cog):
             )
         )
 
-    @app_commands.command(name="status", description="Show structured platform status.")
+    @app_commands.command(name="status", description="Simajilord基盤の詳しい状態を表示します。")
     async def status(self, interaction: discord.Interaction) -> None:
         response = cast(
             StatusResponse,
@@ -1157,27 +1194,27 @@ class SystemCog(commands.Cog):
         )
         await interaction.response.send_message(
             embed=command_embed(
-                "Platform status",
+                "Simajilordの状態",
                 fields=(
                     EmbedField(
-                        "Runtime",
-                        f"Status: **{response.status.upper()}**\n"
-                        f"AI: **{response.model_runtime.title()}**",
+                        "稼働状態",
+                        f"システム: **{'正常' if response.status == 'ok' else response.status}**\n"
+                        f"AI: **{'有効' if response.model_runtime == 'enabled' else '無効'}**",
                     ),
                     EmbedField(
-                        "System",
-                        f"Capabilities: **{response.capability_count}**\n"
-                        "Voice sessions: "
+                        "機能",
+                        f"登録済みAPI: **{response.capability_count}**\n"
+                        "音声セッション: "
                         f"{response.active_audio_session_count}/"
-                        f"{response.audio_session_count} active\n"
-                        f"Speech: **{response.speech_provider.upper()} "
+                        f"{response.audio_session_count}件が稼働中\n"
+                        f"読み上げ: **{response.speech_provider.upper()} "
                         f"{response.speech_voice}**",
                     ),
                     EmbedField(
-                        "Web",
-                        "Search: "
-                        f"**{'Ready' if response.web_search_ready else 'Degraded'}**\n"
-                        f"Backend: **{response.web_search_backend}**",
+                        "Web検索",
+                        "状態: "
+                        f"**{'利用可能' if response.web_search_ready else '一部制限'}**\n"
+                        f"検索エンジン: **{response.web_search_backend}**",
                     ),
                 ),
                 tone=EmbedTone.SUCCESS,
@@ -1188,7 +1225,7 @@ class SystemCog(commands.Cog):
 class MusicCog(commands.Cog):
     music = app_commands.Group(
         name="music",
-        description="Advanced music controls and grouped command aliases.",
+        description="音楽の再生と詳細な操作を行います。",
     )
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
@@ -1242,17 +1279,17 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(
         name="play",
-        description="Play a public media URL or search for a track.",
+        description="URLまたは曲名から音楽を再生します。",
     )
-    @app_commands.describe(reference="Paste a public media URL or type a track name")
+    @app_commands.describe(reference="公開URLまたは曲名")
     async def quick_play(self, interaction: discord.Interaction, reference: str) -> None:
         await self._send_play(interaction, reference)
 
     @music.command(
         name="play",
-        description="Play a public media URL or search for a track.",
+        description="URLまたは曲名から音楽を再生します。",
     )
-    @app_commands.describe(reference="Paste a public media URL or type a track name")
+    @app_commands.describe(reference="公開URLまたは曲名")
     async def play(self, interaction: discord.Interaction, reference: str) -> None:
         await self._send_play(interaction, reference)
 
@@ -1276,14 +1313,14 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(
         name="queue",
-        description="Show what is playing and what comes next.",
+        description="再生中の曲とキューを表示します。",
     )
     async def quick_queue(self, interaction: discord.Interaction) -> None:
         await self._send_queue(interaction)
 
     @music.command(
         name="queue",
-        description="Show what is playing and what comes next.",
+        description="再生中の曲とキューを表示します。",
     )
     async def queue(self, interaction: discord.Interaction) -> None:
         await self._send_queue(interaction)
@@ -1305,7 +1342,7 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(
         name="history",
-        description="Show recently played tracks and who requested them.",
+        description="最近再生した曲と、追加したユーザーを表示します。",
     )
     async def quick_history(
         self,
@@ -1316,7 +1353,7 @@ class MusicCog(commands.Cog):
 
     @music.command(
         name="history",
-        description="Show recently played tracks and who requested them.",
+        description="最近再生した曲と、追加したユーザーを表示します。",
     )
     async def history(
         self,
@@ -1355,26 +1392,30 @@ class MusicCog(commands.Cog):
                 ),
             )
             if response.action == AudioAction.LOOP.value:
-                message = f"Loop mode set to `{response.loop_mode}`."
+                message = f"ループを **{_loop_mode_label(response.loop_mode or '')}** にしました。"
             elif response.action == AudioAction.REMOVE.value:
-                message = f"Removed **{response.affected_title}** from the queue."
+                message = f"**{response.affected_title}** をキューから削除しました。"
             elif response.action == AudioAction.AUTO_LEAVE.value:
-                message = f"Auto leave is now **{'on' if response.enabled else 'off'}**."
+                message = (
+                    f"自動退出を **{'オン' if response.enabled else 'オフ'}** にしました。"
+                )
             elif response.action == AudioAction.SHUFFLE.value:
-                message = "Upcoming tracks shuffled."
+                message = "再生待ちの曲をシャッフルしました。"
             elif response.action == AudioAction.SEEK.value:
-                message = f"Moved to `{_duration(response.position_seconds or 0)}`."
+                position = _duration(response.position_seconds or 0)
+                message = f"再生位置を `{position}` に移動しました。"
             elif response.action == AudioAction.TUNE.value:
                 message = (
-                    f"Speed **{response.speed:.2f}x** · Pitch **{response.pitch:.2f}x**."
+                    f"速度 **{response.speed:.2f}倍**・"
+                    f"ピッチ **{response.pitch:.2f}倍** にしました。"
                     if response.speed is not None and response.pitch is not None
-                    else "Playback tuning updated."
+                    else "再生設定を変更しました。"
                 )
             else:
                 message = _AUDIO_ACTION_MESSAGES[response.action]
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Audio control",
+                    "音楽を操作しました",
                     description=message,
                     tone=EmbedTone.SUCCESS,
                 )
@@ -1382,27 +1423,27 @@ class MusicCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @music.command(name="pause", description="Pause playback.")
+    @music.command(name="pause", description="再生を一時停止します。")
     async def pause(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.PAUSE)
 
-    @music.command(name="resume", description="Resume playback.")
+    @music.command(name="resume", description="一時停止した曲を再開します。")
     async def resume(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.RESUME)
 
-    @music.command(name="skip", description="Skip the current item.")
+    @music.command(name="skip", description="再生中の曲をスキップします。")
     async def skip(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.SKIP)
 
-    @music.command(name="stop", description="Stop playback and clear the queue.")
+    @music.command(name="stop", description="再生を停止し、キューを空にします。")
     async def stop(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.STOP)
 
-    @music.command(name="leave", description="Disconnect from voice.")
+    @music.command(name="leave", description="BOTをボイスチャンネルから退出させます。")
     async def leave(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.LEAVE)
 
-    @music.command(name="loop", description="Set music loop behavior.")
+    @music.command(name="loop", description="音楽のループ方法を設定します。")
     async def loop(
         self,
         interaction: discord.Interaction,
@@ -1410,8 +1451,8 @@ class MusicCog(commands.Cog):
     ) -> None:
         await self._control(interaction, AudioAction.LOOP, LoopMode(mode))
 
-    @music.command(name="remove", description="Remove one upcoming track by position.")
-    @app_commands.describe(position="The number shown under Up next")
+    @music.command(name="remove", description="指定した番号の曲をキューから削除します。")
+    @app_commands.describe(position="「次に再生」に表示されている番号")
     async def remove(self, interaction: discord.Interaction, position: int) -> None:
         try:
             workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
@@ -1430,7 +1471,7 @@ class MusicCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Removed from queue",
+                    "キューから削除しました",
                     description=f"**{response.affected_title}**",
                     tone=EmbedTone.SUCCESS,
                 )
@@ -1440,7 +1481,7 @@ class MusicCog(commands.Cog):
 
     @music.command(
         name="autoleave",
-        description="Leave when the last listener exits without losing the queue.",
+        description="最後のユーザーが退出したとき、キューを残してBOTも退出します。",
     )
     async def autoleave(self, interaction: discord.Interaction, enabled: bool) -> None:
         await self._control(
@@ -1449,12 +1490,12 @@ class MusicCog(commands.Cog):
             enabled=enabled,
         )
 
-    @music.command(name="shuffle", description="Shuffle upcoming music.")
+    @music.command(name="shuffle", description="再生待ちの曲をシャッフルします。")
     async def shuffle(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.SHUFFLE)
 
-    @music.command(name="seek", description="Move within the current track.")
-    @app_commands.describe(position="Absolute 1:23 or relative +30 / -10")
+    @music.command(name="seek", description="再生中の曲の位置を移動します。")
+    @app_commands.describe(position="1:23、+30、-10 のように指定")
     async def seek(self, interaction: discord.Interaction, position: str) -> None:
         try:
             parsed, relative = _parse_position(position)
@@ -1476,7 +1517,7 @@ class MusicCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @music.command(name="tune", description="Adjust playback speed and pitch.")
+    @music.command(name="tune", description="再生速度とピッチを調整します。")
     async def tune(
         self,
         interaction: discord.Interaction,
@@ -1519,7 +1560,7 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
         super().__init__(
             custom_id="simajilord:readaloud:channels",
             channel_types=_READ_ALOUD_CHANNEL_TYPES,
-            placeholder="Select conversation channels",
+            placeholder="読み上げるチャンネルを選択",
             min_values=1,
             max_values=25,
             default_values=default_values,
@@ -1528,7 +1569,7 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
     async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.requester_id:
             await interaction.response.send_message(
-                "Only the person who ran `/join` can change this selection.",
+                "この選択を変更できるのは `/join` を実行したユーザーだけです。",
                 ephemeral=True,
             )
             return
@@ -1555,14 +1596,13 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             )
             await interaction.edit_original_response(
                 embed=command_embed(
-                    "Read-aloud ready",
+                    "読み上げを開始しました",
                     description=(
-                        "The selected conversations were added. New messages there "
-                        "will be read automatically."
+                        "選択したチャンネルへ届く新しいメッセージを、自動で読み上げます。"
                     ),
                     fields=(
                         EmbedField(
-                            "Conversation channels",
+                            "読み上げるチャンネル",
                             "\n".join(
                                 f"<#{channel_id}>"
                                 for channel_id in configured.text_channel_ids
@@ -1570,11 +1610,11 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                             inline=False,
                         ),
                         EmbedField(
-                            "Voice channel",
+                            "音声を流すVC",
                             f"<#{configured.audio_destination_id}>",
                         ),
-                        EmbedField("Connection", "Ready"),
-                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                        EmbedField("接続", "準備完了"),
+                        EmbedField("音声", _speech_voice_label(self.runtime)),
                     ),
                     tone=EmbedTone.SUCCESS,
                 ),
@@ -1592,17 +1632,17 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             )
             await interaction.edit_original_response(
                 embed=command_embed(
-                    "Read-aloud saved",
+                    "読み上げ設定を保存しました",
                     description=(
-                        "The conversations are configured, but the voice connection "
-                        "is not ready yet. The next message will retry automatically."
+                        "チャンネル設定は完了しましたが、VCへの接続準備がまだ整っていません。"
+                        "次のメッセージが届いたときに自動で再接続します。"
                     ),
                     fields=(
                         EmbedField(
-                            "Voice channel",
+                            "音声を流すVC",
                             f"<#{configured.audio_destination_id}>",
                         ),
-                        EmbedField("Connection", error_message(exc)),
+                        EmbedField("接続", error_message(exc)),
                     ),
                     tone=EmbedTone.WARNING,
                 ),
@@ -1633,7 +1673,7 @@ class ReadAloudChannelSelectView(discord.ui.View):
 class ReadAloudCog(commands.Cog):
     readaloud = app_commands.Group(
         name="readaloud",
-        description="Configure automatic Discord message read-aloud.",
+        description="DiscordのメッセージをVCで自動読み上げします。",
     )
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
@@ -1642,14 +1682,14 @@ class ReadAloudCog(commands.Cog):
 
     @app_commands.command(
         name="join",
-        description="Read this channel aloud in the voice channel you joined.",
+        description="選んだ会話チャンネルを、参加中のVCで読み上げます。",
     )
     async def join(self, interaction: discord.Interaction) -> None:
         try:
             member = interaction.user
             source = interaction.channel
             if not isinstance(member, discord.Member):
-                raise UserError("Use this command in a server.")
+                raise UserError("このコマンドはサーバー内で使用してください。")
             if not isinstance(
                 source,
                 (
@@ -1659,10 +1699,10 @@ class ReadAloudCog(commands.Cog):
                     discord.StageChannel,
                 ),
             ):
-                raise UserError("Use this command in a server message channel.")
+                raise UserError("サーバー内のメッセージチャンネルで使用してください。")
             destination = member.voice.channel if member.voice is not None else None
             if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
-                raise UserError("Join a voice channel first.")
+                raise UserError("先に読み上げ先のボイスチャンネルへ参加してください。")
             default_channels: list[discord.abc.GuildChannel | discord.Thread] = []
             selected_source = member.guild.get_channel_or_thread(source.id)
             if selected_source is not None:
@@ -1675,15 +1715,15 @@ class ReadAloudCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Add conversations",
+                    "読み上げるチャンネルを選択",
                     description=(
-                        "Select up to 25 text channels, threads, or voice-channel "
-                        f"chats to add to {destination.mention}."
+                        f"{destination.mention} で読み上げるテキストチャンネル、スレッド、"
+                        "VCチャットを25個まで選べます。"
                     ),
                     fields=(
-                        EmbedField("Current channel", source.mention),
-                        EmbedField("Voice channel", destination.mention),
-                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                        EmbedField("現在のチャンネル", source.mention),
+                        EmbedField("音声を流すVC", destination.mention),
+                        EmbedField("音声", _speech_voice_label(self.runtime)),
                     ),
                 ),
                 view=view,
@@ -1694,13 +1734,13 @@ class ReadAloudCog(commands.Cog):
 
     @readaloud.command(
         name="setup",
-        description="Replace the route with one message channel and voice channel.",
+        description="読み上げる会話チャンネルとVCを設定し直します。",
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.describe(
-        text_channel="Messages from this text or voice channel are read automatically",
-        voice_channel="Audio is played in this channel",
-        mode="Queue speech, or skip it while music is active",
+        text_channel="自動で読み上げるテキストチャンネルまたはVCチャット",
+        voice_channel="読み上げ音声を流すボイスチャンネル",
+        mode="音楽再生中のメッセージを待機させるか、読み飛ばすか",
     )
     async def setup(
         self,
@@ -1712,7 +1752,7 @@ class ReadAloudCog(commands.Cog):
         try:
             member = interaction.user
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
-                raise UserError("Manage Server permission is required.")
+                raise UserError("この設定には「サーバー管理」権限が必要です。")
             selected_text = text_channel
             if selected_text is None and isinstance(
                 interaction.channel,
@@ -1720,14 +1760,14 @@ class ReadAloudCog(commands.Cog):
             ):
                 selected_text = interaction.channel
             if selected_text is None:
-                raise UserError("Choose a server text or voice channel.")
+                raise UserError("会話チャンネルを選んでください。")
             selected_voice = voice_channel
             if selected_voice is None and member.voice is not None:
                 candidate = member.voice.channel
                 if isinstance(candidate, discord.VoiceChannel):
                     selected_voice = candidate
             if selected_voice is None:
-                raise UserError("Choose a voice channel or join one first.")
+                raise UserError("ボイスチャンネルを選ぶか、先に参加してください。")
 
             response = cast(
                 ReadAloudResponse,
@@ -1744,12 +1784,12 @@ class ReadAloudCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Read-aloud configured",
+                    "読み上げを設定しました",
                     fields=(
-                        EmbedField("Conversation channel", selected_text.mention),
-                        EmbedField("Voice channel", selected_voice.mention),
-                        EmbedField("Mode", _read_aloud_mode_label(response.mode)),
-                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                        EmbedField("読み上げるチャンネル", selected_text.mention),
+                        EmbedField("音声を流すVC", selected_voice.mention),
+                        EmbedField("動作", _read_aloud_mode_label(response.mode)),
+                        EmbedField("音声", _speech_voice_label(self.runtime)),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
@@ -1757,7 +1797,7 @@ class ReadAloudCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @readaloud.command(name="status", description="Show the configured route.")
+    @readaloud.command(name="status", description="現在の読み上げ設定を表示します。")
     async def status(self, interaction: discord.Interaction) -> None:
         try:
             response = cast(
@@ -1771,29 +1811,29 @@ class ReadAloudCog(commands.Cog):
             if not response.enabled:
                 await interaction.response.send_message(
                     embed=command_embed(
-                        "Read-aloud status",
-                        description="Read-aloud is disabled.",
+                        "読み上げ設定",
+                        description="現在、読み上げは無効です。",
                         tone=EmbedTone.WARNING,
                     )
                 )
                 return
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Read-aloud status",
+                    "読み上げ設定",
                     fields=(
                         EmbedField(
-                            "Conversation channels",
+                            "読み上げるチャンネル",
                             "\n".join(
                                 f"<#{channel_id}>"
                                 for channel_id in response.text_channel_ids
                             ),
                         ),
                         EmbedField(
-                            "Voice channel",
+                            "音声を流すVC",
                             f"<#{response.audio_destination_id}>",
                         ),
-                        EmbedField("Mode", _read_aloud_mode_label(response.mode)),
-                        EmbedField("Voice", _speech_voice_label(self.runtime)),
+                        EmbedField("動作", _read_aloud_mode_label(response.mode)),
+                        EmbedField("音声", _speech_voice_label(self.runtime)),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
@@ -1803,10 +1843,10 @@ class ReadAloudCog(commands.Cog):
 
     @readaloud.command(
         name="remove",
-        description="Stop reading one conversation channel.",
+        description="指定した会話チャンネルの読み上げを解除します。",
     )
     @app_commands.describe(
-        channel="Conversation channel to remove; defaults to this channel",
+        channel="解除する会話チャンネル。省略時は現在のチャンネル",
     )
     async def remove(
         self,
@@ -1821,7 +1861,7 @@ class ReadAloudCog(commands.Cog):
             ):
                 selected = interaction.channel
             if selected is None:
-                raise UserError("Choose a server text or voice channel.")
+                raise UserError("解除する会話チャンネルを選んでください。")
             response = cast(
                 ReadAloudResponse,
                 await self.runtime.registry.invoke(
@@ -1835,17 +1875,17 @@ class ReadAloudCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Conversation removed",
+                    "読み上げ対象から外しました",
                     description=(
-                        "Read-aloud is now disabled."
+                        "読み上げるチャンネルがなくなったため、読み上げを無効にしました。"
                         if not response.enabled
-                        else "Other configured conversation channels remain active."
+                        else "ほかに設定されているチャンネルの読み上げは続きます。"
                     ),
                     fields=(
-                        EmbedField("Channel", selected.mention),
+                        EmbedField("解除したチャンネル", selected.mention),
                         EmbedField(
-                            "Remaining channels",
-                            str(len(response.text_channel_ids)),
+                            "残り",
+                            f"{len(response.text_channel_ids)}チャンネル",
                         ),
                     ),
                     tone=EmbedTone.SUCCESS,
@@ -1854,13 +1894,13 @@ class ReadAloudCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @readaloud.command(name="disable", description="Disable automatic read-aloud.")
+    @readaloud.command(name="disable", description="このサーバーの自動読み上げを停止します。")
     @app_commands.default_permissions(manage_guild=True)
     async def disable(self, interaction: discord.Interaction) -> None:
         try:
             member = interaction.user
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
-                raise UserError("Manage Server permission is required.")
+                raise UserError("この設定には「サーバー管理」権限が必要です。")
             await self.runtime.registry.invoke(
                 "discord.manage_read_aloud",
                 ReadAloudRequest(action=ReadAloudAction.DISABLE),
@@ -1868,8 +1908,8 @@ class ReadAloudCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Read-aloud disabled",
-                    description="Automatic read-aloud routing has been disabled.",
+                    "読み上げを停止しました",
+                    description="このサーバーの自動読み上げ設定を無効にしました。",
                     tone=EmbedTone.SUCCESS,
                 )
             )
@@ -1919,7 +1959,7 @@ class ReadAloudCog(commands.Cog):
                 "speech.speak",
                 SpeechSpeakRequest(
                     text=message.content,
-                    title=f"Message from {message.author.display_name}",
+                    title=f"{message.author.display_name}さんのメッセージ",
                 ),
                 InvocationContext(
                     actor_id=str(message.author.id),
@@ -2066,11 +2106,11 @@ class WebCog(commands.Cog):
 
     @app_commands.command(
         name="search",
-        description="Search the web through Simajilord's local metasearch provider.",
+        description="Simajilordのローカル検索サービスでWebを検索します。",
     )
     @app_commands.describe(
-        query="Topic, question, or exact phrase to search for",
-        depth="Quick, standard, or deep candidate collection",
+        query="調べたい話題、質問、または完全一致で探す語句",
+        depth="検索の深さ: quick / standard / deep",
     )
     async def search(
         self,
@@ -2097,11 +2137,11 @@ class WebCog(commands.Cog):
 
     @app_commands.command(
         name="fetch",
-        description="Open a public page and show a bounded readable excerpt.",
+        description="公開Webページを開き、読み取れる本文を表示します。",
     )
     @app_commands.describe(
-        url="Public HTTP or HTTPS page to open",
-        offset="Optional text position to resume from",
+        url="開く公開HTTPまたはHTTPS URL",
+        offset="本文を途中から読む場合の開始位置",
     )
     async def fetch(
         self,
@@ -2137,11 +2177,11 @@ class WebCog(commands.Cog):
 
     @app_commands.command(
         name="find",
-        description="Find a phrase inside one public web page.",
+        description="公開Webページの本文から語句を探します。",
     )
     @app_commands.describe(
-        url="Public HTTP or HTTPS page to inspect",
-        phrase="Exact phrase to find, case-insensitively",
+        url="調べる公開HTTPまたはHTTPS URL",
+        phrase="大文字と小文字を区別せずに探す語句",
     )
     async def find(
         self,
@@ -2279,10 +2319,10 @@ def _source_name(value: str) -> str:
 
 def _likelihood(score: float, *, high_threshold: float) -> str:
     if score >= high_threshold:
-        return "High"
+        return "高"
     if score >= 0.5:
-        return "Moderate"
-    return "Low"
+        return "中"
+    return "低"
 
 
 def synthetic_media_embed(
@@ -2295,7 +2335,7 @@ def synthetic_media_embed(
         high_threshold=response.threshold,
     )
     deepfake_likelihood = (
-        "High"
+        "高"
         if response.deepfake_likely
         else _likelihood(
             response.deepfake_score,
@@ -2303,25 +2343,27 @@ def synthetic_media_embed(
         )
     )
     severity_labels = {ai_likelihood, deepfake_likelihood}
-    if "High" in severity_labels:
+    if "高" in severity_labels:
         tone = EmbedTone.ERROR
-    elif "Moderate" in severity_labels:
+    elif "中" in severity_labels:
         tone = EmbedTone.WARNING
     else:
         tone = EmbedTone.SUCCESS
-    media_label = response.modality.value
-    conclusion = (
-        f"**{ai_likelihood} AI-generated {media_label} likelihood**\n"
-        f"{deepfake_likelihood} deepfake likelihood"
-    )
+    media_label = {"image": "画像", "video": "動画"}[response.modality.value]
+    conclusion_lines = [f"**AI生成{media_label}の可能性: {ai_likelihood}**"]
+    # Discordでは小数第1位まで表示するため、表示上0.0%になる値を
+    # 結論文で「ディープフェイクの可能性あり」と強調しない。
+    if response.deepfake_score * 100 >= 0.05:
+        conclusion_lines.append(f"ディープフェイクの可能性: {deepfake_likelihood}")
+    conclusion = "\n".join(conclusion_lines)
     fields = [
         EmbedField(
-            "AI-generated visual",
-            f"**{_percentage(response.ai_generated_score)}** · {ai_likelihood}",
+            "AI生成",
+            f"**{_percentage(response.ai_generated_score)}**・可能性 {ai_likelihood}",
         ),
         EmbedField(
-            "Deepfake",
-            f"**{_percentage(response.deepfake_score)}** · {deepfake_likelihood}",
+            "ディープフェイク",
+            f"**{_percentage(response.deepfake_score)}**・可能性 {deepfake_likelihood}",
         ),
     ]
     if (
@@ -2330,7 +2372,7 @@ def synthetic_media_embed(
     ):
         fields.append(
             EmbedField(
-                "Likely generator",
+                "推定生成モデル",
                 (
                     f"**{_source_name(response.top_source)}** · "
                     f"{_percentage(response.top_source_score)}"
@@ -2339,36 +2381,23 @@ def synthetic_media_embed(
             )
         )
     cache_line = (
-        "Reused cached result · no HIVE API request used"
+        "保存済みの解析結果を再利用・HIVE APIの追加消費なし"
         if response.cached
-        else "New HIVE API analysis"
+        else "HIVE APIで新しく解析"
     )
     sample_name = {
-        "image": "image",
-        "video": "frames",
+        "image": "枚の画像",
+        "video": "フレーム",
     }[response.modality.value]
-    fields.extend(
-        (
-            EmbedField(
-                "Analysis",
-                (
-                    f"{response.sample_count} {sample_name} · {cache_line}"
-                ),
-                inline=False,
-            ),
-            EmbedField(
-                "Daily HIVE API budget",
-                (
-                    f"**{response.quota_used} / {response.quota_limit} used** · "
-                    f"{response.quota_remaining} remaining · "
-                    f"resets <t:{response.quota_reset_at_epoch}:R>"
-                ),
-                inline=False,
-            ),
+    fields.append(
+        EmbedField(
+            "解析",
+            f"{response.sample_count}{sample_name}・{cache_line}",
+            inline=False,
         )
     )
     embed = command_embed(
-        "HIVE analysis",
+        "HIVE AIコンテンツ解析",
         description=conclusion,
         fields=tuple(fields),
         tone=tone,
@@ -2376,7 +2405,7 @@ def synthetic_media_embed(
     if attachment_url is not None and response.content_type.startswith("image/"):
         embed.set_thumbnail(url=attachment_url)
     model_label = response.model.removeprefix("hive/")
-    embed.set_footer(text=f"Powered by HIVE Moderation · {model_label}")
+    embed.set_footer(text=f"HIVE Moderationによる解析・{model_label}")
     return embed
 
 
@@ -2388,9 +2417,9 @@ class ModerationCog(commands.Cog):
 
     @app_commands.command(
         name="detectai",
-        description="Analyze an image or video with HIVE AI-content detection.",
+        description="画像・動画がAI生成かどうかをHIVEで解析します。",
     )
-    @app_commands.describe(media="Image or video attachment to analyze with HIVE")
+    @app_commands.describe(media="HIVEで解析する画像または動画")
     async def detectai(
         self,
         interaction: discord.Interaction,
@@ -2430,7 +2459,7 @@ class DownloadCog(commands.Cog):
 
     @app_commands.command(
         name="download",
-        description="Save media from a provider-supported public HTTPS URL.",
+        description="対応サイトの公開URLから動画または音声を保存します。",
     )
     async def download(
         self,
@@ -2443,7 +2472,7 @@ class DownloadCog(commands.Cog):
             now = time.monotonic()
             previous = self._last_request.get(interaction.user.id, 0.0)
             if now - previous < 30:
-                raise UserError("Wait 30 seconds between downloads.")
+                raise UserError("次のダウンロードまで30秒お待ちください。")
             self._last_request[interaction.user.id] = now
             await interaction.response.defer(thinking=True)
             download_root = self.runtime.settings.data_dir / "downloads"
@@ -2466,18 +2495,21 @@ class DownloadCog(commands.Cog):
             )
             await interaction.followup.send(
                 embed=command_embed(
-                    "Media saved",
+                    "メディアを保存しました",
                     description=(
                         f"### {discord.utils.escape_markdown(response.title)}\n"
-                        f"[Open original]({response.source_url})"
+                        f"[配信元を開く]({response.source_url})"
                     ),
                     fields=(
                         EmbedField(
-                            "Size",
+                            "サイズ",
                             f"{response.size_bytes / 1_000_000:.1f} MB",
                         ),
-                        EmbedField("Type", media_type.title()),
-                        EmbedField("Format", response.path.suffix.lstrip(".").upper()),
+                        EmbedField(
+                            "種類",
+                            "動画" if media_type == "video" else "音声",
+                        ),
+                        EmbedField("形式", response.path.suffix.lstrip(".").upper()),
                     ),
                     tone=EmbedTone.SUCCESS,
                 ),
@@ -2494,7 +2526,7 @@ class UtilityCog(commands.Cog):
     def __init__(self, runtime: SimajilordRuntime) -> None:
         self.runtime = runtime
 
-    @app_commands.command(name="roll", description="Roll bounded virtual dice.")
+    @app_commands.command(name="roll", description="指定した個数・面数のサイコロを振ります。")
     async def roll(
         self,
         interaction: discord.Interaction,
@@ -2513,10 +2545,10 @@ class UtilityCog(commands.Cog):
             values = ", ".join(str(value) for value in response.rolls)
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Dice roll",
+                    "サイコロ",
                     fields=(
-                        EmbedField("Rolls", values, inline=False),
-                        EmbedField("Total", str(response.total)),
+                        EmbedField("出目", values, inline=False),
+                        EmbedField("合計", str(response.total)),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
@@ -2524,7 +2556,7 @@ class UtilityCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @app_commands.command(name="choose", description="Choose one comma-separated option.")
+    @app_commands.command(name="choose", description="カンマ区切りの候補から1つ選びます。")
     async def choose(self, interaction: discord.Interaction, options: str) -> None:
         try:
             parsed = tuple(item.strip() for item in options.split(","))
@@ -2538,7 +2570,7 @@ class UtilityCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Choice",
+                    "選択結果",
                     description=response.choice,
                     tone=EmbedTone.SUCCESS,
                 )
@@ -2551,7 +2583,7 @@ class DiscordInfoCog(commands.Cog):
     def __init__(self, runtime: SimajilordRuntime) -> None:
         self.runtime = runtime
 
-    @app_commands.command(name="serverinfo", description="Show this server's public structure.")
+    @app_commands.command(name="serverinfo", description="このサーバーの公開情報を表示します。")
     async def serverinfo(self, interaction: discord.Interaction) -> None:
         try:
             response = cast(
@@ -2564,16 +2596,16 @@ class DiscordInfoCog(commands.Cog):
             )
             embed = discord.Embed(
                 title=response.name,
-                description=f"Server ID: `{response.server_id}`",
+                description=f"サーバーID: `{response.server_id}`",
                 colour=discord.Colour.blurple(),
                 timestamp=discord.utils.utcnow(),
             )
-            embed.add_field(name="Members", value=response.member_count or "Unknown")
-            embed.add_field(name="Text channels", value=response.text_channel_count)
-            embed.add_field(name="Voice channels", value=response.voice_channel_count)
-            embed.add_field(name="Roles", value=response.role_count)
+            embed.add_field(name="メンバー", value=response.member_count or "不明")
+            embed.add_field(name="テキストチャンネル", value=response.text_channel_count)
+            embed.add_field(name="ボイスチャンネル", value=response.voice_channel_count)
+            embed.add_field(name="ロール", value=response.role_count)
             embed.add_field(
-                name="Created",
+                name="作成日時",
                 value=f"<t:{int(discord.utils.parse_time(response.created_at_iso).timestamp())}:F>",
             )
             if response.icon_url:
@@ -2582,7 +2614,7 @@ class DiscordInfoCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @app_commands.command(name="userinfo", description="Show public data for one Discord user.")
+    @app_commands.command(name="userinfo", description="Discordユーザーの公開情報を表示します。")
     async def userinfo(
         self,
         interaction: discord.Interaction,
@@ -2600,26 +2632,29 @@ class DiscordInfoCog(commands.Cog):
             )
             embed = discord.Embed(
                 title=response.display_name,
-                description=f"User ID: `{response.user_id}`",
+                description=f"ユーザーID: `{response.user_id}`",
                 colour=discord.Colour.blurple(),
                 timestamp=discord.utils.utcnow(),
             )
             embed.set_thumbnail(url=response.avatar_url)
             embed.add_field(
-                name="Account created",
+                name="アカウント作成日時",
                 value=f"<t:{int(discord.utils.parse_time(response.created_at_iso).timestamp())}:F>",
                 inline=False,
             )
             if response.joined_at_iso:
                 joined = discord.utils.parse_time(response.joined_at_iso)
                 embed.add_field(
-                    name="Joined server",
+                    name="サーバー参加日時",
                     value=f"<t:{int(joined.timestamp())}:F>",
                     inline=False,
                 )
             if response.top_role:
-                embed.add_field(name="Top role", value=response.top_role)
-            embed.add_field(name="Account type", value="Bot" if response.bot else "User")
+                embed.add_field(name="最高位ロール", value=response.top_role)
+            embed.add_field(
+                name="アカウント種別",
+                value="BOT" if response.bot else "ユーザー",
+            )
             await interaction.response.send_message(embed=embed)
         except Exception as exc:
             await send_error(interaction, exc)
@@ -2631,7 +2666,7 @@ class DiscordActionCog(commands.Cog):
     def __init__(self, runtime: SimajilordRuntime) -> None:
         self.runtime = runtime
 
-    @app_commands.command(name="avatar", description="Show a Discord user's avatar.")
+    @app_commands.command(name="avatar", description="Discordユーザーのアイコンを表示します。")
     async def avatar(
         self,
         interaction: discord.Interaction,
@@ -2657,7 +2692,7 @@ class DiscordActionCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @app_commands.command(name="poll", description="Create a native Discord poll.")
+    @app_commands.command(name="poll", description="Discordの投票を作成します。")
     async def poll(
         self,
         interaction: discord.Interaction,
@@ -2668,7 +2703,7 @@ class DiscordActionCog(commands.Cog):
     ) -> None:
         try:
             if interaction.channel_id is None:
-                raise UserError("This command requires a text channel.")
+                raise UserError("テキストチャンネルで実行してください。")
             response = cast(
                 DiscordPollResponse,
                 await self.runtime.registry.invoke(
@@ -2685,9 +2720,9 @@ class DiscordActionCog(commands.Cog):
             )
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Poll created",
+                    "投票を作成しました",
                     description=(
-                        f"[Open poll](https://discord.com/channels/{interaction.guild_id}/"
+                        f"[投票を開く](https://discord.com/channels/{interaction.guild_id}/"
                         f"{response.channel_id}/{response.message_id})"
                     ),
                     tone=EmbedTone.SUCCESS,
@@ -2783,17 +2818,17 @@ def _agent_message_groups(content: str) -> tuple[str, ...]:
 
 def _agent_error_text(error: Exception) -> str:
     if isinstance(error, AgentBusyError):
-        return "Simajilord's bounded AI turn queue is full. Try again shortly."
+        return "AIへの依頼が混み合っています。少し待ってからもう一度お試しください。"
     if isinstance(error, AgentRateLimitError):
         if error.retry_after_seconds is not None:
             return (
-                "The local AI usage guard is cooling down. "
-                f"Try again in {_retry_after_text(error.retry_after_seconds)}."
+                "AIの利用間隔を調整しています。"
+                f"あと{_retry_after_text(error.retry_after_seconds)}ほどお待ちください。"
             )
-        return "The local AI usage guard is cooling down. Try again later."
+        return "AIの利用間隔を調整しています。時間を空けてもう一度お試しください。"
     if isinstance(error, AgentUnavailableError):
-        return "Simajilord's AI runtime is unavailable on this host."
-    return "Simajilord could not complete that AI turn."
+        return "現在、このホストではSimajilord AIを利用できません。"
+    return "AIの処理を完了できませんでした。"
 
 
 def _retry_after_text(total_seconds: int) -> str:
@@ -2802,24 +2837,24 @@ def _retry_after_text(total_seconds: int) -> str:
     minutes, seconds = divmod(remainder, 60)
     parts: list[str] = []
     if hours:
-        parts.append(f"{hours}h")
+        parts.append(f"{hours}時間")
     if minutes:
-        parts.append(f"{minutes}m")
+        parts.append(f"{minutes}分")
     if seconds or not parts:
-        parts.append(f"{seconds}s")
-    return " ".join(parts)
+        parts.append(f"{seconds}秒")
+    return "".join(parts)
 
 
 _AGENT_PROGRESS_MESSAGES = {
-    AgentProgressStage.QUEUED: "Waiting for the current AI turn to finish…",
-    AgentProgressStage.STARTING: "Understanding the request…",
-    AgentProgressStage.READING_DISCORD: "Checking the relevant Discord context…",
-    AgentProgressStage.SEARCHING_WEB: "Searching the web…",
-    AgentProgressStage.COMPUTING: "Running a bounded calculation…",
-    AgentProgressStage.ANALYZING_MEDIA: "Analyzing the attachment with HIVE…",
-    AgentProgressStage.GENERATING_IMAGE: "Preparing the local image generation job…",
-    AgentProgressStage.USING_AUDIO: "Preparing the server audio session…",
-    AgentProgressStage.PREPARING_RESPONSE: "Preparing the response…",
+    AgentProgressStage.QUEUED: "先に受け付けたAI処理が終わるのを待っています…",
+    AgentProgressStage.STARTING: "依頼内容を確認しています…",
+    AgentProgressStage.READING_DISCORD: "必要なDiscord上の会話を確認しています…",
+    AgentProgressStage.SEARCHING_WEB: "Webを検索しています…",
+    AgentProgressStage.COMPUTING: "計算を実行しています…",
+    AgentProgressStage.ANALYZING_MEDIA: "添付ファイルをHIVEで解析しています…",
+    AgentProgressStage.GENERATING_IMAGE: "ローカル画像生成の準備をしています…",
+    AgentProgressStage.USING_AUDIO: "サーバーの音声機能を準備しています…",
+    AgentProgressStage.PREPARING_RESPONSE: "回答をまとめています…",
 }
 
 
@@ -2909,7 +2944,7 @@ class _AgentProgressMessage:
                 return
             stage = self._latest
             embed = command_embed(
-                "Working",
+                "処理中",
                 description=_AGENT_PROGRESS_MESSAGES[stage],
                 tone=EmbedTone.INFO,
             )
@@ -3257,11 +3292,11 @@ class PrefixCog(commands.Cog):
         )
         await context.send(
             embed=command_embed(
-                "Platform health",
+                "稼働状況",
                 fields=(
-                    EmbedField("Status", response.status),
+                    EmbedField("状態", "正常" if response.status == "ok" else response.status),
                     EmbedField(
-                        "Discord latency",
+                        "Discord応答時間",
                         f"{response.transport_latency_ms:.1f} ms",
                     ),
                 ),
@@ -3281,13 +3316,14 @@ class PrefixCog(commands.Cog):
         )
         description = (
             "\n".join(
-                f"• `{item.name}` — {item.summary} (`{item.risk}`)"
+                f"• `{item.name}` — {item.summary} "
+                f"— 危険度: **{_risk_label(item.risk)}**"
                 for item in response.capabilities
             )
-            or "No matching capabilities were found."
+            or "条件に合う機能は見つかりませんでした。"
         )
         await context.send(
-            embed=command_embed("Capabilities", description=description)
+            embed=command_embed("利用できる機能", description=description)
         )
 
     @commands.command(name="search")
@@ -3306,7 +3342,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3343,7 +3379,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3371,7 +3407,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3407,7 +3443,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3463,7 +3499,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3489,7 +3525,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3512,7 +3548,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
@@ -3534,7 +3570,7 @@ class PrefixCog(commands.Cog):
             )
             await context.send(
                 embed=command_embed(
-                    "Audio control",
+                    "音楽を操作しました",
                     description=_AUDIO_ACTION_MESSAGES[response.action],
                     tone=EmbedTone.SUCCESS,
                 )
@@ -3542,7 +3578,7 @@ class PrefixCog(commands.Cog):
         except Exception as exc:
             await context.send(
                 embed=command_embed(
-                    "Command failed",
+                    "処理できませんでした",
                     description=error_message(exc),
                     tone=EmbedTone.ERROR,
                 )
