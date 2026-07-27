@@ -13,6 +13,7 @@ from simajilord.agent import (
     AGENT_IMAGE_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
+    AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
 )
 from simajilord.agent.providers import CodexAppServerProvider
@@ -176,6 +177,9 @@ class SimajilordRuntime:
                 "discord.read_messages",
                 "discord.send_message",
                 "discord.speak",
+                "discord.post_expanded_message",
+                "discord.view_custom_emoji",
+                "discord.view_sticker",
             ]
             required_grants: dict[str, str] = {
                 "audio.history": AGENT_AUDIO_GRANT,
@@ -186,6 +190,7 @@ class SimajilordRuntime:
                 "discord.manage_read_aloud": AGENT_AUDIO_GRANT,
                 "discord.speak": AGENT_AUDIO_GRANT,
                 "discord.send_message": AGENT_MESSAGE_GRANT,
+                "discord.post_expanded_message": AGENT_REPOST_GRANT,
             }
             if settings.hive_api_key is not None:
                 capability_name = "discord.analyze_attachment"
@@ -233,6 +238,7 @@ class SimajilordRuntime:
                 write_capabilities=(
                     (
                         "discord.send_message",
+                        "discord.post_expanded_message",
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                     )
                     + (
@@ -252,9 +258,12 @@ class SimajilordRuntime:
                     )
                 ),
                 image_output_capabilities=(
-                    ("discord.view_image_attachment",)
-                    if files is not None
-                    else ()
+                    ("discord.view_custom_emoji", "discord.view_sticker")
+                    + (
+                        ("discord.view_image_attachment",)
+                        if files is not None
+                        else ()
+                    )
                 ),
             )
             agent = AgentService(

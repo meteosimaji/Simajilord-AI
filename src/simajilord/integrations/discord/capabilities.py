@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import PurePath
-from typing import TypeAlias, cast
+from typing import Literal, TypeAlias, cast
+from urllib.parse import urlsplit
 
 import discord
+from PIL import Image, UnidentifiedImageError
 
 from simajilord.capabilities.audio import (
     AudioControlRequest,
@@ -43,6 +47,7 @@ from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import WorkspaceFileRecord
 
 from .audio import DiscordAudioOutput
+from .presenter import expanded_message_embeds, expanded_message_view
 
 DiscordMessageChannel: TypeAlias = (
     discord.TextChannel
@@ -50,6 +55,11 @@ DiscordMessageChannel: TypeAlias = (
     | discord.VoiceChannel
     | discord.StageChannel
 )
+_CUSTOM_EMOJI_PATTERN = re.compile(
+    r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>[0-9]{15,22})>"
+)
+_CUSTOM_EMOJI_PREVIEW_LIMIT = 25
+_CUSTOM_EMOJI_MEDIA_MAX_BYTES = 5_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +130,24 @@ class DiscordAttachmentRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordCustomEmojiRecord:
+    index: int
+    emoji_id: str
+    name: str
+    animated: bool
+    occurrences: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordStickerRecord:
+    index: int
+    sticker_id: str
+    name: str
+    format: str
+    animated: bool
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordMessageRecord:
     message_id: str
     channel_id: str
@@ -178,8 +206,144 @@ class DiscordGetMessageResponse:
     complete: bool
     created_at_iso: str
     attachments: tuple[DiscordAttachmentRecord, ...]
+    custom_emojis: tuple[DiscordCustomEmojiRecord, ...]
+    stickers: tuple[DiscordStickerRecord, ...]
     reference_message_id: str | None
     reply_context: tuple[DiscordReplyContextRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordMessageLink:
+    guild_id: str
+    channel_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandMessageRequest:
+    guild_id: str
+    channel_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandedAttachmentRecord:
+    filename: str
+    content_type: str | None
+    size_bytes: int
+    url: str
+    proxy_url: str
+    spoiler: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandedEmbedRecord:
+    title: str | None
+    description: str | None
+    url: str | None
+    image_url: str | None
+    thumbnail_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandedPollRecord:
+    question: str
+    answers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandMessageResponse:
+    guild_id: str
+    channel_id: str
+    channel_name: str
+    message_id: str
+    jump_url: str
+    author_id: str
+    author_name: str
+    author_avatar_url: str
+    author_is_bot: bool
+    content: str
+    created_at_iso: str
+    edited_at_iso: str | None
+    attachments: tuple[DiscordExpandedAttachmentRecord, ...]
+    embeds: tuple[DiscordExpandedEmbedRecord, ...]
+    sticker_names: tuple[str, ...]
+    poll: DiscordExpandedPollRecord | None
+    reply_author_name: str | None
+    reply_content_preview: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordPostExpandedMessageRequest:
+    source_guild_id: str
+    source_channel_id: str
+    source_message_id: str
+    destination_channel_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordPostExpandedMessageResponse:
+    message_id: str
+    channel_id: str
+    source_jump_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordViewCustomEmojiRequest:
+    channel_id: str
+    message_id: str
+    emoji_index: int = 0
+    mode: Literal["preview", "animation", "frame"] = "preview"
+    frame_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordViewCustomEmojiResponse:
+    emoji_index: int
+    emoji_id: str
+    name: str
+    animated: bool
+    occurrences: int
+    preview_kind: str
+    frame_index: int | None
+    frame_count: int
+    duration_ms: int | None
+    content_type: str
+    image_data_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordViewStickerRequest:
+    channel_id: str
+    message_id: str
+    sticker_index: int = 0
+    mode: Literal["preview", "animation", "frame"] = "preview"
+    frame_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordViewStickerResponse:
+    sticker_index: int
+    sticker_id: str
+    name: str
+    format: str
+    animated: bool
+    preview_kind: str
+    frame_index: int | None
+    frame_count: int
+    duration_ms: int | None
+    content_type: str
+    image_data_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscordAnimatedMedia:
+    content: bytes
+    content_type: str
+    preview_kind: str
+    frame_index: int | None
+    frame_count: int
+    duration_ms: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,12 +584,224 @@ def build_discord_endpoints(
             attachments=tuple(
                 _attachment_record(attachment) for attachment in message.attachments
             ),
+            custom_emojis=_custom_emoji_records(message.content),
+            stickers=_sticker_records(message.stickers),
             reference_message_id=(
                 str(message.reference.message_id)
                 if message.reference and message.reference.message_id
                 else None
             ),
             reply_context=reply_context,
+        )
+
+    async def expand_message(
+        request: DiscordExpandMessageRequest,
+        context: InvocationContext,
+    ) -> DiscordExpandMessageResponse:
+        guild = _guild(client, context)
+        if request.guild_id != str(guild.id):
+            raise UserError("discord.expand_cross_guild_forbidden")
+        channel, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        reply_author_name, reply_content_preview = _expanded_reply(message)
+        return DiscordExpandMessageResponse(
+            guild_id=str(guild.id),
+            channel_id=str(channel.id),
+            channel_name=channel.name,
+            message_id=str(message.id),
+            jump_url=message.jump_url,
+            author_id=str(message.author.id),
+            author_name=message.author.display_name,
+            author_avatar_url=str(message.author.display_avatar.url),
+            author_is_bot=message.author.bot,
+            content=message.content,
+            created_at_iso=message.created_at.isoformat(),
+            edited_at_iso=(
+                message.edited_at.isoformat() if message.edited_at is not None else None
+            ),
+            attachments=tuple(
+                _expanded_attachment(attachment)
+                for attachment in message.attachments[:10]
+            ),
+            embeds=tuple(_expanded_embed(item) for item in message.embeds[:10]),
+            sticker_names=tuple(sticker.name for sticker in message.stickers[:10]),
+            poll=_expanded_poll(message.poll),
+            reply_author_name=reply_author_name,
+            reply_content_preview=reply_content_preview,
+        )
+
+    async def post_expanded_message(
+        request: DiscordPostExpandedMessageRequest,
+        context: InvocationContext,
+    ) -> DiscordPostExpandedMessageResponse:
+        response = await expand_message(
+            DiscordExpandMessageRequest(
+                guild_id=request.source_guild_id,
+                channel_id=request.source_channel_id,
+                message_id=request.source_message_id,
+            ),
+            context,
+        )
+        guild = _guild(client, context)
+        destination = _message_channel(guild, request.destination_channel_id)
+        if context.transport == "agent":
+            _assert_agent_channel_scope(context, request.destination_channel_id)
+        else:
+            actor = _actor_member(guild, context)
+            if not _can_read_messages(
+                destination, actor
+            ) or not _can_read_private_thread(destination, actor):
+                raise UserError("discord.expand_destination_unavailable")
+        bot_member = guild.me
+        if bot_member is None or not _can_post_expanded_message(destination, bot_member):
+            raise UserError("discord.expand_destination_unavailable")
+        try:
+            posted = await destination.send(
+                embeds=expanded_message_embeds(response),
+                view=expanded_message_view(response.jump_url),
+                allowed_mentions=discord.AllowedMentions.none(),
+                silent=True,
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.expand_destination_unavailable") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.expand_failed") from exc
+        return DiscordPostExpandedMessageResponse(
+            message_id=str(posted.id),
+            channel_id=str(destination.id),
+            source_jump_url=response.jump_url,
+        )
+
+    async def view_custom_emoji(
+        request: DiscordViewCustomEmojiRequest,
+        context: InvocationContext,
+    ) -> DiscordViewCustomEmojiResponse:
+        guild = _guild(client, context)
+        _, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        custom_emojis = _custom_emoji_records(message.content)
+        if not 0 <= request.emoji_index < len(custom_emojis):
+            raise UserError("discord.custom_emoji_index_invalid")
+        selected = custom_emojis[request.emoji_index]
+        if request.frame_index < 0:
+            raise UserError("discord.custom_emoji_frame_invalid")
+        if request.mode == "animation" and not selected.animated:
+            raise UserError("discord.custom_emoji_not_animated")
+        if request.mode != "frame" and request.frame_index != 0:
+            raise UserError("discord.custom_emoji_frame_mode_required")
+        extension = (
+            "gif"
+            if selected.animated and request.mode in {"animation", "frame"}
+            else "png"
+        )
+        emoji_url = (
+            f"https://cdn.discordapp.com/emojis/{selected.emoji_id}.{extension}"
+            "?size=128&quality=lossless"
+        )
+        try:
+            content = await client.http.get_from_cdn(emoji_url)
+        except (discord.NotFound, discord.Forbidden) as exc:
+            raise UserError("discord.custom_emoji_unavailable") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.custom_emoji_failed") from exc
+        if not content or len(content) > _CUSTOM_EMOJI_MEDIA_MAX_BYTES:
+            raise UserError("discord.custom_emoji_invalid")
+        try:
+            media = await asyncio.to_thread(
+                _prepare_discord_animated_media,
+                content,
+                mode=request.mode,
+                frame_index=request.frame_index,
+            )
+        except ValueError as exc:
+            raise UserError(str(exc)) from exc
+        return DiscordViewCustomEmojiResponse(
+            emoji_index=selected.index,
+            emoji_id=selected.emoji_id,
+            name=selected.name,
+            animated=selected.animated,
+            occurrences=selected.occurrences,
+            preview_kind=media.preview_kind,
+            frame_index=media.frame_index,
+            frame_count=media.frame_count,
+            duration_ms=media.duration_ms,
+            content_type=media.content_type,
+            image_data_url=(
+                f"data:{media.content_type};base64,"
+                + base64.b64encode(media.content).decode("ascii")
+            ),
+        )
+
+    async def view_sticker(
+        request: DiscordViewStickerRequest,
+        context: InvocationContext,
+    ) -> DiscordViewStickerResponse:
+        guild = _guild(client, context)
+        _, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        if not 0 <= request.sticker_index < len(message.stickers):
+            raise UserError("discord.sticker_index_invalid")
+        selected = message.stickers[request.sticker_index]
+        if request.frame_index < 0:
+            raise UserError("discord.sticker_frame_invalid")
+        if request.mode != "frame" and request.frame_index != 0:
+            raise UserError("discord.sticker_frame_mode_required")
+        if request.mode == "animation" and selected.format is discord.StickerFormatType.png:
+            raise UserError("discord.sticker_not_animated")
+        if selected.format is discord.StickerFormatType.lottie:
+            if request.mode != "preview":
+                raise UserError("discord.sticker_lottie_animation_unavailable")
+            sticker_url = (
+                f"https://media.discordapp.net/stickers/{selected.id}.png"
+                "?size=160&quality=lossless"
+            )
+        else:
+            sticker_url = selected.url
+        try:
+            content = await client.http.get_from_cdn(str(sticker_url))
+        except (discord.NotFound, discord.Forbidden) as exc:
+            raise UserError("discord.sticker_unavailable") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.sticker_failed") from exc
+        if not content or len(content) > _CUSTOM_EMOJI_MEDIA_MAX_BYTES:
+            raise UserError("discord.sticker_invalid")
+        try:
+            media = await asyncio.to_thread(
+                _prepare_discord_animated_media,
+                content,
+                mode=request.mode,
+                frame_index=request.frame_index,
+            )
+        except ValueError as exc:
+            code = str(exc).replace("custom_emoji", "sticker")
+            raise UserError(code) from exc
+        return DiscordViewStickerResponse(
+            sticker_index=request.sticker_index,
+            sticker_id=str(selected.id),
+            name=selected.name,
+            format=selected.format.name,
+            animated=selected.format is not discord.StickerFormatType.png,
+            preview_kind=media.preview_kind,
+            frame_index=media.frame_index,
+            frame_count=media.frame_count,
+            duration_ms=media.duration_ms,
+            content_type=media.content_type,
+            image_data_url=(
+                f"data:{media.content_type};base64,"
+                + base64.b64encode(media.content).decode("ascii")
+            ),
         )
 
     async def analyze_attachment(
@@ -846,6 +1222,79 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
+                name="discord.expand_message",
+                summary=(
+                    "Discordメッセージリンクの内容を、閲覧権限を確認して引用表示用に取得します。"
+                ),
+                risk=RiskLevel.READ,
+                keywords=("discord", "message", "link", "quote", "expand"),
+            ),
+            DiscordExpandMessageRequest,
+            DiscordExpandMessageResponse,
+            expand_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.post_expanded_message",
+                summary=(
+                    "閲覧可能なDiscordメッセージを、出典とJumpリンクを保った引用として"
+                    "閲覧可能なチャンネルへ転載します。本文は変更できません。"
+                ),
+                risk=RiskLevel.WRITE,
+                keywords=("discord", "message", "quote", "repost", "expand", "jump"),
+                side_effects=(
+                    "指定したDiscordチャンネルへ、元メッセージの引用を1件投稿します。",
+                ),
+            ),
+            DiscordPostExpandedMessageRequest,
+            DiscordPostExpandedMessageResponse,
+            post_expanded_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.view_custom_emoji",
+                summary=(
+                    "指定したDiscordメッセージ内のカスタム絵文字を、必要な1件だけ"
+                    "画像として確認します。アニメーション全体や任意フレームも選べます。"
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "message",
+                    "emoji",
+                    "custom emoji",
+                    "animated emoji",
+                    "image",
+                ),
+            ),
+            DiscordViewCustomEmojiRequest,
+            DiscordViewCustomEmojiResponse,
+            view_custom_emoji,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.view_sticker",
+                summary=(
+                    "指定したDiscordメッセージのスタンプを、必要な1件だけ画像として"
+                    "確認します。対応形式ではアニメーション全体や任意フレームも返します。"
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "message",
+                    "sticker",
+                    "stamp",
+                    "animation",
+                    "frame",
+                    "image",
+                ),
+            ),
+            DiscordViewStickerRequest,
+            DiscordViewStickerResponse,
+            view_sticker,
+        ),
+        endpoint(
+            CapabilityDescriptor(
                 name="discord.analyze_attachment",
                 summary=(
                     "許可されたDiscordメッセージの添付ファイルを、バイト列や署名付きURLを"
@@ -1190,6 +1639,185 @@ def _attachment_record(attachment: discord.Attachment) -> DiscordAttachmentRecor
     )
 
 
+def _custom_emoji_records(content: str) -> tuple[DiscordCustomEmojiRecord, ...]:
+    """Return bounded, de-duplicated metadata in first-appearance order."""
+
+    ordered: list[tuple[str, str, bool]] = []
+    occurrence_counts: dict[str, int] = {}
+    for match in _CUSTOM_EMOJI_PATTERN.finditer(content):
+        emoji_id = match.group("id")
+        occurrence_counts[emoji_id] = occurrence_counts.get(emoji_id, 0) + 1
+        if occurrence_counts[emoji_id] == 1 and len(ordered) < _CUSTOM_EMOJI_PREVIEW_LIMIT:
+            ordered.append(
+                (
+                    emoji_id,
+                    match.group("name"),
+                    match.group("animated") == "a",
+                )
+            )
+    return tuple(
+        DiscordCustomEmojiRecord(
+            index=index,
+            emoji_id=emoji_id,
+            name=name,
+            animated=animated,
+            occurrences=occurrence_counts[emoji_id],
+        )
+        for index, (emoji_id, name, animated) in enumerate(ordered)
+    )
+
+
+def _sticker_records(
+    stickers: list[discord.StickerItem],
+) -> tuple[DiscordStickerRecord, ...]:
+    return tuple(
+        DiscordStickerRecord(
+            index=index,
+            sticker_id=str(sticker.id),
+            name=sticker.name,
+            format=sticker.format.name,
+            animated=sticker.format is not discord.StickerFormatType.png,
+        )
+        for index, sticker in enumerate(stickers[:10])
+    )
+
+
+def _prepare_discord_animated_media(
+    content: bytes,
+    *,
+    mode: Literal["preview", "animation", "frame"],
+    frame_index: int,
+) -> _DiscordAnimatedMedia:
+    """Validate model media and optionally extract an exact animation frame."""
+
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image_format = image.format
+            frame_count = getattr(image, "n_frames", 1)
+            durations: list[int] = []
+            for index in range(frame_count):
+                image.seek(index)
+                raw_duration = image.info.get("duration")
+                durations.append(
+                    int(raw_duration)
+                    if isinstance(raw_duration, (int, float))
+                    else 0
+                )
+            duration_ms = sum(durations) or None
+            if mode == "animation":
+                if image_format == "GIF":
+                    content_type = "image/gif"
+                elif image_format == "PNG" and frame_count > 1:
+                    content_type = "image/apng"
+                else:
+                    raise ValueError("discord.custom_emoji_invalid")
+                return _DiscordAnimatedMedia(
+                    content=content,
+                    content_type=content_type,
+                    preview_kind="full_animation",
+                    frame_index=None,
+                    frame_count=frame_count,
+                    duration_ms=duration_ms,
+                )
+            selected_frame = frame_index if mode == "frame" else 0
+            if selected_frame >= frame_count:
+                raise ValueError("discord.custom_emoji_frame_invalid")
+            image.seek(selected_frame)
+            output = io.BytesIO()
+            image.convert("RGBA").save(output, format="PNG", optimize=True)
+            return _DiscordAnimatedMedia(
+                content=output.getvalue(),
+                content_type="image/png",
+                preview_kind=(
+                    "selected_animation_frame"
+                    if mode == "frame"
+                    else "representative_static_frame"
+                ),
+                frame_index=selected_frame,
+                frame_count=frame_count,
+                duration_ms=duration_ms,
+            )
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("discord.custom_emoji_invalid") from exc
+
+
+def parse_discord_message_link(content: str) -> DiscordMessageLink | None:
+    """Parse one bare Discord message link; angle brackets are an explicit opt-out."""
+
+    value = content.strip()
+    if not value or value.startswith("<") or value.endswith(">"):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or (parsed.hostname or "").lower()
+        not in {"discord.com", "ptb.discord.com", "canary.discord.com"}
+    ):
+        return None
+    path = parsed.path.rstrip("/").split("/")
+    if len(path) != 5 or path[1] != "channels":
+        return None
+    guild_id, channel_id, message_id = path[2:]
+    if not all(value.isdigit() and int(value) > 0 for value in path[2:]):
+        return None
+    return DiscordMessageLink(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=message_id,
+    )
+
+
+def _expanded_attachment(
+    attachment: discord.Attachment,
+) -> DiscordExpandedAttachmentRecord:
+    return DiscordExpandedAttachmentRecord(
+        filename=attachment.filename,
+        content_type=attachment.content_type,
+        size_bytes=attachment.size,
+        url=attachment.url,
+        proxy_url=attachment.proxy_url,
+        spoiler=attachment.is_spoiler(),
+    )
+
+
+def _expanded_embed(item: discord.Embed) -> DiscordExpandedEmbedRecord:
+    return DiscordExpandedEmbedRecord(
+        title=item.title,
+        description=item.description,
+        url=item.url,
+        image_url=item.image.url if item.image.url else None,
+        thumbnail_url=item.thumbnail.url if item.thumbnail.url else None,
+    )
+
+
+def _expanded_poll(poll: discord.Poll | None) -> DiscordExpandedPollRecord | None:
+    if poll is None:
+        return None
+    return DiscordExpandedPollRecord(
+        question=poll.question,
+        answers=tuple(answer.text for answer in poll.answers),
+    )
+
+
+def _expanded_reply(message: discord.Message) -> tuple[str | None, str | None]:
+    referenced = message.reference.resolved if message.reference is not None else None
+    if not isinstance(referenced, discord.Message):
+        return None, None
+    content = referenced.content.strip()
+    if not content and referenced.attachments:
+        content = "添付ファイル"
+    return referenced.author.display_name, content[:300] or None
+
+
 async def _attachment(
     client: discord.Client,
     context: InvocationContext,
@@ -1366,3 +1994,70 @@ def _can_read_messages(
     if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         return can_read and permissions.connect
     return can_read
+
+
+async def _fetch_readable_message(
+    guild: discord.Guild,
+    *,
+    channel_id: str,
+    message_id: str,
+    context: InvocationContext,
+) -> tuple[DiscordMessageChannel, discord.Message]:
+    """Fetch one exact message after actor, bot, thread, and voice checks."""
+
+    channel = _message_channel(guild, channel_id)
+    bot_member = guild.me
+    if bot_member is None:
+        raise UserError("discord.expand_unavailable")
+    if context.transport == "agent":
+        _assert_agent_channel_scope(context, channel_id)
+    else:
+        actor = _actor_member(guild, context)
+        if not _can_read_messages(channel, actor) or not _can_read_private_thread(
+            channel, actor
+        ):
+            raise UserError("discord.expand_unavailable")
+    if not _can_read_messages(channel, bot_member) or not _can_read_private_thread(
+        channel, bot_member
+    ):
+        raise UserError("discord.expand_unavailable")
+    try:
+        message = await channel.fetch_message(_snowflake(message_id, "message"))
+    except (discord.NotFound, discord.Forbidden) as exc:
+        raise UserError("discord.expand_unavailable") from exc
+    except discord.DiscordException as exc:
+        raise UserError("discord.expand_failed") from exc
+    return channel, message
+
+
+def _can_read_private_thread(
+    channel: DiscordMessageChannel,
+    member: discord.Member,
+) -> bool:
+    if (
+        not isinstance(channel, discord.Thread)
+        or channel.type is not discord.ChannelType.private_thread
+    ):
+        return True
+    permissions = channel.permissions_for(member)
+    if permissions.administrator or permissions.manage_threads:
+        return True
+    return any(thread_member.id == member.id for thread_member in channel.members)
+
+
+def _can_post_expanded_message(
+    channel: DiscordMessageChannel,
+    member: discord.Member,
+) -> bool:
+    permissions = channel.permissions_for(member)
+    can_send = (
+        permissions.send_messages_in_threads
+        if isinstance(channel, discord.Thread)
+        else permissions.send_messages
+    )
+    can_connect = (
+        permissions.connect
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        else True
+    )
+    return permissions.view_channel and can_send and permissions.embed_links and can_connect

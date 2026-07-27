@@ -14,6 +14,7 @@ AGENT_FILE_GRANT = "files"
 AGENT_IMAGE_GRANT = "image"
 AGENT_MESSAGE_GRANT = "discord_message"
 AGENT_MODERATION_GRANT = "moderation"
+AGENT_REPOST_GRANT = "discord_repost"
 AGENT_WEB_GRANT = "web"
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",

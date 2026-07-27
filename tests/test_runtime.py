@@ -102,6 +102,15 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         assert "discord.speak" in output.text
         assert '"name":"audio.play"' not in output.text
         assert '"name":"speech.speak"' not in output.text
+        media_output = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "Discord custom emoji sticker animation frame", "limit": 5},
+            context=autonomous_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.view_custom_emoji" in media_output.text
+        assert "discord.view_sticker" in media_output.text
         assert provider.tools.dynamic_specs(requested_context)
         await runtime.close()
 

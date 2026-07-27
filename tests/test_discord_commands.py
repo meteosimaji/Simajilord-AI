@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from typing import cast
 from unittest.mock import AsyncMock, Mock
 
@@ -7,6 +8,7 @@ import discord
 import pytest
 from discord import app_commands
 from discord.ext import commands
+from PIL import Image
 
 from simajilord.agent import (
     AGENT_AUDIO_GRANT,
@@ -14,6 +16,7 @@ from simajilord.agent import (
     AGENT_IMAGE_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
+    AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
     AgentRateLimitError,
 )
@@ -35,13 +38,21 @@ from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
+    DiscordViewCustomEmojiRequest,
+    DiscordViewCustomEmojiResponse,
+    DiscordViewStickerRequest,
+    DiscordViewStickerResponse,
     _assert_agent_channel_scope,
     _assert_agent_update_scope,
     _bounded_event_message,
+    _can_post_expanded_message,
+    _custom_emoji_records,
     _discord_event_message_id,
     _message_preview,
+    _prepare_discord_animated_media,
     agent_readable_channel_ids,
     build_discord_endpoints,
+    parse_discord_message_link,
 )
 from simajilord.integrations.discord.cogs import (
     ModerationCog,
@@ -80,6 +91,7 @@ def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
         AGENT_AUDIO_GRANT,
         AGENT_WEB_GRANT,
         AGENT_MODERATION_GRANT,
+        AGENT_REPOST_GRANT,
     } <= autonomous
     assert {
         AGENT_MESSAGE_GRANT,
@@ -711,6 +723,254 @@ def test_message_index_preview_uses_full_short_or_25_plus_5() -> None:
     assert truncated is True
 
 
+def test_discord_message_link_parser_accepts_only_one_bare_safe_link() -> None:
+    expected = ("1415260807494766627", "1415260808103067670", "1531170172465971200")
+    for host in ("discord.com", "ptb.discord.com", "canary.discord.com"):
+        parsed = parse_discord_message_link(
+            f"https://{host}/channels/{expected[0]}/{expected[1]}/{expected[2]}/"
+        )
+        assert parsed is not None
+        assert (parsed.guild_id, parsed.channel_id, parsed.message_id) == expected
+
+    rejected = (
+        f"text https://discord.com/channels/{expected[0]}/{expected[1]}/{expected[2]}",
+        f"<https://discord.com/channels/{expected[0]}/{expected[1]}/{expected[2]}>",
+        f"http://discord.com/channels/{expected[0]}/{expected[1]}/{expected[2]}",
+        f"https://discord.com.evil.test/channels/{expected[0]}/{expected[1]}/{expected[2]}",
+        f"https://discord.com:bad/channels/{expected[0]}/{expected[1]}/{expected[2]}",
+        f"https://discord.com/channels/{expected[0]}/{expected[1]}/{expected[2]}?x=1",
+        f"https://discord.com/channels/@me/{expected[1]}/{expected[2]}",
+    )
+    assert all(parse_discord_message_link(value) is None for value in rejected)
+
+
+def test_custom_emoji_metadata_is_deduplicated_and_keeps_animation() -> None:
+    content = (
+        "a <:wave:111111111111111111> "
+        "<a:dance:222222222222222222> "
+        "<:wave_again:111111111111111111>"
+    )
+    records = _custom_emoji_records(content)
+    assert [(item.index, item.emoji_id, item.name) for item in records] == [
+        (0, "111111111111111111", "wave"),
+        (1, "222222222222222222", "dance"),
+    ]
+    assert records[0].occurrences == 2
+    assert records[0].animated is False
+    assert records[1].occurrences == 1
+    assert records[1].animated is True
+
+
+def test_custom_emoji_metadata_is_bounded_to_25_unique_images() -> None:
+    content = " ".join(
+        f"<:e{index:02d}:{100000000000000000 + index}>"
+        for index in range(30)
+    )
+    records = _custom_emoji_records(content)
+    assert len(records) == 25
+    assert records[0].index == 0
+    assert records[-1].index == 24
+
+
+def test_animated_media_can_return_full_gif_or_an_exact_frame() -> None:
+    frames = tuple(
+        Image.new("RGBA", (4, 4), colour)
+        for colour in ("red", "green", "blue")
+    )
+    source = io.BytesIO()
+    frames[0].save(
+        source,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=(40, 50, 60),
+        loop=0,
+    )
+    content = source.getvalue()
+
+    animation = _prepare_discord_animated_media(
+        content,
+        mode="animation",
+        frame_index=0,
+    )
+    assert animation.content == content
+    assert animation.content_type == "image/gif"
+    assert animation.frame_count == 3
+    assert animation.duration_ms == 150
+
+    second = _prepare_discord_animated_media(
+        content,
+        mode="frame",
+        frame_index=1,
+    )
+    assert second.content_type == "image/png"
+    assert second.preview_kind == "selected_animation_frame"
+    assert second.frame_index == 1
+    assert second.frame_count == 3
+    with Image.open(io.BytesIO(second.content)) as image:
+        red, green, blue, _ = image.convert("RGBA").getpixel((0, 0))
+    assert green > red
+    assert green > blue
+
+    with pytest.raises(ValueError, match=r"discord\.custom_emoji_frame_invalid"):
+        _prepare_discord_animated_media(content, mode="frame", frame_index=3)
+
+
+def test_animated_media_preserves_apng_when_full_animation_is_requested() -> None:
+    frames = (
+        Image.new("RGBA", (4, 4), "red"),
+        Image.new("RGBA", (4, 4), "blue"),
+    )
+    source = io.BytesIO()
+    frames[0].save(
+        source,
+        format="PNG",
+        save_all=True,
+        append_images=frames[1:],
+        duration=(100, 120),
+        loop=0,
+    )
+    animation = _prepare_discord_animated_media(
+        source.getvalue(),
+        mode="animation",
+        frame_index=0,
+    )
+    assert animation.content_type == "image/apng"
+    assert animation.frame_count == 2
+    assert animation.duration_ms == 220
+
+
+@pytest.mark.asyncio
+async def test_custom_emoji_tool_fetches_only_selected_message_emoji(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = io.BytesIO()
+    Image.new("RGBA", (4, 4), "purple").save(image, format="PNG")
+    client = Mock(spec=discord.Client)
+    client.http = Mock()
+    client.http.get_from_cdn = AsyncMock(return_value=image.getvalue())
+    guild = Mock(spec=discord.Guild)
+    message = Mock(spec=discord.Message)
+    message.content = (
+        "<:first:111111111111111111> <:second:222222222222222222>"
+    )
+    message.stickers = []
+    channel = Mock(spec=discord.TextChannel)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda selected_client, context: guild,
+    )
+    fetch = AsyncMock(return_value=(channel, message))
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._fetch_readable_message",
+        fetch,
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(client, Mock(spec=SimajilordRuntime))
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+        resource_ids=("10",),
+    )
+
+    response = cast(
+        DiscordViewCustomEmojiResponse,
+        await endpoints["discord.view_custom_emoji"].invoke(
+            DiscordViewCustomEmojiRequest(
+                channel_id="10",
+                message_id="20",
+                emoji_index=1,
+            ),
+            context,
+        ),
+    )
+
+    assert response.emoji_id == "222222222222222222"
+    assert response.name == "second"
+    assert response.content_type == "image/png"
+    assert response.frame_count == 1
+    assert response.image_data_url.startswith("data:image/png;base64,")
+    client.http.get_from_cdn.assert_awaited_once_with(
+        "https://cdn.discordapp.com/emojis/222222222222222222.png"
+        "?size=128&quality=lossless"
+    )
+    fetch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sticker_tool_returns_full_gif_without_flattening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = (
+        Image.new("RGBA", (4, 4), "red"),
+        Image.new("RGBA", (4, 4), "blue"),
+    )
+    source = io.BytesIO()
+    frames[0].save(
+        source,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=(70, 80),
+        loop=0,
+    )
+    client = Mock(spec=discord.Client)
+    client.http = Mock()
+    client.http.get_from_cdn = AsyncMock(return_value=source.getvalue())
+    guild = Mock(spec=discord.Guild)
+    sticker = Mock(spec=discord.StickerItem)
+    sticker.id = 333333333333333333
+    sticker.name = "dance"
+    sticker.format = discord.StickerFormatType.gif
+    sticker.url = "https://media.discordapp.net/stickers/333333333333333333.gif"
+    message = Mock(spec=discord.Message)
+    message.content = ""
+    message.stickers = [sticker]
+    channel = Mock(spec=discord.TextChannel)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda selected_client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._fetch_readable_message",
+        AsyncMock(return_value=(channel, message)),
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(client, Mock(spec=SimajilordRuntime))
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+        resource_ids=("10",),
+    )
+
+    response = cast(
+        DiscordViewStickerResponse,
+        await endpoints["discord.view_sticker"].invoke(
+            DiscordViewStickerRequest(
+                channel_id="10",
+                message_id="20",
+                mode="animation",
+            ),
+            context,
+        ),
+    )
+
+    assert response.name == "dance"
+    assert response.animated is True
+    assert response.content_type == "image/gif"
+    assert response.frame_count == 2
+    assert response.duration_ms == 150
+    assert response.image_data_url.startswith("data:image/gif;base64,")
+
+
 def test_trigger_message_is_bounded_but_not_head_tail_summarized() -> None:
     content = "x" * 1_500
     preview, truncated = _bounded_event_message(content)
@@ -862,6 +1122,25 @@ def test_voice_chat_requires_message_history_and_connect_permission() -> None:
         trusted_guild=False,
         trigger_channel_id=30,
     ) == ()
+
+
+def test_expanded_message_post_to_voice_chat_requires_connect() -> None:
+    member = Mock(spec=discord.Member)
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        connect=False,
+    )
+    assert _can_post_expanded_message(voice, member) is False
+    voice.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        connect=True,
+    )
+    assert _can_post_expanded_message(voice, member) is True
 
 
 def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:

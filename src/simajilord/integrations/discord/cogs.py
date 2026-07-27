@@ -27,6 +27,7 @@ from simajilord.agent import (
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_NO_ACTION_CONTENT,
+    AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
     AgentBusyError,
     AgentProgressStage,
@@ -99,13 +100,20 @@ from .capabilities import (
     DiscordConnectVoiceRequest,
     DiscordPollRequest,
     DiscordPollResponse,
+    DiscordPostExpandedMessageRequest,
+    DiscordPostExpandedMessageResponse,
     DiscordServerRequest,
     DiscordServerResponse,
     DiscordUserRequest,
     DiscordUserResponse,
     agent_readable_channel_ids,
+    parse_discord_message_link,
 )
-from .presenter import EmbedField, EmbedTone, command_embed
+from .presenter import (
+    EmbedField,
+    EmbedTone,
+    command_embed,
+)
 
 log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
@@ -155,6 +163,19 @@ _ERROR_MESSAGES = {
         "メッセージの取得文字数は1〜1000文字で指定してください。"
     ),
     "discord.message_offset_invalid": "有効なメッセージ開始位置を指定してください。",
+    "discord.expand_cross_guild_forbidden": (
+        "別のサーバーにあるメッセージは展開できません。"
+    ),
+    "discord.expand_unavailable": (
+        "このメッセージは展開できません。リンク先を閲覧できるか確認してください。"
+    ),
+    "discord.expand_destination_unavailable": (
+        "このチャンネルへ展開結果を投稿できません。"
+        "BOTのメッセージ送信・埋め込みリンク権限を確認してください。"
+    ),
+    "discord.expand_failed": (
+        "Discordから元のメッセージを取得できませんでした。時間を空けて試してください。"
+    ),
     "discord.manage_guild_required": (
         "読み上げは別のボイスチャンネルに設定されています。"
         "移動するには、サーバー管理者が `/readaloud setup` を実行してください。"
@@ -1017,6 +1038,16 @@ def prefix_context(context: BotContext) -> InvocationContext:
         transport="discord",
         request_id=str(context.message.id),
         origin_resource_id=str(context.channel.id),
+    )
+
+
+def message_context(message: discord.Message) -> InvocationContext:
+    return InvocationContext(
+        actor_id=str(message.author.id),
+        workspace_id=str(message.guild.id) if message.guild is not None else None,
+        transport="discord",
+        request_id=str(message.id),
+        origin_resource_id=str(message.channel.id),
     )
 
 
@@ -2733,6 +2764,69 @@ class DiscordActionCog(commands.Cog):
             await send_error(interaction, exc)
 
 
+class MessageExpandCog(commands.Cog):
+    """Expand one bare Discord message link with least-privilege checks."""
+
+    def __init__(self, runtime: SimajilordRuntime) -> None:
+        self.runtime = runtime
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if (
+            message.guild is None
+            or message.author.bot
+            or message.webhook_id is not None
+        ):
+            return
+        link = parse_discord_message_link(message.content)
+        if link is None:
+            return
+        try:
+            cast(
+                DiscordPostExpandedMessageResponse,
+                await self.runtime.registry.invoke(
+                    "discord.post_expanded_message",
+                    DiscordPostExpandedMessageRequest(
+                        source_guild_id=link.guild_id,
+                        source_channel_id=link.channel_id,
+                        source_message_id=link.message_id,
+                        destination_channel_id=str(message.channel.id),
+                    ),
+                    message_context(message),
+                ),
+            )
+            try:
+                await message.delete()
+            except discord.DiscordException:
+                log.info(
+                    "Expanded link retained because the source post could not be deleted "
+                    "guild=%s channel=%s message=%s",
+                    message.guild.id,
+                    message.channel.id,
+                    message.id,
+                )
+        except UserError as exc:
+            await message.reply(
+                embed=command_embed(
+                    "メッセージを展開できません",
+                    description=error_message(exc),
+                    tone=EmbedTone.WARNING,
+                ),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+                silent=True,
+            )
+        except discord.DiscordException:
+            log.exception(
+                "Could not publish expanded Discord message guild=%s channel=%s "
+                "message=%s source_message=%s",
+                message.guild.id,
+                message.channel.id,
+                message.id,
+                link.message_id,
+            )
+
+
 def discord_conversation_id(
     *,
     guild_id: int | None,
@@ -2756,7 +2850,7 @@ def _agent_grants(
     autonomous: bool = False,
 ) -> frozenset[str]:
     settings = runtime.settings
-    grants: set[str] = {AGENT_AUDIO_GRANT}
+    grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_REPOST_GRANT}
     if not autonomous:
         grants.add(AGENT_MESSAGE_GRANT)
     if (
@@ -3617,6 +3711,7 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     await bot.add_cog(UtilityCog(runtime))
     await bot.add_cog(DiscordInfoCog(runtime))
     await bot.add_cog(DiscordActionCog(runtime))
+    await bot.add_cog(MessageExpandCog(runtime))
     await bot.add_cog(AgentCog(bot, runtime))
     await bot.add_cog(ObservationCog(bot, runtime))
     await bot.add_cog(AgentAutonomyCog(bot, runtime))

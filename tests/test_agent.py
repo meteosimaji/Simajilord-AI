@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -60,6 +61,16 @@ class WriteRequest:
 @dataclass(frozen=True, slots=True)
 class WriteResponse:
     job_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class LiteralRequest:
+    mode: Literal["preview", "animation", "frame"] = "preview"
+
+
+@dataclass(frozen=True, slots=True)
+class LiteralResponse:
+    mode: str
 
 
 class FakeProvider:
@@ -509,6 +520,55 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
         max_output_characters=1_000,
     )
     assert '"content":"bc"' in output
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_catalog_validates_literal_choices() -> None:
+    registry = CapabilityRegistry()
+
+    async def select(
+        request: LiteralRequest,
+        _: InvocationContext,
+    ) -> LiteralResponse:
+        return LiteralResponse(mode=request.mode)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "test.select",
+                "Select one test mode.",
+                RiskLevel.READ,
+            ),
+            LiteralRequest,
+            LiteralResponse,
+            select,
+        )
+    )
+    catalog = AgentToolCatalog(registry, ("test.select",))
+    tools = catalog.dynamic_specs()[0]["tools"]
+    assert isinstance(tools, list)
+    schema = tools[0]["inputSchema"]
+    assert schema["properties"]["mode"] == {
+        "type": "string",
+        "enum": ["preview", "animation", "frame"],
+    }
+    context = InvocationContext("actor", "workspace", "agent", "request")
+    result = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="test_select",
+        arguments={"mode": "frame"},
+        context=context,
+        max_output_characters=1_000,
+    )
+    assert '"mode":"frame"' in result
+    with pytest.raises(AgentToolError, match="arguments are invalid"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="test_select",
+            arguments={"mode": "unknown"},
+            context=context,
+            max_output_characters=1_000,
+        )
 
 
 @pytest.mark.asyncio

@@ -34,8 +34,8 @@ local agent / human commands / future transports
 Conversation text is not hard-coded into capabilities. Only the Discord presenter owns fixed
 operational feedback such as command success, validation, and permission errors. The agent
 generates conversational text and chooses `discord.send_message` separately.
-Explicit human commands use compact English embeds with useful result fields and a Discord
-timestamp; implementation labels and decorative footer text are intentionally omitted.
+Explicit human commands use compact, natural Japanese embeds with useful result fields and a
+Discord timestamp; implementation labels and decorative footer text are intentionally omitted.
 
 ## Current Discord capabilities
 
@@ -63,6 +63,12 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - Native polls, dice, and bounded random choice
 - Bounded Discord channel listing, reply-chain retrieval, and message-history reads—including
   voice-channel chat—for the agent without injecting entire messages into its initial context
+- A bare Discord message link expands in place only after actor and BOT permission checks;
+  the replacement preserves a Jump link and the original link post is deleted only after the
+  replacement succeeds
+- Custom emoji and sticker metadata stays text-only by default. The agent can request one
+  selected asset as a preview, full GIF/APNG animation, or exact animation frame only when
+  visual inspection is actually needed
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
 - Plain message sending and voice connection as independently invokable Discord APIs
@@ -73,8 +79,9 @@ timestamp; implementation labels and decorative footer text are intentionally om
 - A bounded FIFO AI-turn queue with durable conversation IDs, context-budget rotation,
   exact-message verification, progressive status updates, and corrective retries after
   failed writes
-- Autonomous turns retain bounded audio inspection but receive no audio-write approval,
-  Discord-message write scope, image-generation scope, or file-write scope
+- Autonomous turns retain bounded audio inspection and a provenance-locked message-repost API,
+  but receive no arbitrary Discord-message write scope, audio-write approval,
+  image-generation scope, or file-write scope
 - Structured, append-only local command/capability/message events in SQLite
 
 One independent audio session is created per Discord server. Different servers may use voice

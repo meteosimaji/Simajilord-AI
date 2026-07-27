@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Union, cast, get_args, get_origin, get_type_hints
+from typing import Any, Literal, Union, cast, get_args, get_origin, get_type_hints
 
 from simajilord.core import ApprovalMode, CapabilityRegistry, InvocationContext, RiskLevel
 
@@ -443,6 +443,12 @@ def _dataclass_schema(model: type[Any]) -> Mapping[str, object]:
 def _annotation_schema(annotation: object) -> Mapping[str, object]:
     origin = get_origin(annotation)
     arguments = get_args(annotation)
+    if origin is Literal:
+        if not arguments or not all(isinstance(item, str) for item in arguments):
+            raise AgentToolError(
+                f"Unsupported dynamic tool literal annotation: {annotation!r}"
+            )
+        return {"type": "string", "enum": list(arguments)}
     if origin in (Union, types.UnionType):
         non_none = tuple(item for item in arguments if item is not type(None))
         if len(non_none) == 1 and len(non_none) != len(arguments):
@@ -480,9 +486,9 @@ def _build_dataclass(model: type[Any], arguments: object) -> object:
         raise AgentToolError(f"Unknown dynamic tool fields: {', '.join(sorted(unknown))}")
     hints = get_type_hints(model)
     values: dict[str, object] = {}
-    for field_name, value in arguments.items():
-        values[field_name] = _convert_value(value, hints.get(field_name, Any))
     try:
+        for field_name, value in arguments.items():
+            values[field_name] = _convert_value(value, hints.get(field_name, Any))
         return model(**values)
     except (TypeError, ValueError) as exc:
         raise AgentToolError("Dynamic tool arguments are invalid.") from exc
@@ -491,6 +497,10 @@ def _build_dataclass(model: type[Any], arguments: object) -> object:
 def _convert_value(value: object, annotation: object) -> object:
     origin = get_origin(annotation)
     arguments = get_args(annotation)
+    if origin is Literal:
+        if value not in arguments:
+            raise ValueError("Value is not one of the allowed literal values.")
+        return value
     if origin in (Union, types.UnionType):
         if value is None and type(None) in arguments:
             return None

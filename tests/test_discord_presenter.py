@@ -24,6 +24,10 @@ from simajilord.domain.image import (
 from simajilord.domain.moderation import SyntheticMediaModality, SyntheticMediaVerdict
 from simajilord.domain.web import WebSource
 from simajilord.integrations.discord.bot import _image_result_embed
+from simajilord.integrations.discord.capabilities import (
+    DiscordExpandedAttachmentRecord,
+    DiscordExpandMessageResponse,
+)
 from simajilord.integrations.discord.cogs import (
     music_added_embed,
     music_history_embed,
@@ -37,6 +41,8 @@ from simajilord.integrations.discord.presenter import (
     EmbedField,
     EmbedTone,
     command_embed,
+    expanded_message_embeds,
+    expanded_message_view,
 )
 
 
@@ -51,6 +57,48 @@ def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
     assert embed.footer.text is None
     assert embed.fields[0].name == "Status"
     assert embed.fields[0].value == "ok"
+
+
+def test_expanded_message_keeps_jump_and_bounds_visible_images() -> None:
+    response = DiscordExpandMessageResponse(
+        guild_id="1",
+        channel_id="2",
+        channel_name="general",
+        message_id="3",
+        jump_url="https://discord.com/channels/1/2/3",
+        author_id="4",
+        author_name="Alice",
+        author_avatar_url="https://cdn.example.com/avatar.png",
+        author_is_bot=False,
+        content="hello",
+        created_at_iso="2026-07-27T00:00:00+00:00",
+        edited_at_iso=None,
+        attachments=tuple(
+            DiscordExpandedAttachmentRecord(
+                filename=f"{index}.png",
+                content_type="image/png",
+                size_bytes=100,
+                url=f"https://cdn.example.com/{index}.png",
+                proxy_url=f"https://proxy.example.com/{index}.png",
+                spoiler=False,
+            )
+            for index in range(6)
+        ),
+        embeds=(),
+        sticker_names=(),
+        poll=None,
+        reply_author_name=None,
+        reply_content_preview=None,
+    )
+    embeds = expanded_message_embeds(response)
+    view = expanded_message_view(response.jump_url)
+    assert len(embeds) == 4
+    assert embeds[0].title == "元のメッセージへ"
+    assert embeds[0].url == response.jump_url
+    assert embeds[0].image.url == "https://proxy.example.com/0.png"
+    button = view.children[0]
+    assert getattr(button, "label", None) == "Jump"
+    assert getattr(button, "url", None) == response.jump_url
 
 
 def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
