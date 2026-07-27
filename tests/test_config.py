@@ -36,6 +36,8 @@ _AGENT_ENVIRONMENT_NAMES = (
     "VOICEVOX_AUTO_START",
     "VOICEVOX_TIMEOUT_SECONDS",
     "READ_ALOUD_CHUNK_CHARACTERS",
+    "MAX_PENDING_MUSIC",
+    "MAX_PENDING_MUSIC_PER_USER",
 )
 
 
@@ -80,6 +82,8 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.hive_daily_limit == 100
     assert settings.hive_threshold == 0.9
     assert settings.read_aloud_chunk_characters == 400
+    assert settings.max_pending_music == 100
+    assert settings.max_pending_music_per_user == 20
 
 
 def test_hive_secret_is_hidden_and_daily_limit_cannot_exceed_plan(

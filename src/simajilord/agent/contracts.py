@@ -17,9 +17,25 @@ AGENT_MODERATION_GRANT = "moderation"
 AGENT_QUOTE_GRANT = "discord_quote"
 AGENT_REPOST_GRANT = "discord_repost"
 AGENT_WEB_GRANT = "web"
+AGENT_AUDIO_CONTROL_CAPABILITIES = (
+    "discord.pause_audio",
+    "discord.resume_audio",
+    "discord.skip_audio",
+    "discord.stop_audio",
+    "discord.leave_audio",
+    "discord.set_audio_loop",
+    "discord.remove_audio",
+    "discord.set_audio_auto_leave",
+    "discord.shuffle_audio",
+    "discord.seek_audio",
+    "discord.tune_audio",
+    "discord.set_audio_volume",
+    "discord.move_audio",
+    "discord.clear_my_audio",
+)
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",
-    "discord.control_audio",
+    *AGENT_AUDIO_CONTROL_CAPABILITIES,
     "discord.read_aloud_add_sources",
     "discord.read_aloud_remove_source",
     "discord.read_aloud_disable",

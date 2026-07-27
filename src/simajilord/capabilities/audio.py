@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 from simajilord.core.capabilities import (
+    ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
     InvocationContext,
@@ -33,6 +36,9 @@ class AudioAction(StrEnum):
     SHUFFLE = "shuffle"
     SEEK = "seek"
     TUNE = "tune"
+    VOLUME = "volume"
+    MOVE = "move"
+    CLEAR_MINE = "clear_mine"
 
 
 class AudioSearchReason(StrEnum):
@@ -116,6 +122,8 @@ class AudioQueueResponse:
     speed: float
     pitch: float
     waiting_for_voice: bool
+    music_volume_percent: int = 100
+    speech_volume_percent: int = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +154,9 @@ class AudioControlRequest:
     position_seconds: float | None = None
     speed: float | None = None
     pitch: float | None = None
+    music_percent: int | None = None
+    speech_percent: int | None = None
+    to_position: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +168,52 @@ class AudioControlResponse:
     position_seconds: float | None = None
     speed: float | None = None
     pitch: float | None = None
+    music_volume_percent: int | None = None
+    speech_volume_percent: int | None = None
+    removed_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AudioNoArgsRequest:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AudioLoopRequest:
+    mode: LoopMode
+
+
+@dataclass(frozen=True, slots=True)
+class AudioQueuePositionRequest:
+    position: int
+
+
+@dataclass(frozen=True, slots=True)
+class AudioMoveRequest:
+    from_position: int
+    to_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class AudioAutoLeaveRequest:
+    enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AudioSeekRequest:
+    position_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class AudioTuneRequest:
+    speed: float
+    pitch: float
+
+
+@dataclass(frozen=True, slots=True)
+class AudioVolumeRequest:
+    music_percent: int | None = None
+    speech_percent: int | None = None
 
 
 def build_audio_endpoints(
@@ -246,6 +303,8 @@ def build_audio_endpoints(
             speed=snapshot.speed,
             pitch=snapshot.pitch,
             waiting_for_voice=bool(snapshot.waiting_actor_ids),
+            music_volume_percent=round(snapshot.music_volume * 100),
+            speech_volume_percent=round(snapshot.speech_volume * 100),
         )
 
     async def history(
@@ -279,6 +338,9 @@ def build_audio_endpoints(
         position_seconds: float | None = None
         speed: float | None = None
         pitch: float | None = None
+        music_volume_percent: int | None = None
+        speech_volume_percent: int | None = None
+        removed_count: int | None = None
         if request.action is AudioAction.PAUSE:
             session.pause()
         elif request.action is AudioAction.RESUME:
@@ -310,6 +372,31 @@ def build_audio_endpoints(
             await session.tune(request.speed, request.pitch)
             speed = request.speed
             pitch = request.pitch
+        elif request.action is AudioAction.VOLUME:
+            if request.music_percent is None and request.speech_percent is None:
+                raise UserError("audio.volume_value_required")
+            music_volume, speech_volume = await session.set_volume(
+                music=(
+                    None
+                    if request.music_percent is None
+                    else request.music_percent / 100
+                ),
+                speech=(
+                    None
+                    if request.speech_percent is None
+                    else request.speech_percent / 100
+                ),
+            )
+            music_volume_percent = round(music_volume * 100)
+            speech_volume_percent = round(speech_volume * 100)
+        elif request.action is AudioAction.MOVE:
+            if request.position is None or request.to_position is None:
+                raise UserError("audio.queue_position_invalid")
+            affected_title = (
+                await session.move(request.position, request.to_position)
+            ).title
+        elif request.action is AudioAction.CLEAR_MINE:
+            removed_count = len(await session.clear_for_actor(context.actor_id))
         else:
             if request.loop_mode is None:
                 raise UserError("audio.loop_mode_required")
@@ -322,6 +409,150 @@ def build_audio_endpoints(
             position_seconds=position_seconds,
             speed=speed,
             pitch=pitch,
+            music_volume_percent=music_volume_percent,
+            speech_volume_percent=speech_volume_percent,
+            removed_count=removed_count,
+        )
+
+    async def pause(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.PAUSE), context)
+
+    async def resume(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.RESUME), context)
+
+    async def skip(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.SKIP), context)
+
+    async def stop(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.STOP), context)
+
+    async def leave(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.LEAVE), context)
+
+    async def set_loop(
+        request: AudioLoopRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(action=AudioAction.LOOP, loop_mode=request.mode),
+            context,
+        )
+
+    async def remove(
+        request: AudioQueuePositionRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(action=AudioAction.REMOVE, position=request.position),
+            context,
+        )
+
+    async def set_auto_leave(
+        request: AudioAutoLeaveRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(action=AudioAction.AUTO_LEAVE, enabled=request.enabled),
+            context,
+        )
+
+    async def shuffle(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.SHUFFLE), context)
+
+    async def seek(
+        request: AudioSeekRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(
+                action=AudioAction.SEEK,
+                position_seconds=request.position_seconds,
+            ),
+            context,
+        )
+
+    async def tune(
+        request: AudioTuneRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(
+                action=AudioAction.TUNE,
+                speed=request.speed,
+                pitch=request.pitch,
+            ),
+            context,
+        )
+
+    async def set_volume(
+        request: AudioVolumeRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(
+                action=AudioAction.VOLUME,
+                music_percent=request.music_percent,
+                speech_percent=request.speech_percent,
+            ),
+            context,
+        )
+
+    async def move(
+        request: AudioMoveRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(
+            AudioControlRequest(
+                action=AudioAction.MOVE,
+                position=request.from_position,
+                to_position=request.to_position,
+            ),
+            context,
+        )
+
+    async def clear_mine(
+        _request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await control(AudioControlRequest(action=AudioAction.CLEAR_MINE), context)
+
+    def exact_control_endpoint(
+        name: str,
+        summary: str,
+        keywords: tuple[str, ...],
+        request_type: type[Any],
+        handler: Callable[..., Awaitable[AudioControlResponse]],
+    ) -> CapabilityEndpoint:
+        return endpoint(
+            CapabilityDescriptor(
+                name=name,
+                summary=summary,
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("music", "audio", *keywords),
+                side_effects=("サーバーの永続音声セッションを変更します。",),
+            ),
+            request_type,
+            AudioControlResponse,
+            handler,
         )
 
     return (
@@ -389,6 +620,104 @@ def build_audio_endpoints(
             AudioControlRequest,
             AudioControlResponse,
             control,
+        ),
+        exact_control_endpoint(
+            "audio.pause",
+            "再生中の音楽を一時停止します。",
+            ("pause",),
+            AudioNoArgsRequest,
+            pause,
+        ),
+        exact_control_endpoint(
+            "audio.resume",
+            "一時停止した音楽を再開します。",
+            ("resume",),
+            AudioNoArgsRequest,
+            resume,
+        ),
+        exact_control_endpoint(
+            "audio.skip",
+            "再生中の曲をスキップします。",
+            ("skip",),
+            AudioNoArgsRequest,
+            skip,
+        ),
+        exact_control_endpoint(
+            "audio.stop",
+            "再生を止め、音楽キューを空にします。",
+            ("stop", "clear"),
+            AudioNoArgsRequest,
+            stop,
+        ),
+        exact_control_endpoint(
+            "audio.leave",
+            "音楽キューを空にして音声接続を終了します。",
+            ("leave", "disconnect"),
+            AudioNoArgsRequest,
+            leave,
+        ),
+        exact_control_endpoint(
+            "audio.set_loop",
+            "1曲またはキュー全体のループ方法を設定します。",
+            ("loop", "repeat"),
+            AudioLoopRequest,
+            set_loop,
+        ),
+        exact_control_endpoint(
+            "audio.remove",
+            "指定位置の待機曲をキューから削除します。",
+            ("remove", "queue"),
+            AudioQueuePositionRequest,
+            remove,
+        ),
+        exact_control_endpoint(
+            "audio.set_auto_leave",
+            "人がいなくなったときの自動退出を設定します。",
+            ("auto", "leave"),
+            AudioAutoLeaveRequest,
+            set_auto_leave,
+        ),
+        exact_control_endpoint(
+            "audio.shuffle",
+            "待機中の音楽キューをシャッフルします。",
+            ("shuffle", "queue"),
+            AudioNoArgsRequest,
+            shuffle,
+        ),
+        exact_control_endpoint(
+            "audio.seek",
+            "再生中の曲を指定秒へ移動します。",
+            ("seek", "position"),
+            AudioSeekRequest,
+            seek,
+        ),
+        exact_control_endpoint(
+            "audio.tune",
+            "音楽の速度とピッチを設定します。",
+            ("speed", "pitch", "tune"),
+            AudioTuneRequest,
+            tune,
+        ),
+        exact_control_endpoint(
+            "audio.set_volume",
+            "音楽と読み上げの音量を百分率で設定します。",
+            ("volume", "speech"),
+            AudioVolumeRequest,
+            set_volume,
+        ),
+        exact_control_endpoint(
+            "audio.move",
+            "待機曲をキュー内の別の位置へ移動します。",
+            ("move", "queue", "reorder"),
+            AudioMoveRequest,
+            move,
+        ),
+        exact_control_endpoint(
+            "audio.clear_mine",
+            "依頼者自身が追加した待機曲だけを削除します。",
+            ("clear", "mine", "requester"),
+            AudioNoArgsRequest,
+            clear_mine,
         ),
     )
 

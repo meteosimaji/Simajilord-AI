@@ -760,12 +760,14 @@ class CodexAppServerProvider:
         capability_name: str | None,
     ) -> None:
         selected = capability_name or tool_name
-        if selected in {
-            "discord.play_audio",
-            "discord.control_audio",
-            "discord.speak",
-            "discord.manage_read_aloud",
-        } or selected.startswith("discord.read_aloud_"):
+        if (
+            selected.startswith("discord.")
+            and (
+                "audio" in selected
+                or selected == "discord.speak"
+                or selected.startswith("discord.read_aloud_")
+            )
+        ):
             await self._emit_progress(AgentProgressStage.USING_AUDIO)
         elif selected.startswith("image."):
             await self._emit_progress(AgentProgressStage.GENERATING_IMAGE)

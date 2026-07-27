@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from time import monotonic
 
 from simajilord.agent import (
+    AGENT_AUDIO_CONTROL_CAPABILITIES,
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_FILE_GRANT,
@@ -91,6 +92,8 @@ class SimajilordRuntime:
         audio = AudioSessionManager(
             max_active=settings.max_active_voice_guilds,
             max_pending_speech=settings.max_pending_speech,
+            max_pending_music=settings.max_pending_music,
+            max_pending_music_per_actor=settings.max_pending_music_per_user,
             resolver=media.resolve_audio,
             state_store=AudioStateStore(settings.data_dir / "audio_sessions.json"),
         )
@@ -189,7 +192,7 @@ class SimajilordRuntime:
                 "discord.read_aloud_announcements_set",
                 "discord.read_aloud_semantics_set",
                 "discord.play_audio",
-                "discord.control_audio",
+                *AGENT_AUDIO_CONTROL_CAPABILITIES,
                 "discord.read_messages",
                 "discord.send_message",
                 "discord.speak",
@@ -203,7 +206,10 @@ class SimajilordRuntime:
                 "audio.queue": AGENT_AUDIO_GRANT,
                 "audio.search": AGENT_AUDIO_GRANT,
                 "discord.play_audio": AGENT_AUDIO_GRANT,
-                "discord.control_audio": AGENT_AUDIO_GRANT,
+                **{
+                    name: AGENT_AUDIO_GRANT
+                    for name in AGENT_AUDIO_CONTROL_CAPABILITIES
+                },
                 "discord.read_aloud_status": AGENT_AUDIO_GRANT,
                 "discord.read_aloud_add_sources": AGENT_AUDIO_GRANT,
                 "discord.read_aloud_remove_source": AGENT_AUDIO_GRANT,

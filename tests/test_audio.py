@@ -8,6 +8,8 @@ import pytest
 from simajilord.capabilities.audio import (
     AudioHistoryRequest,
     AudioHistoryResponse,
+    AudioMoveRequest,
+    AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
     AudioQueueRequest,
@@ -15,9 +17,10 @@ from simajilord.capabilities.audio import (
     AudioSearchReason,
     AudioSearchRequest,
     AudioSearchResponse,
+    AudioVolumeRequest,
     build_audio_endpoints,
 )
-from simajilord.core import InvocationContext
+from simajilord.core import ApprovalMode, InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, AudioKind, LoopMode
 from simajilord.domain.media import MediaCandidate
@@ -144,6 +147,187 @@ async def test_snapshot_is_transport_neutral() -> None:
     assert snapshot.loop is LoopMode.QUEUE
     assert snapshot.current is None or snapshot.current.title == "track"
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_music_queue_limits_reject_and_clean_up_resolved_files(tmp_path) -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession(
+        "one",
+        output,
+        max_pending_speech=3,
+        max_pending_music=2,
+        max_pending_music_per_actor=2,
+    )
+    await session.wait_for_listener("actor")
+    for index in range(2):
+        await session.enqueue(
+            AudioItem(
+                f"stream-{index}",
+                f"track-{index}",
+                f"https://example.com/{index}",
+                resolver_reference=f"https://example.com/{index}",
+                requested_by_id=f"actor-{index}",
+            )
+        )
+    owned_file = tmp_path / "rejected.webm"
+    owned_file.write_bytes(b"temporary")
+    with pytest.raises(UserError, match=r"audio\.queue_full"):
+        await session.enqueue(
+            AudioItem(
+                "stream-rejected",
+                "rejected",
+                "https://example.com/rejected",
+                resolver_reference="https://example.com/rejected",
+                requested_by_id="third",
+                owned_file=owned_file,
+            )
+        )
+    assert not owned_file.exists()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_music_queue_limits_each_actor_and_duplicate_reference() -> None:
+    output = FakeOutput()
+    output.connected = False
+    per_actor = AudioSession(
+        "actor-limit",
+        output,
+        max_pending_speech=3,
+        max_pending_music=10,
+        max_pending_music_per_actor=1,
+    )
+    await per_actor.wait_for_listener("actor")
+    await per_actor.enqueue(
+        AudioItem(
+            "one",
+            "one",
+            "https://example.com/one",
+            resolver_reference="https://example.com/one",
+            requested_by_id="actor",
+        )
+    )
+    with pytest.raises(UserError, match=r"audio\.user_queue_full"):
+        await per_actor.enqueue(
+            AudioItem(
+                "two",
+                "two",
+                "https://example.com/two",
+                resolver_reference="https://example.com/two",
+                requested_by_id="actor",
+            )
+        )
+    await per_actor.close()
+
+    duplicate = AudioSession(
+        "duplicate-limit",
+        output,
+        max_pending_speech=3,
+        max_pending_music=10,
+        max_pending_music_per_actor=10,
+    )
+    await duplicate.wait_for_listener("actor")
+    for actor_id in ("one", "two"):
+        await duplicate.enqueue(
+            AudioItem(
+                actor_id,
+                actor_id,
+                "https://example.com/same",
+                resolver_reference="https://example.com/same",
+                requested_by_id=actor_id,
+            )
+        )
+    with pytest.raises(UserError, match=r"audio\.duplicate_limit"):
+        await duplicate.enqueue(
+            AudioItem(
+                "three",
+                "three",
+                "https://example.com/same",
+                resolver_reference="https://example.com/same",
+                requested_by_id="three",
+            )
+        )
+    await duplicate.close()
+
+
+@pytest.mark.asyncio
+async def test_music_move_clear_mine_and_volume_are_transport_neutral() -> None:
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(max_active=2, max_pending_speech=3)
+    session = manager.get_or_create("guild", lambda: output)
+    await session.wait_for_listener("alice")
+    for source, actor in (("first", "alice"), ("second", "bob"), ("third", "alice")):
+        await session.enqueue(
+            AudioItem(
+                source,
+                source,
+                f"https://example.com/{source}",
+                resolver_reference=f"https://example.com/{source}",
+                requested_by_id=actor,
+            )
+        )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_audio_endpoints(cast(MediaService, object()), manager)
+    }
+    context = InvocationContext("alice", "guild", "test", "request")
+
+    moved = await endpoints["audio.move"].invoke(
+        AudioMoveRequest(from_position=3, to_position=1),
+        context,
+    )
+    assert moved.affected_title == "third"
+    volume = await endpoints["audio.set_volume"].invoke(
+        AudioVolumeRequest(music_percent=75, speech_percent=125),
+        context,
+    )
+    assert volume.music_volume_percent == 75
+    assert volume.speech_volume_percent == 125
+    cleared = await endpoints["audio.clear_mine"].invoke(AudioNoArgsRequest(), context)
+    assert cleared.removed_count == 2
+
+    queue_endpoint = endpoints["audio.queue"]
+    queue = await queue_endpoint.invoke(AudioQueueRequest(), context)
+    assert isinstance(queue, AudioQueueResponse)
+    assert [item.title for item in queue.pending] == ["second"]
+    assert queue.music_volume_percent == 75
+    assert queue.speech_volume_percent == 125
+    await manager.close()
+
+
+def test_audio_exact_write_endpoints_have_small_typed_requests() -> None:
+    manager = AudioSessionManager(max_active=2, max_pending_speech=3)
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_audio_endpoints(cast(MediaService, object()), manager)
+    }
+    exact_names = {
+        "audio.pause",
+        "audio.resume",
+        "audio.skip",
+        "audio.stop",
+        "audio.leave",
+        "audio.set_loop",
+        "audio.remove",
+        "audio.set_auto_leave",
+        "audio.shuffle",
+        "audio.seek",
+        "audio.tune",
+        "audio.set_volume",
+        "audio.move",
+        "audio.clear_mine",
+    }
+    assert exact_names <= endpoints.keys()
+    assert all(
+        endpoints[name].descriptor.approval is ApprovalMode.WHEN_REQUESTED
+        for name in exact_names
+    )
+    assert endpoints["audio.pause"].request_type is AudioNoArgsRequest
+    assert endpoints["audio.move"].request_type is AudioMoveRequest
+    assert endpoints["audio.set_volume"].request_type is AudioVolumeRequest
 
 
 @pytest.mark.asyncio
@@ -501,6 +685,7 @@ async def test_music_queue_survives_manager_restart_without_signed_url(tmp_path)
     )
     session = manager.get_or_create("guild", lambda: output)
     await session.connect("voice")
+    await session.set_volume(music=0.7, speech=1.2)
     await session.enqueue(
         AudioItem(
             "https://signed.invalid/expires-soon",
@@ -515,6 +700,8 @@ async def test_music_queue_survives_manager_restart_without_signed_url(tmp_path)
     saved = AudioStateStore(state_path).all()
     assert len(saved) == 1
     assert saved[0].destination_id == "voice"
+    assert saved[0].music_volume == pytest.approx(0.7)
+    assert saved[0].speech_volume == pytest.approx(1.2)
     assert saved[0].items[0].reference == "https://example.com/watch"
     assert "signed.invalid" not in state_path.read_text(encoding="utf-8")
     assert state_path.stat().st_mode & 0o077 == 0
@@ -531,6 +718,8 @@ async def test_music_queue_survives_manager_restart_without_signed_url(tmp_path)
     snapshot = await sessions[0].snapshot()
     assert snapshot.destination_id == "voice"
     assert snapshot.pending[0].source == ""
+    assert snapshot.music_volume == pytest.approx(0.7)
+    assert snapshot.speech_volume == pytest.approx(1.2)
     await restored_manager.close()
 
 

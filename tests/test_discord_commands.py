@@ -21,6 +21,8 @@ from simajilord.agent import (
     AgentRateLimitError,
 )
 from simajilord.capabilities.audio import (
+    AudioControlResponse,
+    AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
     AudioSearchItem,
@@ -158,12 +160,13 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         for command in MusicCog.__cog_app_commands__
         if isinstance(command, app_commands.Command)
     }
-    assert {"play", "queue", "history"} <= commands.keys()
+    assert {"play", "queue", "history", "nowplaying"} <= commands.keys()
     assert commands["play"].description == "URLまたは曲名から音楽を再生します。"
     assert commands["queue"].description == "再生中の曲とキューを表示します。"
     assert commands["history"].description == (
         "最近再生した曲と、追加したユーザーを表示します。"
     )
+    assert commands["nowplaying"].description == "現在再生している曲を表示します。"
 
 
 @pytest.mark.asyncio
@@ -228,6 +231,57 @@ async def test_agent_audio_adapter_rebinds_requester_identity(
     delegated_request = runtime.registry.invoke.await_args.args[1]
     assert isinstance(delegated_request, AudioPlayRequest)
     assert delegated_request.requested_by_name == "Real member"
+
+
+@pytest.mark.asyncio
+async def test_agent_pause_adapter_invokes_exact_audio_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(
+        return_value=AudioControlResponse(action="pause", loop_mode=None)
+    )
+    session = Mock()
+    session.output.connected = False
+    session.waiting_for_voice = False
+    runtime.audio.require.return_value = session
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    member = Mock(spec=discord.Member)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+    )
+
+    response = await endpoint_by_name["discord.pause_audio"].invoke(
+        AudioNoArgsRequest(),
+        context,
+    )
+
+    assert response.action == "pause"
+    runtime.registry.invoke.assert_awaited_once_with(
+        "audio.pause",
+        AudioNoArgsRequest(),
+        context,
+    )
 
 
 @pytest.mark.asyncio
@@ -622,6 +676,9 @@ def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
         "shuffle",
         "seek",
         "tune",
+        "volume",
+        "move",
+        "clear-mine",
     }
 
 

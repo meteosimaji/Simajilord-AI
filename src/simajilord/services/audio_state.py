@@ -42,6 +42,8 @@ class StoredAudioSession:
     pitch: float
     items: tuple[StoredAudioItem, ...]
     history: tuple[StoredAudioItem, ...]
+    music_volume: float = 1.0
+    speech_volume: float = 1.0
 
 
 class AudioStateStore:
@@ -155,6 +157,8 @@ def _decode_session(value: object) -> StoredAudioSession | None:
             pitch=_bounded_factor(value.get("pitch", 1.0)),
             items=items,
             history=history,
+            music_volume=_bounded_volume(value.get("music_volume", 1.0)),
+            speech_volume=_bounded_volume(value.get("speech_volume", 1.0)),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -172,6 +176,13 @@ def _bounded_factor(value: object) -> float:
         return 1.0
     factor = float(value)
     return factor if 0.5 <= factor <= 2.0 else 1.0
+
+
+def _bounded_volume(value: object) -> float:
+    if not isinstance(value, (int, float, str)):
+        return 1.0
+    volume = float(value)
+    return volume if 0.0 <= volume <= 2.0 else 1.0
 
 
 def _decode_item(value: dict[str, Any]) -> StoredAudioItem:

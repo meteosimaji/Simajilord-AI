@@ -1,6 +1,7 @@
 """Event-driven agent runtime contracts."""
 
 from .contracts import (
+    AGENT_AUDIO_CONTROL_CAPABILITIES,
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_AUTONOMY_ACTOR_ID,
@@ -34,6 +35,7 @@ from .errors import (
 )
 
 __all__ = [
+    "AGENT_AUDIO_CONTROL_CAPABILITIES",
     "AGENT_AUDIO_GRANT",
     "AGENT_AUDIO_WRITE_CAPABILITIES",
     "AGENT_AUTONOMY_ACTOR_ID",

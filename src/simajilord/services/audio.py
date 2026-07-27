@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 _MAX_STREAM_AGE_SECONDS = 10 * 60
 _IMMEDIATE_RETRY_DELAYS = (0.0, 1.0, 3.0)
 _MAX_HISTORY_ITEMS = 25
+_MAX_IDENTICAL_PENDING_REFERENCES = 2
 
 
 class AudioOutput(Protocol):
@@ -57,12 +58,16 @@ class AudioSession:
         output: AudioOutput,
         *,
         max_pending_speech: int,
+        max_pending_music: int = 100,
+        max_pending_music_per_actor: int = 20,
         resolver: AudioResolver | None = None,
         state_hook: StateHook | None = None,
     ) -> None:
         self.workspace_id = workspace_id
         self.output = output
         self.max_pending_speech = max_pending_speech
+        self.max_pending_music = max_pending_music
+        self.max_pending_music_per_actor = max_pending_music_per_actor
         self.destination_id: str | None = None
         self.auto_leave = True
         self._resolver = resolver
@@ -87,6 +92,8 @@ class AudioSession:
         self._paused_seconds = 0.0
         self._speed = 1.0
         self._pitch = 1.0
+        self._music_volume = 1.0
+        self._speech_volume = 1.0
 
     @property
     def current(self) -> AudioItem | None:
@@ -143,6 +150,11 @@ class AudioSession:
                     self._restart_requested = True
                     interrupt_music = True
             else:
+                try:
+                    self._assert_music_queue_capacity(item)
+                except UserError:
+                    item.cleanup()
+                    raise
                 self._music.append(item)
                 position = len(self._music)
             self._wake.set()
@@ -213,6 +225,38 @@ class AudioSession:
             await self._wait_for_current()
         await self._state_changed()
 
+    async def set_volume(
+        self,
+        *,
+        music: float | None = None,
+        speech: float | None = None,
+    ) -> tuple[float, float]:
+        """Set durable music/read-aloud gain without coupling to Discord."""
+
+        if music is None and speech is None:
+            raise UserError("audio.volume_value_required")
+        if music is not None and not 0.0 <= music <= 2.0:
+            raise UserError("audio.volume_range_invalid")
+        if speech is not None and not 0.0 <= speech <= 2.0:
+            raise UserError("audio.volume_range_invalid")
+        restart_music = (
+            music is not None
+            and self._current is not None
+            and self._current.kind is AudioKind.MUSIC
+        )
+        if restart_music and self._current is not None:
+            self._current.start_seconds = self._position_seconds()
+            self._restart_requested = True
+        if music is not None:
+            self._music_volume = music
+        if speech is not None:
+            self._speech_volume = speech
+        if restart_music:
+            self.output.stop()
+            await self._wait_for_current()
+        await self._state_changed()
+        return self._music_volume, self._speech_volume
+
     async def remove(self, position: int) -> AudioItem:
         if position < 1:
             raise UserError("audio.queue_position_invalid")
@@ -225,6 +269,38 @@ class AudioSession:
         item.cleanup()
         await self._state_changed()
         return item
+
+    async def move(self, from_position: int, to_position: int) -> AudioItem:
+        """Move one pending music item using the one-based positions shown to users."""
+
+        if from_position < 1 or to_position < 1:
+            raise UserError("audio.queue_position_invalid")
+        async with self._lock:
+            if from_position > len(self._music) or to_position > len(self._music):
+                raise UserError("audio.queue_position_invalid")
+            item = self._music[from_position - 1]
+            del self._music[from_position - 1]
+            self._music.insert(to_position - 1, item)
+        await self._state_changed()
+        return item
+
+    async def clear_for_actor(self, actor_id: str) -> tuple[AudioItem, ...]:
+        """Remove only pending music requested by one actor."""
+
+        if not actor_id:
+            raise ValueError("actor_id must not be empty")
+        async with self._lock:
+            removed = tuple(
+                item for item in self._music if item.requested_by_id == actor_id
+            )
+            self._music = deque(
+                item for item in self._music if item.requested_by_id != actor_id
+            )
+        for item in removed:
+            item.cleanup()
+        if removed:
+            await self._state_changed()
+        return removed
 
     async def skip(self) -> None:
         if self._current is None:
@@ -323,6 +399,8 @@ class AudioSession:
                 position_seconds=self._position_seconds(),
                 speed=self._speed,
                 pitch=self._pitch,
+                music_volume=self._music_volume,
+                speech_volume=self._speech_volume,
             )
 
     def restore(self, state: StoredAudioSession) -> None:
@@ -336,6 +414,8 @@ class AudioSession:
         self.auto_leave = state.auto_leave
         self._speed = state.speed
         self._pitch = state.pitch
+        self._music_volume = state.music_volume
+        self._speech_volume = state.speech_volume
         self._music.extend(
             AudioItem(
                 source="",
@@ -431,7 +511,28 @@ class AudioSession:
                 pitch=self._pitch,
                 items=stored_items,
                 history=stored_history,
+                music_volume=self._music_volume,
+                speech_volume=self._speech_volume,
             )
+
+    def _assert_music_queue_capacity(self, item: AudioItem) -> None:
+        if len(self._music) >= self.max_pending_music:
+            raise UserError("audio.queue_full")
+        actor_id = item.requested_by_id
+        if actor_id is not None:
+            actor_pending = sum(
+                queued.requested_by_id == actor_id for queued in self._music
+            )
+            if actor_pending >= self.max_pending_music_per_actor:
+                raise UserError("audio.user_queue_full")
+        reference = item.resolver_reference or item.page_url
+        if reference:
+            identical = sum(
+                (queued.resolver_reference or queued.page_url) == reference
+                for queued in self._music
+            )
+            if identical >= _MAX_IDENTICAL_PENDING_REFERENCES:
+                raise UserError("audio.duplicate_limit")
 
     def _ensure_worker(self) -> None:
         if self._worker is None or self._worker.done():
@@ -505,6 +606,12 @@ class AudioSession:
             self._restart_requested = False
             item.speed = self._speed
             item.pitch = self._pitch
+            item.volume = (
+                self._speech_volume
+                if item.kind is AudioKind.SPEECH
+                else self._music_volume
+            )
+            item.speech_overlay_volume = self._speech_volume
             self._started_at = monotonic()
             self._paused_at = None
             self._paused_seconds = 0.0
@@ -643,6 +750,8 @@ class AudioSession:
         resolved.start_seconds = item.start_seconds
         resolved.speed = item.speed
         resolved.pitch = item.pitch
+        resolved.volume = item.volume
+        resolved.speech_overlay_volume = item.speech_overlay_volume
         resolved.requested_by_id = item.requested_by_id
         resolved.requested_by_name = item.requested_by_name
         resolved.uploader = resolved.uploader or item.uploader
@@ -696,11 +805,15 @@ class AudioSessionManager:
         *,
         max_active: int,
         max_pending_speech: int,
+        max_pending_music: int = 100,
+        max_pending_music_per_actor: int = 20,
         resolver: AudioResolver | None = None,
         state_store: AudioStateStore | None = None,
     ) -> None:
         self.max_active = max_active
         self.max_pending_speech = max_pending_speech
+        self.max_pending_music = max_pending_music
+        self.max_pending_music_per_actor = max_pending_music_per_actor
         self._resolver = resolver
         self._state_store = state_store
         self._sessions: dict[str, AudioSession] = {}
@@ -726,6 +839,8 @@ class AudioSessionManager:
             workspace_id,
             output_factory(),
             max_pending_speech=self.max_pending_speech,
+            max_pending_music=self.max_pending_music,
+            max_pending_music_per_actor=self.max_pending_music_per_actor,
             resolver=self._resolver,
             state_hook=self._persist,
         )

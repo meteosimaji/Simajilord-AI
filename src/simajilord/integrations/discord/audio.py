@@ -216,6 +216,8 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
     if item.start_seconds > 0:
         before_parts.extend(("-ss", f"{item.start_seconds:.3f}"))
     filters: list[str] = []
+    if item.volume != 1.0:
+        filters.append(f"volume={item.volume:.6f}")
     if item.pitch != 1.0:
         filters.extend(
             (
@@ -229,8 +231,11 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
     options: list[str]
     if item.speech_overlay_source is not None:
         music_filter = ",".join(filters) if filters else "anull"
+        speech_filter = "aresample=48000"
+        if item.speech_overlay_volume != 1.0:
+            speech_filter += f",volume={item.speech_overlay_volume:.6f}"
         filter_graph = (
-            "[0:a]aresample=48000,asplit=2[speech_sc][speech_mix];"
+            f"[0:a]{speech_filter},asplit=2[speech_sc][speech_mix];"
             f"[1:a]{music_filter}[music];"
             "[music][speech_sc]sidechaincompress="
             "threshold=0.015:ratio=8:attack=20:release=350[ducked];"

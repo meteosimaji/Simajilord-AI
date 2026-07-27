@@ -25,10 +25,12 @@ def test_discord_source_is_preencoded_opus(tmp_path) -> None:
         output.writeframes(b"\0" * (48_000 // 10))
 
     source = build_discord_audio_source(
-        AudioItem(str(path), "Silence", path.as_uri())
+        AudioItem(str(path), "Silence", path.as_uri(), volume=0.75)
     )
     try:
         assert source.is_opus()
+        arguments = " ".join(str(value) for value in source._process.args)
+        assert "volume=0.750000" in arguments
     finally:
         source.cleanup()
 
@@ -49,14 +51,18 @@ def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> N
             "Music with speech",
             music.as_uri(),
             kind=AudioKind.MUSIC,
+            volume=0.6,
             speech_overlay_source=str(speech),
             speech_overlay_duration_seconds=0.1,
+            speech_overlay_volume=1.25,
         )
     )
     try:
         arguments = " ".join(str(value) for value in source._process.args)
         assert "sidechaincompress=" in arguments
         assert "amix=" in arguments
+        assert "[1:a]volume=0.600000[music]" in arguments
+        assert "aresample=48000,volume=1.250000" in arguments
         assert "[mixed]" in arguments
         assert str(speech) in arguments
         assert source.read()

@@ -6,20 +6,29 @@ import asyncio
 import base64
 import io
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import PurePath
-from typing import Literal, TypeAlias, cast
+from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
 import discord
 from PIL import Image, UnidentifiedImageError
 
 from simajilord.capabilities.audio import (
+    AudioAutoLeaveRequest,
     AudioControlRequest,
     AudioControlResponse,
+    AudioLoopRequest,
+    AudioMoveRequest,
+    AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
+    AudioQueuePositionRequest,
+    AudioSeekRequest,
+    AudioTuneRequest,
+    AudioVolumeRequest,
 )
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -1174,6 +1183,13 @@ def build_discord_endpoints(
     ) -> AudioControlResponse:
         """Enforce requester ownership before mutating a Discord audio session."""
 
+        return await _invoke_audio_control("audio.control", request, context)
+
+    async def _invoke_audio_control(
+        capability_name: str,
+        request: object,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
         guild = _guild(client, context)
         member = await _actor_member(guild, context)
         session = runtime.audio.require(str(guild.id))
@@ -1186,8 +1202,113 @@ def build_discord_endpoints(
             context.actor_id
         ):
             raise UserError("audio.waiting_queue_restricted")
-        response = await runtime.registry.invoke("audio.control", request, context)
+        response = await runtime.registry.invoke(capability_name, request, context)
         return cast(AudioControlResponse, response)
+
+    async def pause_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.pause", request, context)
+
+    async def resume_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.resume", request, context)
+
+    async def skip_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.skip", request, context)
+
+    async def stop_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.stop", request, context)
+
+    async def leave_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.leave", request, context)
+
+    async def set_audio_loop(
+        request: AudioLoopRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.set_loop", request, context)
+
+    async def remove_audio(
+        request: AudioQueuePositionRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.remove", request, context)
+
+    async def set_audio_auto_leave(
+        request: AudioAutoLeaveRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.set_auto_leave", request, context)
+
+    async def shuffle_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.shuffle", request, context)
+
+    async def seek_audio(
+        request: AudioSeekRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.seek", request, context)
+
+    async def tune_audio(
+        request: AudioTuneRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.tune", request, context)
+
+    async def set_audio_volume(
+        request: AudioVolumeRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.set_volume", request, context)
+
+    async def move_audio(
+        request: AudioMoveRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.move", request, context)
+
+    async def clear_my_audio(
+        request: AudioNoArgsRequest,
+        context: InvocationContext,
+    ) -> AudioControlResponse:
+        return await _invoke_audio_control("audio.clear_mine", request, context)
+
+    def discord_audio_endpoint(
+        name: str,
+        summary: str,
+        keywords: tuple[str, ...],
+        request_type: type[Any],
+        handler: Callable[..., Awaitable[AudioControlResponse]],
+    ) -> CapabilityEndpoint:
+        return endpoint(
+            CapabilityDescriptor(
+                name=name,
+                summary=summary,
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "music", *keywords),
+                side_effects=("サーバーの永続音声セッションを変更します。",),
+            ),
+            request_type,
+            AudioControlResponse,
+            handler,
+        )
 
     async def speak(
         request: SpeechSpeakRequest,
@@ -1759,6 +1880,104 @@ def build_discord_endpoints(
             AudioControlRequest,
             AudioControlResponse,
             control_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.pause_audio",
+            "依頼者と同じVCで再生中の音楽を一時停止します。",
+            ("pause",),
+            AudioNoArgsRequest,
+            pause_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.resume_audio",
+            "依頼者と同じVCで一時停止中の音楽を再開します。",
+            ("resume",),
+            AudioNoArgsRequest,
+            resume_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.skip_audio",
+            "依頼者と同じVCで再生中の曲をスキップします。",
+            ("skip",),
+            AudioNoArgsRequest,
+            skip_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.stop_audio",
+            "依頼者と同じVCの再生を止め、音楽キューを空にします。",
+            ("stop", "clear"),
+            AudioNoArgsRequest,
+            stop_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.leave_audio",
+            "音楽キューを空にし、BOTを依頼者と同じVCから退出させます。",
+            ("leave", "disconnect"),
+            AudioNoArgsRequest,
+            leave_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.set_audio_loop",
+            "音楽のループ方法を設定します。",
+            ("loop", "repeat"),
+            AudioLoopRequest,
+            set_audio_loop,
+        ),
+        discord_audio_endpoint(
+            "discord.remove_audio",
+            "指定位置の待機曲をキューから削除します。",
+            ("remove", "queue"),
+            AudioQueuePositionRequest,
+            remove_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.set_audio_auto_leave",
+            "人がいなくなったときのBOT自動退出を設定します。",
+            ("auto", "leave"),
+            AudioAutoLeaveRequest,
+            set_audio_auto_leave,
+        ),
+        discord_audio_endpoint(
+            "discord.shuffle_audio",
+            "待機中の音楽キューをシャッフルします。",
+            ("shuffle", "queue"),
+            AudioNoArgsRequest,
+            shuffle_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.seek_audio",
+            "再生中の曲を指定秒へ移動します。",
+            ("seek", "position"),
+            AudioSeekRequest,
+            seek_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.tune_audio",
+            "音楽の速度とピッチを設定します。",
+            ("speed", "pitch", "tune"),
+            AudioTuneRequest,
+            tune_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.set_audio_volume",
+            "音楽と読み上げの音量を百分率で設定します。",
+            ("volume", "speech"),
+            AudioVolumeRequest,
+            set_audio_volume,
+        ),
+        discord_audio_endpoint(
+            "discord.move_audio",
+            "待機曲をキュー内の別の位置へ移動します。",
+            ("move", "queue", "reorder"),
+            AudioMoveRequest,
+            move_audio,
+        ),
+        discord_audio_endpoint(
+            "discord.clear_my_audio",
+            "依頼者自身が追加した待機曲だけを削除します。",
+            ("clear", "mine", "requester"),
+            AudioNoArgsRequest,
+            clear_my_audio,
         ),
         endpoint(
             CapabilityDescriptor(

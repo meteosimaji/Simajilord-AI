@@ -1,16 +1,24 @@
 """Independent application endpoints available to every adapter."""
 
 from .audio import (
+    AudioAutoLeaveRequest,
     AudioControlRequest,
     AudioControlResponse,
+    AudioLoopRequest,
+    AudioMoveRequest,
+    AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
+    AudioQueuePositionRequest,
     AudioQueueRequest,
     AudioQueueResponse,
     AudioSearchItem,
     AudioSearchReason,
     AudioSearchRequest,
     AudioSearchResponse,
+    AudioSeekRequest,
+    AudioTuneRequest,
+    AudioVolumeRequest,
     build_audio_endpoints,
 )
 from .files import build_file_endpoints
@@ -70,16 +78,24 @@ from .web import (
 )
 
 __all__ = [
+    "AudioAutoLeaveRequest",
     "AudioControlRequest",
     "AudioControlResponse",
+    "AudioLoopRequest",
+    "AudioMoveRequest",
+    "AudioNoArgsRequest",
     "AudioPlayRequest",
     "AudioPlayResponse",
+    "AudioQueuePositionRequest",
     "AudioQueueRequest",
     "AudioQueueResponse",
     "AudioSearchItem",
     "AudioSearchReason",
     "AudioSearchRequest",
     "AudioSearchResponse",
+    "AudioSeekRequest",
+    "AudioTuneRequest",
+    "AudioVolumeRequest",
     "CapabilitySearchRequest",
     "CapabilitySearchResponse",
     "ChooseRequest",

@@ -40,6 +40,8 @@ class AudioItem:
     start_seconds: float = 0.0
     speed: float = 1.0
     pitch: float = 1.0
+    volume: float = 1.0
+    speech_overlay_volume: float = 1.0
     requested_by_id: str | None = None
     requested_by_name: str | None = None
     played_at_epoch: int | None = None
@@ -120,3 +122,5 @@ class QueueSnapshot:
     position_seconds: float = 0.0
     speed: float = 1.0
     pitch: float = 1.0
+    music_volume: float = 1.0
+    speech_volume: float = 1.0

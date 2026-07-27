@@ -40,8 +40,9 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 ## Current Discord capabilities
 
 - Health, uptime, and searchable capability discovery
-- Per-server durable music queues with play, pause, resume, seek, tuning, shuffle, removal,
-  skip, stop, leave, loop, and persistent button controls
+- Per-server durable music queues with play, pause, resume, seek, tuning, separate
+  music/read-aloud volume, shuffle, move, requester-only clearing, skip, stop, leave, loop,
+  bounded per-server/per-user admission, and persistent button controls
 - Zero-click track search when one result is clear, with direct one-click choices only for
   genuinely ambiguous same-name tracks
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
@@ -69,6 +70,10 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - Custom emoji and sticker metadata stays text-only by default. The agent can request one
   selected asset as a preview, full GIF/APNG animation, or exact animation frame only when
   visual inspection is actually needed
+- The `Quote` message action renders locally without an external image API. Static output is
+  the default; animated custom emoji or stickers can be preserved as GIF on request. A known
+  Discord CDN asset ID can be rendered even when the BOT is not a member of the asset's
+  original server, but reading that server's message still requires normal Discord access
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
 - Plain message sending and voice connection as independently invokable Discord APIs
@@ -128,10 +133,12 @@ existing local file with mode `0600`. The platform never extracts cookies from a
 ## Commands
 
 - `/ping`, `/uptime`, `/about`, `/capabilities`
-- `/play`, `/queue`, `/history` for the shortest everyday paths
+- `/play`, `/queue`, `/nowplaying`, `/history` for the shortest everyday paths
 - `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
 - `/music skip`, `/music stop`, `/music leave`, `/music loop`
-- `/music remove`, `/music shuffle`, `/music seek`, `/music tune`, `/music autoleave`
+- `/music remove`, `/music move`, `/music clear-mine`, `/music shuffle`
+- `/music seek`, `/music tune`, `/music volume`, `/music autoleave`
+- Right-click or long-press a message, then choose `Apps` → `Quote` for local quote rendering
 - `/join` to select up to 25 conversations and read them in your current VC
 - `/readaloud setup`, `/readaloud status`, `/readaloud remove`, `/readaloud disable` for
   advanced route management

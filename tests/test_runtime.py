@@ -102,6 +102,26 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         assert "discord.speak" in output.text
         assert '"name":"audio.play"' not in output.text
         assert '"name":"speech.speak"' not in output.text
+        playback_controls = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "pause move music queue", "limit": 5},
+            context=requested_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.pause_audio" in playback_controls.text
+        assert "discord.move_audio" in playback_controls.text
+        assert "discord.control_audio" not in playback_controls.text
+        queue_controls = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "clear my music volume", "limit": 5},
+            context=requested_context,
+            max_output_characters=10_000,
+        )
+        assert "discord.clear_my_audio" in queue_controls.text
+        assert "discord.set_audio_volume" in queue_controls.text
+        assert "discord.control_audio" not in queue_controls.text
         autonomous_read_aloud = await provider.tools.invoke(
             namespace="simajilord",
             tool_name="capability_search",

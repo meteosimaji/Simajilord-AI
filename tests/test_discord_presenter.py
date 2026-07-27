@@ -259,8 +259,11 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert embed.timestamp is not None
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
+    upcoming = next(
+        field.value for field in embed.fields if field.name.startswith("次に再生")
+    )
     assert "0:45 / 3:00" in fields["再生位置"]
-    assert "Next" in fields["次に再生"]
+    assert "Next" in upcoming
     assert fields["状態"] == "再生中"
     assert fields["ループ"] == "キュー全体"
     assert fields["自動退出"] == "オン"
@@ -268,7 +271,7 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert "速度 1.25倍" in fields["再生調整"]
     assert fields["追加した人"] == "Alice"
     assert fields["投稿者"] == "Current Artist"
-    assert "Bob" in fields["次に再生"]
+    assert "Bob" in upcoming
     assert embed.thumbnail.url == "https://img.example.com/current.jpg"
 
 

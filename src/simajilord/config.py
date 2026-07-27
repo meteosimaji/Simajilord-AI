@@ -50,6 +50,8 @@ class Settings:
     voicevox_timeout_seconds: float
     read_aloud_chunk_characters: int
     max_pending_speech: int
+    max_pending_music: int
+    max_pending_music_per_user: int
     max_concurrent_tts: int
     max_active_voice_guilds: int
     download_timeout_seconds: float
@@ -409,6 +411,12 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             "READ_ALOUD_CHUNK_CHARACTERS", 400, maximum=2_000
         ),
         max_pending_speech=_positive_int("MAX_PENDING_SPEECH", 20, maximum=100),
+        max_pending_music=_positive_int("MAX_PENDING_MUSIC", 100, maximum=500),
+        max_pending_music_per_user=_positive_int(
+            "MAX_PENDING_MUSIC_PER_USER",
+            20,
+            maximum=100,
+        ),
         max_concurrent_tts=_positive_int("MAX_CONCURRENT_TTS", 2, maximum=10),
         max_active_voice_guilds=_positive_int("MAX_ACTIVE_VOICE_GUILDS", 8, maximum=100),
         download_timeout_seconds=_positive_float(

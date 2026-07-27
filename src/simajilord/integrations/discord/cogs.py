@@ -141,6 +141,11 @@ _ERROR_MESSAGES = {
     "audio.nothing_playing": "現在再生している曲はありません。",
     "audio.output_disconnected": "ボイスチャンネルに接続されていません。",
     "audio.queue_position_invalid": "キューに表示されている有効な番号を指定してください。",
+    "audio.queue_full": "このサーバーの音楽キューは上限に達しています。",
+    "audio.user_queue_full": "自分が追加できる待機曲数の上限に達しています。",
+    "audio.duplicate_limit": (
+        "同じ曲がすでに複数回待機しています。繰り返し再生にはループを利用してください。"
+    ),
     "audio.seek_position_required": "移動先の再生位置を指定してください。",
     "audio.search_empty": "一致する曲が見つかりませんでした。",
     "audio.search_limit_invalid": "検索件数は1〜10件で指定してください。",
@@ -154,6 +159,8 @@ _ERROR_MESSAGES = {
     ),
     "audio.tune_range_invalid": "再生速度とピッチは、それぞれ0.5〜2.0で指定してください。",
     "audio.tune_values_required": "再生速度とピッチの両方を指定してください。",
+    "audio.volume_range_invalid": "音量は0〜200%で指定してください。",
+    "audio.volume_value_required": "音楽または読み上げの音量を指定してください。",
     "media.reference_required": "メディアのURLまたは検索キーワードを入力してください。",
     "media.reference_too_long": "URLまたは検索キーワードが長すぎます。",
     "media.query_url_not_allowed": "検索キーワードにURLは含められません。",
@@ -427,7 +434,12 @@ def music_added_embed(response: AudioPlayResponse) -> discord.Embed:
     return embed
 
 
-def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
+def music_queue_embed(
+    response: AudioQueueResponse,
+    *,
+    page: int = 1,
+    page_size: int = 10,
+) -> discord.Embed:
     fields: list[EmbedField] = []
     if response.current is None:
         description = "現在再生している曲はありません。"
@@ -453,14 +465,22 @@ def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
 
     upcoming = tuple(item for item in response.pending if item.kind == AudioKind.MUSIC.value)
     if upcoming:
+        page_count = max(1, (len(upcoming) + page_size - 1) // page_size)
+        selected_page = min(max(1, page), page_count)
+        start = (selected_page - 1) * page_size
+        visible = upcoming[start : start + page_size]
         lines = [
             f"`{index:02d}` [{item.title}]({item.page_url}) · "
             f"`{_duration(item.duration_seconds)}` · {_requester(item.requested_by_name)}"
-            for index, item in enumerate(upcoming[:10], start=1)
+            for index, item in enumerate(visible, start=start + 1)
         ]
-        if len(upcoming) > 10:
-            lines.append(f"…ほか **{len(upcoming) - 10}曲**")
-        fields.append(EmbedField("次に再生", "\n".join(lines), inline=False))
+        fields.append(
+            EmbedField(
+                f"次に再生 · {selected_page}/{page_count}ページ · 全{len(upcoming)}曲",
+                "\n".join(lines),
+                inline=False,
+            )
+        )
     else:
         fields.append(EmbedField("次に再生", "キューは空です", inline=False))
 
@@ -477,6 +497,11 @@ def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
             EmbedField("状態", state),
             EmbedField("ループ", _loop_mode_label(response.loop_mode)),
             EmbedField("自動退出", "オン" if response.auto_leave else "オフ"),
+            EmbedField(
+                "音量",
+                f"音楽 {response.music_volume_percent}%・"
+                f"読み上げ {response.speech_volume_percent}%",
+            ),
         )
     )
     if response.speed != 1.0 or response.pitch != 1.0:
@@ -499,6 +524,42 @@ def music_queue_embed(response: AudioQueueResponse) -> discord.Embed:
     embed = command_embed("音楽", description=description, fields=tuple(fields))
     if response.current and response.current.thumbnail_url:
         embed.set_thumbnail(url=response.current.thumbnail_url)
+    return embed
+
+
+def music_now_playing_embed(response: AudioQueueResponse) -> discord.Embed:
+    if response.current is None:
+        return command_embed("再生中", description="現在再生している曲はありません。")
+    current = response.current
+    elapsed = min(response.position_seconds, current.duration_seconds)
+    state = "一時停止中" if response.paused else "再生中"
+    fields = [
+        EmbedField(
+            "再生位置",
+            f"`{_progress(elapsed, current.duration_seconds)}` "
+            f"`{_duration(elapsed)} / {_duration(current.duration_seconds)}`",
+            inline=False,
+        ),
+        EmbedField("状態", state),
+        EmbedField("追加した人", _requester(current.requested_by_name)),
+        EmbedField(
+            "音量",
+            f"音楽 {response.music_volume_percent}%・"
+            f"読み上げ {response.speech_volume_percent}%",
+        ),
+    ]
+    if current.uploader:
+        fields.append(
+            EmbedField("投稿者", discord.utils.escape_markdown(current.uploader))
+        )
+    embed = command_embed(
+        "再生中",
+        description=f"### [{current.title}]({current.page_url})",
+        fields=tuple(fields),
+        tone=EmbedTone.SUCCESS,
+    )
+    if current.thumbnail_url:
+        embed.set_thumbnail(url=current.thumbnail_url)
     return embed
 
 
@@ -1366,7 +1427,7 @@ class MusicCog(commands.Cog):
     async def play(self, interaction: discord.Interaction, reference: str) -> None:
         await self._send_play(interaction, reference)
 
-    async def _send_queue(self, interaction: discord.Interaction) -> None:
+    async def _send_queue(self, interaction: discord.Interaction, page: int = 1) -> None:
         try:
             _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
             response = cast(
@@ -1378,7 +1439,7 @@ class MusicCog(commands.Cog):
                 ),
             )
             await interaction.response.send_message(
-                embed=music_queue_embed(response),
+                embed=music_queue_embed(response, page=page),
                 view=MusicControlsView(self.runtime),
             )
         except Exception as exc:
@@ -1388,15 +1449,45 @@ class MusicCog(commands.Cog):
         name="queue",
         description="再生中の曲とキューを表示します。",
     )
-    async def quick_queue(self, interaction: discord.Interaction) -> None:
-        await self._send_queue(interaction)
+    async def quick_queue(
+        self,
+        interaction: discord.Interaction,
+        page: app_commands.Range[int, 1, 50] = 1,
+    ) -> None:
+        await self._send_queue(interaction, int(page))
 
     @music.command(
         name="queue",
         description="再生中の曲とキューを表示します。",
     )
-    async def queue(self, interaction: discord.Interaction) -> None:
-        await self._send_queue(interaction)
+    async def queue(
+        self,
+        interaction: discord.Interaction,
+        page: app_commands.Range[int, 1, 50] = 1,
+    ) -> None:
+        await self._send_queue(interaction, int(page))
+
+    @app_commands.command(
+        name="nowplaying",
+        description="現在再生している曲を表示します。",
+    )
+    async def now_playing(self, interaction: discord.Interaction) -> None:
+        try:
+            _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
+            response = cast(
+                AudioQueueResponse,
+                await self.runtime.registry.invoke(
+                    "audio.queue",
+                    AudioQueueRequest(),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=music_now_playing_embed(response),
+                view=MusicControlsView(self.runtime),
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
 
     async def _send_history(self, interaction: discord.Interaction, limit: int) -> None:
         try:
@@ -1444,6 +1535,10 @@ class MusicCog(commands.Cog):
         position_seconds: float | None = None,
         speed: float | None = None,
         pitch: float | None = None,
+        position: int | None = None,
+        to_position: int | None = None,
+        music_percent: int | None = None,
+        speech_percent: int | None = None,
     ) -> None:
         try:
             workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
@@ -1460,6 +1555,10 @@ class MusicCog(commands.Cog):
                         position_seconds=position_seconds,
                         speed=speed,
                         pitch=pitch,
+                        position=position,
+                        to_position=to_position,
+                        music_percent=music_percent,
+                        speech_percent=speech_percent,
                     ),
                     invocation_context(interaction),
                 ),
@@ -1475,8 +1574,8 @@ class MusicCog(commands.Cog):
             elif response.action == AudioAction.SHUFFLE.value:
                 message = "再生待ちの曲をシャッフルしました。"
             elif response.action == AudioAction.SEEK.value:
-                position = _duration(response.position_seconds or 0)
-                message = f"再生位置を `{position}` に移動しました。"
+                formatted_position = _duration(response.position_seconds or 0)
+                message = f"再生位置を `{formatted_position}` に移動しました。"
             elif response.action == AudioAction.TUNE.value:
                 message = (
                     f"速度 **{response.speed:.2f}倍**・"
@@ -1484,6 +1583,16 @@ class MusicCog(commands.Cog):
                     if response.speed is not None and response.pitch is not None
                     else "再生設定を変更しました。"
                 )
+            elif response.action == AudioAction.VOLUME.value:
+                message = (
+                    f"音楽 **{response.music_volume_percent}%**・"
+                    f"読み上げ **{response.speech_volume_percent}%** にしました。"
+                )
+            elif response.action == AudioAction.MOVE.value:
+                message = f"**{response.affected_title}** の再生順を変更しました。"
+            elif response.action == AudioAction.CLEAR_MINE.value:
+                removed_count = response.removed_count or 0
+                message = f"自分が追加した待機曲を **{removed_count}曲** 削除しました。"
             else:
                 message = _AUDIO_ACTION_MESSAGES[response.action]
             await interaction.response.send_message(
@@ -1603,6 +1712,52 @@ class MusicCog(commands.Cog):
             speed=float(speed),
             pitch=float(pitch),
         )
+
+    @music.command(
+        name="volume",
+        description="音楽と読み上げの音量を個別に設定します。",
+    )
+    @app_commands.describe(
+        music="音楽の音量 (0〜200%・省略時は変更しない)",
+        read_aloud="読み上げの音量 (0〜200%・省略時は変更しない)",
+    )
+    async def volume(
+        self,
+        interaction: discord.Interaction,
+        music: app_commands.Range[int, 0, 200] | None = None,
+        read_aloud: app_commands.Range[int, 0, 200] | None = None,
+    ) -> None:
+        await self._control(
+            interaction,
+            AudioAction.VOLUME,
+            music_percent=None if music is None else int(music),
+            speech_percent=None if read_aloud is None else int(read_aloud),
+        )
+
+    @music.command(name="move", description="待機曲の再生順を変更します。")
+    @app_commands.describe(
+        source="現在のキュー番号",
+        destination="移動後のキュー番号",
+    )
+    async def move(
+        self,
+        interaction: discord.Interaction,
+        source: int,
+        destination: int,
+    ) -> None:
+        await self._control(
+            interaction,
+            AudioAction.MOVE,
+            position=source,
+            to_position=destination,
+        )
+
+    @music.command(
+        name="clear-mine",
+        description="自分が追加した待機曲だけをキューから削除します。",
+    )
+    async def clear_mine(self, interaction: discord.Interaction) -> None:
+        await self._control(interaction, AudioAction.CLEAR_MINE)
 
 
 _READ_ALOUD_CHANNEL_TYPES = [
@@ -4398,7 +4553,7 @@ class PrefixCog(commands.Cog):
             )
 
     @commands.command(name="queue")
-    async def queue(self, context: BotContext) -> None:
+    async def queue(self, context: BotContext, page: int = 1) -> None:
         try:
             guild_id = context.guild.id if context.guild else None
             _discord_audio_session(self.bot, self.runtime, guild_id)
@@ -4411,7 +4566,7 @@ class PrefixCog(commands.Cog):
                 ),
             )
             await context.send(
-                embed=music_queue_embed(response),
+                embed=music_queue_embed(response, page=page),
                 view=MusicControlsView(self.runtime),
             )
         except Exception as exc:
@@ -4446,7 +4601,42 @@ class PrefixCog(commands.Cog):
                 )
             )
 
-    async def _control(self, context: BotContext, action: AudioAction) -> None:
+    @commands.command(name="nowplaying", aliases=("np",))
+    async def nowplaying(self, context: BotContext) -> None:
+        try:
+            guild_id = context.guild.id if context.guild else None
+            _discord_audio_session(self.bot, self.runtime, guild_id)
+            response = cast(
+                AudioQueueResponse,
+                await self.runtime.registry.invoke(
+                    "audio.queue",
+                    AudioQueueRequest(),
+                    prefix_context(context),
+                ),
+            )
+            await context.send(
+                embed=music_now_playing_embed(response),
+                view=MusicControlsView(self.runtime),
+            )
+        except Exception as exc:
+            await context.send(
+                embed=command_embed(
+                    "処理できませんでした",
+                    description=error_message(exc),
+                    tone=EmbedTone.ERROR,
+                )
+            )
+
+    async def _control(
+        self,
+        context: BotContext,
+        action: AudioAction,
+        *,
+        position: int | None = None,
+        to_position: int | None = None,
+        music_percent: int | None = None,
+        speech_percent: int | None = None,
+    ) -> None:
         try:
             if context.guild is None:
                 raise UserError("workspace.required")
@@ -4456,14 +4646,39 @@ class PrefixCog(commands.Cog):
                 AudioControlResponse,
                 await self.runtime.registry.invoke(
                     "audio.control",
-                    AudioControlRequest(action=action),
+                    AudioControlRequest(
+                        action=action,
+                        position=position,
+                        to_position=to_position,
+                        music_percent=music_percent,
+                        speech_percent=speech_percent,
+                    ),
                     prefix_context(context),
                 ),
             )
+            description = _AUDIO_ACTION_MESSAGES.get(
+                response.action,
+                "音楽の状態を更新しました。",
+            )
+            if response.action == AudioAction.MOVE.value:
+                description = (
+                    f"**{response.affected_title}** を再生待ちの "
+                    f"**{to_position}番目**へ移動しました。"
+                )
+            elif response.action == AudioAction.CLEAR_MINE.value:
+                description = (
+                    f"あなたが追加した曲を **{response.removed_count or 0}曲** "
+                    "キューから削除しました。"
+                )
+            elif response.action == AudioAction.VOLUME.value:
+                description = (
+                    f"音楽 **{response.music_volume_percent}%**・"
+                    f"読み上げ **{response.speech_volume_percent}%** にしました。"
+                )
             await context.send(
                 embed=command_embed(
                     "音楽を操作しました",
-                    description=_AUDIO_ACTION_MESSAGES[response.action],
+                    description=description,
                     tone=EmbedTone.SUCCESS,
                 )
             )
@@ -4495,6 +4710,38 @@ class PrefixCog(commands.Cog):
     @commands.command(name="leave")
     async def leave(self, context: BotContext) -> None:
         await self._control(context, AudioAction.LEAVE)
+
+    @commands.command(name="volume")
+    async def volume(
+        self,
+        context: BotContext,
+        music: int | None = None,
+        read_aloud: int | None = None,
+    ) -> None:
+        await self._control(
+            context,
+            AudioAction.VOLUME,
+            music_percent=music,
+            speech_percent=read_aloud,
+        )
+
+    @commands.command(name="move")
+    async def move(
+        self,
+        context: BotContext,
+        from_position: int,
+        to_position: int,
+    ) -> None:
+        await self._control(
+            context,
+            AudioAction.MOVE,
+            position=from_position,
+            to_position=to_position,
+        )
+
+    @commands.command(name="clear-mine", aliases=("clearmine",))
+    async def clear_mine(self, context: BotContext) -> None:
+        await self._control(context, AudioAction.CLEAR_MINE)
 
 
 async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
