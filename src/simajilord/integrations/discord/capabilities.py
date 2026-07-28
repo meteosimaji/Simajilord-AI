@@ -58,6 +58,10 @@ from simajilord.capabilities.speech import (
     SpeechSpeakRequest,
     SpeechSpeakResponse,
 )
+from simajilord.capabilities.translation import (
+    TranslationTranslateRequest,
+    TranslationTranslateResponse,
+)
 from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
@@ -76,6 +80,7 @@ from simajilord.services.quote import (
 )
 
 from .audio import DiscordAudioOutput
+from .local_media import attachment_can_play, import_discord_attachment
 from .presenter import (
     expanded_message_embeds,
     expanded_message_view,
@@ -453,6 +458,34 @@ class DiscordImportAttachmentRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordPlayAttachmentRequest:
+    channel_id: str
+    message_id: str
+    attachment_index: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordTranslateMessageRequest:
+    channel_id: str
+    message_id: str
+    target_language: str
+    source_language: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordTranslateMessageResponse:
+    message_id: str
+    channel_id: str
+    jump_url: str
+    author_name: str
+    original: str
+    translation: str
+    source_language: str
+    target_language: str
+    provider: str
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordViewImageAttachmentRequest:
     channel_id: str
     message_id: str
@@ -776,6 +809,43 @@ def build_discord_endpoints(
             poll=_expanded_poll(message.poll),
             reply_author_name=reply_author_name,
             reply_content_preview=reply_content_preview,
+        )
+
+    async def translate_message(
+        request: DiscordTranslateMessageRequest,
+        context: InvocationContext,
+    ) -> DiscordTranslateMessageResponse:
+        guild = _guild(client, context)
+        channel, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        if not message.content.strip():
+            raise UserError("translation.message_text_required")
+        translated = cast(
+            TranslationTranslateResponse,
+            await runtime.registry.invoke(
+                "translation.translate",
+                TranslationTranslateRequest(
+                    text=message.content,
+                    target_language=request.target_language,
+                    source_language=request.source_language,
+                ),
+                context,
+            ),
+        )
+        return DiscordTranslateMessageResponse(
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            jump_url=message.jump_url,
+            author_name=message.author.display_name,
+            original=translated.original,
+            translation=translated.translation,
+            source_language=translated.source_language,
+            target_language=translated.target_language,
+            provider=translated.provider,
         )
 
     async def post_expanded_message(
@@ -1254,6 +1324,32 @@ def build_discord_endpoints(
         )
         return cast(AudioPlayResponse, response)
 
+    async def play_attachment(
+        request: DiscordPlayAttachmentRequest,
+        context: InvocationContext,
+    ) -> AudioPlayResponse:
+        """Import one authorized Discord attachment, then use normal voice policy."""
+
+        message, attachment = await _attachment(
+            client,
+            context,
+            request.channel_id,
+            request.message_id,
+            request.attachment_index,
+        )
+        if not attachment_can_play(attachment):
+            raise UserError("local_media.content_type_unsupported")
+        record = await import_discord_attachment(
+            runtime,
+            attachment,
+            source_message=message,
+            uploader=message.author,
+        )
+        return await play_audio(
+            AudioPlayRequest(reference=record.reference),
+            context,
+        )
+
     async def control_audio(
         request: AudioControlRequest,
         context: InvocationContext,
@@ -1355,7 +1451,7 @@ def build_discord_endpoints(
     ) -> AudioControlResponse:
         return await _invoke_audio_control("audio.set_volume", request, context)
 
-    async def set_audio_mix(
+    async def set_audio_radio(
         request: AudioMixRequest,
         context: InvocationContext,
     ) -> AudioMixResponse:
@@ -1390,6 +1486,16 @@ def build_discord_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "music", *keywords),
                 side_effects=("Changes the server's persistent audio session.",),
+                requires_workspace=True,
+                requires_voice=True,
+                requires_same_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "audio.same_voice_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Updates the shared Audio panel and playback state.",
             ),
             request_type,
             AudioControlResponse,
@@ -1698,6 +1804,9 @@ def build_discord_endpoints(
                 summary="List channels and identifiers in the current Discord server.",
                 risk=RiskLevel.READ,
                 keywords=("discord", "channels", "threads", "where"),
+                requires_workspace=True,
+                expected_errors=("discord.member_required",),
+                timeout_seconds=10,
             ),
             DiscordListChannelsRequest,
             DiscordListChannelsResponse,
@@ -1709,6 +1818,12 @@ def build_discord_endpoints(
                 summary="Read a bounded number of messages from an authorized Discord channel.",
                 risk=RiskLevel.READ,
                 keywords=("discord", "messages", "history", "conversation", "moderation"),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.message_limit_invalid",
+                ),
+                timeout_seconds=15,
             ),
             DiscordReadMessagesRequest,
             DiscordReadMessagesResponse,
@@ -1723,6 +1838,12 @@ def build_discord_endpoints(
                 ),
                 risk=RiskLevel.READ,
                 keywords=("discord", "message", "chunk", "mention", "content"),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.message_offset_invalid",
+                ),
+                timeout_seconds=15,
             ),
             DiscordGetMessageRequest,
             DiscordGetMessageResponse,
@@ -1736,10 +1857,47 @@ def build_discord_endpoints(
                 ),
                 risk=RiskLevel.READ,
                 keywords=("discord", "message", "link", "quote", "expand"),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.expand_cross_guild_forbidden",
+                ),
+                timeout_seconds=20,
             ),
             DiscordExpandMessageRequest,
             DiscordExpandMessageResponse,
             expand_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.translate_message",
+                summary=(
+                    "Read one authorized Discord message and translate its text locally "
+                    "to a requested BCP-47 language."
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "message",
+                    "translate",
+                    "translation",
+                    "language",
+                    "メッセージ",
+                    "翻訳",
+                    "言語",
+                    "ドイツ語",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "translation.message_text_required",
+                    "translation.language_unsupported",
+                ),
+                timeout_seconds=60,
+            ),
+            DiscordTranslateMessageRequest,
+            DiscordTranslateMessageResponse,
+            translate_message,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -1751,6 +1909,14 @@ def build_discord_endpoints(
                 risk=RiskLevel.WRITE,
                 keywords=("discord", "message", "quote", "repost", "expand", "jump"),
                 side_effects=("Posts one quotation of the source message to the chosen channel.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.expand_destination_unavailable",
+                ),
+                timeout_seconds=30,
+                user_visible_effect="Posts a quoted message with attribution and a Jump button.",
             ),
             DiscordPostExpandedMessageRequest,
             DiscordPostExpandedMessageResponse,
@@ -1772,6 +1938,15 @@ def build_discord_endpoints(
                     "render",
                 ),
                 side_effects=("Posts one locally rendered quote image to the chosen channel.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.quote_render_failed",
+                    "discord.quote_destination_unavailable",
+                ),
+                timeout_seconds=60,
+                user_visible_effect="Posts a locally rendered quote image with source attribution.",
             ),
             DiscordCreateQuoteImageRequest,
             DiscordCreateQuoteImageResponse,
@@ -1793,6 +1968,13 @@ def build_discord_endpoints(
                     "animated emoji",
                     "image",
                 ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.custom_emoji_index_invalid",
+                    "discord.custom_emoji_unavailable",
+                ),
+                timeout_seconds=30,
             ),
             DiscordViewCustomEmojiRequest,
             DiscordViewCustomEmojiResponse,
@@ -1815,6 +1997,13 @@ def build_discord_endpoints(
                     "frame",
                     "image",
                 ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.sticker_index_invalid",
+                    "discord.sticker_unavailable",
+                ),
+                timeout_seconds=30,
             ),
             DiscordViewStickerRequest,
             DiscordViewStickerResponse,
@@ -1841,6 +2030,14 @@ def build_discord_endpoints(
                     "Retrieves one authorized Discord attachment.",
                     "Uses one HIVE API request when no cached result is available.",
                 ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.attachment_missing",
+                    "moderation.media_too_large",
+                ),
+                timeout_seconds=120,
             ),
             DiscordAnalyzeAttachmentRequest,
             SyntheticMediaAnalyzeResponse,
@@ -1857,6 +2054,15 @@ def build_discord_endpoints(
                 approval=ApprovalMode.NEVER,
                 keywords=("discord", "attachment", "import", "file", "pdf", "zip"),
                 side_effects=("Creates or replaces a file inside the isolated workspace.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "files.workspace_required",
+                    "discord.attachment_missing",
+                    "files.file_too_large",
+                ),
+                timeout_seconds=60,
+                user_visible_effect="Creates or replaces a file in the isolated workspace.",
             ),
             DiscordImportAttachmentRequest,
             WorkspaceFileRecord,
@@ -1872,6 +2078,13 @@ def build_discord_endpoints(
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=("discord", "attachment", "image", "view", "vision"),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.attachment_missing",
+                    "discord.attachment_not_supported_image",
+                ),
+                timeout_seconds=30,
             ),
             DiscordViewImageAttachmentRequest,
             DiscordViewImageAttachmentResponse,
@@ -1892,6 +2105,11 @@ def build_discord_endpoints(
                     "notify",
                 ),
                 side_effects=("Creates a user-visible message in a Discord channel.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=("discord.agent_update_channel_forbidden",),
+                timeout_seconds=15,
+                user_visible_effect="Posts a new Discord message visible to channel members.",
             ),
             DiscordSendMessageRequest,
             DiscordSendMessageResponse,
@@ -1905,6 +2123,14 @@ def build_discord_endpoints(
                 approval=ApprovalMode.NEVER,
                 keywords=("discord", "file", "attachment", "send", "deliver", "export"),
                 side_effects=("Creates one Discord message with an attachment.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.workspace_required",
+                    "discord.file_too_large",
+                ),
+                timeout_seconds=30,
+                user_visible_effect="Posts a Discord message containing the selected file.",
             ),
             DiscordSendFileRequest,
             DiscordSendFileResponse,
@@ -1945,15 +2171,81 @@ def build_discord_endpoints(
                 ),
                 risk=RiskLevel.EXTERNAL,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "music", "audio", "play", "queue", "voice"),
+                keywords=(
+                    "discord",
+                    "music",
+                    "audio",
+                    "play",
+                    "queue",
+                    "voice",
+                    "曲",
+                    "流して",
+                    "再生",
+                ),
                 side_effects=(
                     "May join the requester's voice channel.",
                     "Adds one track to the server's persistent queue.",
                 ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "audio.waiting_queue_restricted",
+                    "audio.same_voice_required",
+                ),
+                timeout_seconds=60,
+                user_visible_effect="Queues a track and refreshes the shared Audio panel.",
             ),
             AudioPlayRequest,
             AudioPlayResponse,
             play_audio,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.play_attachment",
+                summary=(
+                    "Validate and persist an audio or video attachment from an "
+                    "authorized Discord message, then queue its audio."
+                ),
+                risk=RiskLevel.EXTERNAL,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "attachment",
+                    "audio",
+                    "video",
+                    "play",
+                    "queue",
+                    "voice",
+                    "添付",
+                    "音声",
+                    "動画",
+                    "流して",
+                ),
+                side_effects=(
+                    "Copies the selected attachment into the private local media store.",
+                    "May join the requester's voice channel.",
+                    "Adds one item to the server's persistent queue.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.attachment_missing",
+                    "discord.attachment_unavailable",
+                    "local_media.content_type_unsupported",
+                    "local_media.too_large",
+                    "local_media.cache_full",
+                ),
+                timeout_seconds=120,
+                user_visible_effect=(
+                    "Stores the attachment locally, queues its audio, and refreshes "
+                    "the shared Audio panel."
+                ),
+            ),
+            DiscordPlayAttachmentRequest,
+            AudioPlayResponse,
+            play_attachment,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -1966,6 +2258,16 @@ def build_discord_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "music", "pause", "resume", "skip", "stop", "loop"),
                 side_effects=("Changes the server's persistent audio session.",),
+                requires_workspace=True,
+                requires_voice=True,
+                requires_same_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "audio.same_voice_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Updates the shared Audio panel and playback state.",
             ),
             AudioControlRequest,
             AudioControlResponse,
@@ -2051,13 +2353,13 @@ def build_discord_endpoints(
         discord_audio_endpoint(
             "discord.set_audio_volume",
             "Set music and read-aloud volume percentages.",
-            ("volume", "speech"),
+            ("volume", "speech", "音楽", "音量", "下げて", "上げて"),
             AudioVolumeRequest,
             set_audio_volume,
         ),
         endpoint(
             CapabilityDescriptor(
-                name="discord.set_audio_mix",
+                name="discord.set_audio_radio",
                 summary=(
                     "Start or stop related-track selection from one or more YouTube seeds. "
                     "Human requests always take priority over automatically selected tracks."
@@ -2073,10 +2375,21 @@ def build_discord_endpoints(
                     "related",
                 ),
                 side_effects=("Changes the server's persistent automatic selection settings.",),
+                requires_workspace=True,
+                requires_voice=True,
+                requires_same_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "audio.same_voice_required",
+                    "audio.mix_seed_limit",
+                ),
+                timeout_seconds=60,
+                user_visible_effect="Changes Radio state and refreshes the shared Audio panel.",
             ),
             AudioMixRequest,
             AudioMixResponse,
-            set_audio_mix,
+            set_audio_radio,
         ),
         discord_audio_endpoint(
             "discord.move_audio",
@@ -2106,6 +2419,12 @@ def build_discord_endpoints(
                     "May join the requester's voice channel.",
                     "Plays synthesized speech.",
                 ),
+                requires_workspace=True,
+                requires_voice=True,
+                idempotency="non_idempotent_write",
+                expected_errors=("discord.member_required",),
+                timeout_seconds=90,
+                user_visible_effect="Plays synthesized speech in the requester's voice channel.",
             ),
             SpeechSpeakRequest,
             SpeechSpeakResponse,
@@ -2117,6 +2436,9 @@ def build_discord_endpoints(
                 summary="Inspect the current Discord read-aloud routes without changing them.",
                 risk=RiskLevel.READ,
                 keywords=("discord", "read aloud", "status", "route", "tts"),
+                requires_workspace=True,
+                expected_errors=("discord.member_required",),
+                timeout_seconds=10,
             ),
             ReadAloudStatusRequest,
             ReadAloudResponse,
@@ -2132,6 +2454,18 @@ def build_discord_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "read aloud", "add", "channel", "tts"),
                 side_effects=("Adds read-aloud source channels to persistent settings.",),
+                requires_workspace=True,
+                requires_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.voice_channel_required",
+                    "read_aloud.source_channel_limit",
+                ),
+                timeout_seconds=20,
+                user_visible_effect=(
+                    "Enables automatic read aloud for the selected conversation channels."
+                ),
             ),
             ReadAloudAddSourcesRequest,
             ReadAloudResponse,
@@ -2235,8 +2569,26 @@ def build_discord_endpoints(
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "read aloud", "join", "leave", "move"),
+                keywords=(
+                    "discord",
+                    "read aloud",
+                    "join",
+                    "leave",
+                    "move",
+                    "読み上げ",
+                    "入退室",
+                    "入室",
+                    "退出",
+                ),
                 side_effects=("Updates read-aloud settings for voice-channel events.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.manage_guild_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Changes which voice join, leave, and move events are spoken.",
             ),
             ReadAloudAnnouncementsSetRequest,
             ReadAloudPolicyResponse,
@@ -2250,6 +2602,16 @@ def build_discord_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "read aloud", "messages", "events", "off"),
                 side_effects=("Persists the selected read-aloud content mode.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.manage_guild_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect=(
+                    "Changes whether messages, voice events, both, or neither are spoken."
+                ),
             ),
             ReadAloudContentModeSetRequest,
             ReadAloudPolicyResponse,

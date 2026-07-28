@@ -1086,7 +1086,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
-    { name = "davey" },
     { name = "discord-py", extra = ["voice"] },
     { name = "pillow" },
     { name = "pypdf" },
@@ -1106,7 +1105,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14,<4" },
-    { name = "davey", specifier = "==0.1.6" },
     { name = "discord-py", extras = ["voice"], specifier = "==2.7.1" },
     { name = "pillow", specifier = ">=11.3,<13" },
     { name = "pypdf", specifier = ">=6.6,<7" },

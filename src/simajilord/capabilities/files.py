@@ -110,10 +110,13 @@ def build_file_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="files.list",
-                summary="このDiscordサーバー専用の隔離ワークスペース内にあるファイルを一覧表示します。",
+                summary="List files in this Discord server's isolated workspace.",
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=("files", "workspace", "attachments", "documents"),
+                requires_workspace=True,
+                expected_errors=("files.workspace_required",),
+                timeout_seconds=10,
             ),
             FileListRequest,
             FileListResponse,
@@ -123,12 +126,15 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.read",
                 summary=(
-                    "隔離ワークスペース内のテキストを読み、PDF・ZIPを調べます。"
-                    "長い内容は開始位置を指定して続きを取得できます。"
+                    "Read text or inspect PDF and ZIP files in the isolated workspace. "
+                    "Use an offset to continue long content."
                 ),
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=("file", "read", "pdf", "zip", "document", "inspect"),
+                requires_workspace=True,
+                expected_errors=("files.workspace_required",),
+                timeout_seconds=30,
             ),
             FileReadRequest,
             WorkspaceReadResult,
@@ -138,13 +144,20 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.write_text",
                 summary=(
-                    "隔離ワークスペース内のUTF-8テキストファイルを安全に作成・更新します。"
-                    "必要に応じて更新前のSHA-256を照合します。"
+                    "Create or update a UTF-8 text file in the isolated workspace, "
+                    "optionally checking the previous SHA-256."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("file", "write", "create", "edit", "document", "code"),
-                side_effects=("隔離ワークスペース内のテキストファイルを作成・更新します。",),
+                side_effects=(
+                    "Creates or updates a text file in the isolated workspace.",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=("files.workspace_required",),
+                timeout_seconds=15,
+                user_visible_effect="Creates or updates a file in the isolated workspace.",
             ),
             FileWriteTextRequest,
             WorkspaceFileRecord,
@@ -153,13 +166,16 @@ def build_file_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="files.replace_text",
-                summary=(
-                    "SHA-256で競合を防ぎながら、一意に一致する文章を1か所置換します。"
-                ),
+                summary="Replace one unique text match with optional SHA-256 locking.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=("file", "edit", "replace", "patch"),
-                side_effects=("隔離ワークスペース内のテキストファイルを安全に編集します。",),
+                side_effects=("Edits a text file in the isolated workspace.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=("files.workspace_required",),
+                timeout_seconds=15,
+                user_visible_effect="Edits a file in the isolated workspace.",
             ),
             FileReplaceTextRequest,
             WorkspaceFileRecord,

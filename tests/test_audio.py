@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import cast
 
@@ -1036,6 +1037,42 @@ async def test_audio_state_store_coalesces_burst_writes(
 
     assert writes == 1
     assert AudioStateStore(store.path).all()[0].destination_id == "voice"
+    persisted = json.loads(store.path.read_text(encoding="utf-8"))
+    assert "voice_activation_required" in persisted["sessions"][0]
+    assert "resume_confirmation_required" not in persisted["sessions"][0]
+
+
+def test_audio_state_store_migrates_legacy_resume_confirmation(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "audio_sessions.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sessions": [
+                    {
+                        "workspace_id": "guild",
+                        "destination_id": "voice",
+                        "waiting_actor_ids": [],
+                        "loop_mode": "none",
+                        "auto_leave": True,
+                        "speed": 1.0,
+                        "pitch": 1.0,
+                        "items": [],
+                        "history": [],
+                        "resume_confirmation_required": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = AudioStateStore(state_path).all()
+
+    assert len(restored) == 1
+    assert restored[0].voice_activation_required is True
 
 
 @pytest.mark.asyncio
@@ -1131,7 +1168,7 @@ async def test_music_queue_survives_manager_restart_without_signed_url(tmp_path)
     assert snapshot.pending[0].source == ""
     assert snapshot.music_volume == pytest.approx(0.7)
     assert snapshot.speech_volume == pytest.approx(1.2)
-    assert snapshot.resume_confirmation_required is True
+    assert snapshot.voice_activation_required is True
     await restored_manager.close()
 
 
@@ -1430,7 +1467,7 @@ async def test_auto_leave_suspends_voice_without_losing_current_track(tmp_path) 
     assert [item.title for item in snapshot.pending] == ["Keep me"]
     assert snapshot.pending[0].start_seconds > 0
     assert snapshot.destination_id == "voice"
-    assert snapshot.resume_confirmation_required is True
+    assert snapshot.voice_activation_required is True
     await manager.close()
 
 
@@ -1447,7 +1484,7 @@ async def test_auto_leave_holds_read_aloud_only_route_for_explicit_resume() -> N
     assert snapshot.current is None
     assert snapshot.pending == ()
     assert snapshot.destination_id == "voice"
-    assert snapshot.resume_confirmation_required is True
+    assert snapshot.voice_activation_required is True
     await session.close()
 
 
@@ -1481,5 +1518,5 @@ async def test_read_aloud_only_resume_hold_survives_manager_restart(
     snapshot = await restored[0].snapshot()
     assert snapshot.pending == ()
     assert snapshot.destination_id == "voice"
-    assert snapshot.resume_confirmation_required is True
+    assert snapshot.voice_activation_required is True
     await restored_manager.close()

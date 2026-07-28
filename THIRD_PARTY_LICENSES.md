@@ -6,7 +6,7 @@ The package distributions and linked repositories contain the complete license t
 | Package | Purpose | License |
 | --- | --- | --- |
 | discord.py | Discord API and voice client | MIT |
-| davey | Discord DAVE media encryption binding | MIT |
+| davey | Discord voice encryption support (installed by discord.py voice extras) | MIT |
 | aiohttp | Bounded asynchronous HTTP client | Apache-2.0 / MIT |
 | pypdf | Text extraction from bounded PDF sources | BSD-3-Clause |
 | yt-dlp | Media metadata and stream resolution | Unlicense |
@@ -15,9 +15,7 @@ The package distributions and linked repositories contain the complete license t
 | PyNaCl | Discord voice encryption support | Apache-2.0 |
 
 The complete yt-dlp upstream repository is vendored at `vendor/yt-dlp`; its license text and
-third-party notices are preserved in that directory. `davey` is also pinned directly because
-the experimental video media layer requires codec-aware DAVE frame encryption in addition to
-the audio support provided through `discord.py[voice]`. `yt-dlp-ejs` is pinned because current
+third-party notices are preserved in that directory. `yt-dlp-ejs` is pinned because current
 yt-dlp releases require it, together with a supported JavaScript runtime, for complete YouTube
 support.
 

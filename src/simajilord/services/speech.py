@@ -12,6 +12,7 @@ import wave
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from time import monotonic
@@ -370,6 +371,67 @@ class SpeechService:
     async def close(self) -> None:
         await self._scheduler.close()
         await self.provider.close()
+
+    async def cleanup_orphans(
+        self,
+        *,
+        before: datetime,
+        max_cache_bytes: int,
+    ) -> tuple[int, int]:
+        """Remove stale owned speech files and bound the reusable speech cache."""
+
+        if before.tzinfo is None:
+            raise ValueError("Retention cutoffs must be timezone-aware.")
+        if max_cache_bytes < 0:
+            raise ValueError("max_cache_bytes cannot be negative.")
+        return await asyncio.to_thread(
+            self._cleanup_orphans,
+            before.timestamp(),
+            max_cache_bytes,
+        )
+
+    def _cleanup_orphans(
+        self,
+        cutoff_epoch: float,
+        max_cache_bytes: int,
+    ) -> tuple[int, int]:
+        orphan_count = 0
+        for path in self.output_dir.glob("speech-*"):
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and path.stat().st_mtime < cutoff_epoch
+            ):
+                path.unlink(missing_ok=True)
+                orphan_count += 1
+
+        cache_files = tuple(
+            path
+            for path in self._cache_dir.iterdir()
+            if path.is_file() and not path.is_symlink()
+        )
+        removed_cache = 0
+        for path in cache_files:
+            if path.stat().st_mtime < cutoff_epoch:
+                path.unlink(missing_ok=True)
+                removed_cache += 1
+        remaining = sorted(
+            (
+                path
+                for path in self._cache_dir.iterdir()
+                if path.is_file() and not path.is_symlink()
+            ),
+            key=lambda path: (path.stat().st_mtime, path.name),
+        )
+        total = sum(path.stat().st_size for path in remaining)
+        for path in remaining:
+            if total <= max_cache_bytes:
+                break
+            size = path.stat().st_size
+            path.unlink(missing_ok=True)
+            total -= size
+            removed_cache += 1
+        return orphan_count, removed_cache
 
     async def _synthesize_part(
         self,

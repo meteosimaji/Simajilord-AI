@@ -34,8 +34,8 @@ local agent / human commands / future transports
 Conversation text is not hard-coded into capabilities. Only the Discord presenter owns fixed
 operational feedback such as command success, validation, and permission errors. The agent
 generates conversational text and chooses `discord.send_message` separately.
-Explicit human commands use compact, natural Japanese embeds with useful result fields and a
-Discord timestamp; implementation labels and decorative footer text are intentionally omitted.
+Explicit human commands use compact English embeds with useful result fields and a Discord
+timestamp; implementation labels and decorative footer text are intentionally omitted.
 
 ## Current Discord capabilities
 
@@ -54,7 +54,7 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - A silent, five-minute YouTube link card with direct `Play`, `Add`, and `Radio` actions;
   simply posting the link does not resolve media or change the queue
 - Durable Radio mode fed one related track at a time, while manual requests always take
-  priority; the old `mix` name remains a compatibility alias
+  priority
 - Durable requester attribution and a bounded recently-played history
 - Automatic read-aloud from text channels, threads, and voice-channel chats with persistent
   many-conversations-to-one-voice routing
@@ -77,6 +77,12 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - A bare Discord message link expands in place only after actor and BOT permission checks;
   the replacement preserves a Jump link and the original link post is deleted only after the
   replacement succeeds
+- Discord audio/video attachments can be imported through `/play file:` or
+  `Apps` → `Play Audio`. Files are probed before admission, stored under a private
+  content-addressed local cache, and retained while a durable queue still references them
+- On macOS 26 or newer, `/translate` and `Apps` → `Translate` use Apple's on-device
+  Natural Language and Translation frameworks through a small local Swift helper. Message
+  text is not sent to a cloud translation API
 - Custom emoji and sticker metadata stays text-only by default. The agent can request one
   selected asset as a preview, full GIF/APNG animation, or exact animation frame only when
   visual inspection is actually needed
@@ -96,6 +102,9 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - A bounded FIFO AI-turn queue with durable conversation IDs, context-budget rotation,
   exact-message verification, progressive status updates, and corrective retries after
   failed writes
+- An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
+  OAuth identity and same-VC membership are checked by the backend; the browser receives no
+  stream URLs, authorization headers, local paths, or playback controls
 - Autonomous turns retain bounded audio inspection and a provenance-locked message-repost API,
   but receive no arbitrary Discord-message write scope, audio-write approval,
   image-generation scope, or file-write scope
@@ -105,32 +114,13 @@ One independent audio session is created per Discord server. Different servers m
 concurrently up to the configured process limit; one server never owns multiple Discord voice
 connections.
 
-## Experimental video foundation
-
-The repository contains a transport-neutral, testable video media foundation:
-
-- H.264 Annex-B and VP8 encoding through FFmpeg, including Apple VideoToolbox when available
-- RFC 6184 H.264 and RFC 7741 VP8 RTP packetization
-- DAVE video-frame encryption through `davey`
-- Discord voice UDP `aead_xchacha20_poly1305_rtpsize` transport encryption
-- RTCP sender reports, PLI/FIR keyframe requests, NACK retransmission, stop, and reconnect
-
-Run `uv run simajilord-video-doctor` to exercise both codecs entirely offline.
-
-This is deliberately **not exposed as a camera or Go Live command**. Discord's public Bot
-Voice documentation describes audio SSRC negotiation and audio RTP transmission, but does
-not document a Bot operation that starts a camera/Go Live stream or allocates a video SSRC.
-The public Voice State object reports `self_video` and `self_stream`; those fields are not
-accepted by the documented voice-state update operation. Simajilord does not guess private
-client opcodes or inspect/copy the proprietary client protocol. A live adapter can be added
-without changing the codec/session layer if Discord publishes the required Bot signaling.
-
 The optional agent is default-off. Its Codex runtime has browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 
 ## Requirements
 
 - A local VOICEVOX Engine installation, or macOS with the built-in `say` fallback
+- macOS 26 or newer with Xcode Command Line Tools for optional on-device translation
 - Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/)
 - [FFmpeg](https://ffmpeg.org/)
@@ -162,25 +152,57 @@ stops only the process it owns during clean shutdown.
 An optional Netscape cookie file may be configured with `MEDIA_COOKIE_FILE`. It must be an
 existing local file with mode `0600`. The platform never extracts cookies from a browser.
 
+### Optional Now Playing Activity
+
+The Activity uses Discord's official Embedded App SDK and public
+`LAUNCH_ACTIVITY` interaction response. The initial release is display-only.
+
+Build the bundled frontend:
+
+```bash
+cd activity
+npm ci
+npm run build
+cd ..
+```
+
+In the Discord Developer Portal, enable Activities, add the public HTTPS endpoint that maps
+to `DISCORD_ACTIVITY_HOST:DISCORD_ACTIVITY_PORT`, and keep the OAuth client secret only in
+the real `.env`:
+
+```dotenv
+DISCORD_ACTIVITY_ENABLED=true
+DISCORD_CLIENT_SECRET=replace-in-local-env-only
+DISCORD_ACTIVITY_HOST=127.0.0.1
+DISCORD_ACTIVITY_PORT=8787
+```
+
+When enabled, `Open Player` appears in the `/audio` panel and uses discord.py's public
+`launch_activity()` interaction response. A viewer must authenticate with Discord and be in
+the same active voice channel. The Activity is intentionally display-only. See Discord's
+[Activity tutorial](https://docs.discord.com/developers/activities/building-an-activity) and
+[networking guide](https://docs.discord.com/developers/activities/development-guides/networking)
+for URL Mapping and production-hosting requirements.
+
 ## Commands
 
-- `/ping`, `/uptime`, `/about`, `/capabilities`
+- `/help`, `/status`
 - `/audio` opens the shared music and read-aloud control panel
-- `/play`, `/queue`, `/nowplaying`, `/history` for the shortest everyday paths
-- `/radio` starts continuous related playback; `/mix` remains a compatibility alias
-- `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
-- `/music skip`, `/music stop`, `/music leave`, `/music loop`
-- `/music remove`, `/music move`, `/music clear-mine`, `/music shuffle`
-- `/music seek`, `/music tune`, `/music volume`, `/music autoleave`
-- Right-click or long-press a message, then choose `Apps` → `Quote` for local quote rendering
-- `/join` to select up to 25 conversations and read them in your current VC
-- `/timer` creates, lists, or cancels a persistent Focus Timer
-- `/readaloud setup`, `/readaloud status`, `/readaloud remove`, `/readaloud disable` for
-  advanced route management
-- `/download`
-- `/search`, `/fetch`, `/find`
-- `/serverinfo`, `/userinfo`, `/avatar`, `/poll`
-- `/roll`, `/choose`
+- `/play` adds a track and `/radio` starts or stops continuous related playback
+- `/join` selects up to 25 conversations to read in the current VC
+- `/timer` creates a persistent Focus Timer
+- `/system ping`, `/system uptime`, `/system about`, `/system capabilities`
+- `/readaloud ...` manages advanced read-aloud routes, voices, dictionaries, and exclusions
+- `/web search`, `/web fetch`, `/web find`
+- `/translate` translates supplied text or the latest visible message locally
+- `/media download`, `/media detect-ai`
+- `/info server`, `/info user`, `/info avatar`
+- `/utility poll`, `/utility roll`, `/utility choose`
+- Right-click or long-press a message, then choose `Apps` → `Play Audio`, `Translate`, or
+  `Quote` for attachment playback, private translation, or local quote rendering
+
+Playback controls such as pause, skip, loop, queue, levels, and leave are kept in the
+`/audio` panel instead of being duplicated as a large slash-command group.
 
 The configurable prefix remains available as a manual adapter. Its operations and slash
 commands call the same capability APIs.
@@ -205,7 +227,6 @@ uv run ruff check src tests
 uv run mypy src/simajilord
 uv run pytest
 uv run simajilord-audio-doctor
-uv run simajilord-video-doctor
 uv run simajilord-web-doctor "Python"
 uv run python -m compileall -q src
 ```

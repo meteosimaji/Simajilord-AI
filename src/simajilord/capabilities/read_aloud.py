@@ -60,10 +60,10 @@ class ReadAloudStatusRequest:
 @dataclass(frozen=True, slots=True)
 class ReadAloudAddSourcesRequest:
     text_channel_ids: tuple[str, ...] = field(
-        metadata={"description": "読み上げ対象に追加するDiscordチャンネルID。"}
+        metadata={"description": "Discord channel IDs to add as read-aloud sources."}
     )
     audio_destination_id: str = field(
-        metadata={"description": "音声を流すDiscordボイスチャンネルID。"}
+        metadata={"description": "Discord voice channel ID used for audio output."}
     )
     mode: ReadAloudMode = ReadAloudMode.QUEUE
 
@@ -71,7 +71,7 @@ class ReadAloudAddSourcesRequest:
 @dataclass(frozen=True, slots=True)
 class ReadAloudRemoveSourceRequest:
     text_channel_id: str = field(
-        metadata={"description": "読み上げ対象から外すDiscordチャンネルID。"}
+        metadata={"description": "Discord channel ID to remove from read aloud."}
     )
 
 
@@ -87,13 +87,13 @@ class ReadAloudDictionaryListRequest:
 
 @dataclass(frozen=True, slots=True)
 class ReadAloudDictionarySetRequest:
-    surface: str = field(metadata={"description": "メッセージ中で置換する表記。"})
-    reading: str = field(metadata={"description": "VOICEVOXへ渡す自然な読み。"})
+    surface: str = field(metadata={"description": "Written form to replace in messages."})
+    reading: str = field(metadata={"description": "Natural reading passed to VOICEVOX."})
 
 
 @dataclass(frozen=True, slots=True)
 class ReadAloudDictionaryRemoveRequest:
-    surface: str = field(metadata={"description": "辞書から削除する表記。"})
+    surface: str = field(metadata={"description": "Written form to remove."})
 
 
 class ReadAloudExclusionTarget(StrEnum):
@@ -105,10 +105,10 @@ class ReadAloudExclusionTarget(StrEnum):
 class ReadAloudExclusionSetRequest:
     target: ReadAloudExclusionTarget
     target_id: str = field(
-        metadata={"description": "対象のDiscordユーザーIDまたはロールID。"}
+        metadata={"description": "Target Discord user or role ID."}
     )
     ignored: bool = field(
-        metadata={"description": "trueなら読み上げから除外、falseなら解除。"}
+        metadata={"description": "True to exclude from read aloud; false to restore."}
     )
 
 
@@ -128,7 +128,7 @@ class ReadAloudSemanticsSetRequest:
         default=None,
         metadata={
             "description": (
-                "trueなら読み上げ先VCに現在参加中のユーザーの投稿だけを読み上げます。"
+                "When true, read only messages from users currently in the output VC."
             )
         },
     )
@@ -148,7 +148,7 @@ class ReadAloudServerVoiceSetRequest:
 class ReadAloudUserVoiceSetRequest:
     preset: ReadAloudVoicePreset | None = field(
         default=None,
-        metadata={"description": "省略すると本人の上書きを解除します。"},
+        metadata={"description": "Omit to clear the current actor's override."},
     )
 
 
@@ -253,13 +253,13 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
     return endpoint(
         CapabilityDescriptor(
             name="speech.manage_read_aloud",
-            summary="チャンネルの自動読み上げ経路を設定・確認・無効化します。",
+            summary="Configure, inspect, or disable an automatic read-aloud route.",
             risk=RiskLevel.WRITE,
             approval=ApprovalMode.WHEN_REQUESTED,
             keywords=("tts", "speech", "messages", "channel", "voice"),
             side_effects=(
-                "ワークスペースの読み上げ経路を保存します。",
-                "今後届くメッセージの音声が再生される場合があります。",
+                "Persists the workspace read-aloud route.",
+                "Future messages may produce synthesized speech.",
             ),
         ),
         ReadAloudRequest,
@@ -324,7 +324,7 @@ def build_read_aloud_route_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_status",
-                summary="現在の読み上げ経路だけを確認します。",
+                summary="Inspect the current read-aloud route.",
                 risk=RiskLevel.READ,
                 keywords=("read aloud", "status", "route", "tts"),
             ),
@@ -335,11 +335,11 @@ def build_read_aloud_route_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_add_sources",
-                summary="会話チャンネルを現在のVC読み上げ経路へ追加します。",
+                summary="Add conversation channels to the current voice route.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "add", "channel", "voice", "tts"),
-                side_effects=("読み上げ対象チャンネルを永続設定します。",),
+                side_effects=("Persists read-aloud source channels.",),
             ),
             ReadAloudAddSourcesRequest,
             ReadAloudResponse,
@@ -348,11 +348,11 @@ def build_read_aloud_route_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_remove_source",
-                summary="会話チャンネルを読み上げ対象から外します。",
+                summary="Remove a conversation channel from read aloud.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "remove", "channel", "tts"),
-                side_effects=("読み上げ対象チャンネルを永続設定から外します。",),
+                side_effects=("Removes a source from persistent read-aloud settings.",),
             ),
             ReadAloudRemoveSourceRequest,
             ReadAloudResponse,
@@ -361,11 +361,11 @@ def build_read_aloud_route_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_disable",
-                summary="このサーバーの読み上げ経路を無効にします。",
+                summary="Disable the read-aloud route for this server.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "disable", "stop", "tts"),
-                side_effects=("このサーバーの読み上げ経路を削除します。",),
+                side_effects=("Deletes this server's read-aloud route.",),
             ),
             ReadAloudDisableRequest,
             ReadAloudResponse,
@@ -507,11 +507,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_user_voice_set",
-                summary="自分の読み上げ音声プリセットを設定または解除します。",
+                summary="Set or clear the current actor's read-aloud voice preset.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "voice", "preset", "self"),
-                side_effects=("本人の音声プリセットを永続設定します。",),
+                side_effects=("Persists the current actor's voice preset.",),
             ),
             ReadAloudUserVoiceSetRequest,
             ReadAloudPolicyResponse,
@@ -520,11 +520,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_server_voice_set",
-                summary="サーバー既定の読み上げ音声プリセットを設定します。",
+                summary="Set the server's default read-aloud voice preset.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "voice", "preset", "server"),
-                side_effects=("サーバー既定の音声プリセットを永続設定します。",),
+                side_effects=("Persists the server's default voice preset.",),
             ),
             ReadAloudServerVoiceSetRequest,
             ReadAloudPolicyResponse,
@@ -533,11 +533,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_content_mode_set",
-                summary="読み上げをall/messages/events/offのプリセットで設定します。",
+                summary="Set read aloud to all, messages, events, or off.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "messages", "events", "off", "mode"),
-                side_effects=("読み上げ対象の種類を永続設定します。",),
+                side_effects=("Persists which content types are read aloud.",),
             ),
             ReadAloudContentModeSetRequest,
             ReadAloudPolicyResponse,
@@ -546,7 +546,7 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_policy_status",
-                summary="読み上げ辞書・除外・入退室通知の現在値を確認します。",
+                summary="Inspect read-aloud dictionary, exclusions, and announcements.",
                 risk=RiskLevel.READ,
                 keywords=("read aloud", "policy", "settings", "tts"),
             ),
@@ -557,7 +557,7 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_dictionary_list",
-                summary="このサーバーの読み上げ辞書を一覧表示します。",
+                summary="List this server's read-aloud dictionary.",
                 risk=RiskLevel.READ,
                 keywords=("read aloud", "dictionary", "pronunciation", "tts"),
             ),
@@ -568,11 +568,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_dictionary_set",
-                summary="表記と読みをサーバー別読み上げ辞書へ登録します。",
+                summary="Add or update a server-specific pronunciation entry.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "dictionary", "pronunciation", "add"),
-                side_effects=("サーバー別読み上げ辞書を更新します。",),
+                side_effects=("Updates the server-specific pronunciation dictionary.",),
             ),
             ReadAloudDictionarySetRequest,
             ReadAloudPolicyResponse,
@@ -581,11 +581,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_dictionary_remove",
-                summary="指定した表記をサーバー別読み上げ辞書から削除します。",
+                summary="Remove a pronunciation entry from this server.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "dictionary", "pronunciation", "remove"),
-                side_effects=("サーバー別読み上げ辞書を更新します。",),
+                side_effects=("Updates the server-specific pronunciation dictionary.",),
             ),
             ReadAloudDictionaryRemoveRequest,
             ReadAloudPolicyResponse,
@@ -594,11 +594,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_exclusion_set",
-                summary="ユーザーまたはロールの読み上げ除外を設定・解除します。",
+                summary="Set or clear a user or role read-aloud exclusion.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "ignore", "mute", "user", "role"),
-                side_effects=("読み上げ除外設定を更新します。",),
+                side_effects=("Updates persistent read-aloud exclusions.",),
             ),
             ReadAloudExclusionSetRequest,
             ReadAloudPolicyResponse,
@@ -607,11 +607,11 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_announcements_set",
-                summary="VCへの参加・退出・移動の読み上げを設定します。",
+                summary="Configure voice join, leave, and move announcements.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "join", "leave", "move", "announce"),
-                side_effects=("VC入退室通知の読み上げ設定を更新します。",),
+                side_effects=("Updates persistent voice-event announcement settings.",),
             ),
             ReadAloudAnnouncementsSetRequest,
             ReadAloudPolicyResponse,
@@ -621,7 +621,7 @@ def build_read_aloud_policy_endpoints(
             CapabilityDescriptor(
                 name="speech.read_aloud_semantics_set",
                 summary=(
-                    "投稿者名・返信先・添付と、VC参加者限定の読み上げを設定します。"
+                    "Configure author, reply, attachment, and voice-member-only narration."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -633,7 +633,7 @@ def build_read_aloud_policy_endpoints(
                     "semantic",
                     "voice members",
                 ),
-                side_effects=("意味的な読み上げ設定を更新します。",),
+                side_effects=("Updates persistent semantic read-aloud settings.",),
             ),
             ReadAloudSemanticsSetRequest,
             ReadAloudPolicyResponse,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import cast
 
@@ -42,6 +43,28 @@ def test_runtime_composes_before_discord_starts_the_event_loop(
         "image.status",
     } <= set(capability_names)
     asyncio.run(runtime.close())
+
+
+def test_complete_core_capability_catalog_uses_english_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "false")
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+    japanese = re.compile(r"[ぁ-んァ-ヶ一-龯]")
+
+    try:
+        for endpoint in runtime.registry.all():
+            descriptor = endpoint.descriptor
+            assert not japanese.search(descriptor.summary), descriptor.name
+            for side_effect in descriptor.side_effects:
+                assert not japanese.search(side_effect), descriptor.name
+    finally:
+        asyncio.run(runtime.close())
 
 
 def test_agent_discovers_only_permission_guarded_audio_writes(

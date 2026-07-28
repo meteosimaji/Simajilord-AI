@@ -194,7 +194,7 @@ class AudioSession:
         self._suspend_requested = False
         self._restart_requested = False
         self._suspended = False
-        self._resume_confirmation_required = False
+        self._voice_activation_required = False
         self._closed = False
         self._lock = asyncio.Lock()
         self._transport_lock = asyncio.Lock()
@@ -227,17 +227,17 @@ class AudioSession:
         return bool(self._waiting_actor_ids)
 
     @property
-    def resume_confirmation_required(self) -> bool:
-        """Whether a suspended voice route needs an explicit listener resume."""
+    def voice_activation_required(self) -> bool:
+        """Whether the voice route requires an explicit activation action."""
 
-        return self._resume_confirmation_required
+        return self._voice_activation_required
 
     async def connect(self, destination_id: str) -> None:
         await self.output.connect(destination_id)
         self.destination_id = destination_id
         self._waiting_actor_ids.clear()
         self._suspended = False
-        self._resume_confirmation_required = False
+        self._voice_activation_required = False
         self._wake.set()
         self._ensure_worker()
         await self._state_changed()
@@ -644,7 +644,7 @@ class AudioSession:
         async with self._transport_lock, self._lock:
             self._discard_requested = True
             self._waiting_actor_ids.clear()
-            self._resume_confirmation_required = False
+            self._voice_activation_required = False
             self._autoplay_enabled = False
             self._autoplay_generation += 1
             autoplay_task = self._autoplay_refill_task
@@ -694,7 +694,7 @@ class AudioSession:
 
         async with self._transport_lock:
             self._suspended = True
-            self._resume_confirmation_required = True
+            self._voice_activation_required = True
             self._suspend_requested = True
             if self._current is not None:
                 if self._current.kind is AudioKind.MUSIC:
@@ -759,7 +759,7 @@ class AudioSession:
                 autoplay_enabled=self._autoplay_enabled,
                 autoplay_next=self._autoplay[0] if self._autoplay else None,
                 mix_seed_references=tuple(self._mix_seed_references),
-                resume_confirmation_required=self._resume_confirmation_required,
+                voice_activation_required=self._voice_activation_required,
                 connected=self.output.connected,
             )
 
@@ -829,11 +829,11 @@ class AudioSession:
             )
             for item in state.history[-_MAX_HISTORY_ITEMS:]
         )
-        self._resume_confirmation_required = state.resume_confirmation_required
+        self._voice_activation_required = state.voice_activation_required
         if (self._music or self._autoplay) and not self.output.connected:
             self._suspended = True
-            self._resume_confirmation_required = True
-        elif self._resume_confirmation_required and not self.output.connected:
+            self._voice_activation_required = True
+        elif self._voice_activation_required and not self.output.connected:
             self._suspended = True
 
     async def persisted_state(self) -> StoredAudioSession:
@@ -906,7 +906,7 @@ class AudioSession:
                 speech_volume=self._speech_volume,
                 autoplay_enabled=self._autoplay_enabled,
                 mix_seed_references=tuple(self._mix_seed_references),
-                resume_confirmation_required=self._resume_confirmation_required,
+                voice_activation_required=self._voice_activation_required,
             )
 
     def _assert_music_queue_capacity(self, item: AudioItem) -> None:
@@ -1042,6 +1042,15 @@ class AudioSession:
                 "Automatic mix refill failed workspace=%s seeds=%s",
                 self.workspace_id,
                 len(seeds),
+            )
+            await self._record_metric(
+                ServiceOperationMetric(
+                    operation="audio.autoplay_refill",
+                    workspace_id=self.workspace_id,
+                    wait_ms=0.0,
+                    duration_ms=0.0,
+                    outcome="failed",
+                )
             )
             async with self._lock:
                 if generation == self._autoplay_generation:
@@ -1704,6 +1713,14 @@ class AudioSessionManager:
     @property
     def active_session_count(self) -> int:
         return sum(session.output.connected for session in self._sessions.values())
+
+    async def queued_audio_count(self) -> int:
+        """Return pending music and speech across all isolated guild sessions."""
+
+        snapshots = await asyncio.gather(
+            *(session.snapshot() for session in self._sessions.values())
+        )
+        return sum(len(snapshot.pending) for snapshot in snapshots)
 
     def get_or_create(
         self,

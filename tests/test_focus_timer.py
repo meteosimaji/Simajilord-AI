@@ -95,6 +95,52 @@ def test_focus_timer_owner_boundary_and_retry(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_focus_timer_retention_never_removes_active_timers(tmp_path: Path) -> None:
+    path = tmp_path / "timers.sqlite3"
+
+    async def run() -> None:
+        service = FocusTimerService(path)
+        active = await service.create(
+            workspace_id="guild",
+            actor_id="actor",
+            delivery_target_id="channel",
+            duration_seconds=5,
+            message="Still active",
+        )
+        terminal = await service.create(
+            workspace_id="guild",
+            actor_id="actor",
+            delivery_target_id="channel",
+            duration_seconds=5,
+            message="Finished",
+        )
+        await service.cancel(
+            timer_id=terminal.timer_id,
+            workspace_id="guild",
+            actor_id="actor",
+        )
+        old = datetime.now(UTC) - timedelta(days=31)
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "UPDATE focus_timers SET due_at = ? WHERE timer_id = ?",
+                (old.isoformat(), active.timer_id),
+            )
+            connection.execute(
+                "UPDATE focus_timers SET finished_at = ? WHERE timer_id = ?",
+                (old.isoformat(), terminal.timer_id),
+            )
+
+        removed = await service.prune_terminal(
+            before=datetime.now(UTC) - timedelta(days=30)
+        )
+        assert removed == 1
+        assert tuple(
+            timer.timer_id for timer in await service.active(workspace_id="guild")
+        ) == (active.timer_id,)
+
+    asyncio.run(run())
+
+
 def test_focus_timer_capability_enters_and_restores_focus_policy(
     tmp_path: Path,
 ) -> None:

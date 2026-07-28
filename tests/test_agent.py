@@ -522,6 +522,91 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
     assert '"content":"bc"' in output
 
 
+def test_dynamic_tool_catalog_exposes_operational_metadata() -> None:
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: WriteRequest,
+        _: InvocationContext,
+    ) -> WriteResponse:
+        return WriteResponse(job_id=request.subject)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.test_voice",
+                "Update one voice setting.",
+                RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                requires_workspace=True,
+                requires_voice=True,
+                requires_same_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=("audio.same_voice_required",),
+                timeout_seconds=15,
+                user_visible_effect="Updates the shared Audio panel.",
+            ),
+            WriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.test_voice",),
+        required_grants={"discord.test_voice": "audio"},
+        write_capabilities=("discord.test_voice",),
+    )
+    context = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "request",
+        grants=frozenset({"audio"}),
+        approvals=frozenset({"discord.test_voice"}),
+    )
+
+    tool = catalog.dynamic_specs(context)[0]["tools"][0]
+    description = tool["description"]
+    assert "share the bot's voice channel" in description
+    assert "idempotent write" in description
+    assert "approval: when_requested" in description
+    assert "timeout: 15s" in description
+    assert "audio.same_voice_required" in description
+
+
+def test_workspace_capability_is_hidden_without_workspace_context() -> None:
+    registry = CapabilityRegistry()
+
+    async def read(
+        request: ReadRequest,
+        _: InvocationContext,
+    ) -> ReadResponse:
+        return ReadResponse(content=str(request.offset), next_offset=None)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.read",
+                "Read one server value.",
+                RiskLevel.READ,
+                requires_workspace=True,
+            ),
+            ReadRequest,
+            ReadResponse,
+            read,
+        )
+    )
+    catalog = AgentToolCatalog(registry, ("discord.read",))
+
+    assert catalog.dynamic_specs(
+        InvocationContext("actor", None, "agent", "request")
+    ) == ()
+    assert catalog.dynamic_specs(
+        InvocationContext("actor", "workspace", "agent", "request")
+    )
+
+
 @pytest.mark.asyncio
 async def test_dynamic_tool_catalog_validates_literal_choices() -> None:
     registry = CapabilityRegistry()

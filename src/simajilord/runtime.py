@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from time import monotonic
 
 from simajilord.agent import (
@@ -34,6 +36,7 @@ from simajilord.capabilities import (
     build_read_aloud_route_endpoints,
     build_speech_endpoint,
     build_system_endpoints,
+    build_translation_endpoints,
     build_utility_endpoints,
     build_web_endpoints,
 )
@@ -41,19 +44,22 @@ from simajilord.capabilities.status import build_status_endpoint
 from simajilord.config import AgentFeatureAccess, Settings
 from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.domain.audio import AudioItem, AudioQueueLane
-from simajilord.media.providers import YtDlpProvider
+from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
 from simajilord.observability import EventJournal
 from simajilord.providers.image import IdeogramMlxProvider
 from simajilord.providers.moderation import HiveSyntheticMediaProvider
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
+from simajilord.providers.translation import MacOSTranslationProvider
 from simajilord.providers.web import AiohttpPublicWebFetcher, SearxngSearchProvider
 from simajilord.services import (
     AgentFileSandbox,
     AudioSessionManager,
     AudioStateStore,
+    DataMaintenanceService,
     FocusTimerService,
     ImageGenerationService,
     ImageGenerationStore,
+    LocalMediaStore,
     MediaPriority,
     MediaService,
     ModerationService,
@@ -62,6 +68,7 @@ from simajilord.services import (
     ReadAloudService,
     ServiceOperationMetric,
     SpeechService,
+    TranslationService,
     WebService,
 )
 
@@ -73,6 +80,7 @@ class SimajilordRuntime:
     settings: Settings
     registry: CapabilityRegistry
     media: MediaService
+    local_media: LocalMediaStore
     audio: AudioSessionManager
     focus_timer: FocusTimerService
     speech: SpeechService
@@ -81,8 +89,11 @@ class SimajilordRuntime:
     moderation: ModerationService
     image: ImageGenerationService
     quote: QuoteImageService
+    translation: TranslationService
     files: AgentFileSandbox | None
     journal: EventJournal
+    agent_store: AgentConversationStore
+    maintenance: DataMaintenanceService
     agent: AgentService | None
     started_at: datetime
     started_monotonic: float
@@ -90,6 +101,9 @@ class SimajilordRuntime:
     @classmethod
     def build(cls, settings: Settings) -> SimajilordRuntime:
         journal = EventJournal(settings.data_dir / "events.sqlite3")
+        agent_store = AgentConversationStore(
+            settings.data_dir / "agent_conversations.sqlite3"
+        )
 
         async def record_service_metric(metric: ServiceOperationMetric) -> None:
             await journal.append(
@@ -103,10 +117,20 @@ class SimajilordRuntime:
                 },
             )
 
+        local_media = LocalMediaStore(
+            settings.data_dir / "local_media",
+            max_file_bytes=settings.local_media_max_file_bytes,
+            max_cache_bytes=settings.local_media_cache_bytes,
+            max_duration_seconds=settings.local_media_max_duration_seconds,
+            audio_state_path=settings.data_dir / "audio_sessions.json",
+        )
         media = MediaService(
-            YtDlpProvider(
-                cookie_file=settings.media_cookie_file,
-                download_timeout_seconds=settings.download_timeout_seconds,
+            RoutingMediaProvider(
+                YtDlpProvider(
+                    cookie_file=settings.media_cookie_file,
+                    download_timeout_seconds=settings.download_timeout_seconds,
+                ),
+                local_media,
             ),
             max_concurrent=settings.max_concurrent_media,
             max_per_workspace=settings.max_concurrent_media_per_guild,
@@ -210,9 +234,10 @@ class SimajilordRuntime:
             if settings.hive_api_key is not None
             else None
         )
+        moderation_store = ModerationStore(settings.data_dir / "moderation.sqlite3")
         moderation = ModerationService(
             provider=moderation_provider,
-            store=ModerationStore(settings.data_dir / "moderation.sqlite3"),
+            store=moderation_store,
             daily_limit=settings.hive_daily_limit,
             max_media_bytes=settings.hive_max_media_bytes,
             threshold=settings.hive_threshold,
@@ -227,11 +252,15 @@ class SimajilordRuntime:
             if settings.image_model_path is not None
             else None
         )
+        image_store = ImageGenerationStore(
+            settings.data_dir / "image_generation.sqlite3"
+        )
+        image_output_dir = settings.data_dir / "generated_images"
         image = ImageGenerationService(
             provider=image_provider,
-            store=ImageGenerationStore(settings.data_dir / "image_generation.sqlite3"),
+            store=image_store,
             journal=journal,
-            output_dir=settings.data_dir / "generated_images",
+            output_dir=image_output_dir,
             per_user_requests=settings.image_per_user_requests,
             per_user_window_seconds=settings.image_per_user_window_seconds,
             per_workspace_requests=settings.image_per_workspace_requests,
@@ -240,6 +269,24 @@ class SimajilordRuntime:
             rate_limit_exempt_actor_ids=settings.agent_rate_limit_exempt_user_ids,
         )
         quote = QuoteImageService()
+        translation_package = (
+            Path(__file__).resolve().parents[2]
+            / "native"
+            / "macos"
+            / "TranslationHelper"
+        )
+        translation = TranslationService(
+            (
+                MacOSTranslationProvider(
+                    translation_package,
+                    executable_path=settings.translation_helper_path,
+                    timeout_seconds=settings.translation_timeout_seconds,
+                ),
+            )
+            if settings.translation_enabled and sys.platform == "darwin"
+            else (),
+            max_characters=settings.translation_max_characters,
+        )
         files = (
             AgentFileSandbox(settings.data_dir / "agent_files")
             if settings.agent_file_sandbox_enabled
@@ -267,10 +314,12 @@ class SimajilordRuntime:
                 "discord.read_aloud_semantics_set",
                 "discord.read_aloud_content_mode_set",
                 "discord.play_audio",
+                "discord.play_attachment",
                 *AGENT_AUDIO_CONTROL_CAPABILITIES,
                 "discord.read_messages",
                 "discord.send_message",
                 "discord.speak",
+                "discord.translate_message",
                 "discord.post_expanded_message",
                 "discord.create_quote_image",
                 "discord.view_custom_emoji",
@@ -278,12 +327,16 @@ class SimajilordRuntime:
                 "timer.create",
                 "timer.list",
                 "timer.cancel",
+                "translation.detect",
+                "translation.languages",
+                "translation.translate",
             ]
             required_grants: dict[str, str] = {
                 "audio.history": AGENT_AUDIO_GRANT,
                 "audio.queue": AGENT_AUDIO_GRANT,
                 "audio.search": AGENT_AUDIO_GRANT,
                 "discord.play_audio": AGENT_AUDIO_GRANT,
+                "discord.play_attachment": AGENT_AUDIO_GRANT,
                 **{
                     name: AGENT_AUDIO_GRANT
                     for name in AGENT_AUDIO_CONTROL_CAPABILITIES
@@ -396,9 +449,7 @@ class SimajilordRuntime:
                     max_tool_calls=settings.agent_max_tool_calls,
                     max_tool_output_characters=settings.agent_max_tool_output_characters,
                 ),
-                store=AgentConversationStore(
-                    settings.data_dir / "agent_conversations.sqlite3"
-                ),
+                store=agent_store,
                 journal=journal,
                 limits=AgentLimits(
                     per_user_requests=settings.agent_per_user_requests,
@@ -415,12 +466,26 @@ class SimajilordRuntime:
                     ),
                 ),
             )
+        maintenance = DataMaintenanceService(
+            data_dir=settings.data_dir,
+            retention_days=settings.data_retention_days,
+            max_data_bytes=settings.max_data_size_bytes,
+            journal=journal,
+            agent_store=agent_store,
+            focus_timers=focus_timer,
+            image_store=image_store,
+            image_output_dir=image_output_dir,
+            moderation_store=moderation_store,
+            speech=speech,
+            local_media=local_media,
+        )
         started_at = datetime.now(UTC)
         started_monotonic = monotonic()
         runtime = cls(
             settings=settings,
             registry=registry,
             media=media,
+            local_media=local_media,
             audio=audio,
             focus_timer=focus_timer,
             speech=speech,
@@ -429,8 +494,11 @@ class SimajilordRuntime:
             moderation=moderation,
             image=image,
             quote=quote,
+            translation=translation,
             files=files,
             journal=journal,
+            agent_store=agent_store,
+            maintenance=maintenance,
             agent=agent,
             started_at=started_at,
             started_monotonic=started_monotonic,
@@ -441,6 +509,7 @@ class SimajilordRuntime:
                 started_at=started_at,
                 started_monotonic=started_monotonic,
             ),
+            *build_translation_endpoints(translation),
             *build_utility_endpoints(),
             *build_audio_endpoints(media, audio),
             *build_focus_timer_endpoints(focus_timer, read_aloud),
@@ -461,6 +530,7 @@ class SimajilordRuntime:
                 journal,
                 audio,
                 web,
+                maintenance,
                 agent_enabled=settings.agent_enabled,
                 speech_provider=settings.tts_provider,
                 speech_voice=(
@@ -478,6 +548,7 @@ class SimajilordRuntime:
         await self.image.close()
         await self.moderation.close()
         await self.web.close()
+        await self.translation.close()
         await self.audio.close()
         await self.media.close()
         await self.speech.close()

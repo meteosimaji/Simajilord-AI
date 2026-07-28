@@ -106,6 +106,19 @@ class ModerationStore:
         async with self._lock:
             return await asyncio.to_thread(self._used, provider, day)
 
+    async def prune(self, *, before: datetime) -> tuple[int, int]:
+        """Remove expired cache entries and old daily quota rows."""
+
+        if before.tzinfo is None:
+            raise ValueError("Retention cutoffs must be timezone-aware.")
+        cutoff = before.astimezone(UTC)
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._prune,
+                cutoff.isoformat(),
+                cutoff.date().isoformat(),
+            )
+
     def _initialize(self) -> None:
         connection = self._connect()
         try:
@@ -224,6 +237,26 @@ class ModerationStore:
                 (provider, day),
             ).fetchone()
             return int(row[0]) if row is not None else 0
+        finally:
+            connection.close()
+
+    def _prune(self, cutoff: str, cutoff_day: str) -> tuple[int, int]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            detections = connection.execute(
+                "DELETE FROM synthetic_media_detections WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+            quotas = connection.execute(
+                "DELETE FROM moderation_quota WHERE day_utc < ?",
+                (cutoff_day,),
+            ).rowcount
+            connection.commit()
+            return detections, quotas
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

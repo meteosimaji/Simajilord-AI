@@ -235,6 +235,90 @@ class ImageGenerationStore:
             ).fetchone()
         return int(row["count"])
 
+    def prune_delivered_terminal(
+        self,
+        *,
+        before: datetime,
+    ) -> tuple[int, tuple[Path, ...]]:
+        """Forget old terminal jobs only after their Discord delivery completed."""
+
+        if before.tzinfo is None:
+            raise ValueError("Retention cutoffs must be timezone-aware.")
+        cutoff = before.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT output_path
+                FROM image_generation_jobs
+                WHERE status IN (?, ?)
+                  AND delivered = 1
+                  AND COALESCE(completed_at, created_at) < ?
+                """,
+                (
+                    ImageJobStatus.COMPLETED.value,
+                    ImageJobStatus.FAILED.value,
+                    cutoff,
+                ),
+            ).fetchall()
+            connection.execute(
+                """
+                DELETE FROM image_generation_jobs
+                WHERE status IN (?, ?)
+                  AND delivered = 1
+                  AND COALESCE(completed_at, created_at) < ?
+                """,
+                (
+                    ImageJobStatus.COMPLETED.value,
+                    ImageJobStatus.FAILED.value,
+                    cutoff,
+                ),
+            )
+            connection.commit()
+        return (
+            len(rows),
+            tuple(
+                Path(str(row["output_path"]))
+                for row in rows
+                if row["output_path"]
+            ),
+        )
+
+    def prune_oldest_delivered_terminal(self) -> tuple[bool, tuple[Path, ...]]:
+        """Remove one oldest safely delivered terminal job under storage pressure."""
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT job_id, output_path
+                FROM image_generation_jobs
+                WHERE status IN (?, ?) AND delivered = 1
+                ORDER BY COALESCE(completed_at, created_at), job_id
+                LIMIT 1
+                """,
+                (
+                    ImageJobStatus.COMPLETED.value,
+                    ImageJobStatus.FAILED.value,
+                ),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return False, ()
+            connection.execute(
+                "DELETE FROM image_generation_jobs WHERE job_id = ?",
+                (row["job_id"],),
+            )
+            connection.commit()
+        return (
+            True,
+            (
+                (Path(str(row["output_path"])),)
+                if row["output_path"]
+                else ()
+            ),
+        )
+
     def _initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(

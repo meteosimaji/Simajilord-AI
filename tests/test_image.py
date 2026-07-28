@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -15,6 +17,7 @@ from simajilord.capabilities.image import (
 from simajilord.core import CapabilityRegistry, InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.domain.image import (
+    ImageGenerationJob,
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
@@ -126,6 +129,58 @@ def test_ideogram_caption_preserves_full_production_brief() -> None:
     element = caption["compositional_deconstruction"]["elements"][0]["desc"]
     assert prompt.details in element
     assert prompt.avoid in element
+
+
+def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
+    tmp_path: Path,
+) -> None:
+    store = ImageGenerationStore(tmp_path / "image.sqlite3")
+    delivered = ImageGenerationJob(
+        job_id="delivered-failure",
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id=None,
+        prompt=_prompt(),
+        caption_json=build_ideogram_caption(_prompt()),
+        status=ImageJobStatus.FAILED,
+        output_path=None,
+        width=512,
+        height=512,
+        seed=1,
+        created_at_iso=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+        completed_at_iso=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        error_code="provider.failed",
+        delivered=True,
+    )
+    undelivered = ImageGenerationJob(
+        job_id="undelivered-failure",
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id=None,
+        prompt=_prompt(),
+        caption_json=build_ideogram_caption(_prompt()),
+        status=ImageJobStatus.FAILED,
+        output_path=None,
+        width=512,
+        height=512,
+        seed=2,
+        created_at_iso=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+        completed_at_iso=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        error_code="provider.failed",
+        delivered=False,
+    )
+    store.insert(delivered)
+    store.insert(undelivered)
+
+    removed, paths = store.prune_oldest_delivered_terminal()
+
+    assert removed is True
+    assert paths == ()
+    assert store.get(delivered.job_id) is None
+    assert store.get(undelivered.job_id) is not None
+    assert store.prune_oldest_delivered_terminal() == (False, ())
 
 
 @pytest.mark.asyncio
@@ -248,4 +303,58 @@ async def test_image_capability_normalizes_exact_agent_event_id(tmp_path: Path) 
     )
     job = service.store.require(response.job_id)
     assert job.reply_to_message_id == "123"
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_retention_requires_terminal_delivery(tmp_path: Path) -> None:
+    service = _service(tmp_path, exempt=frozenset({"actor"}))
+    jobs = [
+        await service.submit(
+            actor_id="actor",
+            workspace_id="guild",
+            delivery_target_id="channel",
+            reply_to_message_id="message",
+            prompt=_prompt(subject),
+        )
+        for subject in ("delivered", "not delivered")
+    ]
+    old = datetime.now(UTC) - timedelta(days=31)
+    output = tmp_path / "output" / "delivered.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(b"png")
+    with sqlite3.connect(service.store.path) as connection:
+        connection.execute(
+            """
+            UPDATE image_generation_jobs
+            SET status = ?, completed_at = ?, output_path = ?, delivered = 1
+            WHERE job_id = ?
+            """,
+            (
+                ImageJobStatus.COMPLETED.value,
+                old.isoformat(),
+                str(output),
+                jobs[0].job_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE image_generation_jobs
+            SET status = ?, completed_at = ?, delivered = 0
+            WHERE job_id = ?
+            """,
+            (
+                ImageJobStatus.FAILED.value,
+                old.isoformat(),
+                jobs[1].job_id,
+            ),
+        )
+
+    removed_jobs, paths = service.store.prune_delivered_terminal(
+        before=datetime.now(UTC) - timedelta(days=30)
+    )
+    assert removed_jobs == 1
+    assert paths == (output,)
+    assert service.store.get(jobs[0].job_id) is None
+    assert service.store.get(jobs[1].job_id) is not None
     await service.close()

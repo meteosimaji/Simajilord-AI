@@ -3,16 +3,35 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 from time import monotonic
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 from .errors import CapabilityError
 
 RequestT = TypeVar("RequestT")
 ResponseT = TypeVar("ResponseT")
+CapabilityIdempotency = Literal[
+    "read",
+    "idempotent_write",
+    "non_idempotent_write",
+]
+_SEARCH_TOKEN_PATTERN = re.compile(r"[\w.-]+", re.UNICODE)
+
+
+def _normalize_search_text(value: str) -> str:
+    """Normalize user and descriptor text without assuming an ASCII language."""
+
+    return " ".join(
+        unicodedata.normalize("NFKC", value).casefold().split()
+    )
+
+
+def _search_tokens(value: str) -> set[str]:
+    return set(_SEARCH_TOKEN_PATTERN.findall(_normalize_search_text(value)))
 
 
 class RiskLevel(StrEnum):
@@ -56,6 +75,31 @@ class CapabilityDescriptor:
     approval: ApprovalMode = ApprovalMode.NEVER
     keywords: tuple[str, ...] = ()
     side_effects: tuple[str, ...] = ()
+    requires_workspace: bool = False
+    requires_voice: bool = False
+    requires_same_voice: bool = False
+    idempotency: CapabilityIdempotency = "read"
+    expected_errors: tuple[str, ...] = ()
+    timeout_seconds: float | None = None
+    user_visible_effect: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject metadata that would teach an agent contradictory behavior."""
+
+        if self.requires_same_voice and not self.requires_voice:
+            raise ValueError("requires_same_voice requires requires_voice")
+        if self.requires_voice and not self.requires_workspace:
+            raise ValueError("requires_voice requires requires_workspace")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if len(set(self.expected_errors)) != len(self.expected_errors):
+            raise ValueError("expected_errors must be unique")
+        if any(not item.strip() for item in self.expected_errors):
+            raise ValueError("expected_errors must not contain empty values")
+        if self.risk is RiskLevel.READ and self.idempotency != "read":
+            raise ValueError("read capabilities must use read idempotency")
+        if self.risk is RiskLevel.WRITE and self.idempotency == "read":
+            object.__setattr__(self, "idempotency", "non_idempotent_write")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,27 +188,44 @@ class CapabilityRegistry:
     def search(self, query: str, *, limit: int = 5) -> tuple[CapabilityEndpoint, ...]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        terms = set(re.findall(r"[a-z0-9_.-]+", query.lower()))
-        if not terms:
+        normalized_query = _normalize_search_text(query)
+        if not normalized_query:
             return self.all()[:limit]
+        terms = _search_tokens(normalized_query)
 
         scored: list[tuple[int, CapabilityEndpoint]] = []
         for item in self._endpoints.values():
             descriptor = item.descriptor
-            name_terms = set(re.findall(r"[a-z0-9_.-]+", descriptor.name.lower()))
-            text_terms = set(
-                re.findall(
-                    r"[a-z0-9_.-]+",
-                    " ".join(
-                        (
-                            descriptor.summary,
-                            *descriptor.keywords,
-                            *descriptor.side_effects,
-                        )
-                    ).lower(),
+            name_terms = _search_tokens(descriptor.name)
+            searchable_text = _normalize_search_text(
+                " ".join(
+                    (
+                        descriptor.summary,
+                        *descriptor.keywords,
+                        *descriptor.side_effects,
+                    )
                 )
             )
-            score = len(terms & text_terms) + 3 * len(terms & name_terms)
+            text_terms = _search_tokens(searchable_text)
+            keyword_phrases = tuple(
+                normalized
+                for keyword in descriptor.keywords
+                if (normalized := _normalize_search_text(keyword))
+            )
+            keyword_substring_score = 2 * sum(
+                phrase in normalized_query
+                for phrase in keyword_phrases
+            )
+            exact_text_score = int(
+                len(normalized_query) >= 3
+                and normalized_query in searchable_text
+            )
+            score = (
+                len(terms & text_terms)
+                + 3 * len(terms & name_terms)
+                + keyword_substring_score
+                + exact_text_score
+            )
             if score:
                 scored.append((score, item))
         scored.sort(key=lambda entry: (-entry[0], entry[1].descriptor.name))
@@ -213,6 +274,13 @@ class CapabilityRegistry:
                 "summary": item.descriptor.summary,
                 "risk": item.descriptor.risk.value,
                 "approval": item.descriptor.approval.value,
+                "requires_workspace": item.descriptor.requires_workspace,
+                "requires_voice": item.descriptor.requires_voice,
+                "requires_same_voice": item.descriptor.requires_same_voice,
+                "idempotency": item.descriptor.idempotency,
+                "expected_errors": item.descriptor.expected_errors,
+                "timeout_seconds": item.descriptor.timeout_seconds,
+                "user_visible_effect": item.descriptor.user_visible_effect,
                 "request_fields": item.schema.request_fields,
                 "response_fields": item.schema.response_fields,
                 "side_effects": item.descriptor.side_effects,

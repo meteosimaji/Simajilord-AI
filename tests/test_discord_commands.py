@@ -4,6 +4,7 @@ import io
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock
 
@@ -24,6 +25,7 @@ from simajilord.agent import (
     AgentRateLimitError,
 )
 from simajilord.capabilities.audio import (
+    AudioAction,
     AudioControlResponse,
     AudioNoArgsRequest,
     AudioPlayRequest,
@@ -43,9 +45,10 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
 )
+from simajilord.capabilities.translation import TranslationLanguageItem
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
-from simajilord.core import InvocationContext
+from simajilord.core import CapabilityRegistry, InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
@@ -71,13 +74,12 @@ from simajilord.integrations.discord.capabilities import (
 )
 from simajilord.integrations.discord.cogs import (
     _QUOTE_CONTEXT_MENU_NAME,
-    DiscordActionCog,
-    DiscordInfoCog,
-    DownloadCog,
+    _TRANSLATE_CONTEXT_MENU_NAME,
     FocusTimerCog,
     HelpCog,
+    InfoCog,
     LoopMixConflictView,
-    ModerationCog,
+    MediaCog,
     MusicCog,
     MusicControlsView,
     MusicDashboardManager,
@@ -89,6 +91,9 @@ from simajilord.integrations.discord.cogs import (
     ReadAloudChannelSelectView,
     ReadAloudCog,
     SystemCog,
+    TranslationCog,
+    TranslationTargetSelect,
+    TranslationTargetSelectView,
     UtilityCog,
     VoiceLifecycleCog,
     WebCog,
@@ -100,8 +105,11 @@ from simajilord.integrations.discord.cogs import (
     _agent_message_groups,
     _AgentProgressMessage,
     _discord_message_chunks,
+    _resolve_translation_target,
     _retry_after_text,
+    _translation_target_autocomplete_choices,
     _youtube_card_reference,
+    audio_control_capability_call,
     discord_conversation_id,
     error_message,
     server_info_embed,
@@ -110,6 +118,8 @@ from simajilord.integrations.discord.cogs import (
 from simajilord.integrations.discord.help_catalog import (
     HELP_ENTRIES,
     HELP_ENTRIES_BY_TOPIC,
+    PUBLIC_COMMAND_SPECS,
+    PublicCommandSpec,
 )
 from simajilord.runtime import SimajilordRuntime
 
@@ -197,7 +207,7 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         "Open music controls and read-aloud setup in one panel."
     )
     assert commands["play"].description == (
-        "Find a song or public URL and add it to the shared queue."
+        "Add a song, public URL, or attached audio/video to the queue."
     )
     assert commands["radio"].description.startswith("Keep related music")
 
@@ -210,11 +220,10 @@ def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
         MusicCog,
         ReadAloudCog,
         WebCog,
-        ModerationCog,
-        DownloadCog,
+        TranslationCog,
+        MediaCog,
         UtilityCog,
-        DiscordInfoCog,
-        DiscordActionCog,
+        InfoCog,
     )
     public_topics: set[str] = set()
     command_by_topic: dict[str, app_commands.Command[object, ..., object]] = {}
@@ -233,9 +242,14 @@ def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
     help_topics = {entry.topic for entry in HELP_ENTRIES}
     assert len(HELP_ENTRIES_BY_TOPIC) == len(HELP_ENTRIES)
     assert help_topics == public_topics
+    assert HELP_ENTRIES is PUBLIC_COMMAND_SPECS
+    assert all(isinstance(entry, PublicCommandSpec) for entry in HELP_ENTRIES)
 
     for topic, command in command_by_topic.items():
-        usage = HELP_ENTRIES_BY_TOPIC[topic.casefold()].usage
+        spec = HELP_ENTRIES_BY_TOPIC[topic.casefold()]
+        usage = spec.usage
+        assert spec.permissions
+        assert spec.common_errors
         for parameter in command.parameters:
             assert parameter.description and parameter.description != "…", (
                 f"/{topic} option `{parameter.name}` has no Discord description"
@@ -254,11 +268,10 @@ def test_public_command_and_option_descriptions_use_the_official_english_surface
         MusicCog,
         ReadAloudCog,
         WebCog,
-        ModerationCog,
-        DownloadCog,
+        TranslationCog,
+        MediaCog,
         UtilityCog,
-        DiscordInfoCog,
-        DiscordActionCog,
+        InfoCog,
     )
     for cog_type in cog_types:
         for command in cog_type.__cog_app_commands__:
@@ -294,10 +307,178 @@ def test_help_categories_fit_discord_select_limits() -> None:
         assert all(len(entry.summary) <= 100 for entry in entries)
 
 
-def test_prefix_help_is_not_shadowed_by_capability_search() -> None:
-    assert PrefixCog.help.name == "help"
-    assert "help" not in PrefixCog.capabilities.aliases
-    assert PrefixCog.capabilities.name == "capabilities"
+def test_prefix_surface_is_derived_from_canonical_primary_commands() -> None:
+    registered = {command.name for command in PrefixCog.__cog_commands__}
+    canonical = {
+        entry.prefix_name
+        for entry in PUBLIC_COMMAND_SPECS
+        if entry.prefix_name is not None
+    }
+    assert registered == canonical == {"help", "audio", "play"}
+
+
+def test_translation_uses_short_canonical_names() -> None:
+    commands = {
+        command.name: command
+        for command in TranslationCog.__cog_app_commands__
+        if isinstance(command, app_commands.Command)
+    }
+    assert set(commands) == {"translate"}
+    assert _TRANSLATE_CONTEXT_MENU_NAME == "Translate"
+
+
+def test_translation_target_accepts_code_english_and_native_name() -> None:
+    languages = (
+        TranslationLanguageItem("en-GB", "English", "English", "installed"),
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+    )
+
+    assert _resolve_translation_target("EN_gb", languages) == "en-GB"
+    assert _resolve_translation_target("English", languages) == "en"
+    assert _resolve_translation_target("日本語", languages) == "ja"
+    with pytest.raises(UserError, match=r"translation\.language_invalid"):
+        _resolve_translation_target("not-a-language", languages)
+
+
+def test_translation_context_menu_pages_every_available_language() -> None:
+    languages = tuple(
+        TranslationLanguageItem(
+            code=f"x-{index}",
+            english_name=f"Language {index:02d}",
+            native_name=f"Native {index:02d}",
+            availability="installed",
+        )
+        for index in range(38)
+    )
+    message = Mock(spec=discord.Message)
+    view = TranslationTargetSelectView(
+        Mock(spec=TranslationCog),
+        requester_id=7,
+        message=message,
+        detected_language="ja",
+        languages=languages,
+    )
+
+    assert view.page_count == 2
+    first = next(
+        item
+        for item in view.children
+        if isinstance(item, TranslationTargetSelect)
+    )
+    assert len(first.options) == 25
+    view.page = 1
+    view._rebuild()
+    second = next(
+        item
+        for item in view.children
+        if isinstance(item, TranslationTargetSelect)
+    )
+    assert len(second.options) == 13
+    assert {
+        option.value
+        for option in (*first.options, *second.options)
+    } == {language.code for language in languages}
+
+
+def test_translation_slash_autocomplete_filters_all_languages_and_caps_results() -> None:
+    languages = tuple(
+        TranslationLanguageItem(
+            code=f"x-{index}",
+            english_name=f"Language {index:02d}",
+            native_name=f"Native {index:02d}",
+            availability="installed",
+        )
+        for index in range(38)
+    )
+
+    assert len(_translation_target_autocomplete_choices(languages, "")) == 25
+    assert [
+        choice.value
+        for choice in _translation_target_autocomplete_choices(
+            languages,
+            "Language 37",
+        )
+    ] == ["x-37"]
+    assert [
+        choice.value
+        for choice in _translation_target_autocomplete_choices(
+            languages,
+            "Native 36",
+        )
+    ] == ["x-36"]
+
+
+def test_human_audio_controls_map_to_exact_agent_capabilities() -> None:
+    calls = (
+        (AudioAction.PAUSE, {}, "discord.pause_audio"),
+        (AudioAction.RESUME, {}, "discord.resume_audio"),
+        (AudioAction.SKIP, {}, "discord.skip_audio"),
+        (AudioAction.STOP, {}, "discord.stop_audio"),
+        (AudioAction.LEAVE, {}, "discord.leave_audio"),
+        (
+            AudioAction.LOOP,
+            {"loop_mode": LoopMode.TRACK},
+            "discord.set_audio_loop",
+        ),
+        (AudioAction.REMOVE, {"position": 1}, "discord.remove_audio"),
+        (
+            AudioAction.AUTO_LEAVE,
+            {"enabled": True},
+            "discord.set_audio_auto_leave",
+        ),
+        (AudioAction.SHUFFLE, {}, "discord.shuffle_audio"),
+        (
+            AudioAction.SEEK,
+            {"position_seconds": 12.0},
+            "discord.seek_audio",
+        ),
+        (
+            AudioAction.TUNE,
+            {"speed": 1.0, "pitch": 1.0},
+            "discord.tune_audio",
+        ),
+        (
+            AudioAction.VOLUME,
+            {"music_percent": 80},
+            "discord.set_audio_volume",
+        ),
+        (
+            AudioAction.MOVE,
+            {"position": 2, "to_position": 1},
+            "discord.move_audio",
+        ),
+        (AudioAction.CLEAR_MINE, {}, "discord.clear_my_audio"),
+    )
+
+    assert {
+        audio_control_capability_call(action, **arguments)[0]
+        for action, arguments, _ in calls
+    } == {expected for _, _, expected in calls}
+
+
+def test_japanese_requests_find_the_intended_discord_capability() -> None:
+    registry = CapabilityRegistry()
+    for selected_endpoint in build_discord_endpoints(
+        cast(discord.Client, object()),
+        Mock(spec=SimajilordRuntime),
+    ):
+        registry.register(selected_endpoint)
+
+    expected_by_query = {
+        "この曲流して": "discord.play_audio",
+        "読み上げを入退室だけにして": (
+            "discord.read_aloud_announcements_set"
+        ),
+        "音楽を少し下げて": "discord.set_audio_volume",
+        "このメッセージをドイツ語にして": "discord.translate_message",
+        "この添付音声を流して": "discord.play_attachment",
+    }
+
+    for query, expected in expected_by_query.items():
+        matches = registry.search(query, limit=1)
+        assert matches
+        assert matches[0].descriptor.name == expected
 
 
 def test_server_info_embed_contains_identity_population_channels_and_safety() -> None:
@@ -856,29 +1037,11 @@ async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
     assert delegated_request == request
 
 
-def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
-    group = next(
-        command
+def test_advanced_music_commands_are_not_duplicated_as_a_slash_group() -> None:
+    assert not any(
+        isinstance(command, app_commands.Group) and command.name == "music"
         for command in MusicCog.__cog_app_commands__
-        if isinstance(command, app_commands.Group) and command.name == "music"
     )
-    names = {command.name for command in group.commands}
-    assert names == {
-        "pause",
-        "resume",
-        "skip",
-        "stop",
-        "leave",
-        "loop",
-        "remove",
-        "autoleave",
-        "shuffle",
-        "seek",
-        "tune",
-        "volume",
-        "move",
-        "clear-mine",
-    }
 
 
 @pytest.mark.asyncio
@@ -935,6 +1098,45 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
     ]
     assert None not in custom_ids
     assert len(custom_ids) == len(set(custom_ids))
+
+
+def test_music_panel_exposes_official_activity_only_when_enabled() -> None:
+    response = AudioQueueResponse(
+        current=AudioQueueItem(
+            title="Track",
+            page_url="https://example.com/track",
+            kind="music",
+            duration_seconds=240,
+            requested_by_name="Requester",
+        ),
+        pending=(),
+        paused=False,
+        loop_mode="none",
+        destination_id="10",
+        auto_leave=True,
+        position_seconds=30,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=False,
+        connected=True,
+    )
+    runtime = SimpleNamespace(settings=SimpleNamespace(activity_enabled=True))
+
+    view = MusicControlsView(
+        cast(SimajilordRuntime, runtime),
+        response=response,
+    )
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+    open_player = next(button for button in buttons if button.label == "Open Player")
+
+    assert open_player.custom_id == "simajilord:audio:open-player"
+    assert open_player.row == 2
+    assert [button.label for button in buttons if button.row == 0] == [
+        "Pause",
+        "Skip",
+        "Stop",
+        "Add music",
+    ]
 
 
 @pytest.mark.asyncio
@@ -994,7 +1196,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         speed=1,
         pitch=1,
         waiting_for_voice=False,
-        resume_confirmation_required=True,
+        voice_activation_required=True,
         connected=False,
     )
     view = MusicControlsView(
@@ -1513,16 +1715,70 @@ def test_agent_conversation_key_is_shared_per_channel() -> None:
     )
 
 
-def test_web_commands_are_short_direct_paths() -> None:
+def test_web_commands_use_one_discoverable_group() -> None:
     commands = {
         command.name: command
-        for command in WebCog.__cog_app_commands__
-        if isinstance(command, app_commands.Command)
+        for group in WebCog.__cog_app_commands__
+        if isinstance(group, app_commands.Group)
+        for command in group.commands
     }
     assert set(commands) == {"search", "fetch", "find"}
     assert commands["search"].description == (
         "Search the web through Simajilord's local search service."
     )
+
+
+def test_public_command_tree_has_no_legacy_or_duplicate_top_level_names() -> None:
+    cog_types = (
+        HelpCog,
+        SystemCog,
+        FocusTimerCog,
+        MusicCog,
+        ReadAloudCog,
+        WebCog,
+        MediaCog,
+        UtilityCog,
+        InfoCog,
+    )
+    top_level = [
+        command.name
+        for cog_type in cog_types
+        for command in cog_type.__cog_app_commands__
+    ]
+    assert len(top_level) == len(set(top_level))
+    assert set(top_level) == {
+        "help",
+        "status",
+        "system",
+        "timer",
+        "audio",
+        "play",
+        "radio",
+        "join",
+        "readaloud",
+        "web",
+        "media",
+        "utility",
+        "info",
+    }
+    assert not {
+        "ping",
+        "capabilities",
+        "about",
+        "uptime",
+        "search",
+        "fetch",
+        "find",
+        "detectai",
+        "download",
+        "roll",
+        "choose",
+        "serverinfo",
+        "userinfo",
+        "avatar",
+        "poll",
+        "music",
+    } & set(top_level)
 
 
 def test_quote_context_menu_uses_a_short_native_label() -> None:
@@ -1763,9 +2019,7 @@ def test_fresh_mix_and_duplicate_music_aliases_are_hidden() -> None:
 
     assert "freshmix" not in top_level
     assert top_level == {"audio", "play", "radio"}
-    assert len(groups) == 1
-    grouped = {command.name for command in groups[0].commands}
-    assert {"freshmix", "radio", "mix", "play", "queue", "history"} & grouped == set()
+    assert groups == []
 
 
 @pytest.mark.asyncio
@@ -1803,7 +2057,7 @@ async def test_listener_join_keeps_persisted_read_aloud_route_in_standby() -> No
     session = Mock()
     session.waiting_for_voice = False
     session.has_music = False
-    session.resume_confirmation_required = False
+    session.voice_activation_required = False
     session.destination_id = None
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
@@ -1837,7 +2091,7 @@ async def test_startup_keeps_read_aloud_passive_when_listener_is_already_present
     session = Mock()
     session.output.connected = False
     session.has_music = False
-    session.resume_confirmation_required = False
+    session.voice_activation_required = False
     session.destination_id = None
     runtime.audio.get_or_create.return_value = session
     runtime.audio.connect = AsyncMock()
@@ -1865,7 +2119,7 @@ async def test_listener_join_reposts_panel_without_restarting_held_music() -> No
     session = Mock()
     session.waiting_for_voice = False
     session.has_music = True
-    session.resume_confirmation_required = True
+    session.voice_activation_required = True
     session.destination_id = "55"
     session.output.connected = False
     runtime.audio.find.return_value = session
@@ -1898,7 +2152,7 @@ async def test_startup_read_aloud_does_not_restart_held_read_aloud_route() -> No
     session = Mock()
     session.output.connected = False
     session.has_music = False
-    session.resume_confirmation_required = True
+    session.voice_activation_required = True
     session.destination_id = "55"
     runtime.audio.get_or_create.return_value = session
     runtime.audio.connect = AsyncMock()
@@ -1928,7 +2182,7 @@ async def test_listener_join_does_not_restart_held_read_aloud_route() -> None:
     session = Mock()
     session.waiting_for_voice = False
     session.has_music = False
-    session.resume_confirmation_required = True
+    session.voice_activation_required = True
     session.destination_id = "55"
     session.output.connected = False
     runtime.audio.find.return_value = session
@@ -1952,11 +2206,12 @@ async def test_listener_join_does_not_restart_held_read_aloud_route() -> None:
 def test_hive_analysis_is_one_direct_attachment_command() -> None:
     commands = {
         command.name: command
-        for command in ModerationCog.__cog_app_commands__
-        if isinstance(command, app_commands.Command)
+        for group in MediaCog.__cog_app_commands__
+        if isinstance(group, app_commands.Group)
+        for command in group.commands
     }
-    assert set(commands) == {"detectai"}
-    assert commands["detectai"].description == (
+    assert set(commands) == {"detect-ai", "download"}
+    assert commands["detect-ai"].description == (
         "Estimate AI-generation and deepfake likelihood with HIVE."
     )
 

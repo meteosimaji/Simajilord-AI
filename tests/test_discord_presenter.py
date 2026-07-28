@@ -30,6 +30,7 @@ from simajilord.integrations.discord.capabilities import (
     DiscordExpandMessageResponse,
 )
 from simajilord.integrations.discord.cogs import (
+    async_progress_embed,
     music_added_embed,
     music_history_embed,
     music_queue_embed,
@@ -60,6 +61,14 @@ def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
     assert embed.footer.text is None
     assert embed.fields[0].name == "Status"
     assert embed.fields[0].value == "ok"
+
+
+def test_async_progress_embed_has_loading_fallback_and_no_success_claim() -> None:
+    embed = async_progress_embed(object(), "Translating…")  # type: ignore[arg-type]
+
+    assert embed.title == "Working"
+    assert embed.description == "⏳ Translating…"
+    assert "complete" not in (embed.description or "").casefold()
 
 
 def test_expanded_message_keeps_jump_and_bounds_visible_images() -> None:
@@ -290,7 +299,7 @@ def test_music_embed_explains_explicit_resume_after_voice_reentry() -> None:
             speed=1.0,
             pitch=1.0,
             waiting_for_voice=False,
-            resume_confirmation_required=True,
+            voice_activation_required=True,
         )
     )
 
@@ -325,6 +334,40 @@ def test_audio_embed_shows_active_read_aloud_route_in_the_shared_panel() -> None
     fields = {field.name: field.value for field in embed.fields}
     assert fields["Read aloud"] == (
         "On · **2 channels** → <#123>\nMode **Queue**"
+    )
+
+
+def test_audio_embed_uses_application_emoji_only_for_real_async_state() -> None:
+    embed = music_queue_embed(
+        AudioQueueResponse(
+            current=AudioQueueItem(
+                title="Read aloud",
+                page_url="",
+                kind="speech",
+                duration_seconds=4,
+                requested_by_name=None,
+            ),
+            pending=(),
+            paused=False,
+            loop_mode="none",
+            destination_id="123",
+            auto_leave=True,
+            position_seconds=0,
+            speed=1.0,
+            pitch=1.0,
+            waiting_for_voice=False,
+            autoplay_enabled=True,
+            autoplay_next=None,
+        ),
+        loading_emoji="<a:loading:10>",
+        audio_wave_emoji="<a:audio_wave:11>",
+        radio_emoji="<:radio:12>",
+    )
+
+    fields = {field.name: field.value for field in embed.fields}
+    assert "<a:audio_wave:11>" in (embed.description or "")
+    assert fields["<:radio:12> Radio"].startswith(
+        "<a:loading:10> Finding the next track…"
     )
 
 

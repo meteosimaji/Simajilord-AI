@@ -117,8 +117,8 @@ def build_moderation_endpoints(
             CapabilityDescriptor(
                 name="moderation.detect_synthetic_media",
                 summary=(
-                    "設定済みの解析サービスを使い、画像または動画のAI生成・"
-                    "ディープフェイクの可能性を調べます。"
+                    "Estimate AI-generated and deepfake likelihood for an image "
+                    "or video with the configured analysis provider."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
@@ -129,7 +129,9 @@ def build_moderation_endpoints(
                     "deepfake",
                     "hive",
                 ),
-                side_effects=("保存済みの結果がなければ、解析サービスを1回利用します。",),
+                side_effects=(
+                    "Uses one provider analysis when no cached result exists.",
+                ),
             ),
             SyntheticMediaAnalyzeRequest,
             SyntheticMediaAnalyzeResponse,
@@ -138,7 +140,7 @@ def build_moderation_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="moderation.status",
-                summary="解析サービスの準備状況と、本日のローカルAPI利用枠を表示します。",
+                summary="Check synthetic-media analysis provider readiness.",
                 risk=RiskLevel.READ,
                 keywords=("moderation", "status", "quota", "hive"),
             ),

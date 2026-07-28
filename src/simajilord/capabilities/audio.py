@@ -137,7 +137,7 @@ class AudioQueueResponse:
     autoplay_enabled: bool = False
     autoplay_next: AudioQueueItem | None = None
     mix_seed_references: tuple[str, ...] = ()
-    resume_confirmation_required: bool = False
+    voice_activation_required: bool = False
     connected: bool = False
 
 
@@ -599,7 +599,12 @@ def build_audio_endpoints(
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("music", "audio", *keywords),
-                side_effects=("サーバーの永続音声セッションを変更します。",),
+                side_effects=("Changes the server's persistent audio session.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=("workspace.required",),
+                timeout_seconds=15,
+                user_visible_effect="Changes the shared audio session.",
             ),
             request_type,
             AudioControlResponse,
@@ -610,7 +615,7 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.search",
-                summary="音楽を検索し、候補を自動選択できるか確認します。",
+                summary="Search for music and determine whether one result is unambiguous.",
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
                     "music",
@@ -620,7 +625,14 @@ def build_audio_endpoints(
                     "candidate",
                     "disambiguate",
                 ),
-                side_effects=("メディア検索サービスへ接続します。",),
+                side_effects=("Connects to the configured media search service.",),
+                requires_workspace=True,
+                expected_errors=(
+                    "workspace.required",
+                    "audio.search_empty",
+                    "audio.search_limit_invalid",
+                ),
+                timeout_seconds=45,
             ),
             AudioSearchRequest,
             AudioSearchResponse,
@@ -629,9 +641,12 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.history",
-                summary="このワークスペースで最近再生した音楽を確認します。",
+                summary="List music recently played in this workspace.",
                 risk=RiskLevel.READ,
                 keywords=("music", "history", "recent", "played", "karaoke"),
+                requires_workspace=True,
+                expected_errors=("workspace.required",),
+                timeout_seconds=10,
             ),
             AudioHistoryRequest,
             AudioHistoryResponse,
@@ -640,9 +655,12 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.queue",
-                summary="このワークスペースで再生中・待機中の音声を確認します。",
+                summary="Inspect current and pending audio in this workspace.",
                 risk=RiskLevel.READ,
                 keywords=("music", "speech", "queue", "playing", "now"),
+                requires_workspace=True,
+                expected_errors=("workspace.required",),
+                timeout_seconds=10,
             ),
             AudioQueueRequest,
             AudioQueueResponse,
@@ -651,10 +669,18 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.play",
-                summary="公開メディアを解決し、音声を再生キューへ追加します。",
+                summary="Resolve public media and add its audio to the playback queue.",
                 risk=RiskLevel.EXTERNAL,
                 keywords=("music", "media", "song", "track", "stream", "queue"),
-                side_effects=("メディアサイトへ接続します。", "現在の出力先で音声を再生します。"),
+                side_effects=(
+                    "Connects to a public media service.",
+                    "Queues audio for the current output destination.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=("workspace.required",),
+                timeout_seconds=60,
+                user_visible_effect="Queues one track in the shared audio session.",
             ),
             AudioPlayRequest,
             AudioPlayResponse,
@@ -663,10 +689,15 @@ def build_audio_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="audio.control",
-                summary="一時停止・再開・スキップ・停止・退出・ループ変更などを行います。",
+                summary="Pause, resume, skip, stop, leave, or change repeat settings.",
                 risk=RiskLevel.WRITE,
                 keywords=("music", "voice", "pause", "skip", "loop"),
-                side_effects=("再生状態を変更します。",),
+                side_effects=("Changes the shared playback state.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=("workspace.required",),
+                timeout_seconds=15,
+                user_visible_effect="Changes the shared playback state.",
             ),
             AudioControlRequest,
             AudioControlResponse,
@@ -676,16 +707,24 @@ def build_audio_endpoints(
             CapabilityDescriptor(
                 name="audio.mix",
                 summary=(
-                    "最大8曲を起点にYouTube Mixを有効化または停止します。"
-                    "人が追加した曲を常に優先し、空いたときだけ次の1曲を自動供給します。"
+                    "Enable or stop Radio from up to eight seed tracks. "
+                    "Manual requests stay first and Radio supplies one track at a time."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("music", "mix", "autoplay", "station", "radio"),
                 side_effects=(
-                    "YouTube Mixの候補メタデータを取得します。",
-                    "サーバーの永続音声セッションを変更します。",
+                    "Retrieves related-track metadata from the media provider.",
+                    "Changes the server's persistent audio session.",
                 ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "workspace.required",
+                    "audio.mix_seed_limit",
+                ),
+                timeout_seconds=60,
+                user_visible_effect="Changes Radio state for the shared audio session.",
             ),
             AudioMixRequest,
             AudioMixResponse,
@@ -693,98 +732,98 @@ def build_audio_endpoints(
         ),
         exact_control_endpoint(
             "audio.pause",
-            "再生中の音楽を一時停止します。",
+            "Pause the currently playing music.",
             ("pause",),
             AudioNoArgsRequest,
             pause,
         ),
         exact_control_endpoint(
             "audio.resume",
-            "一時停止した音楽を再開します。",
+            "Resume paused music.",
             ("resume",),
             AudioNoArgsRequest,
             resume,
         ),
         exact_control_endpoint(
             "audio.skip",
-            "再生中の曲をスキップします。",
+            "Skip the current track.",
             ("skip",),
             AudioNoArgsRequest,
             skip,
         ),
         exact_control_endpoint(
             "audio.stop",
-            "再生を止め、音楽キューを空にします。",
+            "Stop playback and clear pending music.",
             ("stop", "clear"),
             AudioNoArgsRequest,
             stop,
         ),
         exact_control_endpoint(
             "audio.leave",
-            "音楽キューを空にして音声接続を終了します。",
+            "Clear music and disconnect from voice.",
             ("leave", "disconnect"),
             AudioNoArgsRequest,
             leave,
         ),
         exact_control_endpoint(
             "audio.set_loop",
-            "1曲またはキュー全体のループ方法を設定します。",
+            "Set track, queue, or no repeat.",
             ("loop", "repeat"),
             AudioLoopRequest,
             set_loop,
         ),
         exact_control_endpoint(
             "audio.remove",
-            "指定位置の待機曲をキューから削除します。",
+            "Remove the pending track at a queue position.",
             ("remove", "queue"),
             AudioQueuePositionRequest,
             remove,
         ),
         exact_control_endpoint(
             "audio.set_auto_leave",
-            "人がいなくなったときの自動退出を設定します。",
+            "Set whether voice disconnects after all listeners leave.",
             ("auto", "leave"),
             AudioAutoLeaveRequest,
             set_auto_leave,
         ),
         exact_control_endpoint(
             "audio.shuffle",
-            "待機中の音楽キューをシャッフルします。",
+            "Shuffle pending manual music requests.",
             ("shuffle", "queue"),
             AudioNoArgsRequest,
             shuffle,
         ),
         exact_control_endpoint(
             "audio.seek",
-            "再生中の曲を指定秒へ移動します。",
+            "Seek to a position in the current track.",
             ("seek", "position"),
             AudioSeekRequest,
             seek,
         ),
         exact_control_endpoint(
             "audio.tune",
-            "音楽の速度とピッチを設定します。",
+            "Set music playback speed and pitch.",
             ("speed", "pitch", "tune"),
             AudioTuneRequest,
             tune,
         ),
         exact_control_endpoint(
             "audio.set_volume",
-            "音楽と読み上げの音量を百分率で設定します。",
+            "Set music and read-aloud volume percentages.",
             ("volume", "speech"),
             AudioVolumeRequest,
             set_volume,
         ),
         exact_control_endpoint(
             "audio.move",
-            "待機曲をキュー内の別の位置へ移動します。",
+            "Move a pending request to another queue position.",
             ("move", "queue", "reorder"),
             AudioMoveRequest,
             move,
         ),
         exact_control_endpoint(
             "audio.clear_mine",
-            "依頼者自身が追加した待機曲だけを削除します。",
+            "Remove only pending tracks requested by the current actor.",
             ("clear", "mine", "requester"),
             AudioNoArgsRequest,
             clear_mine,
@@ -829,7 +868,7 @@ def audio_queue_response(snapshot: QueueSnapshot) -> AudioQueueResponse:
             _queue_item(snapshot.autoplay_next) if snapshot.autoplay_next is not None else None
         ),
         mix_seed_references=snapshot.mix_seed_references,
-        resume_confirmation_required=snapshot.resume_confirmation_required,
+        voice_activation_required=snapshot.voice_activation_required,
         connected=snapshot.connected,
     )
 

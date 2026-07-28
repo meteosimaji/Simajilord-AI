@@ -30,12 +30,13 @@ AGENT_AUDIO_CONTROL_CAPABILITIES = (
     "discord.seek_audio",
     "discord.tune_audio",
     "discord.set_audio_volume",
-    "discord.set_audio_mix",
+    "discord.set_audio_radio",
     "discord.move_audio",
     "discord.clear_my_audio",
 )
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",
+    "discord.play_attachment",
     *AGENT_AUDIO_CONTROL_CAPABILITIES,
     "discord.read_aloud_add_sources",
     "discord.read_aloud_remove_source",

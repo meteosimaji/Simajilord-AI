@@ -63,7 +63,18 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         if component.get("type") == 2
     ) == ("Play", "Add", "Radio")
     assert panels[5].embed["title"] == "Help"
+    overview_fields = panels[5].embed["fields"]
+    assert all("commands" in str(field["name"]) for field in overview_fields)
+    assert all("`/" not in str(field["value"]) for field in overview_fields)
     assert panels[6].embed["title"] == "/play"
+    assert [field["name"] for field in panels[6].embed["fields"]] == [
+        "Usage",
+        "Examples",
+        "Required permissions",
+        "Side effects",
+        "Behaviour notes",
+        "Common errors",
+    ]
     assert panels[7].embed["title"] == "Simajilord Audio Lab"
     assert panels[8].embed["title"] == "Meteo in Simajilord"
 

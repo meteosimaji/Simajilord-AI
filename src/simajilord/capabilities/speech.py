@@ -88,12 +88,17 @@ def build_speech_endpoint(
         CapabilityDescriptor(
             name="speech.speak",
             summary=(
-                "文章を音声合成して共通音声セッションのキューへ追加します。"
-                "音楽の再生中は聞き取りやすいよう自動調整します。"
+                "Synthesize text and add it to the shared audio session. "
+                "Speech is mixed for intelligibility while music is playing."
             ),
             risk=RiskLevel.WRITE,
             keywords=("speech", "voice", "tts", "say", "speak", "voicevox"),
-            side_effects=("合成音声を生成して再生します。",),
+            side_effects=("Generates and plays synthesized speech.",),
+            requires_workspace=True,
+            idempotency="non_idempotent_write",
+            expected_errors=("workspace.required",),
+            timeout_seconds=90,
+            user_visible_effect="Plays synthesized speech in the shared audio session.",
         ),
         SpeechSpeakRequest,
         SpeechSpeakResponse,

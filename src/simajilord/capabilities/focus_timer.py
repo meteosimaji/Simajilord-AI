@@ -27,7 +27,7 @@ class FocusTimerCreateRequest:
     message: str = "Focus session complete."
     delivery_target_id: str | None = field(
         default=None,
-        metadata={"description": "通知を送るtransport固有のチャンネルID。"},
+        metadata={"description": "Transport-specific destination channel ID."},
     )
     voice_notify: bool = True
     focus_session: bool = False
@@ -138,11 +138,16 @@ def build_focus_timer_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="timer.create",
-                summary="永続Focus Timerを作成し、期限後に指定先へ通知します。",
+                summary="Create a persistent Focus Timer and notify its destination.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("timer", "focus", "pomodoro", "reminder"),
                 side_effects=("Persists a timer.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=("workspace.required",),
+                timeout_seconds=15,
+                user_visible_effect="Creates a timer and later posts its notification.",
             ),
             FocusTimerCreateRequest,
             FocusTimerResponse,
@@ -151,9 +156,12 @@ def build_focus_timer_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="timer.list",
-                summary="現在有効なFocus Timerを取得します。",
+                summary="List active Focus Timers.",
                 risk=RiskLevel.READ,
                 keywords=("timer", "focus", "status"),
+                requires_workspace=True,
+                expected_errors=("workspace.required",),
+                timeout_seconds=10,
             ),
             FocusTimerListRequest,
             FocusTimerListResponse,
@@ -162,11 +170,16 @@ def build_focus_timer_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="timer.cancel",
-                summary="本人が作成したFocus Timerをキャンセルします。",
+                summary="Cancel a Focus Timer created by the current actor.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("timer", "focus", "cancel"),
                 side_effects=("Cancels a persisted timer.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=("workspace.required",),
+                timeout_seconds=10,
+                user_visible_effect="Cancels a timer owned by the requester.",
             ),
             FocusTimerCancelRequest,
             FocusTimerResponse,

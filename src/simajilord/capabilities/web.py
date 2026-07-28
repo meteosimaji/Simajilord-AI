@@ -172,8 +172,8 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             CapabilityDescriptor(
                 name="web.search",
                 summary=(
-                    "ローカルのメタ検索サービスでWebを検索します。候補数・情報源の多様性・"
-                    "ドメイン・期間を制御できます。"
+                    "Search the web through the local metasearch service with "
+                    "bounded sources, domains, and time ranges."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
@@ -184,7 +184,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                     "research",
                     "recent",
                 ),
-                side_effects=("設定済みの検索エンジンへ検索語句を送信します。",),
+                side_effects=("Sends the query to configured search engines.",),
             ),
             WebSearchRequest,
             WebSearchResponse,
@@ -194,12 +194,12 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             CapabilityDescriptor(
                 name="web.fetch",
                 summary=(
-                    "公開URLを開き、読み取れる本文を一定文字数ずつ返します。"
-                    "続きは開始位置を指定して取得できます。"
+                    "Fetch readable text from one public URL in bounded chunks. "
+                    "Use an offset to continue."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=("web", "fetch", "open", "read", "page", "pdf", "url"),
-                side_effects=("公開HTTPまたはHTTPSリソースを1件取得します。",),
+                side_effects=("Fetches one public HTTP or HTTPS resource.",),
             ),
             WebFetchRequest,
             WebFetchResponse,
@@ -208,12 +208,12 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
         endpoint(
             CapabilityDescriptor(
                 name="web.find",
-                summary=(
-                    "公開ページ内から語句を探し、前後の文章を一定範囲で返します。"
-                ),
+                summary="Find a phrase in a public page and return bounded context.",
                 risk=RiskLevel.EXTERNAL,
                 keywords=("web", "find", "page", "phrase", "match", "context"),
-                side_effects=("未保存の場合、公開HTTPまたはHTTPSリソースを1件取得します。",),
+                side_effects=(
+                    "Fetches one public HTTP or HTTPS resource when not cached.",
+                ),
             ),
             WebFindRequest,
             WebFindResponse,
@@ -222,7 +222,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
         endpoint(
             CapabilityDescriptor(
                 name="web.status",
-                summary="ローカルのメタ検索サービスへ接続できるか確認します。",
+                summary="Check readiness of the local metasearch service.",
                 risk=RiskLevel.READ,
                 keywords=("web", "search", "status", "health", "provider"),
             ),

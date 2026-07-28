@@ -107,6 +107,17 @@ class FocusTimerService:
         async with self._lock:
             return await asyncio.to_thread(self._retry, timer_id, delay_seconds)
 
+    async def prune_terminal(self, *, before: datetime) -> int:
+        """Remove only completed or cancelled timers older than the cutoff."""
+
+        if before.tzinfo is None:
+            raise ValueError("Retention cutoffs must be timezone-aware.")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._prune_terminal,
+                before.astimezone(UTC).isoformat(),
+            )
+
     async def cancel(
         self,
         *,
@@ -146,12 +157,23 @@ class FocusTimerService:
                     focus_session INTEGER NOT NULL,
                     restore_content_mode TEXT,
                     status TEXT NOT NULL,
-                    attempts INTEGER NOT NULL DEFAULT 0
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    finished_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS focus_timers_due
                 ON focus_timers (status, due_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(focus_timers)"
+                ).fetchall()
+            }
+            if "finished_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE focus_timers ADD COLUMN finished_at TEXT"
+                )
         self.path.chmod(0o600)
 
     def _requeue_interrupted(self) -> None:
@@ -159,7 +181,7 @@ class FocusTimerService:
             connection.execute(
                 """
                 UPDATE focus_timers
-                SET status = ?, due_at = ?
+                SET status = ?, due_at = ?, finished_at = NULL
                 WHERE status = ?
                 """,
                 (
@@ -243,8 +265,23 @@ class FocusTimerService:
     ) -> FocusTimer:
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE focus_timers SET status = ? WHERE timer_id = ?",
-                (status.value, timer_id),
+                """
+                UPDATE focus_timers
+                SET status = ?, finished_at = ?
+                WHERE timer_id = ?
+                """,
+                (
+                    status.value,
+                    (
+                        datetime.now(UTC).isoformat()
+                        if status in {
+                            FocusTimerStatus.COMPLETED,
+                            FocusTimerStatus.CANCELLED,
+                        }
+                        else None
+                    ),
+                    timer_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise UserError("timer.not_found")
@@ -256,7 +293,7 @@ class FocusTimerService:
             cursor = connection.execute(
                 """
                 UPDATE focus_timers
-                SET status = ?, due_at = ?
+                SET status = ?, due_at = ?, finished_at = NULL
                 WHERE timer_id = ? AND status = ?
                 """,
                 (
@@ -269,6 +306,22 @@ class FocusTimerService:
             if cursor.rowcount != 1:
                 raise UserError("timer.not_active")
         return self._require(timer_id)
+
+    def _prune_terminal(self, cutoff: str) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM focus_timers
+                WHERE status IN (?, ?)
+                  AND COALESCE(finished_at, due_at) < ?
+                """,
+                (
+                    FocusTimerStatus.COMPLETED.value,
+                    FocusTimerStatus.CANCELLED.value,
+                    cutoff,
+                ),
+            )
+            return cursor.rowcount
 
     def _require(self, timer_id: str) -> FocusTimer:
         with self._connect() as connection:

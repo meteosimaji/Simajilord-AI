@@ -69,6 +69,16 @@ from .system import (
     UptimeResponse,
     build_system_endpoints,
 )
+from .translation import (
+    TranslationDetectRequest,
+    TranslationDetectResponse,
+    TranslationLanguageItem,
+    TranslationLanguagesRequest,
+    TranslationLanguagesResponse,
+    TranslationTranslateRequest,
+    TranslationTranslateResponse,
+    build_translation_endpoints,
+)
 from .utility import (
     ChooseRequest,
     ChooseResponse,
@@ -137,6 +147,13 @@ __all__ = [
     "SpeechSpeakResponse",
     "SyntheticMediaAnalyzeRequest",
     "SyntheticMediaAnalyzeResponse",
+    "TranslationDetectRequest",
+    "TranslationDetectResponse",
+    "TranslationLanguageItem",
+    "TranslationLanguagesRequest",
+    "TranslationLanguagesResponse",
+    "TranslationTranslateRequest",
+    "TranslationTranslateResponse",
     "UptimeRequest",
     "UptimeResponse",
     "WebFetchRequest",
@@ -158,6 +175,7 @@ __all__ = [
     "build_read_aloud_route_endpoints",
     "build_speech_endpoint",
     "build_system_endpoints",
+    "build_translation_endpoints",
     "build_utility_endpoints",
     "build_web_endpoints",
 ]

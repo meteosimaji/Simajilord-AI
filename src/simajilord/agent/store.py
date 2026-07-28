@@ -89,6 +89,17 @@ class AgentConversationStore:
         async with self._lock:
             await asyncio.to_thread(self._rotate, conversation_id, model)
 
+    async def prune(self, *, before: datetime) -> tuple[int, int]:
+        """Remove old request accounting and then unreferenced old conversations."""
+
+        if before.tzinfo is None:
+            raise ValueError("Retention cutoffs must be timezone-aware.")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._prune,
+                before.astimezone(UTC).isoformat(),
+            )
+
     async def request_window(
         self,
         *,
@@ -188,6 +199,39 @@ class AgentConversationStore:
                 (conversation_id,),
             ).fetchone()
             return _conversation_from_row(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def _prune(self, cutoff: str) -> tuple[int, int]:
+        connection = _connection(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            request_cursor = connection.execute(
+                """
+                DELETE FROM agent_requests
+                WHERE COALESCE(completed_at, started_at) < ?
+                  AND status != 'in_progress'
+                """,
+                (cutoff,),
+            )
+            conversation_cursor = connection.execute(
+                """
+                DELETE FROM agent_conversations
+                WHERE updated_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_requests
+                      WHERE agent_requests.conversation_id =
+                            agent_conversations.conversation_id
+                  )
+                """,
+                (cutoff,),
+            )
+            connection.commit()
+            return request_cursor.rowcount, conversation_cursor.rowcount
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 

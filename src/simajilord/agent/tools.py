@@ -11,7 +11,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Union, cast, get_args, get_origin, get_type_hints
 
-from simajilord.core import ApprovalMode, CapabilityRegistry, InvocationContext, RiskLevel
+from simajilord.core import (
+    ApprovalMode,
+    CapabilityDescriptor,
+    CapabilityRegistry,
+    InvocationContext,
+    RiskLevel,
+)
 
 from .errors import AgentToolError
 
@@ -151,7 +157,7 @@ class AgentToolCatalog:
                 {
                     "type": "function",
                     "name": alias,
-                    "description": endpoint.descriptor.summary,
+                    "description": _descriptor_description(endpoint.descriptor),
                     "inputSchema": _dataclass_schema(endpoint.request_type),
                 }
             )
@@ -249,6 +255,7 @@ class AgentToolCatalog:
                     "name": item.descriptor.name,
                     "summary": item.descriptor.summary,
                     "risk": item.descriptor.risk.value,
+                    "metadata": _descriptor_metadata(item.descriptor),
                     "input_schema": _dataclass_schema(item.request_type),
                 }
                 for item in matches
@@ -332,6 +339,10 @@ class AgentToolCatalog:
         if not has_grant:
             return False
         descriptor = self._registry.endpoint(capability_name).descriptor
+        if descriptor.requires_workspace and (
+            context is None or context.workspace_id is None
+        ):
+            return False
         if descriptor.approval is ApprovalMode.NEVER:
             return True
         if descriptor.approval is ApprovalMode.WHEN_REQUESTED:
@@ -372,6 +383,48 @@ class AgentToolCatalog:
                 f"Agent catalog cannot expose unapproved write {capability_name}."
             )
         return endpoint
+
+
+def _descriptor_metadata(descriptor: CapabilityDescriptor) -> Mapping[str, object]:
+    """Return compact, stable behavior metadata for model-side planning."""
+
+    return {
+        "approval": descriptor.approval.value,
+        "requires_workspace": descriptor.requires_workspace,
+        "requires_voice": descriptor.requires_voice,
+        "requires_same_voice": descriptor.requires_same_voice,
+        "idempotency": descriptor.idempotency,
+        "expected_errors": descriptor.expected_errors,
+        "timeout_seconds": descriptor.timeout_seconds,
+        "user_visible_effect": descriptor.user_visible_effect,
+    }
+
+
+def _descriptor_description(descriptor: CapabilityDescriptor) -> str:
+    """Describe operational constraints without requiring another tool call."""
+
+    constraints: list[str] = []
+    if descriptor.requires_same_voice:
+        constraints.append("requester must share the bot's voice channel")
+    elif descriptor.requires_voice:
+        constraints.append("requester must be in a voice channel")
+    elif descriptor.requires_workspace:
+        constraints.append("Discord server context required")
+    if descriptor.idempotency == "read":
+        constraints.append("read-only; safe to retry")
+    elif descriptor.idempotency == "idempotent_write":
+        constraints.append("idempotent write; safe to retry after timeout")
+    else:
+        constraints.append("non-idempotent write; inspect state before retrying")
+    if descriptor.approval is not ApprovalMode.NEVER:
+        constraints.append(f"approval: {descriptor.approval.value}")
+    if descriptor.timeout_seconds is not None:
+        constraints.append(f"timeout: {descriptor.timeout_seconds:g}s")
+    if descriptor.user_visible_effect:
+        constraints.append(f"visible effect: {descriptor.user_visible_effect}")
+    if descriptor.expected_errors:
+        constraints.append("expected errors: " + ", ".join(descriptor.expected_errors))
+    return f"{descriptor.summary} Operational metadata: {'; '.join(constraints)}."
 
 
 def _search_spec() -> Mapping[str, object]:

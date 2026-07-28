@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111214" />
+    <title>Simajilord Player</title>
+    <script type="module" crossorigin src="/assets/index-B3efDiMb.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-CTe0uFvo.css">
+  </head>
+  <body>
+    <main id="app">
+      <section class="shell" aria-live="polite">
+        <header class="topbar">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">S</span>
+            <div>
+              <p class="eyebrow">SIMAJILORD AUDIO</p>
+              <h1>Now Playing</h1>
+            </div>
+          </div>
+          <span id="connection" class="status">Connecting</span>
+        </header>
+
+        <section class="hero">
+          <div id="artwork" class="artwork" role="img" aria-label="Track artwork">
+            <div class="disc" aria-hidden="true"></div>
+          </div>
+          <div class="track-copy">
+            <p id="mode" class="eyebrow">VOICE CHANNEL</p>
+            <h2 id="title">Waiting for audio…</h2>
+            <p id="artist" class="muted">Open this player from an active voice channel.</p>
+            <div class="progress-row">
+              <span id="elapsed">0:00</span>
+              <div class="progress-track">
+                <span id="progress"></span>
+              </div>
+              <span id="duration">0:00</span>
+            </div>
+            <p id="requester" class="requested"></p>
+          </div>
+        </section>
+
+        <section class="visualizer" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </section>
+
+        <section class="lower-grid">
+          <article class="panel">
+            <div class="panel-heading">
+              <h3>Up Next</h3>
+              <span id="queue-count" class="muted">0 tracks</span>
+            </div>
+            <ol id="up-next" class="queue">
+              <li class="empty">Manual requests appear here.</li>
+            </ol>
+          </article>
+
+          <article class="panel">
+            <h3>Session</h3>
+            <dl class="session-grid">
+              <div><dt>Radio</dt><dd id="radio">Off</dd></div>
+              <div><dt>Loop</dt><dd id="loop">Off</dd></div>
+              <div><dt>Read aloud</dt><dd id="read-aloud">Off</dd></div>
+              <div><dt>Levels</dt><dd id="levels">100 / 100</dd></div>
+            </dl>
+            <p class="read-only">Display only · controls stay in Discord</p>
+          </article>
+        </section>
+
+        <section id="fatal" class="fatal" hidden>
+          <h2>Player unavailable</h2>
+          <p id="fatal-message"></p>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,4 +1,4 @@
-"""Curated help text for the public Discord command surface."""
+"""Canonical metadata for the public Discord command surface."""
 
 from __future__ import annotations
 
@@ -6,13 +6,19 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
-class HelpEntry:
+class PublicCommandSpec:
+    """One public command definition shared by Help and surface audits."""
+
     topic: str
     category: str
     summary: str
     usage: str
     examples: tuple[str, ...]
+    permissions: tuple[str, ...]
+    side_effects: tuple[str, ...]
     notes: tuple[str, ...] = ()
+    common_errors: tuple[str, ...] = ()
+    prefix_name: str | None = None
 
 
 def _entry(
@@ -21,9 +27,28 @@ def _entry(
     summary: str,
     usage: str,
     *examples: str,
+    permissions: tuple[str, ...] = (
+        "View the current channel and use application commands.",
+    ),
+    side_effects: tuple[str, ...] = (),
     notes: tuple[str, ...] = (),
-) -> HelpEntry:
-    return HelpEntry(topic, category, summary, usage, examples, notes)
+    common_errors: tuple[str, ...] = (
+        "The BOT cannot view or respond in the current channel.",
+    ),
+    prefix_name: str | None = None,
+) -> PublicCommandSpec:
+    return PublicCommandSpec(
+        topic=topic,
+        category=category,
+        summary=summary,
+        usage=usage,
+        examples=examples,
+        permissions=permissions,
+        side_effects=side_effects,
+        notes=notes,
+        common_errors=common_errors,
+        prefix_name=prefix_name,
+    )
 
 
 HELP_CATEGORY_DESCRIPTIONS: dict[str, str] = {
@@ -35,7 +60,7 @@ HELP_CATEGORY_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-HELP_ENTRIES: tuple[HelpEntry, ...] = (
+PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
     _entry(
         "help",
         "Getting started",
@@ -43,14 +68,15 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
         "/help [topic]",
         "/help",
         "/help topic:play",
+        prefix_name="help",
         notes=("The topic field supports autocomplete.",),
     ),
     _entry(
-        "ping",
+        "system ping",
         "Getting started",
         "Check Discord gateway latency and whether the BOT can answer.",
-        "/ping",
-        "/ping",
+        "/system ping",
+        "/system ping",
     ),
     _entry(
         "status",
@@ -60,38 +86,52 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
         "/status",
     ),
     _entry(
-        "uptime",
+        "system uptime",
         "Getting started",
         "Show when this process started and how long it has been running.",
-        "/uptime",
-        "/uptime",
+        "/system uptime",
+        "/system uptime",
     ),
     _entry(
-        "about",
+        "system about",
         "Getting started",
         "Explain the Simajilord platform and this Discord entrance.",
-        "/about",
-        "/about",
+        "/system about",
+        "/system about",
     ),
     _entry(
-        "capabilities",
+        "system capabilities",
         "Getting started",
         "Search the underlying capability APIs by what you want to accomplish.",
-        "/capabilities [query]",
-        "/capabilities query:search the web",
-        "/capabilities query:play music",
+        "/system capabilities [query]",
+        "/system capabilities query:search the web",
+        "/system capabilities query:play music",
         notes=("This is an API inventory; use /help for human command instructions.",),
     ),
     _entry(
         "play",
         "Audio",
-        "Resolve a song, artist, or public URL and add the selected track.",
-        "/play reference:<song, artist, or URL>",
+        "Add a song, public URL, or attached audio/video to the shared queue.",
+        "/play [reference:<song, artist, or URL>] [file:<audio or video>]",
         "/play reference:Good Morning World BURNOUT SYNDROMES",
         "/play reference:https://www.youtube.com/watch?v=...",
+        "/play file:recording.m4a",
+        prefix_name="play",
         notes=(
+            "Provide exactly one of reference or file.",
             "Join a voice channel to start immediately.",
             "If you are outside voice, the request waits and starts when you join.",
+            "Use Apps → Play Audio on an existing Discord message.",
+        ),
+        side_effects=(
+            "Adds one track to the server queue and may connect to your voice channel.",
+            "Attachments are validated and stored privately for restart-safe playback.",
+        ),
+        common_errors=(
+            "No playable result was found for the reference.",
+            "The attachment is too large, too long, or has no audio stream.",
+            "You are not in the BOT's voice channel.",
+            "The server or per-user queue is full.",
         ),
     ),
     _entry(
@@ -100,6 +140,7 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
         "Open the single music and read-aloud control panel.",
         "/audio",
         "/audio",
+        prefix_name="audio",
         notes=(
             "Primary controls stay visible; secondary actions are under More actions.",
             "The panel is silent and updates only when meaningful state changes.",
@@ -117,6 +158,9 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
             "Up to eight seed URLs may be separated by spaces.",
             "Radio and Loop cannot be active together; confirmation is requested.",
         ),
+        side_effects=(
+            "Changes the server Radio state and may resolve related tracks in the background.",
+        ),
     ),
     _entry(
         "join",
@@ -127,6 +171,9 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
         notes=(
             "A private channel picker appears after the command.",
             "The selected sources are read into the VC you currently occupy.",
+        ),
+        side_effects=(
+            "Creates or updates the server read-aloud route and activates voice.",
         ),
     ),
     _entry(
@@ -140,110 +187,7 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
             "The timer survives a BOT restart.",
             "Focus session mode temporarily limits normal message read aloud.",
         ),
-    ),
-    _entry(
-        "music pause",
-        "Audio",
-        "Pause the current track while preserving its position.",
-        "/music pause",
-        "/music pause",
-        notes=("You must be in the same VC as the BOT.",),
-    ),
-    _entry(
-        "music resume",
-        "Audio",
-        "Resume paused audio.",
-        "/music resume",
-        "/music resume",
-        notes=("You must be in the same VC as the BOT.",),
-    ),
-    _entry(
-        "music skip",
-        "Audio",
-        "Fade out the current track and continue to the next request.",
-        "/music skip",
-        "/music skip",
-        notes=("You must be in the same VC as the BOT.",),
-    ),
-    _entry(
-        "music stop",
-        "Audio",
-        "Stop playback and clear the pending music queue.",
-        "/music stop",
-        "/music stop",
-        notes=("This affects the whole server audio session.",),
-    ),
-    _entry(
-        "music leave",
-        "Audio",
-        "Disconnect the BOT from voice.",
-        "/music leave",
-        "/music leave",
-    ),
-    _entry(
-        "music loop",
-        "Audio",
-        "Choose no loop, current-track loop, or whole-queue loop.",
-        "/music loop mode:<none|track|queue>",
-        "/music loop mode:track",
-        "/music loop mode:none",
-    ),
-    _entry(
-        "music remove",
-        "Audio",
-        "Remove one pending item by the position shown in the queue.",
-        "/music remove position:<number>",
-        "/music remove position:3",
-    ),
-    _entry(
-        "music autoleave",
-        "Audio",
-        "Choose whether the BOT leaves after the VC is empty.",
-        "/music autoleave enabled:<true|false>",
-        "/music autoleave enabled:true",
-    ),
-    _entry(
-        "music shuffle",
-        "Audio",
-        "Shuffle pending manual requests without changing the current track.",
-        "/music shuffle",
-        "/music shuffle",
-    ),
-    _entry(
-        "music seek",
-        "Audio",
-        "Move within the current track.",
-        "/music seek position:<seconds, mm:ss, +seconds, or -seconds>",
-        "/music seek position:1:30",
-        "/music seek position:+30",
-    ),
-    _entry(
-        "music tune",
-        "Audio",
-        "Adjust playback speed and pitch.",
-        "/music tune speed:<0.5-2.0> pitch:<0.5-2.0>",
-        "/music tune speed:1.1 pitch:1.0",
-    ),
-    _entry(
-        "music volume",
-        "Audio",
-        "Set music and read-aloud volume independently.",
-        "/music volume [music] [read_aloud]",
-        "/music volume music:70 read_aloud:110",
-    ),
-    _entry(
-        "music move",
-        "Audio",
-        "Move a pending request to another queue position.",
-        "/music move source:<number> destination:<number>",
-        "/music move source:5 destination:2",
-    ),
-    _entry(
-        "music clear-mine",
-        "Audio",
-        "Remove only the pending tracks that you requested.",
-        "/music clear-mine",
-        "/music clear-mine",
+        side_effects=("Persists a timer and posts when it expires.",),
     ),
     _entry(
         "readaloud setup",
@@ -377,84 +321,97 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
         notes=("Manage Server permission is required.",),
     ),
     _entry(
-        "search",
+        "web search",
         "Web & media",
         "Search the web and return compact, linked results.",
-        "/search query:<text> [depth]",
-        "/search query:Discord voice API documentation",
+        "/web search query:<text> [depth]",
+        "/web search query:Discord voice API documentation",
     ),
     _entry(
-        "fetch",
+        "web fetch",
         "Web & media",
         "Fetch readable text and metadata from one public URL.",
-        "/fetch url:<public URL> [offset]",
-        "/fetch url:https://example.com/article",
+        "/web fetch url:<public URL> [offset]",
+        "/web fetch url:https://example.com/article",
     ),
     _entry(
-        "find",
+        "web find",
         "Web & media",
         "Find text inside a fetched public page.",
-        "/find url:<public URL> phrase:<needle>",
-        "/find url:https://example.com phrase:license",
+        "/web find url:<public URL> phrase:<needle>",
+        "/web find url:https://example.com phrase:license",
     ),
     _entry(
-        "download",
+        "translate",
+        "Web & media",
+        "Translate supplied or recent message text with local on-device models.",
+        "/translate target:<language> [text]",
+        "/translate target:English text:おはようございます",
+        "/translate target:ja text:Good morning",
+        notes=(
+            "Omit text to translate the latest visible non-BOT message.",
+            "Use Apps → Translate on a message to choose the target privately.",
+            "No cloud translation API receives the text.",
+        ),
+    ),
+    _entry(
+        "media download",
         "Web & media",
         "Save public video or audio when the result fits Discord's upload limit.",
-        "/download url:<public URL> [media_type]",
-        "/download url:https://... media_type:video",
+        "/media download url:<public URL> [media_type]",
+        "/media download url:https://... media_type:video",
         notes=("A 30-second per-user cooldown protects the downloader.",),
     ),
     _entry(
-        "detectai",
+        "media detect-ai",
         "Web & media",
         "Ask HIVE to estimate AI-generated and deepfake likelihood for an image or video.",
-        "/detectai media:<attachment>",
-        "/detectai media:photo.png",
+        "/media detect-ai media:<attachment>",
+        "/media detect-ai media:photo.png",
         notes=("Results are estimates, not proof.", "Audio-only detection is not enabled."),
     ),
     _entry(
-        "roll",
+        "utility roll",
         "Discord",
         "Roll one or more dice and show every result plus the total.",
-        "/roll [dice] [sides]",
-        "/roll dice:2 sides:20",
+        "/utility roll [dice] [sides]",
+        "/utility roll dice:2 sides:20",
     ),
     _entry(
-        "choose",
+        "utility choose",
         "Discord",
         "Choose one item from a comma-separated list.",
-        "/choose options:<comma-separated text>",
-        "/choose options:ramen,curry,sushi",
+        "/utility choose options:<comma-separated text>",
+        "/utility choose options:ramen,curry,sushi",
     ),
     _entry(
-        "serverinfo",
+        "info server",
         "Discord",
         "Show public server identity, population, channels, assets, and moderation settings.",
-        "/serverinfo",
-        "/serverinfo",
+        "/info server",
+        "/info server",
     ),
     _entry(
-        "userinfo",
+        "info user",
         "Discord",
         "Show public account and server-membership information.",
-        "/userinfo [user]",
-        "/userinfo",
-        "/userinfo user:@Example",
+        "/info user [user]",
+        "/info user",
+        "/info user user:@Example",
     ),
     _entry(
-        "avatar",
+        "info avatar",
         "Discord",
         "Open a member's current display avatar at full size.",
-        "/avatar [user]",
-        "/avatar user:@Example",
+        "/info avatar [user]",
+        "/info avatar user:@Example",
     ),
     _entry(
-        "poll",
+        "utility poll",
         "Discord",
         "Create a native Discord poll from comma-separated answers.",
-        "/poll question:<text> options:<answers> [hours] [multiple]",
-        "/poll question:Lunch? options:Ramen,Curry,Sushi hours:24",
+        "/utility poll question:<text> options:<answers> [hours] [multiple]",
+        "/utility poll question:Lunch? options:Ramen,Curry,Sushi hours:24",
     ),
     _entry(
         "Quote",
@@ -467,6 +424,10 @@ HELP_ENTRIES: tuple[HelpEntry, ...] = (
 )
 
 
-HELP_ENTRIES_BY_TOPIC: dict[str, HelpEntry] = {
-    entry.topic.casefold(): entry for entry in HELP_ENTRIES
+PUBLIC_COMMAND_SPECS_BY_TOPIC: dict[str, PublicCommandSpec] = {
+    entry.topic.casefold(): entry for entry in PUBLIC_COMMAND_SPECS
 }
+
+# Transitional collection names for callers; both refer to the canonical specs.
+HELP_ENTRIES = PUBLIC_COMMAND_SPECS
+HELP_ENTRIES_BY_TOPIC = PUBLIC_COMMAND_SPECS_BY_TOPIC

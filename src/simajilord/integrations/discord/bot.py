@@ -11,10 +11,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from simajilord.activity import ActivityServer
 from simajilord.config import CommandScope
 from simajilord.domain.image import ImageGenerationJob, ImageJobStatus
 from simajilord.runtime import SimajilordRuntime
 
+from .application_emojis import ApplicationEmojiCatalog
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import DiscordMessageChannel, build_discord_endpoints
 from .cogs import setup_cogs
@@ -37,6 +39,10 @@ class SimajilordDiscordBot(commands.Bot):
             application_id=runtime.settings.application_id,
         )
         self.runtime = runtime
+        self.activity_server = ActivityServer(self, runtime)
+        self.application_emojis = ApplicationEmojiCatalog.from_settings(
+            runtime.settings
+        )
         self._command_templates: tuple[
             app_commands.Command[Any, ..., Any] | app_commands.Group | app_commands.ContextMenu,
             ...,
@@ -47,9 +53,19 @@ class SimajilordDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await verify_ffmpeg_opus()
+        await self.application_emojis.refresh(self)
         for item in build_discord_endpoints(self, self.runtime):
             self.runtime.registry.register(item)
         await setup_cogs(self, self.runtime)
+        await self.activity_server.start()
+        report = await self.runtime.maintenance.run()
+        log.info(
+            "Data maintenance complete: used=%s limit=%s removed=%s over_capacity=%s",
+            report.storage_used_bytes,
+            report.storage_limit_bytes,
+            report.orphan_cleanup_removed,
+            report.over_capacity,
+        )
         await self.runtime.image.start(self._deliver_image_job)
         self._command_templates = tuple(self.tree.get_commands())
 
@@ -99,6 +115,14 @@ class SimajilordDiscordBot(commands.Bot):
             await self._restore_audio_sessions()
             await self._prepare_read_aloud_presence()
             self._audio_restored = True
+        dashboard = getattr(self, "_simajilord_music_dashboard", None)
+        prune_stale = getattr(dashboard, "prune_stale_records", None)
+        if callable(prune_stale):
+            removed = await prune_stale(
+                frozenset(str(guild.id) for guild in self.guilds)
+            )
+            if removed:
+                log.info("Removed %s stale music dashboard record(s)", removed)
         await self._synchronize_initial_commands()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -256,6 +280,7 @@ class SimajilordDiscordBot(commands.Bot):
             await self.runtime.image.mark_delivered(job.job_id)
 
     async def close(self) -> None:
+        await self.activity_server.close()
         await self.runtime.close()
         await super().close()
 

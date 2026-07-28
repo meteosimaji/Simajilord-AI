@@ -36,10 +36,21 @@ class Settings:
 
     token: str = field(repr=False)
     application_id: int
+    discord_emoji_loading_id: int | None
+    discord_emoji_success_id: int | None
+    discord_emoji_warning_id: int | None
+    discord_emoji_audio_wave_id: int | None
+    discord_emoji_radio_id: int | None
+    activity_enabled: bool
+    activity_client_secret: str | None = field(repr=False)
+    activity_host: str
+    activity_port: int
     command_scope: CommandScope
     command_prefix: str
     log_level: str
     data_dir: Path
+    data_retention_days: int
+    max_data_size_bytes: int
     media_cookie_file: Path | None
     tts_provider: str
     tts_voice: str
@@ -64,6 +75,13 @@ class Settings:
     max_concurrent_media_per_guild: int
     max_active_voice_guilds: int
     download_timeout_seconds: float
+    local_media_max_file_bytes: int
+    local_media_cache_bytes: int
+    local_media_max_duration_seconds: float
+    translation_enabled: bool
+    translation_helper_path: Path | None
+    translation_timeout_seconds: float
+    translation_max_characters: int
     web_search_base_url: str
     web_search_shared_secret: str | None = field(repr=False)
     web_request_timeout_seconds: float
@@ -282,6 +300,18 @@ def _snowflake_set(name: str) -> frozenset[str]:
     return values
 
 
+def _optional_snowflake(name: str) -> int | None:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return None
+    if not raw_value.isdigit() or int(raw_value) <= 0:
+        raise ConfigurationError(f"{name} must be a positive Discord ID.")
+    value = int(raw_value)
+    if value >= 1 << 64:
+        raise ConfigurationError(f"{name} exceeds Discord's snowflake range.")
+    return value
+
+
 def _optional_private_file(name: str) -> Path | None:
     raw_path = os.getenv(name, "").strip()
     if not raw_path:
@@ -310,6 +340,13 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         raise ConfigurationError("DISCORD_APPLICATION_ID must be an integer.") from exc
     if application_id <= 0:
         raise ConfigurationError("DISCORD_APPLICATION_ID must be positive.")
+
+    activity_enabled = _boolean("DISCORD_ACTIVITY_ENABLED", False)
+    activity_client_secret = _optional_secret("DISCORD_CLIENT_SECRET")
+    if activity_enabled and activity_client_secret is None:
+        raise ConfigurationError(
+            "DISCORD_CLIENT_SECRET is required when DISCORD_ACTIVITY_ENABLED is true."
+        )
 
     raw_scope = os.getenv("COMMAND_SCOPE", CommandScope.GUILD.value).strip().lower()
     try:
@@ -410,14 +447,76 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         raise ConfigurationError(
             "MAX_CONCURRENT_MEDIA_PER_GUILD cannot exceed MAX_CONCURRENT_MEDIA."
         )
+    local_media_max_file_bytes = _bounded_int(
+        "LOCAL_MEDIA_MAX_FILE_BYTES",
+        100_000_000,
+        minimum=1_000_000,
+        maximum=500_000_000,
+    )
+    local_media_size_gb = os.getenv("LOCAL_MEDIA_SIZE_GB", "").strip()
+    local_media_cache_bytes = (
+        _positive_int("LOCAL_MEDIA_SIZE_GB", 5, maximum=20) * 1_000_000_000
+        if local_media_size_gb
+        else _bounded_int(
+            "LOCAL_MEDIA_CACHE_BYTES",
+            5_000_000_000,
+            minimum=100_000_000,
+            maximum=20_000_000_000,
+        )
+    )
+    if local_media_cache_bytes < local_media_max_file_bytes:
+        raise ConfigurationError(
+            "LOCAL_MEDIA_CACHE_BYTES cannot be smaller than "
+            "LOCAL_MEDIA_MAX_FILE_BYTES."
+        )
+
+    data_retention_days = _positive_int(
+        "DATA_RETENTION_DAYS",
+        30,
+        maximum=3_650,
+    )
+    max_data_size_bytes = (
+        _positive_int("MAX_DATA_SIZE_GB", 10, maximum=100) * 1_000_000_000
+    )
+    if local_media_cache_bytes > max_data_size_bytes:
+        raise ConfigurationError(
+            "LOCAL_MEDIA_SIZE_GB/LOCAL_MEDIA_CACHE_BYTES cannot exceed "
+            "MAX_DATA_SIZE_GB."
+        )
 
     return Settings(
         token=_required("DISCORD_TOKEN"),
         application_id=application_id,
+        discord_emoji_loading_id=_optional_snowflake(
+            "DISCORD_EMOJI_LOADING_ID"
+        ),
+        discord_emoji_success_id=_optional_snowflake(
+            "DISCORD_EMOJI_SUCCESS_ID"
+        ),
+        discord_emoji_warning_id=_optional_snowflake(
+            "DISCORD_EMOJI_WARNING_ID"
+        ),
+        discord_emoji_audio_wave_id=_optional_snowflake(
+            "DISCORD_EMOJI_AUDIO_WAVE_ID"
+        ),
+        discord_emoji_radio_id=_optional_snowflake(
+            "DISCORD_EMOJI_RADIO_ID"
+        ),
+        activity_enabled=activity_enabled,
+        activity_client_secret=activity_client_secret,
+        activity_host=_text("DISCORD_ACTIVITY_HOST", "127.0.0.1"),
+        activity_port=_bounded_int(
+            "DISCORD_ACTIVITY_PORT",
+            8_787,
+            minimum=1_024,
+            maximum=65_535,
+        ),
         command_scope=command_scope,
         command_prefix=command_prefix,
         log_level=log_level,
         data_dir=data_dir,
+        data_retention_days=data_retention_days,
+        max_data_size_bytes=max_data_size_bytes,
         media_cookie_file=_optional_private_file("MEDIA_COOKIE_FILE"),
         tts_provider=tts_provider,
         tts_voice=tts_voice,
@@ -471,6 +570,25 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         max_active_voice_guilds=_positive_int("MAX_ACTIVE_VOICE_GUILDS", 8, maximum=100),
         download_timeout_seconds=_positive_float(
             "DOWNLOAD_TIMEOUT_SECONDS", 180.0, maximum=900.0
+        ),
+        local_media_max_file_bytes=local_media_max_file_bytes,
+        local_media_cache_bytes=local_media_cache_bytes,
+        local_media_max_duration_seconds=_positive_float(
+            "LOCAL_MEDIA_MAX_DURATION_SECONDS",
+            21_600.0,
+            maximum=86_400.0,
+        ),
+        translation_enabled=_boolean("TRANSLATION_ENABLED", True),
+        translation_helper_path=_optional_private_file("TRANSLATION_HELPER_PATH"),
+        translation_timeout_seconds=_positive_float(
+            "TRANSLATION_TIMEOUT_SECONDS",
+            30.0,
+            maximum=120.0,
+        ),
+        translation_max_characters=_positive_int(
+            "TRANSLATION_MAX_CHARACTERS",
+            8_000,
+            maximum=20_000,
         ),
         web_search_base_url=_web_search_base_url(),
         web_search_shared_secret=_optional_secret("WEB_SEARCH_SHARED_SECRET"),

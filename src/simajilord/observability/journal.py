@@ -36,6 +36,15 @@ class EventRecord:
     payload: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class OperationDiagnostics:
+    """Bounded operational counters derived from the retained event journal."""
+
+    last_radio_failure_at: datetime | None
+    overlay_failure_count: int
+    dashboard_429_count: int
+
+
 class EventJournal:
     """Store capability and transport events for audit and agent reconciliation."""
 
@@ -116,6 +125,19 @@ class EventJournal:
     async def latest_sequence(self) -> int:
         async with self._lock:
             return await asyncio.to_thread(self._latest_sequence)
+
+    async def prune(self, *, before: datetime) -> int:
+        """Delete retained events older than an explicit UTC cutoff."""
+
+        cutoff = _utc_iso(before)
+        async with self._lock:
+            return await asyncio.to_thread(self._prune, cutoff)
+
+    async def operation_diagnostics(self) -> OperationDiagnostics:
+        """Summarise the failure signals surfaced by ``/status``."""
+
+        async with self._lock:
+            return await asyncio.to_thread(self._operation_diagnostics)
 
     def _initialize(self) -> None:
         connection = sqlite3.connect(self.path)
@@ -218,6 +240,58 @@ class EventJournal:
         finally:
             connection.close()
 
+    def _prune(self, cutoff: str) -> int:
+        connection = sqlite3.connect(self.path)
+        try:
+            cursor = connection.execute(
+                "DELETE FROM events WHERE occurred_at < ?",
+                (cutoff,),
+            )
+            connection.commit()
+            return cursor.rowcount
+        finally:
+            connection.close()
+
+    def _operation_diagnostics(self) -> OperationDiagnostics:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT occurred_at, payload_json
+                FROM events
+                WHERE kind = 'service.operation'
+                ORDER BY sequence
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        last_radio_failure_at: datetime | None = None
+        overlay_failure_count = 0
+        dashboard_429_count = 0
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            operation = payload.get("operation")
+            outcome = payload.get("outcome")
+            if operation == "audio.autoplay_refill" and outcome == "failed":
+                last_radio_failure_at = datetime.fromisoformat(
+                    str(row["occurred_at"])
+                )
+            elif operation == "audio.overlay_failed":
+                overlay_failure_count += 1
+            elif operation == "discord.dashboard_429":
+                dashboard_429_count += 1
+        return OperationDiagnostics(
+            last_radio_failure_at=last_radio_failure_at,
+            overlay_failure_count=overlay_failure_count,
+            dashboard_429_count=dashboard_429_count,
+        )
+
     def _latest_sequence(self) -> int:
         connection = sqlite3.connect(self.path)
         try:
@@ -265,3 +339,9 @@ def cast_payload(value: object) -> dict[str, object]:
 
 def _bounded(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _utc_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        raise ValueError("Retention cutoffs must be timezone-aware.")
+    return value.astimezone(UTC).isoformat()

@@ -241,7 +241,7 @@ async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
     runtime.registry.invoke = AsyncMock()
     runtime.audio = Mock()
     session = Mock()
-    session.resume_confirmation_required = False
+    session.voice_activation_required = False
     session.current = None
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
@@ -277,7 +277,7 @@ async def _announcement_cog(tmp_path) -> tuple[
     runtime.audio.connect = AsyncMock()
     session = Mock()
     session.has_music = False
-    session.resume_confirmation_required = False
+    session.voice_activation_required = False
     session.destination_id = "55"
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
