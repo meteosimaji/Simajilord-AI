@@ -9,13 +9,18 @@ import pytest
 from discord.ext import commands
 
 from simajilord.integrations.discord.cogs import ReadAloudCog
-from simajilord.integrations.discord.read_aloud import ReadAloudMessageFormatter
+from simajilord.integrations.discord.read_aloud import (
+    ReadAloudMessageFormatter,
+    ReadAloudMessageText,
+    merge_read_aloud_messages,
+)
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.read_aloud import (
     ReadAloudMode,
     ReadAloudRoute,
     ReadAloudService,
 )
+from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
 
 def _message(
@@ -174,6 +179,25 @@ async def test_formatter_avoids_repeating_same_author_until_timeout(
     assert third is not None and third.text == "めておさん。三つ目"
 
 
+def test_short_burst_compacts_exact_consecutive_spam_without_reordering() -> None:
+    author = SpeechSegment(SpeechSegmentKind.AUTHOR, "めておさん")
+    hello = SpeechSegment(SpeechSegmentKind.BODY, "こんにちは")
+    other = SpeechSegment(SpeechSegmentKind.BODY, "別の内容")
+
+    merged = merge_read_aloud_messages(
+        (
+            ("10", ReadAloudMessageText((author, hello), "一つ目")),
+            ("10", ReadAloudMessageText((hello,), "二つ目")),
+            ("11", ReadAloudMessageText((other,), "三つ目")),
+        )
+    )
+
+    assert merged.title == "3件のメッセージ"
+    assert merged.text == (
+        "めておさん。こんにちは。同じ内容を2回送信しました。別の内容"
+    )
+
+
 @pytest.mark.asyncio
 async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
     tmp_path,
@@ -225,7 +249,7 @@ async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
 
     await cog.on_message(message)
 
-    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.get_or_create.assert_not_called()
     runtime.registry.invoke.assert_not_awaited()
 
 

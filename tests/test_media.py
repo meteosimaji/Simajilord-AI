@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+from collections import defaultdict
+from pathlib import Path
+
 import pytest
 
 from simajilord.core.errors import MediaError, UserError
+from simajilord.domain.audio import AudioItem
+from simajilord.domain.media import (
+    DownloadArtifact,
+    DownloadFormat,
+    MediaCandidate,
+)
 from simajilord.media.providers.yt_dlp import YtDlpProvider, classify_yt_dlp_error
 from simajilord.media.security import (
     normalize_media_query,
@@ -10,6 +20,71 @@ from simajilord.media.security import (
     validate_media_url,
     validate_public_media_url,
 )
+from simajilord.services.media import MediaPriority, MediaService
+
+
+class TrackingMediaProvider:
+    def __init__(self) -> None:
+        self.active = 0
+        self.max_active = 0
+        self.active_by_workspace: dict[str, int] = defaultdict(int)
+        self.max_by_workspace: dict[str, int] = defaultdict(int)
+        self.started: list[str] = []
+        self.block_started = asyncio.Event()
+        self.release_block = asyncio.Event()
+
+    async def search_audio(
+        self,
+        query: str,
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
+        workspace_id = query.split(":", maxsplit=1)[0]
+        self.active += 1
+        self.active_by_workspace[workspace_id] += 1
+        self.max_active = max(self.max_active, self.active)
+        self.max_by_workspace[workspace_id] = max(
+            self.max_by_workspace[workspace_id],
+            self.active_by_workspace[workspace_id],
+        )
+        self.started.append(query)
+        try:
+            if query == "block:first":
+                self.block_started.set()
+                await self.release_block.wait()
+            else:
+                await asyncio.sleep(0.005)
+            return (
+                MediaCandidate(
+                    reference=f"https://example.test/{query}",
+                    title=query,
+                    duration_seconds=float(limit),
+                ),
+            )
+        finally:
+            self.active -= 1
+            self.active_by_workspace[workspace_id] -= 1
+
+    async def resolve_audio(self, reference: str) -> AudioItem:
+        raise NotImplementedError
+
+    async def mix_audio(
+        self,
+        seed_references: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
+        raise NotImplementedError
+
+    async def download(
+        self,
+        url: str,
+        media_type: DownloadFormat,
+        destination: Path,
+        *,
+        max_bytes: int,
+    ) -> DownloadArtifact:
+        raise NotImplementedError
 
 
 @pytest.mark.parametrize(
@@ -205,3 +280,82 @@ async def test_provider_combines_multiple_youtube_mix_seeds_without_stream_resol
 def test_provider_errors_have_stable_categories(detail: str, category: str) -> None:
     error: MediaError = classify_yt_dlp_error(detail)
     assert error.category == category
+
+
+@pytest.mark.asyncio
+async def test_media_scheduler_bounds_eight_guild_load_fairly() -> None:
+    provider = TrackingMediaProvider()
+    media = MediaService(
+        provider,
+        max_concurrent=3,
+        max_per_workspace=1,
+    )
+    try:
+        results = await asyncio.gather(
+            *(
+                media.search_audio(
+                    f"guild-{guild}:{round_index}",
+                    limit=1,
+                    workspace_id=f"guild-{guild}",
+                    priority=MediaPriority.NORMAL,
+                )
+                for round_index in range(2)
+                for guild in range(8)
+            )
+        )
+    finally:
+        await media.close()
+
+    assert len(results) == 16
+    assert provider.max_active == 3
+    assert set(provider.max_by_workspace) == {
+        f"guild-{guild}" for guild in range(8)
+    }
+    assert set(provider.max_by_workspace.values()) == {1}
+
+
+@pytest.mark.asyncio
+async def test_interactive_media_work_overtakes_queued_background_work() -> None:
+    provider = TrackingMediaProvider()
+    media = MediaService(
+        provider,
+        max_concurrent=1,
+        max_per_workspace=1,
+    )
+    blocker = asyncio.create_task(
+        media.search_audio(
+            "block:first",
+            limit=1,
+            workspace_id="block",
+            priority=MediaPriority.BACKGROUND,
+        )
+    )
+    await provider.block_started.wait()
+    background = asyncio.create_task(
+        media.search_audio(
+            "background:second",
+            limit=1,
+            workspace_id="background",
+            priority=MediaPriority.BACKGROUND,
+        )
+    )
+    interactive = asyncio.create_task(
+        media.search_audio(
+            "interactive:first",
+            limit=1,
+            workspace_id="interactive",
+            priority=MediaPriority.INTERACTIVE,
+        )
+    )
+    await asyncio.sleep(0)
+    provider.release_block.set()
+    try:
+        await asyncio.gather(blocker, background, interactive)
+    finally:
+        await media.close()
+
+    assert provider.started == [
+        "block:first",
+        "interactive:first",
+        "background:second",
+    ]

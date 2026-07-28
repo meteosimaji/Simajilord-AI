@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 simajilord-discord = "simajilord.integrations.discord.__main__:main"
 simajilord-audio-doctor = "simajilord.diagnostics.audio:main"
+simajilord-offline-preview = "simajilord.diagnostics.offline_discord:main"
 simajilord-web-doctor = "simajilord.diagnostics.web:main"
 
 [dependency-groups]

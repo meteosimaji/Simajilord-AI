@@ -32,12 +32,20 @@ _AGENT_ENVIRONMENT_NAMES = (
     "TTS_VOICE",
     "VOICEVOX_BASE_URL",
     "VOICEVOX_SPEAKER_ID",
+    "VOICEVOX_PRESET_CLEAR_ID",
+    "VOICEVOX_PRESET_CALM_ID",
+    "VOICEVOX_PRESET_ENERGETIC_ID",
+    "VOICEVOX_PRESET_CUTE_ID",
+    "VOICEVOX_PRESET_NARRATOR_ID",
     "VOICEVOX_ENGINE_PATH",
     "VOICEVOX_AUTO_START",
     "VOICEVOX_TIMEOUT_SECONDS",
+    "VOICEVOX_READINESS_TTL_SECONDS",
     "READ_ALOUD_CHUNK_CHARACTERS",
     "MAX_PENDING_MUSIC",
     "MAX_PENDING_MUSIC_PER_USER",
+    "MAX_CONCURRENT_MEDIA",
+    "MAX_CONCURRENT_MEDIA_PER_GUILD",
 )
 
 
@@ -82,8 +90,26 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.hive_daily_limit == 100
     assert settings.hive_threshold == 0.9
     assert settings.read_aloud_chunk_characters == 400
+    assert settings.voicevox_readiness_ttl_seconds == 5.0
     assert settings.max_pending_music == 100
     assert settings.max_pending_music_per_user == 20
+    assert settings.max_concurrent_media == 4
+    assert settings.max_concurrent_media_per_guild == 2
+
+
+def test_media_per_guild_concurrency_cannot_exceed_global_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("MAX_CONCURRENT_MEDIA", "2")
+    monkeypatch.setenv("MAX_CONCURRENT_MEDIA_PER_GUILD", "3")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="MAX_CONCURRENT_MEDIA_PER_GUILD cannot exceed",
+    ):
+        load_settings(dotenv_path=dotenv_path)
 
 
 def test_hive_secret_is_hidden_and_daily_limit_cannot_exceed_plan(

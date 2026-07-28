@@ -37,7 +37,7 @@ from simajilord.services.fresh_mix import (
     FreshMixTrack,
     FreshMixVocals,
 )
-from simajilord.services.media import MediaService
+from simajilord.services.media import MediaPriority, MediaService
 
 
 class AudioAction(StrEnum):
@@ -148,6 +148,7 @@ class AudioQueueResponse:
     autoplay_next: AudioQueueItem | None = None
     mix_seed_references: tuple[str, ...] = ()
     resume_confirmation_required: bool = False
+    connected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,7 +318,12 @@ def build_audio_endpoints(
         if not 1 <= request.limit <= 10:
             raise UserError("audio.search_limit_invalid")
         workspace_id = _workspace(context)
-        candidates = await media.search_audio(request.query, limit=request.limit)
+        candidates = await media.search_audio(
+            request.query,
+            limit=request.limit,
+            workspace_id=workspace_id,
+            priority=MediaPriority.INTERACTIVE,
+        )
         session = sessions.find(workspace_id)
         snapshot = await session.snapshot() if session is not None else None
         selected_index, reason = _select_candidate(
@@ -352,7 +358,11 @@ def build_audio_endpoints(
     ) -> AudioPlayResponse:
         workspace_id = _workspace(context)
         session = sessions.require(workspace_id)
-        item = await media.resolve_audio(request.reference)
+        item = await media.resolve_audio(
+            request.reference,
+            workspace_id=workspace_id,
+            priority=MediaPriority.INTERACTIVE,
+        )
         item.requested_by_id = context.actor_id
         item.requested_by_name = request.requested_by_name
         item.request_source = context.transport
@@ -1026,6 +1036,7 @@ def audio_queue_response(snapshot: QueueSnapshot) -> AudioQueueResponse:
         ),
         mix_seed_references=snapshot.mix_seed_references,
         resume_confirmation_required=snapshot.resume_confirmation_required,
+        connected=snapshot.connected,
     )
 
 

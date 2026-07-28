@@ -10,12 +10,18 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudExclusionTarget,
     ReadAloudPolicyResponse,
     ReadAloudResponse,
+    ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
+    ReadAloudUserVoiceSetRequest,
     build_read_aloud_policy_endpoints,
     build_read_aloud_route_endpoints,
 )
 from simajilord.core import ApprovalMode, InvocationContext, RiskLevel
-from simajilord.services.read_aloud import ReadAloudMode, ReadAloudService
+from simajilord.services.read_aloud import (
+    ReadAloudMode,
+    ReadAloudService,
+    ReadAloudVoicePreset,
+)
 
 
 def _context() -> InvocationContext:
@@ -97,6 +103,16 @@ async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> N
     assert response.announce_join is True
     assert response.announce_leave is True
     assert response.announce_move is False
+    await endpoints["speech.read_aloud_server_voice_set"].invoke(
+        ReadAloudServerVoiceSetRequest(ReadAloudVoicePreset.NARRATOR),
+        context,
+    )
+    voice_response = await endpoints["speech.read_aloud_user_voice_set"].invoke(
+        ReadAloudUserVoiceSetRequest(ReadAloudVoicePreset.CUTE),
+        context,
+    )
+    assert voice_response.default_voice_preset == "narrator"
+    assert voice_response.user_voice_presets == (("user", "cute"),)
     assert ReadAloudService(service.state_file).policy("guild") == service.policy(
         "guild"
     )

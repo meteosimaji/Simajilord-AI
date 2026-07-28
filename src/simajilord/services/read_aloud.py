@@ -29,6 +29,16 @@ class ReadAloudContentMode(StrEnum):
     OFF = "off"
 
 
+class ReadAloudVoicePreset(StrEnum):
+    """Small, stable voice vocabulary exposed instead of raw style IDs."""
+
+    CLEAR = "clear"
+    CALM = "calm"
+    ENERGETIC = "energetic"
+    CUTE = "cute"
+    NARRATOR = "narrator"
+
+
 @dataclass(frozen=True, slots=True)
 class ReadAloudRoute:
     workspace_id: str
@@ -70,6 +80,9 @@ class ReadAloudPolicy:
     read_author_names: bool = True
     read_replies: bool = True
     read_attachments: bool = True
+    vc_members_only: bool = False
+    default_voice_preset: ReadAloudVoicePreset = ReadAloudVoicePreset.CLEAR
+    user_voice_presets: tuple[tuple[str, ReadAloudVoicePreset], ...] = ()
     ignore_bots: bool = True
     ignore_webhooks: bool = True
 
@@ -359,6 +372,60 @@ class ReadAloudService:
             await asyncio.to_thread(self._save)
             return updated
 
+    async def set_default_voice_preset(
+        self,
+        *,
+        workspace_id: str,
+        preset: ReadAloudVoicePreset,
+    ) -> ReadAloudPolicy:
+        """Set the server-wide voice used unless a member overrides it."""
+
+        async with self._lock:
+            current = self.policy(workspace_id)
+            updated = replace(current, default_voice_preset=preset)
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated
+
+    async def set_user_voice_preset(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        preset: ReadAloudVoicePreset | None,
+    ) -> ReadAloudPolicy:
+        """Set or clear one member's self-managed voice override."""
+
+        normalized_id = self._required_identifier(user_id, field="user_id")
+        async with self._lock:
+            current = self.policy(workspace_id)
+            overrides = dict(current.user_voice_presets)
+            if preset is None:
+                overrides.pop(normalized_id, None)
+            else:
+                overrides[normalized_id] = preset
+            updated = replace(
+                current,
+                user_voice_presets=tuple(sorted(overrides.items())),
+            )
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated
+
+    def voice_preset_for(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+    ) -> ReadAloudVoicePreset:
+        """Resolve a member override with the server default as fallback."""
+
+        policy = self.policy(workspace_id)
+        return dict(policy.user_voice_presets).get(
+            user_id,
+            policy.default_voice_preset,
+        )
+
     async def set_semantic_options(
         self,
         *,
@@ -366,10 +433,16 @@ class ReadAloudService:
         author_names: bool | None = None,
         replies: bool | None = None,
         attachments: bool | None = None,
+        vc_members_only: bool | None = None,
     ) -> ReadAloudPolicy:
         """Update selected semantic speech formatting switches."""
 
-        if author_names is None and replies is None and attachments is None:
+        if (
+            author_names is None
+            and replies is None
+            and attachments is None
+            and vc_members_only is None
+        ):
             raise ValueError("read_aloud.semantic_value_required")
         async with self._lock:
             current = self.policy(workspace_id)
@@ -385,6 +458,11 @@ class ReadAloudService:
                     current.read_attachments
                     if attachments is None
                     else attachments
+                ),
+                vc_members_only=(
+                    current.vc_members_only
+                    if vc_members_only is None
+                    else vc_members_only
                 ),
             )
             self._policies[workspace_id] = updated
@@ -570,6 +648,24 @@ class ReadAloudService:
             read_author_names=bool(item.get("read_author_names", True)),
             read_replies=bool(item.get("read_replies", True)),
             read_attachments=bool(item.get("read_attachments", True)),
+            vc_members_only=bool(item.get("vc_members_only", False)),
+            default_voice_preset=ReadAloudVoicePreset(
+                str(item.get("default_voice_preset", ReadAloudVoicePreset.CLEAR.value))
+            ),
+            user_voice_presets=tuple(
+                sorted(
+                    (
+                        ReadAloudService._required_identifier(
+                            str(user_id),
+                            field="user_id",
+                        ),
+                        ReadAloudVoicePreset(str(preset)),
+                    )
+                    for user_id, preset in dict(
+                        item.get("user_voice_presets", {})
+                    ).items()
+                )
+            ),
             ignore_bots=bool(item.get("ignore_bots", True)),
             ignore_webhooks=bool(item.get("ignore_webhooks", True)),
         )
@@ -588,6 +684,12 @@ class ReadAloudService:
             "read_author_names": policy.read_author_names,
             "read_replies": policy.read_replies,
             "read_attachments": policy.read_attachments,
+            "vc_members_only": policy.vc_members_only,
+            "default_voice_preset": policy.default_voice_preset.value,
+            "user_voice_presets": {
+                user_id: preset.value
+                for user_id, preset in policy.user_voice_presets
+            },
             "ignore_bots": policy.ignore_bots,
             "ignore_webhooks": policy.ignore_webhooks,
         }

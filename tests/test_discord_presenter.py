@@ -266,7 +266,7 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert "Next" in upcoming
     assert "Queue **1**" in fields["Playback"]
     assert "Loop **Queue**" in fields["Playback"]
-    assert "Mix **Off**" in fields["Playback"]
+    assert "Radio **Off**" in fields["Playback"]
     assert "Music **100%**" in fields["Levels"]
     assert "Read aloud **100%**" in fields["Levels"]
     assert "Select **Read aloud**" in fields["Read aloud"]

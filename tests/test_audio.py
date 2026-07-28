@@ -28,8 +28,8 @@ from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, AudioKind, AudioQueueLane, LoopMode
 from simajilord.domain.media import MediaCandidate
 from simajilord.services.audio import AudioSession, AudioSessionManager
-from simajilord.services.audio_state import AudioStateStore
-from simajilord.services.media import MediaService
+from simajilord.services.audio_state import AudioStateStore, StoredAudioSession
+from simajilord.services.media import MediaPriority, MediaService
 
 
 class FakeOutput:
@@ -531,7 +531,15 @@ async def test_play_api_queues_without_voice_then_starts_and_records_history(
     tmp_path,
 ) -> None:
     class FakeMedia:
-        async def resolve_audio(self, reference: str) -> AudioItem:
+        async def resolve_audio(
+            self,
+            reference: str,
+            *,
+            workspace_id: str,
+            priority: MediaPriority,
+        ) -> AudioItem:
+            assert workspace_id == "guild"
+            assert priority is MediaPriority.INTERACTIVE
             return AudioItem(
                 "resolved-stream",
                 "Requested track",
@@ -606,9 +614,13 @@ async def test_search_requires_one_click_for_same_title_from_different_artists()
             query: str,
             *,
             limit: int,
+            workspace_id: str,
+            priority: MediaPriority,
         ) -> tuple[MediaCandidate, ...]:
             assert query == "Hello"
             assert limit == 5
+            assert workspace_id == "guild"
+            assert priority is MediaPriority.INTERACTIVE
             return (
                 MediaCandidate(
                     "https://example.com/adele",
@@ -647,7 +659,11 @@ async def test_search_uses_explicit_artist_without_an_extra_click() -> None:
             query: str,
             *,
             limit: int,
+            workspace_id: str,
+            priority: MediaPriority,
         ) -> tuple[MediaCandidate, ...]:
+            assert workspace_id == "guild"
+            assert priority is MediaPriority.INTERACTIVE
             return (
                 MediaCandidate(
                     "https://example.com/wrong",
@@ -701,7 +717,11 @@ async def test_search_reuses_requesters_durable_choice_without_an_extra_click() 
             query: str,
             *,
             limit: int,
+            workspace_id: str,
+            priority: MediaPriority,
         ) -> tuple[MediaCandidate, ...]:
+            assert workspace_id == "guild"
+            assert priority is MediaPriority.INTERACTIVE
             return candidates
 
     output = FakeOutput()
@@ -797,6 +817,89 @@ async def test_concurrent_voice_connections_cannot_exceed_process_limit() -> Non
     assert str(results[1]) == "audio.capacity_reached"
     assert manager.active_session_count == 1
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_voice_connection_does_not_block_another_reserved_guild() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowConnectOutput(FakeOutput):
+        async def connect(self, destination_id: str) -> None:
+            del destination_id
+            entered.set()
+            await release.wait()
+            self.connected = True
+
+    first_output = SlowConnectOutput()
+    second_output = FakeOutput()
+    first_output.connected = False
+    second_output.connected = False
+    manager = AudioSessionManager(max_active=2, max_pending_speech=3)
+    manager.get_or_create("guild-one", lambda: first_output)
+    manager.get_or_create("guild-two", lambda: second_output)
+
+    first = asyncio.create_task(manager.connect("guild-one", "voice-one"))
+    await entered.wait()
+    await asyncio.wait_for(
+        manager.connect("guild-two", "voice-two"),
+        timeout=0.5,
+    )
+    assert second_output.connected
+    release.set()
+    await first
+    assert manager.active_session_count == 2
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_state_store_coalesces_burst_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = AudioStateStore(
+        tmp_path / "audio_sessions.json",
+        debounce_seconds=60.0,
+    )
+    writes = 0
+    original_write = store._write
+
+    def counted_write() -> None:
+        nonlocal writes
+        writes += 1
+        original_write()
+
+    monkeypatch.setattr(store, "_write", counted_write)
+    first = StoredAudioSession(
+        workspace_id="guild",
+        destination_id=None,
+        waiting_actor_ids=(),
+        loop_mode=LoopMode.NONE,
+        auto_leave=True,
+        speed=1.0,
+        pitch=1.0,
+        items=(),
+        history=(),
+    )
+    second = StoredAudioSession(
+        workspace_id="guild",
+        destination_id="voice",
+        waiting_actor_ids=(),
+        loop_mode=LoopMode.NONE,
+        auto_leave=True,
+        speed=1.0,
+        pitch=1.0,
+        items=(),
+        history=(),
+    )
+
+    await store.put(first)
+    await store.put(second)
+    assert writes == 0
+    await store.flush()
+
+    assert writes == 1
+    assert AudioStateStore(store.path).all()[0].destination_id == "voice"
 
 
 @pytest.mark.asyncio

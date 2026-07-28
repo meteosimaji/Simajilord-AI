@@ -34,6 +34,52 @@ class ReadAloudMessageText:
         return "。".join(segment.text for segment in self.segments)
 
 
+def merge_read_aloud_messages(
+    messages: tuple[tuple[str, ReadAloudMessageText], ...],
+) -> ReadAloudMessageText:
+    """Merge one short channel burst while compacting exact consecutive spam."""
+
+    if not messages:
+        raise ValueError("At least one read-aloud message is required.")
+    if len(messages) == 1:
+        return messages[0][1]
+
+    segments: list[SpeechSegment] = []
+    index = 0
+    while index < len(messages):
+        author_id, prepared = messages[index]
+        semantic = tuple(
+            (segment.kind, segment.text)
+            for segment in prepared.segments
+            if segment.kind is not SpeechSegmentKind.AUTHOR
+        )
+        repeat_count = 1
+        while index + repeat_count < len(messages):
+            next_author, next_prepared = messages[index + repeat_count]
+            next_semantic = tuple(
+                (segment.kind, segment.text)
+                for segment in next_prepared.segments
+                if segment.kind is not SpeechSegmentKind.AUTHOR
+            )
+            if next_author != author_id or next_semantic != semantic:
+                break
+            repeat_count += 1
+        segments.extend(prepared.segments)
+        if repeat_count > 1:
+            segments.append(
+                SpeechSegment(
+                    SpeechSegmentKind.EVENT,
+                    f"同じ内容を{repeat_count}回送信しました",
+                )
+            )
+        index += repeat_count
+
+    return ReadAloudMessageText(
+        segments=tuple(segments),
+        title=f"{len(messages)}件のメッセージ",
+    )
+
+
 class ReadAloudMessageFormatter:
     """Resolve Discord markup only when a message is actually spoken."""
 

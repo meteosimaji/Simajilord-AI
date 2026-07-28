@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -21,6 +22,7 @@ from simajilord.domain.audio import (
 )
 
 from .audio_state import AudioStateStore, StoredAudioItem, StoredAudioSession
+from .metrics import ServiceMetricHook, ServiceOperationMetric
 
 log = logging.getLogger(__name__)
 
@@ -80,8 +82,47 @@ class AudioOutput(Protocol):
 
 AudioResolver = Callable[[str], Awaitable[AudioItem]]
 AutoplaySupplier = Callable[[tuple[str, ...], int], Awaitable[tuple[AudioItem, ...]]]
+WorkspaceAudioResolver = Callable[[str, str], Awaitable[AudioItem]]
+WorkspaceAutoplaySupplier = Callable[
+    [str, tuple[str, ...], int],
+    Awaitable[tuple[AudioItem, ...]],
+]
 StateHook = Callable[["AudioSession"], Awaitable[None]]
 StateListener = Callable[["AudioSession"], Awaitable[None]]
+
+
+class SpeechQueueReservation:
+    """One pre-synthesis slot in a workspace speech queue."""
+
+    def __init__(self, session: AudioSession, token: str) -> None:
+        self._session = session
+        self._token = token
+        self._active = True
+
+    async def commit(self, item: AudioItem) -> int:
+        """Transfer a synthesized speech item into the reserved queue slot."""
+
+        if not self._active:
+            item.cleanup()
+            raise UserError("speech.reservation_inactive")
+        try:
+            position = await self._session._commit_speech_reservation(
+                self._token,
+                item,
+            )
+        except Exception:
+            item.cleanup()
+            raise
+        self._active = False
+        return position
+
+    async def release(self) -> None:
+        """Release an unused slot; safe to call after commit or cancellation."""
+
+        if not self._active:
+            return
+        self._active = False
+        await self._session._release_speech_reservation(self._token)
 
 
 class AudioSession:
@@ -112,6 +153,7 @@ class AudioSession:
         self._music: deque[AudioItem] = deque()
         self._autoplay: deque[AudioItem] = deque()
         self._speech: deque[AudioItem] = deque()
+        self._speech_reservations: set[str] = set()
         self._history: deque[AudioItem] = deque(maxlen=_MAX_HISTORY_ITEMS)
         self._current: AudioItem | None = None
         self._waiting_actor_ids: set[str] = set()
@@ -185,29 +227,10 @@ class AudioSession:
                 item.cleanup()
                 raise UserError("audio.session_closed")
             if item.kind is AudioKind.SPEECH:
-                item.volume = self._speech_volume
-                pending_speech = len(self._speech)
-                if self._speech_active or (
-                    self._current and self._current.kind is AudioKind.SPEECH
-                ):
-                    pending_speech += 1
-                if pending_speech >= self.max_pending_speech:
+                if self._speech_load_locked() >= self.max_pending_speech:
                     item.cleanup()
                     raise UserError("speech.queue_full")
-                position = pending_speech + 1
-                current = self._current
-                if (
-                    current is not None
-                    and current.kind is AudioKind.MUSIC
-                    and self._overlay_task is None
-                ):
-                    self._speech_active = True
-                    self._overlay_task = asyncio.create_task(
-                        self._run_speech_overlays(current, item),
-                        name=f"simajilord-speech-overlay-{self.workspace_id}",
-                    )
-                else:
-                    self._speech.append(item)
+                position = self._enqueue_speech_locked(item)
             else:
                 if item.queue_lane is AudioQueueLane.AUTOPLAY:
                     self._autoplay.append(item)
@@ -225,6 +248,72 @@ class AudioSession:
             self._wake.set()
             self._ensure_worker()
         await self._state_changed()
+        return position
+
+    async def reserve_speech(self) -> SpeechQueueReservation:
+        """Reserve queue capacity before an expensive speech synthesis starts."""
+
+        async with self._lock:
+            if self._closed:
+                raise UserError("audio.session_closed")
+            if self._speech_load_locked() >= self.max_pending_speech:
+                raise UserError("speech.queue_full")
+            token = uuid.uuid4().hex
+            self._speech_reservations.add(token)
+        return SpeechQueueReservation(self, token)
+
+    async def _commit_speech_reservation(
+        self,
+        token: str,
+        item: AudioItem,
+    ) -> int:
+        if item.kind is not AudioKind.SPEECH:
+            raise ValueError("A speech reservation only accepts speech audio.")
+        async with self._lock:
+            if token not in self._speech_reservations:
+                raise UserError("speech.reservation_cancelled")
+            self._speech_reservations.remove(token)
+            if self._closed:
+                raise UserError("audio.session_closed")
+            position = self._enqueue_speech_locked(item)
+            self._wake.set()
+            self._ensure_worker()
+        await self._state_changed()
+        return position
+
+    async def _release_speech_reservation(self, token: str) -> None:
+        async with self._lock:
+            self._speech_reservations.discard(token)
+
+    def _speech_load_locked(self) -> int:
+        pending = len(self._speech) + len(self._speech_reservations)
+        if self._speech_active or (
+            self._current is not None and self._current.kind is AudioKind.SPEECH
+        ):
+            pending += 1
+        return pending
+
+    def _enqueue_speech_locked(self, item: AudioItem) -> int:
+        item.volume = self._speech_volume
+        pending = len(self._speech)
+        if self._speech_active or (
+            self._current is not None and self._current.kind is AudioKind.SPEECH
+        ):
+            pending += 1
+        position = pending + 1
+        current = self._current
+        if (
+            current is not None
+            and current.kind is AudioKind.MUSIC
+            and self._overlay_task is None
+        ):
+            self._speech_active = True
+            self._overlay_task = asyncio.create_task(
+                self._run_speech_overlays(current, item),
+                name=f"simajilord-speech-overlay-{self.workspace_id}",
+            )
+        else:
+            self._speech.append(item)
         return position
 
     async def enqueue_many(
@@ -536,6 +625,7 @@ class AudioSession:
             for item in (*self._speech, *self._music, *self._autoplay):
                 item.cleanup()
             self._speech.clear()
+            self._speech_reservations.clear()
             self._music.clear()
             self._autoplay.clear()
             if self._current is not None:
@@ -601,6 +691,7 @@ class AudioSession:
         if self._current is not None:
             self._current.cleanup()
         self._speech.clear()
+        self._speech_reservations.clear()
         self._music.clear()
         self._autoplay.clear()
         self._current = None
@@ -637,6 +728,7 @@ class AudioSession:
                 autoplay_next=self._autoplay[0] if self._autoplay else None,
                 mix_seed_references=tuple(self._mix_seed_references),
                 resume_confirmation_required=self._resume_confirmation_required,
+                connected=self.output.connected,
             )
 
     def restore(self, state: StoredAudioSession) -> None:
@@ -1289,7 +1381,10 @@ class AudioSessionManager:
         max_pending_music_per_actor: int = 20,
         resolver: AudioResolver | None = None,
         autoplay_supplier: AutoplaySupplier | None = None,
+        workspace_resolver: WorkspaceAudioResolver | None = None,
+        workspace_autoplay_supplier: WorkspaceAutoplaySupplier | None = None,
         state_store: AudioStateStore | None = None,
+        metric_hook: ServiceMetricHook | None = None,
     ) -> None:
         self.max_active = max_active
         self.max_pending_speech = max_pending_speech
@@ -1297,9 +1392,14 @@ class AudioSessionManager:
         self.max_pending_music_per_actor = max_pending_music_per_actor
         self._resolver = resolver
         self._autoplay_supplier = autoplay_supplier
+        self._workspace_resolver = workspace_resolver
+        self._workspace_autoplay_supplier = workspace_autoplay_supplier
         self._state_store = state_store
+        self._metric_hook = metric_hook
         self._sessions: dict[str, AudioSession] = {}
         self._connection_lock = asyncio.Lock()
+        self._connection_locks: dict[str, asyncio.Lock] = {}
+        self._connection_reservations: set[str] = set()
         self._state_listeners: list[StateListener] = []
 
     @property
@@ -1318,14 +1418,40 @@ class AudioSessionManager:
         existing = self._sessions.get(workspace_id)
         if existing is not None:
             return existing
+
+        session_resolver = self._resolver
+        if self._workspace_resolver is not None:
+
+            async def resolve_for_workspace(reference: str) -> AudioItem:
+                workspace_resolver = self._workspace_resolver
+                if workspace_resolver is None:
+                    raise RuntimeError("Workspace media resolver is unavailable.")
+                return await workspace_resolver(workspace_id, reference)
+
+            session_resolver = resolve_for_workspace
+
+        session_autoplay_supplier = self._autoplay_supplier
+        if self._workspace_autoplay_supplier is not None:
+
+            async def supply_for_workspace(
+                seeds: tuple[str, ...],
+                limit: int,
+            ) -> tuple[AudioItem, ...]:
+                workspace_supplier = self._workspace_autoplay_supplier
+                if workspace_supplier is None:
+                    raise RuntimeError("Workspace autoplay supplier is unavailable.")
+                return await workspace_supplier(workspace_id, seeds, limit)
+
+            session_autoplay_supplier = supply_for_workspace
+
         session = AudioSession(
             workspace_id,
             output_factory(),
             max_pending_speech=self.max_pending_speech,
             max_pending_music=self.max_pending_music,
             max_pending_music_per_actor=self.max_pending_music_per_actor,
-            resolver=self._resolver,
-            autoplay_supplier=self._autoplay_supplier,
+            resolver=session_resolver,
+            autoplay_supplier=session_autoplay_supplier,
             state_hook=self._state_changed,
         )
         self._sessions[workspace_id] = session
@@ -1372,17 +1498,59 @@ class AudioSessionManager:
             raise UserError("audio.capacity_reached")
 
     async def connect(self, workspace_id: str, destination_id: str) -> None:
-        """Atomically enforce the process voice limit and connect one session."""
+        """Reserve global capacity briefly, then connect without blocking other guilds."""
 
-        async with self._connection_lock:
+        requested_at = monotonic()
+        workspace_lock = self._connection_locks.setdefault(
+            workspace_id,
+            asyncio.Lock(),
+        )
+        outcome = "succeeded"
+        async with workspace_lock:
             session = self.require(workspace_id)
-            if not session.output.connected:
-                self.assert_connection_capacity(workspace_id)
-            await session.connect(destination_id)
+            reserved = False
+            started_at = monotonic()
+            try:
+                if not session.output.connected:
+                    async with self._connection_lock:
+                        active_or_reserved = sum(
+                            other.output.connected
+                            for other_id, other in self._sessions.items()
+                            if other_id != workspace_id
+                        ) + sum(
+                            reservation != workspace_id
+                            for reservation in self._connection_reservations
+                        )
+                        if active_or_reserved >= self.max_active:
+                            raise UserError("audio.capacity_reached")
+                        self._connection_reservations.add(workspace_id)
+                        reserved = True
+                await session.connect(destination_id)
+            except Exception:
+                outcome = "failed"
+                raise
+            finally:
+                if reserved:
+                    async with self._connection_lock:
+                        self._connection_reservations.discard(workspace_id)
+                finished_at = monotonic()
+                await self._record_metric(
+                    ServiceOperationMetric(
+                        operation="voice.connect",
+                        workspace_id=workspace_id,
+                        wait_ms=max(0.0, (started_at - requested_at) * 1_000),
+                        duration_ms=max(0.0, (finished_at - started_at) * 1_000),
+                        outcome=outcome,
+                    )
+                )
 
     async def close(self) -> None:
         await asyncio.gather(*(session.shutdown() for session in self._sessions.values()))
+        if self._state_store is not None:
+            await self._state_store.flush()
         self._sessions.clear()
+        self._connection_locks.clear()
+        self._connection_reservations.clear()
 
     def add_state_listener(self, listener: StateListener) -> None:
         """Observe durable session changes without replacing persistence."""
@@ -1412,3 +1580,15 @@ class AudioSessionManager:
             return
         state = await session.persisted_state()
         await self._state_store.put(state)
+
+    async def _record_metric(self, metric: ServiceOperationMetric) -> None:
+        if self._metric_hook is None:
+            return
+        try:
+            await self._metric_hook(metric)
+        except Exception:
+            log.exception(
+                "Audio metric hook failed operation=%s workspace=%s",
+                metric.operation,
+                metric.workspace_id,
+            )

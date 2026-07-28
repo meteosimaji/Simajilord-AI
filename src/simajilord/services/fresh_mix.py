@@ -12,7 +12,7 @@ from enum import StrEnum
 
 from simajilord.core.errors import UserError
 from simajilord.domain.media import MediaCandidate
-from simajilord.services.media import MediaService
+from simajilord.services.media import MediaPriority, MediaService
 
 _VARIANT_TERMS = re.compile(
     r"\b(live|cover|remix|nightcore|slowed|sped\s*up|karaoke)\b",
@@ -122,7 +122,15 @@ class FreshMixService:
         for phase_index, phase in enumerate(phases):
             pools = tuple(
                 await asyncio.gather(
-                    *(self.media.search_audio(query, limit=20) for query in phase.queries)
+                    *(
+                        self.media.search_audio(
+                            query,
+                            limit=20,
+                            workspace_id=workspace_id,
+                            priority=MediaPriority.BACKGROUND,
+                        )
+                        for query in phase.queries
+                    )
                 )
             )
             candidates = _round_robin(pools)
@@ -205,7 +213,12 @@ class FreshMixService:
         try:
             if not 1 <= position <= len(draft.tracks):
                 raise UserError("audio.fresh_mix_position_invalid")
-            candidates = await self.media.search_audio(query, limit=10)
+            candidates = await self.media.search_audio(
+                query,
+                limit=10,
+                workspace_id=workspace_id,
+                priority=MediaPriority.INTERACTIVE,
+            )
             other_tracks = tuple(
                 track for index, track in enumerate(draft.tracks, start=1) if index != position
             )

@@ -13,7 +13,7 @@ from simajilord.core.capabilities import (
     endpoint,
 )
 from simajilord.domain.media import DownloadFormat
-from simajilord.services.media import MediaService
+from simajilord.services.media import MediaPriority, MediaService
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,13 +35,16 @@ class DownloadResponse:
 def build_download_endpoint(media: MediaService) -> CapabilityEndpoint:
     async def download(
         request: DownloadRequest,
-        _: InvocationContext,
+        context: InvocationContext,
     ) -> DownloadResponse:
+        workspace_id = context.workspace_id or f"actor:{context.actor_id}"
         artifact = await media.download(
             request.url,
             request.media_type,
             request.destination,
             max_bytes=request.max_bytes,
+            workspace_id=workspace_id,
+            priority=MediaPriority.NORMAL,
         )
         return DownloadResponse(
             path=artifact.path,

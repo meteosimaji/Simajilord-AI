@@ -45,14 +45,22 @@ class Settings:
     tts_voice: str
     voicevox_base_url: str
     voicevox_speaker_id: int
+    voicevox_preset_clear_id: int
+    voicevox_preset_calm_id: int
+    voicevox_preset_energetic_id: int
+    voicevox_preset_cute_id: int
+    voicevox_preset_narrator_id: int
     voicevox_engine_path: Path | None
     voicevox_auto_start: bool
     voicevox_timeout_seconds: float
+    voicevox_readiness_ttl_seconds: float
     read_aloud_chunk_characters: int
     max_pending_speech: int
     max_pending_music: int
     max_pending_music_per_user: int
     max_concurrent_tts: int
+    max_concurrent_media: int
+    max_concurrent_media_per_guild: int
     max_active_voice_guilds: int
     download_timeout_seconds: float
     web_search_base_url: str
@@ -387,6 +395,20 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         raise ConfigurationError(
             "AGENT_ADMIN_USER_IDS is required when image generation is admin-only."
         )
+    max_concurrent_media = _positive_int(
+        "MAX_CONCURRENT_MEDIA",
+        4,
+        maximum=32,
+    )
+    max_concurrent_media_per_guild = _positive_int(
+        "MAX_CONCURRENT_MEDIA_PER_GUILD",
+        2,
+        maximum=16,
+    )
+    if max_concurrent_media_per_guild > max_concurrent_media:
+        raise ConfigurationError(
+            "MAX_CONCURRENT_MEDIA_PER_GUILD cannot exceed MAX_CONCURRENT_MEDIA."
+        )
 
     return Settings(
         token=_required("DISCORD_TOKEN"),
@@ -402,10 +424,30 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         voicevox_speaker_id=_bounded_int(
             "VOICEVOX_SPEAKER_ID", 3, minimum=0, maximum=65_535
         ),
+        voicevox_preset_clear_id=_bounded_int(
+            "VOICEVOX_PRESET_CLEAR_ID", 2, minimum=0, maximum=65_535
+        ),
+        voicevox_preset_calm_id=_bounded_int(
+            "VOICEVOX_PRESET_CALM_ID", 14, minimum=0, maximum=65_535
+        ),
+        voicevox_preset_energetic_id=_bounded_int(
+            "VOICEVOX_PRESET_ENERGETIC_ID", 8, minimum=0, maximum=65_535
+        ),
+        voicevox_preset_cute_id=_bounded_int(
+            "VOICEVOX_PRESET_CUTE_ID", 3, minimum=0, maximum=65_535
+        ),
+        voicevox_preset_narrator_id=_bounded_int(
+            "VOICEVOX_PRESET_NARRATOR_ID", 13, minimum=0, maximum=65_535
+        ),
         voicevox_engine_path=voicevox_engine_path,
         voicevox_auto_start=voicevox_auto_start,
         voicevox_timeout_seconds=_positive_float(
             "VOICEVOX_TIMEOUT_SECONDS", 30.0, maximum=120.0
+        ),
+        voicevox_readiness_ttl_seconds=_positive_float(
+            "VOICEVOX_READINESS_TTL_SECONDS",
+            5.0,
+            maximum=300.0,
         ),
         read_aloud_chunk_characters=_positive_int(
             "READ_ALOUD_CHUNK_CHARACTERS", 400, maximum=2_000
@@ -418,6 +460,8 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             maximum=100,
         ),
         max_concurrent_tts=_positive_int("MAX_CONCURRENT_TTS", 2, maximum=10),
+        max_concurrent_media=max_concurrent_media,
+        max_concurrent_media_per_guild=max_concurrent_media_per_guild,
         max_active_voice_guilds=_positive_int("MAX_ACTIVE_VOICE_GUILDS", 8, maximum=100),
         download_timeout_seconds=_positive_float(
             "DOWNLOAD_TIMEOUT_SECONDS", 180.0, maximum=900.0

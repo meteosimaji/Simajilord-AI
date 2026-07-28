@@ -21,6 +21,7 @@ class SpeechSpeakRequest:
     text: str = ""
     title: str | None = None
     segments: tuple[SpeechSegment, ...] = ()
+    voice_preset: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,25 +44,33 @@ def build_speech_endpoint(
         if context.workspace_id is None:
             raise UserError("workspace.required")
         session = sessions.require(context.workspace_id)
+        reservation = await session.reserve_speech()
         title = (request.title or "Spoken message").strip() or "Spoken message"
-        if request.segments:
-            item = await speech.synthesize_segments(
-                request.segments,
-                title=title,
-                workspace_id=context.workspace_id,
-            )
-        else:
-            item = await speech.synthesize(
-                request.text,
-                title=title,
-                workspace_id=context.workspace_id,
-            )
-        item.requested_by_id = context.actor_id
-        if not session.output.connected:
-            await session.wait_for_listener(context.actor_id)
-        position = await session.enqueue(item)
+        try:
+            if request.segments:
+                item = await speech.synthesize_segments(
+                    request.segments,
+                    title=title,
+                    workspace_id=context.workspace_id,
+                    voice_preset=request.voice_preset,
+                )
+            else:
+                item = await speech.synthesize(
+                    request.text,
+                    title=title,
+                    workspace_id=context.workspace_id,
+                    voice_preset=request.voice_preset,
+                )
+            item.requested_by_id = context.actor_id
+            if not session.output.connected:
+                await session.wait_for_listener(context.actor_id)
+            position = await reservation.commit(item)
+        finally:
+            await reservation.release()
         snapshot = await session.snapshot()
-        if snapshot.current is not None:
+        if snapshot.current is not None or (
+            position == 1 and session.output.connected
+        ):
             playback_state = "playing"
         elif snapshot.waiting_actor_ids:
             playback_state = "waiting_for_voice"

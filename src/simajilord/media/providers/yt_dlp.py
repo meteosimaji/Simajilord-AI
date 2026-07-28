@@ -182,7 +182,12 @@ class YtDlpProvider:
 
         try:
             async with asyncio.timeout(60):
-                pools = await asyncio.gather(*(extract_seed(seed) for seed in seed_ids))
+                # The service scheduler counts this mix as one provider job. Keep
+                # seed extraction serial so a single mix cannot bypass the global
+                # yt-dlp thread limit by spawning up to eight hidden workers.
+                pools = tuple(
+                    [await extract_seed(seed) for seed in seed_ids]
+                )
         except TimeoutError as exc:
             raise MediaError("timeout", "YouTube Mix lookup timed out.") from exc
 

@@ -82,12 +82,15 @@ from simajilord.integrations.discord.cogs import (
     VoiceLifecycleCog,
     WebCog,
     WebFetchContinueView,
+    YouTubeLinkCardCog,
+    YouTubeLinkCardView,
     _agent_error_text,
     _agent_grants,
     _agent_message_groups,
     _AgentProgressMessage,
     _discord_message_chunks,
     _retry_after_text,
+    _youtube_card_reference,
     discord_conversation_id,
     error_message,
 )
@@ -177,8 +180,8 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         "queue",
         "history",
         "nowplaying",
+        "radio",
         "mix",
-        "freshmix",
     } <= commands.keys()
     assert commands["audio"].description == (
         "Open music controls and read-aloud setup in one panel."
@@ -187,9 +190,7 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
     assert commands["queue"].description == "再生中の曲とキューを表示します。"
     assert commands["history"].description == ("最近再生した曲と、追加したユーザーを表示します。")
     assert commands["nowplaying"].description == "現在再生している曲を表示します。"
-    assert commands["freshmix"].description == (
-        "作業内容から履歴を使わず、新しいMixを組み立てます。"
-    )
+    assert commands["mix"].description.startswith("互換用の旧名")
 
 
 @pytest.mark.asyncio
@@ -698,8 +699,8 @@ def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
         "volume",
         "move",
         "clear-mine",
+        "radio",
         "mix",
-        "freshmix",
     }
 
 
@@ -722,6 +723,7 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         speed=1,
         pitch=1,
         waiting_for_voice=False,
+        connected=True,
     )
     view = MusicControlsView(
         cast(SimajilordRuntime, object()),
@@ -732,7 +734,7 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         "Pause",
         "Skip",
         "Loop: Off",
-        "Mix: Off",
+        "Radio: Off",
         "Stop",
         "Add music",
         "Read aloud",
@@ -765,6 +767,7 @@ async def test_music_pause_button_changes_to_resume_without_duplicate_control() 
         pitch=1,
         waiting_for_voice=False,
         autoplay_enabled=True,
+        connected=True,
     )
     view = MusicControlsView(
         cast(SimajilordRuntime, object()),
@@ -773,7 +776,7 @@ async def test_music_pause_button_changes_to_resume_without_duplicate_control() 
     buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
     assert [button.label for button in buttons].count("Resume") == 1
     assert "Pause" not in [button.label for button in buttons]
-    assert "Mix: On" in [button.label for button in buttons]
+    assert "Radio: On" in [button.label for button in buttons]
 
 
 @pytest.mark.asyncio
@@ -798,6 +801,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         pitch=1,
         waiting_for_voice=False,
         resume_confirmation_required=True,
+        connected=False,
     )
     view = MusicControlsView(
         cast(SimajilordRuntime, object()),
@@ -809,12 +813,39 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
     assert labels == [
         "Start",
         "Loop: Off",
-        "Mix: Off",
+        "Radio: Off",
         "Stop",
         "Add music",
         "Read aloud",
-        "Leave",
     ]
+
+
+@pytest.mark.asyncio
+async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() -> None:
+    response = AudioQueueResponse(
+        current=None,
+        pending=(),
+        paused=False,
+        loop_mode="none",
+        destination_id="10",
+        auto_leave=True,
+        position_seconds=0,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=False,
+        autoplay_enabled=True,
+        connected=False,
+    )
+
+    view = MusicControlsView(
+        cast(SimajilordRuntime, object()),
+        response=response,
+    )
+    labels = [
+        child.label for child in view.children if isinstance(child, discord.ui.Button)
+    ]
+
+    assert labels == ["Radio: On", "Add music", "Read aloud"]
 
 
 @pytest.mark.asyncio
@@ -1026,7 +1057,7 @@ def test_loop_mix_conflict_view_offers_one_click_switch() -> None:
         child.label
         for child in mix_view.children
         if isinstance(child, discord.ui.Button)
-    ] == ["Switch to Mix", "Keep current mode"]
+    ] == ["Switch to Radio", "Keep current mode"]
     assert [
         child.label
         for child in loop_view.children
@@ -1241,6 +1272,121 @@ async def test_quote_composer_preserves_combinable_styles_and_jump_choice() -> N
     assert request.flip is True
     assert request.animate is True
     assert request.include_jump is False
+
+
+def test_quote_composer_uses_hierarchical_native_menu() -> None:
+    view = QuoteComposerView(
+        cast(SimajilordRuntime, object()),
+        requester_id=7,
+        source_channel_id=50,
+        source_message_id=60,
+        destination_channel_id=50,
+        has_animation=True,
+    )
+
+    assert [
+        item.label for item in view.children if isinstance(item, discord.ui.Button)
+    ] == [
+        "Layout · Landscape",
+        "Style · B/W",
+        "More · 1 On",
+        "Generate",
+        "Cancel",
+    ]
+
+    view._show_page("more")
+    assert [
+        item.label for item in view.children if isinstance(item, discord.ui.Button)
+    ] == ["Flip Off", "Jump On", "Animation Off", "Back"]
+
+    view._show_page("layout")
+    assert [
+        item.label for item in view.children if isinstance(item, discord.ui.Button)
+    ] == ["Landscape", "Back"]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    (
+        (
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        (
+            "Listen https://music.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        (
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        ("https://youtube.com.example/watch?v=dQw4w9WgXcQ", None),
+        (
+            "https://youtu.be/dQw4w9WgXcQ https://youtu.be/9bZkp7q19f0",
+            None,
+        ),
+    ),
+)
+def test_youtube_card_reference_is_conservative(
+    content: str,
+    expected: str | None,
+) -> None:
+    assert _youtube_card_reference(content) == expected
+
+
+def test_youtube_card_has_three_direct_actions() -> None:
+    view = YouTubeLinkCardView(
+        cast(SimajilordRuntime, object()),
+        reference="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    )
+
+    assert [
+        item.label for item in view.children if isinstance(item, discord.ui.Button)
+    ] == ["Play", "Add", "Radio"]
+
+
+def test_fresh_mix_is_hidden_while_radio_keeps_legacy_aliases() -> None:
+    top_level = {
+        command.name
+        for command in MusicCog.__cog_app_commands__
+        if isinstance(command, app_commands.Command)
+    }
+    groups = [
+        command
+        for command in MusicCog.__cog_app_commands__
+        if isinstance(command, app_commands.Group)
+    ]
+
+    assert "freshmix" not in top_level
+    assert {"radio", "mix"} <= top_level
+    assert len(groups) == 1
+    assert {"radio", "mix"} <= {command.name for command in groups[0].commands}
+    assert "freshmix" not in {command.name for command in groups[0].commands}
+
+
+@pytest.mark.asyncio
+async def test_youtube_message_listener_posts_silent_temporary_card() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    message = Mock(spec=discord.Message)
+    message.guild = Mock(spec=discord.Guild)
+    message.guild.id = 1
+    message.channel = Mock(spec=discord.TextChannel)
+    message.channel.id = 2
+    message.id = 3
+    message.author = Mock(spec=discord.Member)
+    message.author.bot = False
+    message.content = "https://youtu.be/dQw4w9WgXcQ"
+    reply = Mock(spec=discord.Message)
+    message.reply = AsyncMock(return_value=reply)
+
+    await YouTubeLinkCardCog(runtime).on_message(message)
+
+    message.reply.assert_awaited_once()
+    kwargs = message.reply.await_args.kwargs
+    assert kwargs["silent"] is True
+    assert kwargs["mention_author"] is False
+    assert isinstance(kwargs["view"], YouTubeLinkCardView)
+    assert kwargs["view"].message is reply
 
 
 @pytest.mark.asyncio

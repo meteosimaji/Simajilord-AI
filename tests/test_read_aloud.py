@@ -11,6 +11,7 @@ from simajilord.services.read_aloud import (
     ReadAloudPolicy,
     ReadAloudRoute,
     ReadAloudService,
+    ReadAloudVoicePreset,
 )
 
 
@@ -341,6 +342,7 @@ async def test_announcement_and_semantic_options_are_selectively_updated(
         workspace_id="guild",
         author_names=False,
         attachments=False,
+        vc_members_only=True,
     )
 
     assert announced.announce_join is True
@@ -349,6 +351,7 @@ async def test_announcement_and_semantic_options_are_selectively_updated(
     assert semantic.read_author_names is False
     assert semantic.read_replies is True
     assert semantic.read_attachments is False
+    assert semantic.vc_members_only is True
     assert ReadAloudService(path).policy("guild") == semantic
 
 
@@ -358,6 +361,48 @@ def test_default_policy_is_not_stored_or_shared(tmp_path) -> None:
     assert service.policy("one") == ReadAloudPolicy("one")
     assert service.policy("two") == ReadAloudPolicy("two")
     assert not service.state_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_voice_presets_are_server_scoped_user_overridable_and_durable(
+    tmp_path,
+) -> None:
+    state_file = tmp_path / "read_aloud.json"
+    service = ReadAloudService(state_file)
+
+    await service.set_default_voice_preset(
+        workspace_id="guild",
+        preset=ReadAloudVoicePreset.CALM,
+    )
+    await service.set_user_voice_preset(
+        workspace_id="guild",
+        user_id="42",
+        preset=ReadAloudVoicePreset.CUTE,
+    )
+
+    assert service.voice_preset_for(
+        workspace_id="guild",
+        user_id="42",
+    ) is ReadAloudVoicePreset.CUTE
+    assert service.voice_preset_for(
+        workspace_id="guild",
+        user_id="other",
+    ) is ReadAloudVoicePreset.CALM
+
+    restored = ReadAloudService(state_file)
+    assert restored.voice_preset_for(
+        workspace_id="guild",
+        user_id="42",
+    ) is ReadAloudVoicePreset.CUTE
+    await restored.set_user_voice_preset(
+        workspace_id="guild",
+        user_id="42",
+        preset=None,
+    )
+    assert restored.voice_preset_for(
+        workspace_id="guild",
+        user_id="42",
+    ) is ReadAloudVoicePreset.CALM
 
 
 @pytest.mark.asyncio

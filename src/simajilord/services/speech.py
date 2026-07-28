@@ -8,20 +8,34 @@ import re
 import shutil
 import uuid
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol, TypeVar
+from time import monotonic
+from typing import Protocol, TypeVar, runtime_checkable
 
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, AudioKind
+from simajilord.services.metrics import ServiceMetricHook, ServiceOperationMetric
 
 
 class SpeechProvider(Protocol):
     async def synthesize(self, text: str, destination: Path) -> None: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class SelectableSpeechProvider(Protocol):
+    """Optional provider extension for choosing a voice per synthesis."""
+
+    async def synthesize_voice(
+        self,
+        text: str,
+        destination: Path,
+        voice_id: int,
+    ) -> None: ...
 
 
 class SpeechSegmentKind(StrEnum):
@@ -47,20 +61,28 @@ _T = TypeVar("_T")
 class _SpeechWork:
     operation: Callable[[], Awaitable[object]]
     future: asyncio.Future[object]
+    enqueued_at: float
 
 
 class FairSpeechScheduler:
     """Bounded guild round-robin scheduler for a shared TTS provider."""
 
-    def __init__(self, max_concurrent: int) -> None:
+    def __init__(
+        self,
+        max_concurrent: int,
+        *,
+        metric_hook: ServiceMetricHook | None = None,
+    ) -> None:
         if max_concurrent < 1:
             raise ValueError("TTS concurrency must be positive.")
         self.max_concurrent = max_concurrent
         self._condition = asyncio.Condition()
         self._queues: dict[str, deque[_SpeechWork]] = {}
         self._workspaces: deque[str] = deque()
+        self._active_workspaces: set[str] = set()
         self._workers: list[asyncio.Task[None]] = []
         self._closed = False
+        self._metric_hook = metric_hook
 
     async def run(
         self,
@@ -82,8 +104,9 @@ class FairSpeechScheduler:
             if queue is None:
                 queue = deque()
                 self._queues[workspace_id] = queue
+            if not queue and workspace_id not in self._active_workspaces:
                 self._workspaces.append(workspace_id)
-            queue.append(_SpeechWork(erased_operation, future))
+            queue.append(_SpeechWork(erased_operation, future, monotonic()))
             self._ensure_workers()
             self._condition.notify()
         return await future  # type: ignore[return-value]
@@ -103,6 +126,7 @@ class FairSpeechScheduler:
                         work.future.cancel()
             self._queues.clear()
             self._workspaces.clear()
+            self._active_workspaces.clear()
             self._workers.clear()
 
     def _ensure_workers(self) -> None:
@@ -122,24 +146,57 @@ class FairSpeechScheduler:
                 workspace_id = self._workspaces.popleft()
                 queue = self._queues[workspace_id]
                 work = queue.popleft()
-                if queue:
-                    self._workspaces.append(workspace_id)
-                else:
-                    del self._queues[workspace_id]
+                self._active_workspaces.add(workspace_id)
             if work.future.cancelled():
+                await self._finish_workspace(workspace_id)
                 continue
+            started_at = monotonic()
+            outcome = "succeeded"
             try:
                 result = await work.operation()
             except asyncio.CancelledError:
+                outcome = "cancelled"
                 if not work.future.done():
                     work.future.cancel()
                 raise
             except Exception as exc:
+                outcome = "failed"
                 if not work.future.done():
                     work.future.set_exception(exc)
             else:
                 if not work.future.done():
                     work.future.set_result(result)
+            finally:
+                finished_at = monotonic()
+                await self._finish_workspace(workspace_id)
+                await self._record_metric(
+                    ServiceOperationMetric(
+                        operation="tts.synthesize",
+                        workspace_id=workspace_id,
+                        wait_ms=max(0.0, (started_at - work.enqueued_at) * 1_000),
+                        duration_ms=max(0.0, (finished_at - started_at) * 1_000),
+                        outcome=outcome,
+                    )
+                )
+
+    async def _finish_workspace(self, workspace_id: str) -> None:
+        async with self._condition:
+            self._active_workspaces.discard(workspace_id)
+            queue = self._queues.get(workspace_id)
+            if queue:
+                self._workspaces.append(workspace_id)
+                self._condition.notify()
+            else:
+                self._queues.pop(workspace_id, None)
+
+    async def _record_metric(self, metric: ServiceOperationMetric) -> None:
+        if self._metric_hook is None:
+            return
+        try:
+            await self._metric_hook(metric)
+        except Exception:
+            # Observability must never break speech delivery.
+            return
 
 
 class SpeechService:
@@ -150,19 +207,29 @@ class SpeechService:
         output_dir: Path,
         chunk_characters: int,
         max_concurrent: int,
+        max_parallel_parts: int = 2,
+        metric_hook: ServiceMetricHook | None = None,
+        voice_presets: Mapping[str, int] | None = None,
         file_suffix: str = ".aiff",
     ) -> None:
         if not re.fullmatch(r"\.[a-z0-9]{2,5}", file_suffix):
             raise ValueError("Speech file suffix is invalid.")
         if chunk_characters < 1:
             raise ValueError("Speech chunk size must be positive.")
+        if not 1 <= max_parallel_parts <= 2:
+            raise ValueError("Speech part concurrency must be between 1 and 2.")
         self.provider = provider
         self.output_dir = output_dir
         self.chunk_characters = chunk_characters
         self.file_suffix = file_suffix
-        self._scheduler = FairSpeechScheduler(max_concurrent)
+        self._scheduler = FairSpeechScheduler(
+            max_concurrent,
+            metric_hook=metric_hook,
+        )
+        self._max_parallel_parts = max_parallel_parts
         self._cache_dir = output_dir / "cache"
         self._cache_locks: dict[str, asyncio.Lock] = {}
+        self._voice_presets = dict(voice_presets or {})
         self.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -172,11 +239,13 @@ class SpeechService:
         *,
         title: str = "Read aloud",
         workspace_id: str = "default",
+        voice_preset: str | None = None,
     ) -> AudioItem:
         return await self.synthesize_segments(
             (SpeechSegment(SpeechSegmentKind.BODY, text),),
             title=title,
             workspace_id=workspace_id,
+            voice_preset=voice_preset,
         )
 
     async def synthesize_segments(
@@ -185,6 +254,7 @@ class SpeechService:
         *,
         title: str = "Read aloud",
         workspace_id: str,
+        voice_preset: str | None = None,
     ) -> AudioItem:
         normalized_segments: list[SpeechSegment] = []
         for segment in segments:
@@ -200,9 +270,23 @@ class SpeechService:
         prepared = tuple(normalized_segments)
         if not prepared:
             raise UserError("speech.no_readable_text")
+        voice_id = self._resolve_voice_id(voice_preset)
 
+        return await self._scheduler.run(
+            workspace_id,
+            lambda: self._synthesize_job(prepared, title=title, voice_id=voice_id),
+        )
+
+    async def _synthesize_job(
+        self,
+        prepared: tuple[SpeechSegment, ...],
+        *,
+        title: str,
+        voice_id: int | None,
+    ) -> AudioItem:
         destination = self.output_dir / f"speech-{uuid.uuid4().hex}{self.file_suffix}"
         parts: list[Path] = []
+        planned_parts: list[tuple[SpeechSegment, str, Path, bool]] = []
         manifest = destination.with_suffix(".concat.txt")
         try:
             for segment_index, segment in enumerate(prepared, start=1):
@@ -212,14 +296,42 @@ class SpeechService:
                         f"{destination.stem}-part-{segment_index:03d}-"
                         f"{chunk_index:03d}{self.file_suffix}"
                     )
+                    parts.append(part)
+                    planned_parts.append((segment, chunk, part, len(chunks) == 1))
+            part_limit = asyncio.Semaphore(self._max_parallel_parts)
+
+            async def synthesize_part(
+                segment: SpeechSegment,
+                chunk: str,
+                part: Path,
+                cacheable: bool,
+            ) -> None:
+                async with part_limit:
                     await self._synthesize_part(
                         segment,
                         chunk=chunk,
                         destination=part,
-                        workspace_id=workspace_id,
-                        cacheable=len(chunks) == 1,
+                        cacheable=cacheable,
+                        voice_id=voice_id,
                     )
-                    parts.append(part)
+
+            tasks = tuple(
+                asyncio.create_task(
+                    synthesize_part(segment, chunk, part, cacheable),
+                    name=f"simajilord-tts-part-{index}",
+                )
+                for index, (segment, chunk, part, cacheable) in enumerate(
+                    planned_parts,
+                    start=1,
+                )
+            )
+            try:
+                await asyncio.gather(*tasks)
+            except Exception:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             if len(parts) == 1:
                 parts[0].replace(destination)
                 parts.clear()
@@ -256,11 +368,11 @@ class SpeechService:
         *,
         chunk: str,
         destination: Path,
-        workspace_id: str,
         cacheable: bool,
+        voice_id: int | None,
     ) -> None:
         cache_path = (
-            self._cache_path(segment, chunk)
+            self._cache_path(segment, chunk, voice_id=voice_id)
             if cacheable and segment.cache_key is not None
             else None
         )
@@ -272,9 +384,10 @@ class SpeechService:
                         f".{cache_path.stem}.{uuid.uuid4().hex}{cache_path.suffix}"
                     )
                     try:
-                        await self._scheduler.run(
-                            workspace_id,
-                            lambda: self.provider.synthesize(chunk, temporary),
+                        await self._provider_synthesize(
+                            chunk,
+                            temporary,
+                            voice_id=voice_id,
                         )
                         temporary.chmod(0o600)
                         temporary.replace(cache_path)
@@ -283,12 +396,27 @@ class SpeechService:
                 await asyncio.to_thread(shutil.copyfile, cache_path, destination)
                 destination.chmod(0o600)
             return
-        await self._scheduler.run(
-            workspace_id,
-            lambda: self.provider.synthesize(chunk, destination),
-        )
+        await self._provider_synthesize(chunk, destination, voice_id=voice_id)
 
-    def _cache_path(self, segment: SpeechSegment, chunk: str) -> Path:
+    async def _provider_synthesize(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        voice_id: int | None,
+    ) -> None:
+        if voice_id is not None and isinstance(self.provider, SelectableSpeechProvider):
+            await self.provider.synthesize_voice(text, destination, voice_id)
+            return
+        await self.provider.synthesize(text, destination)
+
+    def _cache_path(
+        self,
+        segment: SpeechSegment,
+        chunk: str,
+        *,
+        voice_id: int | None,
+    ) -> Path:
         identity = str(
             getattr(
                 self.provider,
@@ -300,6 +428,7 @@ class SpeechService:
             "\0".join(
                 (
                     identity,
+                    "" if voice_id is None else f"voice={voice_id}",
                     segment.kind.value,
                     segment.cache_key or "",
                     chunk,
@@ -307,6 +436,14 @@ class SpeechService:
             ).encode()
         ).hexdigest()
         return self._cache_dir / f"{digest}{self.file_suffix}"
+
+    def _resolve_voice_id(self, preset: str | None) -> int | None:
+        if preset is None:
+            return None
+        voice_id = self._voice_presets.get(preset)
+        if voice_id is None:
+            raise UserError("speech.voice_preset_invalid")
+        return voice_id
 
 
 def normalize_speech(text: str) -> str:

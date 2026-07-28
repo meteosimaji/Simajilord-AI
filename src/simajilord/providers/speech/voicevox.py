@@ -9,6 +9,7 @@ import os
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
+from time import monotonic
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -32,6 +33,7 @@ class VoicevoxSpeechProvider:
         timeout_seconds: float,
         engine_path: Path | None,
         auto_start: bool,
+        readiness_ttl_seconds: float = 5.0,
     ) -> None:
         normalized_url = base_url.rstrip("/")
         parsed = urlsplit(normalized_url)
@@ -51,6 +53,8 @@ class VoicevoxSpeechProvider:
             raise ValueError("VOICEVOX speaker ID is out of range.")
         if timeout_seconds <= 0:
             raise ValueError("VOICEVOX timeout must be positive.")
+        if not 0 < readiness_ttl_seconds <= 300:
+            raise ValueError("VOICEVOX readiness TTL must be between 0 and 300 seconds.")
         if engine_path is not None and (
             not engine_path.is_file() or not os.access(engine_path, os.X_OK)
         ):
@@ -63,18 +67,34 @@ class VoicevoxSpeechProvider:
         self.timeout_seconds = timeout_seconds
         self.engine_path = engine_path
         self.auto_start = auto_start
+        self.readiness_ttl_seconds = readiness_ttl_seconds
         self._session: aiohttp.ClientSession | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._start_lock = asyncio.Lock()
+        self._ready_until = 0.0
 
     @property
     def cache_identity(self) -> str:
         return f"voicevox:{self.base_url}:speaker={self.speaker_id}"
 
     async def synthesize(self, text: str, destination: Path) -> None:
+        await self.synthesize_voice(text, destination, self.speaker_id)
+
+    async def synthesize_voice(
+        self,
+        text: str,
+        destination: Path,
+        voice_id: int,
+    ) -> None:
+        if not 0 <= voice_id <= 65_535:
+            raise ValueError("VOICEVOX speaker ID is out of range.")
         await self._ensure_ready()
-        query = await self._audio_query(text)
-        wave = await self._synthesis(query)
+        try:
+            query = await self._audio_query(text, voice_id=voice_id)
+            wave = await self._synthesis(query, voice_id=voice_id)
+        except ProviderError:
+            self._ready_until = 0.0
+            raise
         if len(wave) < 44 or not wave.startswith(b"RIFF") or wave[8:12] != b"WAVE":
             raise ProviderError("VOICEVOX returned an invalid WAV file.")
 
@@ -92,6 +112,7 @@ class VoicevoxSpeechProvider:
     async def close(self) -> None:
         session = self._session
         self._session = None
+        self._ready_until = 0.0
         if session is not None:
             await session.close()
 
@@ -107,10 +128,16 @@ class VoicevoxSpeechProvider:
             await process.wait()
 
     async def _ensure_ready(self) -> None:
+        if monotonic() < self._ready_until:
+            return
         if await self._version_is_ready():
+            self._mark_ready()
             return
         async with self._start_lock:
+            if monotonic() < self._ready_until:
+                return
             if await self._version_is_ready():
+                self._mark_ready()
                 return
             if not self.auto_start:
                 raise ProviderError(
@@ -144,6 +171,7 @@ class VoicevoxSpeechProvider:
             deadline = asyncio.get_running_loop().time() + self.timeout_seconds
             while asyncio.get_running_loop().time() < deadline:
                 if await self._version_is_ready():
+                    self._mark_ready()
                     return
                 if process.returncode is not None:
                     raise ProviderError(
@@ -151,6 +179,9 @@ class VoicevoxSpeechProvider:
                     )
                 await asyncio.sleep(0.2)
             raise ProviderError("VOICEVOX Engine startup timed out.")
+
+    def _mark_ready(self) -> None:
+        self._ready_until = monotonic() + self.readiness_ttl_seconds
 
     async def _version_is_ready(self) -> bool:
         try:
@@ -163,11 +194,11 @@ class VoicevoxSpeechProvider:
         except (aiohttp.ClientError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError):
             return False
 
-    async def _audio_query(self, text: str) -> dict[str, object]:
+    async def _audio_query(self, text: str, *, voice_id: int) -> dict[str, object]:
         try:
             async with self._client().post(
                 f"{self.base_url}/audio_query",
-                params={"text": text, "speaker": str(self.speaker_id)},
+                params={"text": text, "speaker": str(voice_id)},
             ) as response:
                 body = await _read_bounded(response, maximum=_MAX_QUERY_BYTES)
                 if response.status != 200:
@@ -186,11 +217,16 @@ class VoicevoxSpeechProvider:
             raise ProviderError("VOICEVOX returned an invalid audio query.")
         return {str(key): value for key, value in payload.items()}
 
-    async def _synthesis(self, query: Mapping[str, object]) -> bytes:
+    async def _synthesis(
+        self,
+        query: Mapping[str, object],
+        *,
+        voice_id: int,
+    ) -> bytes:
         try:
             async with self._client().post(
                 f"{self.base_url}/synthesis",
-                params={"speaker": str(self.speaker_id)},
+                params={"speaker": str(voice_id)},
                 json=query,
                 headers={"Accept": "audio/wav"},
             ) as response:

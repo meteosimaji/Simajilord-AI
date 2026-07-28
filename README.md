@@ -47,8 +47,14 @@ Discord timestamp; implementation labels and decorative footer text are intentio
   genuinely ambiguous same-name tracks
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
   queue-preserving auto-leave
+- Globally bounded, priority-aware media work and guild-fair TTS work, with per-guild
+  connection reservations, debounced durable audio state, and wait/duration metrics
 - Voice-free queueing: add a track before joining, then start automatically when one of its
   requesters enters voice
+- A silent, five-minute YouTube link card with direct `Play`, `Add`, and `Radio` actions;
+  simply posting the link does not resolve media or change the queue
+- Durable Radio mode fed one related track at a time, while manual requests always take
+  priority; the old `mix` name remains a compatibility alias
 - Durable requester attribution and a bounded recently-played history
 - Automatic read-aloud from text channels, threads, and voice-channel chats with persistent
   many-conversations-to-one-voice routing
@@ -59,6 +65,10 @@ Discord timestamp; implementation labels and decorative footer text are intentio
   raw URLs and Discord mention markup are normalized before synthesis
 - Speech-over-music sidechain ducking in the active Discord player, without restarting
   the music stream; standalone speech is used only as an overlay-failure fallback
+- Opt-in VC-member-only read aloud, short-burst merging and spam suppression, plus durable
+  server and user voice presets
+- Restart-safe Focus Timers with retryable text delivery, optional VC-aware speech, and
+  temporary read-aloud focus mode
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
 - Server, user, and avatar information
 - Native polls, dice, and bounded random choice
@@ -73,7 +83,9 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - The `Quote` message action renders locally without an external image API. Static output is
   the default; animated custom emoji or stickers can be preserved as GIF on request. A known
   Discord CDN asset ID can be rendered even when the BOT is not a member of the asset's
-  original server, but reading that server's message still requires normal Discord access
+  original server, but reading that server's message still requires normal Discord access.
+  Its private composer groups controls under `Layout`, `Style`, and `More`, then exposes only
+  `Generate` and `Cancel` on the main screen
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
 - Plain message sending and voice connection as independently invokable Discord APIs
@@ -135,12 +147,14 @@ existing local file with mode `0600`. The platform never extracts cookies from a
 - `/ping`, `/uptime`, `/about`, `/capabilities`
 - `/audio` opens the shared music and read-aloud control panel
 - `/play`, `/queue`, `/nowplaying`, `/history` for the shortest everyday paths
+- `/radio` starts continuous related playback; `/mix` remains a compatibility alias
 - `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
 - `/music skip`, `/music stop`, `/music leave`, `/music loop`
 - `/music remove`, `/music move`, `/music clear-mine`, `/music shuffle`
 - `/music seek`, `/music tune`, `/music volume`, `/music autoleave`
 - Right-click or long-press a message, then choose `Apps` → `Quote` for local quote rendering
 - `/join` to select up to 25 conversations and read them in your current VC
+- `/timer` creates, lists, or cancels a persistent Focus Timer
 - `/readaloud setup`, `/readaloud status`, `/readaloud remove`, `/readaloud disable` for
   advanced route management
 - `/download`
@@ -185,5 +199,21 @@ uv run simajilord-audio-doctor "https://public.example/media/..."
 ```
 
 This does not require a Discord token and never sends audio or messages to Discord.
+
+To inspect Discord embeds, adaptive buttons, local read-aloud, and music ducking without
+connecting a Discord client:
+
+```bash
+uv run simajilord-offline-preview
+python3 -m http.server 8765 --bind 127.0.0.1 \
+  --directory .data/offline_discord_preview
+```
+
+Open `http://127.0.0.1:8765`. The simulator renders the same `discord.Embed` dictionaries and
+component payloads used by the adapter. Its independent CSS is calibrated from the current
+Discord Web client's loaded CSS declarations and computed styles; no Discord client source,
+token, gateway, webhook, or server send is used. Discord can change its client styling, so
+the dated calibration recorded in `manifest.json` should be refreshed when visual drift is
+observed.
 
 Third-party license information is in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

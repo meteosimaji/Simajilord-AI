@@ -122,6 +122,14 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         assert "discord.clear_my_audio" in queue_controls.text
         assert "discord.set_audio_volume" in queue_controls.text
         assert "discord.control_audio" not in queue_controls.text
+        deprecated_mix = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "fresh mix draft preview", "limit": 5},
+            context=requested_context,
+            max_output_characters=10_000,
+        )
+        assert "fresh_mix" not in deprecated_mix.text
         autonomous_read_aloud = await provider.tools.invoke(
             namespace="simajilord",
             tool_name="capability_search",

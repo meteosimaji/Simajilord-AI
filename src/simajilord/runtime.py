@@ -26,6 +26,7 @@ from simajilord.capabilities import (
     build_audio_endpoints,
     build_download_endpoint,
     build_file_endpoints,
+    build_focus_timer_endpoints,
     build_image_endpoints,
     build_moderation_endpoints,
     build_read_aloud_endpoint,
@@ -50,14 +51,17 @@ from simajilord.services import (
     AgentFileSandbox,
     AudioSessionManager,
     AudioStateStore,
+    FocusTimerService,
     FreshMixService,
     ImageGenerationService,
     ImageGenerationStore,
+    MediaPriority,
     MediaService,
     ModerationService,
     ModerationStore,
     QuoteImageService,
     ReadAloudService,
+    ServiceOperationMetric,
     SpeechService,
     WebService,
 )
@@ -72,6 +76,7 @@ class SimajilordRuntime:
     media: MediaService
     audio: AudioSessionManager
     fresh_mix: FreshMixService
+    focus_timer: FocusTimerService
     speech: SpeechService
     read_aloud: ReadAloudService
     web: WebService
@@ -86,18 +91,41 @@ class SimajilordRuntime:
 
     @classmethod
     def build(cls, settings: Settings) -> SimajilordRuntime:
+        journal = EventJournal(settings.data_dir / "events.sqlite3")
+
+        async def record_service_metric(metric: ServiceOperationMetric) -> None:
+            await journal.append(
+                kind="service.operation",
+                workspace_id=metric.workspace_id,
+                payload={
+                    "operation": metric.operation,
+                    "wait_ms": round(metric.wait_ms, 3),
+                    "duration_ms": round(metric.duration_ms, 3),
+                    "outcome": metric.outcome,
+                },
+            )
+
         media = MediaService(
             YtDlpProvider(
                 cookie_file=settings.media_cookie_file,
                 download_timeout_seconds=settings.download_timeout_seconds,
-            )
+            ),
+            max_concurrent=settings.max_concurrent_media,
+            max_per_workspace=settings.max_concurrent_media_per_guild,
+            metric_hook=record_service_metric,
         )
 
         async def supply_autoplay(
+            workspace_id: str,
             seeds: tuple[str, ...],
             limit: int,
         ) -> tuple[AudioItem, ...]:
-            candidates = await media.mix_audio(seeds, limit=limit)
+            candidates = await media.mix_audio(
+                seeds,
+                limit=limit,
+                workspace_id=workspace_id,
+                priority=MediaPriority.BACKGROUND,
+            )
             requested_at = int(datetime.now(UTC).timestamp())
             return tuple(
                 AudioItem(
@@ -115,14 +143,25 @@ class SimajilordRuntime:
                 for candidate in candidates
             )
 
+        async def resolve_for_workspace(
+            workspace_id: str,
+            reference: str,
+        ) -> AudioItem:
+            return await media.resolve_audio(
+                reference,
+                workspace_id=workspace_id,
+                priority=MediaPriority.INTERACTIVE,
+            )
+
         audio = AudioSessionManager(
             max_active=settings.max_active_voice_guilds,
             max_pending_speech=settings.max_pending_speech,
             max_pending_music=settings.max_pending_music,
             max_pending_music_per_actor=settings.max_pending_music_per_user,
-            resolver=media.resolve_audio,
-            autoplay_supplier=supply_autoplay,
+            workspace_resolver=resolve_for_workspace,
+            workspace_autoplay_supplier=supply_autoplay,
             state_store=AudioStateStore(settings.data_dir / "audio_sessions.json"),
+            metric_hook=record_service_metric,
         )
         speech_provider = (
             VoicevoxSpeechProvider(
@@ -131,6 +170,7 @@ class SimajilordRuntime:
                 timeout_seconds=settings.voicevox_timeout_seconds,
                 engine_path=settings.voicevox_engine_path,
                 auto_start=settings.voicevox_auto_start,
+                readiness_ttl_seconds=settings.voicevox_readiness_ttl_seconds,
             )
             if settings.tts_provider == "voicevox"
             else MacOSSayProvider(settings.tts_voice)
@@ -140,9 +180,18 @@ class SimajilordRuntime:
             output_dir=settings.data_dir / "speech",
             chunk_characters=settings.read_aloud_chunk_characters,
             max_concurrent=settings.max_concurrent_tts,
+            metric_hook=record_service_metric,
+            voice_presets={
+                "clear": settings.voicevox_preset_clear_id,
+                "calm": settings.voicevox_preset_calm_id,
+                "energetic": settings.voicevox_preset_energetic_id,
+                "cute": settings.voicevox_preset_cute_id,
+                "narrator": settings.voicevox_preset_narrator_id,
+            },
             file_suffix=".wav" if settings.tts_provider == "voicevox" else ".aiff",
         )
         fresh_mix = FreshMixService(media)
+        focus_timer = FocusTimerService(settings.data_dir / "focus_timers.sqlite3")
         read_aloud = ReadAloudService(settings.data_dir / "read_aloud.json")
         web = WebService(
             search_provider=SearxngSearchProvider(
@@ -180,7 +229,6 @@ class SimajilordRuntime:
             if settings.image_model_path is not None
             else None
         )
-        journal = EventJournal(settings.data_dir / "events.sqlite3")
         image = ImageGenerationService(
             provider=image_provider,
             store=ImageGenerationStore(settings.data_dir / "image_generation.sqlite3"),
@@ -221,9 +269,6 @@ class SimajilordRuntime:
                 "discord.read_aloud_semantics_set",
                 "discord.read_aloud_content_mode_set",
                 "discord.play_audio",
-                "discord.plan_fresh_mix",
-                "discord.revise_fresh_mix",
-                "discord.enqueue_fresh_mix",
                 *AGENT_AUDIO_CONTROL_CAPABILITIES,
                 "discord.read_messages",
                 "discord.send_message",
@@ -232,15 +277,15 @@ class SimajilordRuntime:
                 "discord.create_quote_image",
                 "discord.view_custom_emoji",
                 "discord.view_sticker",
+                "timer.create",
+                "timer.list",
+                "timer.cancel",
             ]
             required_grants: dict[str, str] = {
                 "audio.history": AGENT_AUDIO_GRANT,
                 "audio.queue": AGENT_AUDIO_GRANT,
                 "audio.search": AGENT_AUDIO_GRANT,
                 "discord.play_audio": AGENT_AUDIO_GRANT,
-                "discord.plan_fresh_mix": AGENT_AUDIO_GRANT,
-                "discord.revise_fresh_mix": AGENT_AUDIO_GRANT,
-                "discord.enqueue_fresh_mix": AGENT_AUDIO_GRANT,
                 **{
                     name: AGENT_AUDIO_GRANT
                     for name in AGENT_AUDIO_CONTROL_CAPABILITIES
@@ -261,6 +306,9 @@ class SimajilordRuntime:
                 "discord.send_message": AGENT_MESSAGE_GRANT,
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
                 "discord.create_quote_image": AGENT_QUOTE_GRANT,
+                "timer.create": AGENT_MESSAGE_GRANT,
+                "timer.list": AGENT_MESSAGE_GRANT,
+                "timer.cancel": AGENT_MESSAGE_GRANT,
             }
             if settings.hive_api_key is not None:
                 capability_name = "discord.analyze_attachment"
@@ -310,6 +358,8 @@ class SimajilordRuntime:
                         "discord.send_message",
                         "discord.post_expanded_message",
                         "discord.create_quote_image",
+                        "timer.create",
+                        "timer.cancel",
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                     )
                     + (
@@ -375,6 +425,7 @@ class SimajilordRuntime:
             media=media,
             audio=audio,
             fresh_mix=fresh_mix,
+            focus_timer=focus_timer,
             speech=speech,
             read_aloud=read_aloud,
             web=web,
@@ -395,6 +446,7 @@ class SimajilordRuntime:
             ),
             *build_utility_endpoints(),
             *build_audio_endpoints(media, audio, fresh_mix),
+            *build_focus_timer_endpoints(focus_timer, read_aloud),
             build_download_endpoint(media),
             build_read_aloud_endpoint(read_aloud),
             *build_read_aloud_route_endpoints(read_aloud),
@@ -430,4 +482,5 @@ class SimajilordRuntime:
         await self.moderation.close()
         await self.web.close()
         await self.audio.close()
+        await self.media.close()
         await self.speech.close()

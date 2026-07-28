@@ -147,3 +147,4 @@ class QueueSnapshot:
     autoplay_next: AudioItem | None = None
     mix_seed_references: tuple[str, ...] = ()
     resume_confirmation_required: bool = False
+    connected: bool = False

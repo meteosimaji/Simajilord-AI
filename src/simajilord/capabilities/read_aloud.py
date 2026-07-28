@@ -20,6 +20,7 @@ from simajilord.services.read_aloud import (
     ReadAloudPolicy,
     ReadAloudRoute,
     ReadAloudService,
+    ReadAloudVoicePreset,
 )
 
 
@@ -123,11 +124,32 @@ class ReadAloudSemanticsSetRequest:
     author_names: bool | None = None
     replies: bool | None = None
     attachments: bool | None = None
+    vc_members_only: bool | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "trueなら読み上げ先VCに現在参加中のユーザーの投稿だけを読み上げます。"
+            )
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class ReadAloudContentModeSetRequest:
     mode: ReadAloudContentMode
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAloudServerVoiceSetRequest:
+    preset: ReadAloudVoicePreset
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAloudUserVoiceSetRequest:
+    preset: ReadAloudVoicePreset | None = field(
+        default=None,
+        metadata={"description": "省略すると本人の上書きを解除します。"},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +169,11 @@ class ReadAloudPolicyResponse:
     read_author_names: bool
     read_replies: bool
     read_attachments: bool
+    vc_members_only: bool = False
     read_messages: bool = True
     content_mode: str = ReadAloudContentMode.MESSAGES.value
+    default_voice_preset: str = ReadAloudVoicePreset.CLEAR.value
+    user_voice_presets: tuple[tuple[str, str], ...] = ()
 
 
 def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
@@ -439,6 +464,7 @@ def build_read_aloud_policy_endpoints(
                 author_names=request.author_names,
                 replies=request.replies,
                 attachments=request.attachments,
+                vc_members_only=request.vc_members_only,
             )
         except ValueError as exc:
             raise UserError(str(exc)) from exc
@@ -454,7 +480,56 @@ def build_read_aloud_policy_endpoints(
         )
         return _policy_response(policy)
 
+    async def server_voice_set(
+        request: ReadAloudServerVoiceSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        policy = await service.set_default_voice_preset(
+            workspace_id=_workspace_id(context),
+            preset=request.preset,
+        )
+        return _policy_response(policy)
+
+    async def user_voice_set(
+        request: ReadAloudUserVoiceSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        if context.actor_id is None:
+            raise UserError("actor.required")
+        policy = await service.set_user_voice_preset(
+            workspace_id=_workspace_id(context),
+            user_id=context.actor_id,
+            preset=request.preset,
+        )
+        return _policy_response(policy)
+
     return (
+        endpoint(
+            CapabilityDescriptor(
+                name="speech.read_aloud_user_voice_set",
+                summary="自分の読み上げ音声プリセットを設定または解除します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("read aloud", "voice", "preset", "self"),
+                side_effects=("本人の音声プリセットを永続設定します。",),
+            ),
+            ReadAloudUserVoiceSetRequest,
+            ReadAloudPolicyResponse,
+            user_voice_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="speech.read_aloud_server_voice_set",
+                summary="サーバー既定の読み上げ音声プリセットを設定します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("read aloud", "voice", "preset", "server"),
+                side_effects=("サーバー既定の音声プリセットを永続設定します。",),
+            ),
+            ReadAloudServerVoiceSetRequest,
+            ReadAloudPolicyResponse,
+            server_voice_set,
+        ),
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_content_mode_set",
@@ -545,10 +620,19 @@ def build_read_aloud_policy_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_semantics_set",
-                summary="投稿者名・返信先・添付の意味的な読み上げを設定します。",
+                summary=(
+                    "投稿者名・返信先・添付と、VC参加者限定の読み上げを設定します。"
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("read aloud", "author", "reply", "attachment", "semantic"),
+                keywords=(
+                    "read aloud",
+                    "author",
+                    "reply",
+                    "attachment",
+                    "semantic",
+                    "voice members",
+                ),
                 side_effects=("意味的な読み上げ設定を更新します。",),
             ),
             ReadAloudSemanticsSetRequest,
@@ -611,4 +695,10 @@ def _policy_response(policy: ReadAloudPolicy) -> ReadAloudPolicyResponse:
         read_author_names=policy.read_author_names,
         read_replies=policy.read_replies,
         read_attachments=policy.read_attachments,
+        vc_members_only=policy.vc_members_only,
+        default_voice_preset=policy.default_voice_preset.value,
+        user_voice_presets=tuple(
+            (user_id, preset.value)
+            for user_id, preset in policy.user_voice_presets
+        ),
     )

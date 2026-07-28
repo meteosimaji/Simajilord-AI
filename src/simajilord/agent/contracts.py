@@ -36,9 +36,6 @@ AGENT_AUDIO_CONTROL_CAPABILITIES = (
 )
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",
-    "discord.plan_fresh_mix",
-    "discord.revise_fresh_mix",
-    "discord.enqueue_fresh_mix",
     *AGENT_AUDIO_CONTROL_CAPABILITIES,
     "discord.read_aloud_add_sources",
     "discord.read_aloud_remove_source",

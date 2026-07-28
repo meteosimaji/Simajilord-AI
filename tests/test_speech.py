@@ -14,7 +14,7 @@ from simajilord.capabilities.speech import (
     build_speech_endpoint,
 )
 from simajilord.core import InvocationContext
-from simajilord.core.errors import ProviderError
+from simajilord.core.errors import ProviderError, UserError
 from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.services.audio import AudioSessionManager
@@ -42,6 +42,20 @@ class WaveSpeechProvider:
         pass
 
 
+class SelectableWaveSpeechProvider(WaveSpeechProvider):
+    def __init__(self) -> None:
+        self.voice_ids: list[int] = []
+
+    async def synthesize_voice(
+        self,
+        text: str,
+        destination: Path,
+        voice_id: int,
+    ) -> None:
+        self.voice_ids.append(voice_id)
+        await self.synthesize(text, destination)
+
+
 @pytest.mark.asyncio
 async def test_speech_service_probes_duration_for_music_ducking(tmp_path: Path) -> None:
     service = SpeechService(
@@ -57,6 +71,41 @@ async def test_speech_service_probes_duration_for_music_ducking(tmp_path: Path) 
     assert item.duration_seconds == pytest.approx(0.1, abs=0.02)
     assert item.owned_file is not None and item.owned_file.is_file()
     item.cleanup()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_service_resolves_named_voice_preset(tmp_path: Path) -> None:
+    provider = SelectableWaveSpeechProvider()
+    service = SpeechService(
+        provider,
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        voice_presets={"clear": 2, "cute": 3},
+        file_suffix=".wav",
+    )
+
+    item = await service.synthesize("hello", voice_preset="cute")
+
+    assert provider.voice_ids == [3]
+    item.cleanup()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_service_rejects_unknown_voice_preset(tmp_path: Path) -> None:
+    service = SpeechService(
+        WaveSpeechProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        voice_presets={"clear": 2},
+    )
+
+    with pytest.raises(UserError, match=r"speech\.voice_preset_invalid"):
+        await service.synthesize("hello", voice_preset="missing")
+
     await service.close()
 
 
@@ -194,8 +243,186 @@ async def test_fair_speech_scheduler_round_robins_waiting_guilds() -> None:
     await asyncio.sleep(0)
     release_first.set()
     assert await asyncio.gather(first, a2, a3, b1) == ["a1", "a2", "a3", "b1"]
-    assert order == ["a1", "a2", "b1", "a3"]
+    assert order == ["a1", "b1", "a2", "a3"]
     await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_fair_speech_scheduler_serializes_each_guild_but_runs_other_guilds(
+) -> None:
+    scheduler = FairSpeechScheduler(2)
+    first_started = asyncio.Event()
+    other_started = asyncio.Event()
+    release_first = asyncio.Event()
+    same_guild_second_started = asyncio.Event()
+
+    async def first_operation() -> None:
+        first_started.set()
+        await release_first.wait()
+
+    async def same_guild_operation() -> None:
+        same_guild_second_started.set()
+
+    async def other_guild_operation() -> None:
+        other_started.set()
+
+    first = asyncio.create_task(scheduler.run("guild-a", first_operation))
+    await first_started.wait()
+    same_guild = asyncio.create_task(
+        scheduler.run("guild-a", same_guild_operation)
+    )
+    other_guild = asyncio.create_task(
+        scheduler.run("guild-b", other_guild_operation)
+    )
+
+    await asyncio.wait_for(other_started.wait(), timeout=1.0)
+    assert not same_guild_second_started.is_set()
+    release_first.set()
+    await asyncio.gather(first, same_guild, other_guild)
+    assert same_guild_second_started.is_set()
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_service_synthesizes_at_most_two_parts_in_parallel(
+    tmp_path: Path,
+) -> None:
+    active = 0
+    maximum_active = 0
+    calls: list[str] = []
+
+    class ParallelWaveProvider:
+        async def synthesize(self, text: str, destination: Path) -> None:
+            nonlocal active, maximum_active
+            calls.append(text)
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.02)
+            with wave.open(str(destination), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(48_000)
+                output.writeframes(b"\0" * 9_600)
+            active -= 1
+
+        async def close(self) -> None:
+            pass
+
+    service = SpeechService(
+        ParallelWaveProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        max_parallel_parts=2,
+        file_suffix=".wav",
+    )
+
+    item = await service.synthesize("first\nsecond\nthird", workspace_id="guild")
+
+    assert calls == ["first", "second", "third"]
+    assert maximum_active == 2
+    assert item.duration_seconds == pytest.approx(0.3, abs=0.04)
+    item.cleanup()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_queue_is_reserved_before_provider_work_starts(
+    tmp_path: Path,
+) -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    calls = 0
+
+    class BlockingWaveProvider:
+        async def synthesize(self, text: str, destination: Path) -> None:
+            nonlocal calls
+            del text
+            calls += 1
+            provider_started.set()
+            await release_provider.wait()
+            with wave.open(str(destination), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(48_000)
+                output.writeframes(b"\0" * 9_600)
+
+        async def close(self) -> None:
+            pass
+
+    class DisconnectedOutput:
+        connected = False
+        paused = False
+
+        async def connect(self, destination_id: str) -> None:
+            del destination_id
+            self.connected = True
+
+        async def play(self, item: AudioItem) -> None:
+            del item
+
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, speech, position_seconds
+
+        async def update_music(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, position_seconds
+
+        async def fade_out(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+            duration_seconds: float,
+        ) -> None:
+            del music, position_seconds, duration_seconds
+
+        def pause(self) -> None:
+            pass
+
+        def resume(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        async def disconnect(self) -> None:
+            self.connected = False
+
+    speech = SpeechService(
+        BlockingWaveProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        file_suffix=".wav",
+    )
+    sessions = AudioSessionManager(max_active=1, max_pending_speech=1)
+    sessions.get_or_create("guild", DisconnectedOutput)
+    endpoint = build_speech_endpoint(speech, sessions)
+    context = InvocationContext("actor", "guild", "test", "request")
+
+    first = asyncio.create_task(
+        endpoint.invoke(SpeechSpeakRequest(text="first"), context)
+    )
+    await provider_started.wait()
+    with pytest.raises(UserError, match=r"speech\.queue_full"):
+        await endpoint.invoke(SpeechSpeakRequest(text="second"), context)
+    assert calls == 1
+
+    release_provider.set()
+    await first
+    await sessions.close()
+    await speech.close()
 
 
 @pytest.mark.asyncio
@@ -290,8 +517,11 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
     tmp_path: Path,
 ) -> None:
     calls: list[tuple[str, str]] = []
+    version_calls = 0
 
     async def version(_: web.Request) -> web.Response:
+        nonlocal version_calls
+        version_calls += 1
         return web.json_response("0.25.1")
 
     async def audio_query(request: web.Request) -> web.Response:
@@ -325,11 +555,18 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
     destination = tmp_path / "speech.wav"
     try:
         await provider.synthesize("こんにちは", destination)
+        await provider.synthesize("さようなら", tmp_path / "speech-2.wav")
     finally:
         await provider.close()
         await runner.cleanup()
 
-    assert calls == [("query", "こんにちは"), ("synthesis", "3")]
+    assert calls == [
+        ("query", "こんにちは"),
+        ("synthesis", "3"),
+        ("query", "さようなら"),
+        ("synthesis", "3"),
+    ]
+    assert version_calls == 1
     assert destination.read_bytes() == _wave_bytes()
     assert destination.stat().st_mode & 0o077 == 0
 

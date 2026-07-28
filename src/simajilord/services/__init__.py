@@ -1,11 +1,13 @@
 """Application services used by capabilities and transport adapters."""
 
-from .audio import AudioOutput, AudioSession, AudioSessionManager
+from .audio import AudioOutput, AudioSession, AudioSessionManager, SpeechQueueReservation
 from .audio_state import AudioStateStore, StoredAudioItem, StoredAudioSession
 from .files import AgentFileSandbox
+from .focus_timer import FocusTimer, FocusTimerService, FocusTimerStatus
 from .fresh_mix import FreshMixService
 from .image import ImageGenerationService, ImageGenerationStore
-from .media import MediaService
+from .media import MediaPriority, MediaService
+from .metrics import ServiceMetricHook, ServiceOperationMetric
 from .moderation import ModerationService, ModerationStatus, ModerationStore
 from .quote import (
     QuoteCustomEmojiAsset,
@@ -29,9 +31,13 @@ __all__ = [
     "AudioSession",
     "AudioSessionManager",
     "AudioStateStore",
+    "FocusTimer",
+    "FocusTimerService",
+    "FocusTimerStatus",
     "FreshMixService",
     "ImageGenerationService",
     "ImageGenerationStore",
+    "MediaPriority",
     "MediaService",
     "ModerationService",
     "ModerationStatus",
@@ -45,7 +51,10 @@ __all__ = [
     "ReadAloudMode",
     "ReadAloudRoute",
     "ReadAloudService",
+    "ServiceMetricHook",
+    "ServiceOperationMetric",
     "SpeechProvider",
+    "SpeechQueueReservation",
     "SpeechService",
     "StoredAudioItem",
     "StoredAudioSession",

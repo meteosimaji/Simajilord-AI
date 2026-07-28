@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -14,6 +15,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
+from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord import app_commands
@@ -61,6 +63,10 @@ from simajilord.capabilities.audio import (
     FreshMixReviseRequest,
     audio_queue_response,
 )
+from simajilord.capabilities.focus_timer import (
+    FocusTimerCreateRequest,
+    FocusTimerResponse,
+)
 from simajilord.capabilities.media import DownloadRequest, DownloadResponse
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -79,7 +85,9 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
     ReadAloudSemanticsSetRequest,
+    ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
+    ReadAloudUserVoiceSetRequest,
 )
 from simajilord.capabilities.speech import SpeechSpeakRequest
 from simajilord.capabilities.status import StatusRequest, StatusResponse
@@ -114,11 +122,13 @@ from simajilord.domain.web import SearchDepth, WebSource, WebTextMatch
 from simajilord.observability import EventRecord
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.audio import AudioSession
+from simajilord.services.focus_timer import FocusTimer
 from simajilord.services.fresh_mix import FreshMixEnergy, FreshMixVocals
 from simajilord.services.read_aloud import (
     ReadAloudContentMode,
     ReadAloudMode,
     ReadAloudRoute,
+    ReadAloudVoicePreset,
 )
 from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
@@ -143,7 +153,11 @@ from .presenter import (
     EmbedTone,
     command_embed,
 )
-from .read_aloud import ReadAloudMessageFormatter
+from .read_aloud import (
+    ReadAloudMessageFormatter,
+    ReadAloudMessageText,
+    merge_read_aloud_messages,
+)
 
 log = logging.getLogger(__name__)
 BotContext: TypeAlias = commands.Context[commands.Bot]
@@ -157,16 +171,16 @@ _ERROR_MESSAGES = {
     "audio.history_limit_invalid": "履歴の表示件数は1〜25件で指定してください。",
     "audio.loop_mode_required": "ループ方法を選んでください。",
     "audio.loop_mix_conflict": (
-        "Mixがオンです。ループへ切り替える場合は、先にMixを停止してください。"
+        "Radioがオンです。ループへ切り替える場合は、先にRadioを停止してください。"
     ),
     "audio.mix_loop_conflict": (
-        "ループがオンです。Mixへ切り替える場合は、先にループをオフにしてください。"
+        "ループがオンです。Radioへ切り替える場合は、先にループをオフにしてください。"
     ),
-    "audio.mix_seed_limit": "Mixの起点にできる曲は最大8曲です。",
+    "audio.mix_seed_limit": "Radioの起点にできる曲は最大8曲です。",
     "audio.mix_seed_required": (
-        "Mixの起点にするYouTube曲を指定するか、先に曲をキューへ追加してください。"
+        "Radioの起点にするYouTube曲を指定するか、先に曲をキューへ追加してください。"
     ),
-    "audio.mix_unavailable": "この環境では自動Mixを利用できません。",
+    "audio.mix_unavailable": "この環境ではRadioを利用できません。",
     "audio.not_paused": "現在、一時停止していません。",
     "audio.nothing_playing": "現在再生している曲はありません。",
     "audio.output_disconnected": "ボイスチャンネルに接続されていません。",
@@ -399,7 +413,7 @@ def _requester(name: str | None) -> str:
 def _queue_requester(item: object) -> str:
     lane = getattr(item, "queue_lane", "request")
     if lane == "autoplay":
-        return "Auto Mix"
+        return "Radio"
     return _requester(getattr(item, "requested_by_name", None))
 
 
@@ -542,6 +556,8 @@ def music_queue_embed(
         description_lines.append("**Queued** · Playback starts when the requester joins the VC.")
     elif response.paused:
         description_lines.append("**Paused**")
+    elif not response.connected:
+        description_lines.append("**Disconnected** · Controls will adapt when you join a VC.")
 
     fields.extend(
         (
@@ -549,7 +565,7 @@ def music_queue_embed(
                 "Playback",
                 f"Queue **{len(upcoming)}**\n"
                 f"Loop **{_loop_mode_label(response.loop_mode)}** · "
-                f"Mix **{'On' if response.autoplay_enabled else 'Off'}**",
+                f"Radio **{'On' if response.autoplay_enabled else 'Off'}**",
             ),
             EmbedField(
                 "Levels",
@@ -590,7 +606,7 @@ def music_queue_embed(
         )
         fields.append(
             EmbedField(
-                "Mix",
+                "Radio",
                 f"{autoplay_text}\nManual requests take priority.",
                 inline=False,
             )
@@ -857,7 +873,7 @@ class MusicDashboardManager:
     """Keep one current, silent music panel near the bottom of each bound channel."""
 
     _DEBOUNCE_SECONDS = 0.8
-    _IDLE_SECONDS = 10 * 60
+    _IDLE_SECONDS = 5 * 60
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
@@ -1211,6 +1227,7 @@ def _music_dashboard_fingerprint(
         response.auto_leave,
         response.waiting_for_voice,
         response.resume_confirmation_required,
+        response.connected,
         response.music_volume_percent,
         response.speech_volume_percent,
         response.speed,
@@ -1228,7 +1245,7 @@ def _music_dashboard_fingerprint(
 
 
 def _audio_dashboard_is_idle(response: AudioQueueResponse) -> bool:
-    """Expire only a connected shell with no active, queued, or held work."""
+    """Expire an inactive shell, including Radio state held while disconnected."""
 
     return (
         response.current is None
@@ -1236,9 +1253,9 @@ def _audio_dashboard_is_idle(response: AudioQueueResponse) -> bool:
             item.kind == AudioKind.MUSIC.value
             for item in response.pending
         )
-        and not response.autoplay_enabled
         and not response.waiting_for_voice
         and not response.resume_confirmation_required
+        and not response.connected
     )
 
 
@@ -1684,15 +1701,21 @@ class MusicControlsView(discord.ui.View):
             self.pause_button.label = "Pause"
             self.pause_button.style = discord.ButtonStyle.secondary
         self.loop_button.label = f"Loop: {_loop_mode_label(response.loop_mode)}"
-        self.mix_button.label = f"Mix: {'On' if response.autoplay_enabled else 'Off'}"
+        self.mix_button.label = f"Radio: {'On' if response.autoplay_enabled else 'Off'}"
         self.mix_button.style = (
             discord.ButtonStyle.success
             if response.autoplay_enabled
             else discord.ButtonStyle.secondary
         )
-        if not (active or has_manual_queue or response.autoplay_enabled):
+        if not (active or has_manual_queue):
             self.remove_item(self.stop_button)
-        if response.destination_id is None:
+        if (
+            not active
+            and not has_manual_queue
+            and LoopMode(response.loop_mode) is LoopMode.NONE
+        ):
+            self.remove_item(self.loop_button)
+        if not response.connected:
             self.remove_item(self.leave_button)
 
     def _bind_dashboard(self, interaction: discord.Interaction) -> None:
@@ -1884,10 +1907,10 @@ class MusicControlsView(discord.ui.View):
         if response.autoplay_enabled and next_mode is not LoopMode.NONE:
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Mix is on",
+                    "Radio is on",
                     description=(
-                        "Loop and Mix cannot run together.\n"
-                        "Would you like to stop Mix and switch to "
+                        "Loop and Radio cannot run together.\n"
+                        "Would you like to stop Radio and switch to "
                         f"**{_loop_mode_label(next_mode.value)} loop**?"
                     ),
                     tone=EmbedTone.WARNING,
@@ -1908,7 +1931,7 @@ class MusicControlsView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Mix",
+        label="Radio",
         style=discord.ButtonStyle.secondary,
         custom_id="simajilord:music:mix",
         row=1,
@@ -1939,8 +1962,8 @@ class MusicControlsView(discord.ui.View):
                     embed=command_embed(
                         "Loop is on",
                         description=(
-                            "Loop and Mix cannot run together.\n"
-                            "Would you like to turn off Loop and switch to **Mix**?"
+                        "Loop and Radio cannot run together.\n"
+                        "Would you like to turn off Loop and switch to **Radio**?"
                         ),
                         tone=EmbedTone.WARNING,
                     ),
@@ -2108,7 +2131,7 @@ class LoopMixConflictView(discord.ui.View):
         self.loop_mode = loop_mode
         self.seed_references = seed_references
         self.confirm_button.label = (
-            "Switch to Mix" if loop_mode is None else "Switch to Loop"
+            "Switch to Radio" if loop_mode is None else "Switch to Loop"
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -2145,8 +2168,8 @@ class LoopMixConflictView(discord.ui.View):
                     ),
                     invocation_context(interaction),
                 )
-                title = "Switched to Mix"
-                description = "Loop is off. Mix will supply related tracks continuously."
+                title = "Switched to Radio"
+                description = "Loop is off. Radio will supply related tracks continuously."
             else:
                 await self.runtime.registry.invoke(
                     "audio.control",
@@ -2159,7 +2182,7 @@ class LoopMixConflictView(discord.ui.View):
                 )
                 title = "Switched to Loop"
                 description = (
-                    "Mix is off. Loop is now "
+                    "Radio is off. Loop is now "
                     f"**{_loop_mode_label(self.loop_mode.value)}**."
                 )
             await interaction.edit_original_response(
@@ -2264,6 +2287,238 @@ async def edit_deferred_error(
             description=error_message(error),
             tone=EmbedTone.ERROR,
         )
+    )
+
+
+class FocusTimerCancelView(discord.ui.View):
+    """Short-lived convenience control; timer state itself remains persistent."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        timer: FocusTimer,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.runtime = runtime
+        self.timer = timer
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[FocusTimerCancelView],
+    ) -> None:
+        if str(interaction.user.id) != self.timer.actor_id:
+            await interaction.response.send_message(
+                "Only the person who started this timer can cancel it.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await self.runtime.focus_timer.cancel(
+                timer_id=self.timer.timer_id,
+                workspace_id=self.timer.workspace_id,
+                actor_id=self.timer.actor_id,
+            )
+            await _restore_focus_read_aloud(self.runtime, self.timer)
+            await interaction.response.edit_message(
+                embed=command_embed(
+                    "Focus Timer cancelled",
+                    description="The saved timer was cancelled.",
+                    tone=EmbedTone.WARNING,
+                ),
+                view=None,
+            )
+            self.stop()
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+
+class FocusTimerCog(commands.Cog):
+    """Discord delivery worker for the transport-neutral persistent timer API."""
+
+    def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
+        self.bot = bot
+        self.runtime = runtime
+        self._worker = asyncio.create_task(
+            self._run(),
+            name="simajilord-focus-timer-delivery",
+        )
+
+    async def cog_unload(self) -> None:
+        self._worker.cancel()
+
+    @app_commands.command(
+        name="timer",
+        description="集中時間を保存し、終了時にテキストと必要ならVC音声で知らせます。",
+    )
+    @app_commands.describe(
+        minutes="集中する分数 (1〜10080分)",
+        message="終了時に表示・読み上げる内容",
+        voice="BOTが接続中で人がいるVCでも読み上げる",
+        focus_session="集中中は通常メッセージを読まず、VCイベントだけ読み上げる",
+    )
+    async def timer(
+        self,
+        interaction: discord.Interaction,
+        minutes: app_commands.Range[int, 1, 10080],
+        message: str = "Focus session complete.",
+        voice: bool = True,
+        focus_session: bool = False,
+    ) -> None:
+        try:
+            workspace_id = str(interaction.guild_id) if interaction.guild_id else None
+            channel_id = str(interaction.channel_id) if interaction.channel_id else None
+            if workspace_id is None or channel_id is None:
+                raise UserError("workspace.required")
+            response = cast(
+                FocusTimerResponse,
+                await self.runtime.registry.invoke(
+                    "timer.create",
+                    FocusTimerCreateRequest(
+                        duration_seconds=minutes * 60,
+                        message=message,
+                        delivery_target_id=channel_id,
+                        voice_notify=voice,
+                        focus_session=focus_session,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            timer = (
+                await self.runtime.focus_timer.active(
+                    workspace_id=workspace_id,
+                    actor_id=str(interaction.user.id),
+                )
+            )
+            created = next(
+                item for item in timer if item.timer_id == response.timer.timer_id
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Focus Timer started",
+                    description=(
+                        f"Ends <t:{response.timer.due_at_epoch}:R> · "
+                        f"<t:{response.timer.due_at_epoch}:t>\n"
+                        f"{discord.utils.escape_markdown(response.timer.message)}"
+                    ),
+                    fields=(
+                        EmbedField("Voice", "On" if voice else "Off"),
+                        EmbedField(
+                            "Focus session",
+                            "Events only" if focus_session else "No setting changes",
+                        ),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                view=FocusTimerCancelView(self.runtime, created),
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    async def _run(self) -> None:
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            try:
+                for timer in await self.runtime.focus_timer.claim_due():
+                    await self._deliver(timer)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Focus timer delivery scan failed")
+            await asyncio.sleep(1)
+
+    async def _deliver(self, timer: FocusTimer) -> None:
+        try:
+            try:
+                channel_id = int(timer.delivery_target_id)
+            except ValueError as exc:
+                raise UserError("timer.delivery_target_invalid") from exc
+            channel = self.bot.get_channel(channel_id)
+            if channel is None:
+                channel = await self.bot.fetch_channel(channel_id)
+            if not isinstance(
+                channel,
+                (
+                    discord.TextChannel,
+                    discord.Thread,
+                    discord.VoiceChannel,
+                ),
+            ):
+                raise UserError("timer.delivery_target_invalid")
+            await channel.send(
+                embed=command_embed(
+                    "Focus Timer complete",
+                    description=discord.utils.escape_markdown(timer.message),
+                    fields=(EmbedField("Started by", f"<@{timer.actor_id}>"),),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        except (discord.DiscordException, UserError):
+            log.exception("Focus timer text delivery failed timer=%s", timer.timer_id)
+            await self.runtime.focus_timer.retry(timer.timer_id)
+            return
+
+        await _restore_focus_read_aloud(self.runtime, timer)
+        if timer.voice_notify:
+            with suppress(Exception):
+                await self._deliver_voice(timer)
+        await self.runtime.focus_timer.complete(timer.timer_id)
+
+    async def _deliver_voice(self, timer: FocusTimer) -> None:
+        session = self.runtime.audio.find(timer.workspace_id)
+        if (
+            session is None
+            or not session.output.connected
+            or session.destination_id is None
+        ):
+            return
+        guild = self.bot.get_guild(int(timer.workspace_id))
+        if guild is None:
+            return
+        destination = guild.get_channel(int(session.destination_id))
+        if not isinstance(
+            destination,
+            (discord.VoiceChannel, discord.StageChannel),
+        ) or not any(not member.bot for member in destination.members):
+            return
+        await self.runtime.registry.invoke(
+            "speech.speak",
+            SpeechSpeakRequest(
+                text=timer.message,
+                title="Focus Timer",
+                voice_preset=self.runtime.read_aloud.policy(
+                    timer.workspace_id
+                ).default_voice_preset.value,
+            ),
+            InvocationContext(
+                actor_id=timer.actor_id,
+                workspace_id=timer.workspace_id,
+                transport="discord",
+                request_id=f"focus-timer:{timer.timer_id}",
+            ),
+        )
+
+
+async def _restore_focus_read_aloud(
+    runtime: SimajilordRuntime,
+    timer: FocusTimer,
+) -> None:
+    if not timer.focus_session or timer.restore_content_mode is None:
+        return
+    try:
+        mode = ReadAloudContentMode(timer.restore_content_mode)
+    except ValueError:
+        log.warning(
+            "Focus timer has invalid restore mode timer=%s mode=%s",
+            timer.timer_id,
+            timer.restore_content_mode,
+        )
+        return
+    await runtime.read_aloud.set_content_mode(
+        workspace_id=timer.workspace_id,
+        mode=mode,
     )
 
 
@@ -2655,8 +2910,8 @@ class MusicCog(commands.Cog):
                         embed=command_embed(
                             "Loop is on",
                             description=(
-                                "Loop and Mix cannot run together.\n"
-                                "Would you like to turn off Loop and switch to **Mix**?"
+                                "Loop and Radio cannot run together.\n"
+                                "Would you like to turn off Loop and switch to **Radio**?"
                             ),
                             tone=EmbedTone.WARNING,
                         ),
@@ -2683,13 +2938,13 @@ class MusicCog(commands.Cog):
             if response.enabled:
                 description = (
                     f"**{len(response.seed_references)}曲**を起点に自動選曲します。"
-                    "希望曲は常にMixより先に再生されます。"
+                    "希望曲は常にRadioの自動選曲より先に再生されます。"
                 )
             else:
                 description = "自動選曲を停止しました。希望曲のキューはそのままです。"
             await interaction.response.send_message(
                 embed=command_embed(
-                    "Mixを開始しました" if response.enabled else "Mixを停止しました",
+                    "Radioを開始しました" if response.enabled else "Radioを停止しました",
                     description=description,
                     tone=EmbedTone.SUCCESS,
                 ),
@@ -2700,14 +2955,46 @@ class MusicCog(commands.Cog):
             await send_error(interaction, exc)
 
     @app_commands.command(
-        name="mix",
+        name="radio",
         description="希望曲を優先しながら、関連曲を途切れず自動再生します。",
     )
     @app_commands.describe(
         enabled="オンで開始、オフで停止",
         seeds="起点にするYouTube URL (空白区切り・最大8件)",
     )
-    async def quick_mix(
+    async def quick_radio(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool = True,
+        seeds: str | None = None,
+    ) -> None:
+        await self._send_mix(interaction, enabled=enabled, seeds=seeds)
+
+    @app_commands.command(
+        name="mix",
+        description="互換用の旧名です。新しい /radio と同じ動作をします。",
+    )
+    @app_commands.describe(
+        enabled="オンで開始、オフで停止",
+        seeds="起点にするYouTube URL (空白区切り・最大8件)",
+    )
+    async def legacy_mix(
+        self,
+        interaction: discord.Interaction,
+        enabled: bool = True,
+        seeds: str | None = None,
+    ) -> None:
+        await self._send_mix(interaction, enabled=enabled, seeds=seeds)
+
+    @music.command(
+        name="radio",
+        description="希望曲を優先しながら、関連曲を途切れず自動再生します。",
+    )
+    @app_commands.describe(
+        enabled="オンで開始、オフで停止",
+        seeds="起点にするYouTube URL (空白区切り・最大8件)",
+    )
+    async def radio(
         self,
         interaction: discord.Interaction,
         enabled: bool = True,
@@ -2717,13 +3004,13 @@ class MusicCog(commands.Cog):
 
     @music.command(
         name="mix",
-        description="希望曲を優先しながら、関連曲を途切れず自動再生します。",
+        description="互換用の旧名です。/music radio と同じ動作をします。",
     )
     @app_commands.describe(
         enabled="オンで開始、オフで停止",
         seeds="起点にするYouTube URL (空白区切り・最大8件)",
     )
-    async def mix(
+    async def music_legacy_mix(
         self,
         interaction: discord.Interaction,
         enabled: bool = True,
@@ -2771,16 +3058,6 @@ class MusicCog(commands.Cog):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @app_commands.command(
-        name="freshmix",
-        description="作業内容から履歴を使わず、新しいMixを組み立てます。",
-    )
-    @app_commands.describe(
-        prompt="作業内容、雰囲気、ジャンルなど",
-        minutes="目標の長さ",
-        energy="全体の盛り上がり方",
-        vocals="歌声の量",
-    )
     async def quick_fresh_mix(
         self,
         interaction: discord.Interaction,
@@ -2797,16 +3074,6 @@ class MusicCog(commands.Cog):
             vocals=vocals,
         )
 
-    @music.command(
-        name="freshmix",
-        description="作業内容から履歴を使わず、新しいMixを組み立てます。",
-    )
-    @app_commands.describe(
-        prompt="作業内容、雰囲気、ジャンルなど",
-        minutes="目標の長さ",
-        energy="全体の盛り上がり方",
-        vocals="歌声の量",
-    )
     async def fresh_mix(
         self,
         interaction: discord.Interaction,
@@ -3082,6 +3349,207 @@ class MusicCog(commands.Cog):
         await self._control(interaction, AudioAction.CLEAR_MINE)
 
 
+_YOUTUBE_URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+_YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
+
+
+def _youtube_card_reference(content: str) -> str | None:
+    """Return one conservative YouTube video URL without resolving the page."""
+
+    references: list[str] = []
+    for match in _YOUTUBE_URL_PATTERN.finditer(content):
+        reference = match.group(0).rstrip(".,!?;:、。]})")
+        parsed = urlparse(reference)
+        host = (parsed.hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        video_id: str | None = None
+        if host == "youtu.be":
+            video_id = parsed.path.strip("/").split("/", 1)[0]
+        elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+            if parsed.path == "/watch":
+                values = parse_qs(parsed.query).get("v", ())
+                video_id = values[0] if values else None
+            elif parsed.path.startswith(("/shorts/", "/live/")):
+                parts = parsed.path.strip("/").split("/")
+                video_id = parts[1] if len(parts) > 1 else None
+        if video_id is not None and _YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id):
+            references.append(f"https://www.youtube.com/watch?v={video_id}")
+    return references[0] if len(dict.fromkeys(references)) == 1 else None
+
+
+class YouTubeLinkCardView(discord.ui.View):
+    """Short-lived, zero-search entry points for one explicit YouTube link."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        reference: str,
+    ) -> None:
+        super().__init__(timeout=5 * 60)
+        self.runtime = runtime
+        self.reference = reference
+        self.message: discord.Message | None = None
+        self._lock = asyncio.Lock()
+        self._finished = False
+
+    async def _enqueue(
+        self,
+        interaction: discord.Interaction,
+        *,
+        connect: bool,
+        radio: bool,
+    ) -> None:
+        async with self._lock:
+            if self._finished:
+                await interaction.response.send_message(
+                    "This link has already been handled.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                await interaction.response.defer()
+                dashboard = getattr(
+                    interaction.client,
+                    _MUSIC_DASHBOARD_ATTRIBUTE,
+                    None,
+                )
+                if isinstance(dashboard, MusicDashboardManager):
+                    dashboard.bind(interaction.guild_id, interaction.channel_id)
+                if connect:
+                    response = await _enqueue_interaction_track(
+                        self.runtime,
+                        interaction,
+                        reference=self.reference,
+                        requested_by_name=interaction.user.display_name,
+                    )
+                else:
+                    session = _discord_audio_session(
+                        cast(commands.Bot, interaction.client),
+                        self.runtime,
+                        interaction.guild_id,
+                    )
+                    _require_same_voice(session, interaction.user)
+                    response = cast(
+                        AudioPlayResponse,
+                        await self.runtime.registry.invoke(
+                            "audio.play",
+                            AudioPlayRequest(
+                                reference=self.reference,
+                                requested_by_name=interaction.user.display_name,
+                            ),
+                            invocation_context(interaction),
+                        ),
+                    )
+                if radio:
+                    await self.runtime.registry.invoke(
+                        "audio.mix",
+                        AudioMixRequest(
+                            enabled=True,
+                            seed_references=(response.page_url,),
+                            replace_loop=True,
+                        ),
+                        invocation_context(interaction),
+                    )
+                self._finished = True
+                self.stop()
+                await interaction.edit_original_response(
+                    embed=command_embed(
+                        "Radio started" if radio else "Added to audio",
+                        description=(
+                            f"[{discord.utils.escape_markdown(response.title)}]"
+                            f"({_safe_markdown_url(response.page_url)})\n"
+                            + (
+                                "Related tracks will continue after manually requested music."
+                                if radio
+                                else (
+                                    "Playback will start now."
+                                    if response.playback_state == "playing"
+                                    else "The track is waiting in the queue."
+                                )
+                            )
+                        ),
+                        tone=EmbedTone.SUCCESS,
+                    ),
+                    view=None,
+                )
+                if interaction.message is not None:
+                    _schedule_message_delete(interaction.message, delay=8)
+            except Exception as exc:
+                await edit_deferred_error(interaction, exc)
+
+    @discord.ui.button(label="Play", style=discord.ButtonStyle.success)
+    async def play_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[YouTubeLinkCardView],
+    ) -> None:
+        await self._enqueue(interaction, connect=True, radio=False)
+
+    @discord.ui.button(label="Add", style=discord.ButtonStyle.primary)
+    async def add_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[YouTubeLinkCardView],
+    ) -> None:
+        await self._enqueue(interaction, connect=False, radio=False)
+
+    @discord.ui.button(label="Radio", style=discord.ButtonStyle.secondary)
+    async def radio_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[YouTubeLinkCardView],
+    ) -> None:
+        await self._enqueue(interaction, connect=True, radio=True)
+
+    async def on_timeout(self) -> None:
+        if self.message is not None:
+            with suppress(discord.DiscordException):
+                await self.message.delete()
+        self.stop()
+
+
+class YouTubeLinkCardCog(commands.Cog):
+    """Offer silent audio actions for a single YouTube video link."""
+
+    def __init__(self, runtime: SimajilordRuntime) -> None:
+        self.runtime = runtime
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or message.author.bot:
+            return
+        reference = _youtube_card_reference(message.content)
+        if reference is None:
+            return
+        view = YouTubeLinkCardView(self.runtime, reference=reference)
+        try:
+            reply = await message.reply(
+                embed=command_embed(
+                    "YouTube",
+                    description=(
+                        "Play now, add without joining a VC, "
+                        "or use this track to start Radio."
+                    ),
+                    tone=EmbedTone.INFO,
+                ),
+                view=view,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+                silent=True,
+            )
+        except discord.DiscordException:
+            log.info(
+                "Could not publish YouTube audio card guild=%s channel=%s message=%s",
+                message.guild.id,
+                message.channel.id,
+                message.id,
+            )
+            return
+        view.message = reply
+
+
 _READ_ALOUD_CHANNEL_TYPES = [
     discord.ChannelType.text,
     discord.ChannelType.news,
@@ -3345,11 +3813,23 @@ class ReadAloudCog(commands.Cog):
             tuple[int, int],
             asyncio.Task[None],
         ] = {}
+        self._message_bursts: dict[
+            tuple[int, int],
+            list[tuple[discord.Message, ReadAloudMessageText]],
+        ] = {}
+        self._message_burst_tasks: dict[
+            tuple[int, int],
+            asyncio.Task[None],
+        ] = {}
 
     async def cog_unload(self) -> None:
         for task in self._announcement_tasks.values():
             task.cancel()
+        for task in self._message_burst_tasks.values():
+            task.cancel()
         self._announcement_tasks.clear()
+        self._message_burst_tasks.clear()
+        self._message_bursts.clear()
         self._voice_transitions.clear()
 
     @app_commands.command(
@@ -3487,7 +3967,13 @@ class ReadAloudCog(commands.Cog):
                             (
                                 f"投稿者名 {_on_off(policy.read_author_names)} · "
                                 f"返信先 {_on_off(policy.read_replies)} · "
-                                f"添付 {_on_off(policy.read_attachments)}"
+                                f"添付 {_on_off(policy.read_attachments)}\n"
+                                "話者 "
+                                + (
+                                    "VC参加者のみ"
+                                    if policy.vc_members_only
+                                    else "対象チャンネルの全員"
+                                )
                             ),
                         ),
                         EmbedField(
@@ -3498,7 +3984,13 @@ class ReadAloudCog(commands.Cog):
                                 f"ロール除外 {len(policy.ignored_role_ids)}件"
                             ),
                         ),
-                        EmbedField("音声", _speech_voice_label(self.runtime)),
+                        EmbedField(
+                            "音声",
+                            (
+                                f"サーバー既定 {policy.default_voice_preset.title()} · "
+                                f"個人設定 {len(policy.user_voice_presets)}人"
+                            ),
+                        ),
                     ),
                     tone=(EmbedTone.SUCCESS if response.enabled else EmbedTone.WARNING),
                 )
@@ -3805,7 +4297,7 @@ class ReadAloudCog(commands.Cog):
 
     @readaloud.command(
         name="message-style",
-        description="投稿者名・返信先・添付を読み上げるか選びます。",
+        description="投稿者名・返信先・添付・VC参加者限定を選びます。",
     )
     @app_commands.default_permissions(manage_guild=True)
     async def message_style(
@@ -3814,6 +4306,7 @@ class ReadAloudCog(commands.Cog):
         author_names: bool | None = None,
         replies: bool | None = None,
         attachments: bool | None = None,
+        vc_members_only: bool | None = None,
     ) -> None:
         try:
             policy = cast(
@@ -3824,6 +4317,7 @@ class ReadAloudCog(commands.Cog):
                         author_names=author_names,
                         replies=replies,
                         attachments=attachments,
+                        vc_members_only=vc_members_only,
                     ),
                     invocation_context(interaction),
                 ),
@@ -3835,9 +4329,114 @@ class ReadAloudCog(commands.Cog):
                         EmbedField("投稿者名", _on_off(policy.read_author_names)),
                         EmbedField("返信先", _on_off(policy.read_replies)),
                         EmbedField("添付", _on_off(policy.read_attachments)),
+                        EmbedField(
+                            "話者",
+                            (
+                                "VC参加者のみ"
+                                if policy.vc_members_only
+                                else "対象チャンネルの全員"
+                            ),
+                        ),
                     ),
                     tone=EmbedTone.SUCCESS,
                 )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="server-voice",
+        description="サーバー既定の読み上げ音声を選びます。",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.choices(
+        preset=[
+            app_commands.Choice(name="Clear — 聞き取りやすい標準音声", value="clear"),
+            app_commands.Choice(name="Calm — 落ち着いた音声", value="calm"),
+            app_commands.Choice(name="Energetic — 明るく元気な音声", value="energetic"),
+            app_commands.Choice(name="Cute — 親しみやすい音声", value="cute"),
+            app_commands.Choice(name="Narrator — 案内向きの低い音声", value="narrator"),
+        ]
+    )
+    async def server_voice(
+        self,
+        interaction: discord.Interaction,
+        preset: app_commands.Choice[str],
+    ) -> None:
+        try:
+            member = interaction.user
+            if (
+                not isinstance(member, discord.Member)
+                or not member.guild_permissions.manage_guild
+            ):
+                raise UserError("この設定には「サーバー管理」権限が必要です。")
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "speech.read_aloud_server_voice_set",
+                    ReadAloudServerVoiceSetRequest(
+                        preset=ReadAloudVoicePreset(preset.value),
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "サーバーの音声を変更しました",
+                    fields=(
+                        EmbedField(
+                            "Voice",
+                            policy.default_voice_preset.title(),
+                        ),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="my-voice",
+        description="自分の読み上げ音声を選びます。",
+    )
+    @app_commands.choices(
+        preset=[
+            app_commands.Choice(name="Server default — 個人設定を解除", value="default"),
+            app_commands.Choice(name="Clear — 聞き取りやすい標準音声", value="clear"),
+            app_commands.Choice(name="Calm — 落ち着いた音声", value="calm"),
+            app_commands.Choice(name="Energetic — 明るく元気な音声", value="energetic"),
+            app_commands.Choice(name="Cute — 親しみやすい音声", value="cute"),
+            app_commands.Choice(name="Narrator — 案内向きの低い音声", value="narrator"),
+        ]
+    )
+    async def my_voice(
+        self,
+        interaction: discord.Interaction,
+        preset: app_commands.Choice[str],
+    ) -> None:
+        try:
+            selected = (
+                None
+                if preset.value == "default"
+                else ReadAloudVoicePreset(preset.value)
+            )
+            await self.runtime.registry.invoke(
+                "speech.read_aloud_user_voice_set",
+                ReadAloudUserVoiceSetRequest(preset=selected),
+                invocation_context(interaction),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "自分の音声を変更しました",
+                    fields=(
+                        EmbedField(
+                            "Voice",
+                            "Server default" if selected is None else selected.value.title(),
+                        ),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                ephemeral=True,
             )
         except Exception as exc:
             await send_error(interaction, exc)
@@ -3942,8 +4541,71 @@ class ReadAloudCog(commands.Cog):
             is_webhook=message.webhook_id is not None,
         ):
             return
+        destination = message.guild.get_channel(int(route.audio_destination_id))
+        if not isinstance(
+            destination,
+            (discord.VoiceChannel, discord.StageChannel),
+        ) or not any(not listener.bot for listener in destination.members):
+            return
+        policy = self.runtime.read_aloud.policy(workspace_id)
+        if policy.vc_members_only and (
+            not isinstance(message.author, discord.Member)
+            or message.author.voice is None
+            or message.author.voice.channel is None
+            or message.author.voice.channel.id != destination.id
+        ):
+            return
         prepared = await self._message_formatter.format(message)
         if prepared is None:
+            return
+        key = (message.guild.id, message.channel.id)
+        burst = self._message_bursts.setdefault(key, [])
+        if len(burst) < 8:
+            burst.append((message, prepared))
+        if key not in self._message_burst_tasks:
+            self._message_burst_tasks[key] = asyncio.create_task(
+                self._flush_message_burst(key),
+                name=f"simajilord-read-aloud-burst-{key[0]}-{key[1]}",
+            )
+
+    async def _flush_message_burst(self, key: tuple[int, int]) -> None:
+        try:
+            await asyncio.sleep(0.65)
+            burst = tuple(self._message_bursts.pop(key, ()))
+            if not burst:
+                return
+            if self._message_burst_tasks.get(key) is asyncio.current_task():
+                self._message_burst_tasks.pop(key, None)
+            message = burst[0][0]
+            prepared = merge_read_aloud_messages(
+                tuple(
+                    (str(item.author.id), item_prepared)
+                    for item, item_prepared in burst
+                )
+            )
+            await self._deliver_read_aloud(message, prepared)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Automatic read-aloud burst failed guild=%s channel=%s",
+                key[0],
+                key[1],
+            )
+        finally:
+            if self._message_burst_tasks.get(key) is asyncio.current_task():
+                self._message_burst_tasks.pop(key, None)
+
+    async def _deliver_read_aloud(
+        self,
+        message: discord.Message,
+        prepared: ReadAloudMessageText,
+    ) -> None:
+        if message.guild is None:
+            return
+        workspace_id = str(message.guild.id)
+        route = self.runtime.read_aloud.get(workspace_id)
+        if route is None or str(message.channel.id) not in route.text_channel_ids:
             return
         guild_id = message.guild.id
         session = self.runtime.audio.get_or_create(
@@ -3960,12 +4622,6 @@ class ReadAloudCog(commands.Cog):
             return
         output = cast(DiscordAudioOutput, session.output)
         try:
-            destination = message.guild.get_channel(int(route.audio_destination_id))
-            if not isinstance(
-                destination,
-                (discord.VoiceChannel, discord.StageChannel),
-            ) or not any(not listener.bot for listener in destination.members):
-                return
             if (
                 output.connected
                 and output.destination_id != int(route.audio_destination_id)
@@ -3987,6 +4643,10 @@ class ReadAloudCog(commands.Cog):
                 SpeechSpeakRequest(
                     title=prepared.title,
                     segments=prepared.segments,
+                    voice_preset=self.runtime.read_aloud.voice_preset_for(
+                        workspace_id=workspace_id,
+                        user_id=str(message.author.id),
+                    ).value,
                 ),
                 InvocationContext(
                     actor_id=str(message.author.id),
@@ -4124,6 +4784,7 @@ class ReadAloudCog(commands.Cog):
                         spoken_text,
                     ),
                 ),
+                voice_preset=policy.default_voice_preset.value,
             ),
             InvocationContext(
                 actor_id=str(member.id),
@@ -5007,9 +5668,8 @@ class QuoteComposerView(discord.ui.View):
         self.has_animation = has_animation
         self.animate = False
         self.include_jump = True
-        if not has_animation:
-            self.remove_item(self.animation_button)
-        self._sync_labels()
+        self._page: Literal["main", "layout", "style", "more"] = "main"
+        self._show_page("main")
 
     def embed(self) -> discord.Embed:
         layout = "Vertical · 4:5" if self.vertical else "Landscape · 40:21"
@@ -5026,7 +5686,14 @@ class QuoteComposerView(discord.ui.View):
         ]
         return discord.Embed(
             title="Quote",
-            description="スタイルを選び、Generateで投稿します。",
+            description=(
+                {
+                    "main": "設定を確認してGenerateで投稿します。",
+                    "layout": "画像の向きと比率を選びます。",
+                    "style": "色と文字のスタイルを選びます。",
+                    "more": "反転、Jump、Animationを設定します。",
+                }[self._page]
+            ),
             color=discord.Colour.green(),
         ).add_field(
             name="Preview settings",
@@ -5057,6 +5724,15 @@ class QuoteComposerView(discord.ui.View):
         return False
 
     def _sync_labels(self) -> None:
+        self.layout_menu_button.label = (
+            "Layout · Vertical" if self.vertical else "Layout · Landscape"
+        )
+        style_parts = ["Color" if self.color else "B/W"]
+        if self.bold:
+            style_parts.append("Bold")
+        self.style_menu_button.label = f"Style · {' + '.join(style_parts)}"
+        more_count = sum((self.flip, self.include_jump, self.animate))
+        self.more_menu_button.label = f"More · {more_count} On"
         self.color_button.label = f"Color {'On' if self.color else 'Off'}"
         self.vertical_button.label = "Vertical" if self.vertical else "Landscape"
         self.bold_button.label = f"Bold {'On' if self.bold else 'Off'}"
@@ -5082,11 +5758,77 @@ class QuoteComposerView(discord.ui.View):
             discord.ButtonStyle.primary if self.animate else discord.ButtonStyle.secondary
         )
 
+    def _show_page(
+        self,
+        page: Literal["main", "layout", "style", "more"],
+    ) -> None:
+        self._page = page
+        self._sync_labels()
+        self.clear_items()
+        if page == "main":
+            for item in (
+                self.layout_menu_button,
+                self.style_menu_button,
+                self.more_menu_button,
+            ):
+                item.row = 0
+                self.add_item(item)
+            for item in (self.generate_button, self.cancel_button):
+                item.row = 1
+                self.add_item(item)
+            return
+        choices: tuple[discord.ui.Button[QuoteComposerView], ...]
+        if page == "layout":
+            choices = (self.vertical_button,)
+        elif page == "style":
+            choices = (self.color_button, self.bold_button)
+        else:
+            choices = (self.flip_button, self.jump_button)
+            if self.has_animation:
+                choices = (*choices, self.animation_button)
+        for item in choices:
+            item.row = 0
+            self.add_item(item)
+        self.back_button.row = 1
+        self.add_item(self.back_button)
+
     async def _refresh_composer(self, interaction: discord.Interaction) -> None:
         self._sync_labels()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Color Off", emoji="🎨", row=0)
+    async def _open_page(
+        self,
+        interaction: discord.Interaction,
+        page: Literal["layout", "style", "more"],
+    ) -> None:
+        self._show_page(page)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Layout", style=discord.ButtonStyle.secondary, row=0)
+    async def layout_menu_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        await self._open_page(interaction, "layout")
+
+    @discord.ui.button(label="Style", style=discord.ButtonStyle.secondary, row=0)
+    async def style_menu_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        await self._open_page(interaction, "style")
+
+    @discord.ui.button(label="More", style=discord.ButtonStyle.secondary, row=0)
+    async def more_menu_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        await self._open_page(interaction, "more")
+
+    @discord.ui.button(label="Color Off", emoji="🎨", row=2)
     async def color_button(
         self,
         interaction: discord.Interaction,
@@ -5095,7 +5837,7 @@ class QuoteComposerView(discord.ui.View):
         self.color = not self.color
         await self._refresh_composer(interaction)
 
-    @discord.ui.button(label="Landscape", emoji="↔️", row=0)
+    @discord.ui.button(label="Landscape", emoji="↔️", row=2)
     async def vertical_button(
         self,
         interaction: discord.Interaction,
@@ -5104,7 +5846,7 @@ class QuoteComposerView(discord.ui.View):
         self.vertical = not self.vertical
         await self._refresh_composer(interaction)
 
-    @discord.ui.button(label="Bold Off", emoji="🅱️", row=0)
+    @discord.ui.button(label="Bold Off", emoji="🅱️", row=2)
     async def bold_button(
         self,
         interaction: discord.Interaction,
@@ -5113,7 +5855,7 @@ class QuoteComposerView(discord.ui.View):
         self.bold = not self.bold
         await self._refresh_composer(interaction)
 
-    @discord.ui.button(label="Flip Off", emoji="🔄", row=0)
+    @discord.ui.button(label="Flip Off", emoji="🔄", row=2)
     async def flip_button(
         self,
         interaction: discord.Interaction,
@@ -5122,7 +5864,7 @@ class QuoteComposerView(discord.ui.View):
         self.flip = not self.flip
         await self._refresh_composer(interaction)
 
-    @discord.ui.button(label="Jump On", emoji="↗️", row=0)
+    @discord.ui.button(label="Jump On", emoji="↗️", row=2)
     async def jump_button(
         self,
         interaction: discord.Interaction,
@@ -5131,7 +5873,7 @@ class QuoteComposerView(discord.ui.View):
         self.include_jump = not self.include_jump
         await self._refresh_composer(interaction)
 
-    @discord.ui.button(label="Animation Off", emoji="🎞️", row=1)
+    @discord.ui.button(label="Animation Off", emoji="🎞️", row=3)
     async def animation_button(
         self,
         interaction: discord.Interaction,
@@ -5139,6 +5881,15 @@ class QuoteComposerView(discord.ui.View):
     ) -> None:
         self.animate = not self.animate
         await self._refresh_composer(interaction)
+
+    @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=4)
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        self._show_page("main")
+        await interaction.response.edit_message(embed=self.embed(), view=self)
 
     @discord.ui.button(
         label="Generate",
@@ -5169,6 +5920,21 @@ class QuoteComposerView(discord.ui.View):
                 ),
                 view=self,
             )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.danger,
+        row=1,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[QuoteComposerView],
+    ) -> None:
+        await interaction.response.defer()
+        with suppress(discord.DiscordException):
+            await interaction.delete_original_response()
+        self.stop()
 
 
 def discord_conversation_id(
@@ -6170,7 +6936,9 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     setattr(bot, _MUSIC_DASHBOARD_ATTRIBUTE, dashboard)
     bot.add_view(MusicControlsView(runtime, dashboard))
     await bot.add_cog(SystemCog(bot, runtime))
+    await bot.add_cog(FocusTimerCog(bot, runtime))
     await bot.add_cog(MusicCog(bot, runtime, dashboard))
+    await bot.add_cog(YouTubeLinkCardCog(runtime))
     await bot.add_cog(ReadAloudCog(bot, runtime))
     await bot.add_cog(VoiceLifecycleCog(bot, runtime))
     await bot.add_cog(WebCog(runtime))

@@ -56,11 +56,17 @@ class StoredAudioSession:
 class AudioStateStore:
     """Atomically persist queues while excluding expiring provider stream URLs."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, debounce_seconds: float = 0.1) -> None:
+        if debounce_seconds < 0:
+            raise ValueError("Audio state debounce cannot be negative.")
         self.path = path
+        self.debounce_seconds = debounce_seconds
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
         self._sessions = self._load()
+        self._dirty = False
+        self._write_task: asyncio.Task[None] | None = None
+        self._flush_event = asyncio.Event()
 
     def all(self) -> tuple[StoredAudioSession, ...]:
         return tuple(self._sessions.values())
@@ -68,12 +74,56 @@ class AudioStateStore:
     async def put(self, state: StoredAudioSession) -> None:
         async with self._lock:
             self._sessions[state.workspace_id] = state
-            await asyncio.to_thread(self._write)
+            self._dirty = True
+            self._ensure_writer_locked()
 
     async def remove(self, workspace_id: str) -> None:
         async with self._lock:
             if self._sessions.pop(workspace_id, None) is not None:
+                self._dirty = True
+                self._ensure_writer_locked()
+
+    async def flush(self) -> None:
+        """Force pending coalesced changes to durable storage."""
+
+        async with self._lock:
+            if self._dirty:
+                self._ensure_writer_locked()
+            task = self._write_task
+            if task is None:
+                return
+            self._flush_event.set()
+        await task
+
+    def _ensure_writer_locked(self) -> None:
+        if self._write_task is None or self._write_task.done():
+            self._write_task = asyncio.create_task(
+                self._debounced_writer(),
+                name="simajilord-audio-state-writer",
+            )
+
+    async def _debounced_writer(self) -> None:
+        while True:
+            forced = False
+            try:
+                await asyncio.wait_for(
+                    self._flush_event.wait(),
+                    timeout=self.debounce_seconds,
+                )
+                forced = True
+            except TimeoutError:
+                pass
+            async with self._lock:
+                if forced:
+                    self._flush_event.clear()
+                if not self._dirty:
+                    self._write_task = None
+                    return
+                self._dirty = False
                 await asyncio.to_thread(self._write)
+                if forced:
+                    self._write_task = None
+                    return
 
     def _load(self) -> dict[str, StoredAudioSession]:
         if not self.path.exists():
