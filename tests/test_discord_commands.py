@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, Mock
@@ -49,6 +50,8 @@ from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
+    DiscordServerResponse,
+    DiscordUserResponse,
     DiscordViewCustomEmojiRequest,
     DiscordViewCustomEmojiResponse,
     DiscordViewStickerRequest,
@@ -68,17 +71,25 @@ from simajilord.integrations.discord.capabilities import (
 )
 from simajilord.integrations.discord.cogs import (
     _QUOTE_CONTEXT_MENU_NAME,
+    DiscordActionCog,
+    DiscordInfoCog,
+    DownloadCog,
+    FocusTimerCog,
+    HelpCog,
     LoopMixConflictView,
     ModerationCog,
     MusicCog,
     MusicControlsView,
     MusicDashboardManager,
     MusicSearchChoiceView,
+    PrefixCog,
     QuoteCog,
     QuoteComposerView,
     ReadAloudChannelSelect,
     ReadAloudChannelSelectView,
     ReadAloudCog,
+    SystemCog,
+    UtilityCog,
     VoiceLifecycleCog,
     WebCog,
     WebFetchContinueView,
@@ -93,6 +104,12 @@ from simajilord.integrations.discord.cogs import (
     _youtube_card_reference,
     discord_conversation_id,
     error_message,
+    server_info_embed,
+    user_info_embed,
+)
+from simajilord.integrations.discord.help_catalog import (
+    HELP_ENTRIES,
+    HELP_ENTRIES_BY_TOPIC,
 )
 from simajilord.runtime import SimajilordRuntime
 
@@ -130,8 +147,9 @@ async def test_agent_no_action_sentinel_is_never_published() -> None:
     assert progress.message is None
 
 
-def test_member_lookup_error_is_localized() -> None:
-    assert "ユーザー情報" in error_message(UserError("discord.member_required"))
+def test_member_lookup_error_is_clear_and_english() -> None:
+    message = error_message(UserError("discord.member_required"))
+    assert message == "Could not resolve that member in this server."
 
 
 def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
@@ -174,23 +192,187 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         for command in MusicCog.__cog_app_commands__
         if isinstance(command, app_commands.Command)
     }
-    assert {
-        "audio",
-        "play",
-        "queue",
-        "history",
-        "nowplaying",
-        "radio",
-        "mix",
-    } <= commands.keys()
+    assert set(commands) == {"audio", "play", "radio"}
     assert commands["audio"].description == (
         "Open music controls and read-aloud setup in one panel."
     )
-    assert commands["play"].description == "URLまたは曲名から音楽を再生します。"
-    assert commands["queue"].description == "再生中の曲とキューを表示します。"
-    assert commands["history"].description == ("最近再生した曲と、追加したユーザーを表示します。")
-    assert commands["nowplaying"].description == "現在再生している曲を表示します。"
-    assert commands["mix"].description.startswith("互換用の旧名")
+    assert commands["play"].description == (
+        "Find a song or public URL and add it to the shared queue."
+    )
+    assert commands["radio"].description.startswith("Keep related music")
+
+
+def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
+    cog_types = (
+        HelpCog,
+        SystemCog,
+        FocusTimerCog,
+        MusicCog,
+        ReadAloudCog,
+        WebCog,
+        ModerationCog,
+        DownloadCog,
+        UtilityCog,
+        DiscordInfoCog,
+        DiscordActionCog,
+    )
+    public_topics: set[str] = set()
+    command_by_topic: dict[str, app_commands.Command[object, ..., object]] = {}
+    for cog_type in cog_types:
+        for command in cog_type.__cog_app_commands__:
+            if isinstance(command, app_commands.Group):
+                for child in command.commands:
+                    topic = f"{command.name} {child.name}"
+                    public_topics.add(topic)
+                    command_by_topic[topic] = child
+            elif isinstance(command, app_commands.Command):
+                public_topics.add(command.name)
+                command_by_topic[command.name] = command
+    public_topics.add(_QUOTE_CONTEXT_MENU_NAME)
+
+    help_topics = {entry.topic for entry in HELP_ENTRIES}
+    assert len(HELP_ENTRIES_BY_TOPIC) == len(HELP_ENTRIES)
+    assert help_topics == public_topics
+
+    for topic, command in command_by_topic.items():
+        usage = HELP_ENTRIES_BY_TOPIC[topic.casefold()].usage
+        for parameter in command.parameters:
+            assert parameter.description and parameter.description != "…", (
+                f"/{topic} option `{parameter.name}` has no Discord description"
+            )
+            assert parameter.name in usage, (
+                f"/{topic} help omits the `{parameter.name}` option"
+            )
+
+
+def test_public_command_and_option_descriptions_use_the_official_english_surface() -> None:
+    japanese = re.compile(r"[ぁ-んァ-ヶ一-龯]")
+    cog_types = (
+        HelpCog,
+        SystemCog,
+        FocusTimerCog,
+        MusicCog,
+        ReadAloudCog,
+        WebCog,
+        ModerationCog,
+        DownloadCog,
+        UtilityCog,
+        DiscordInfoCog,
+        DiscordActionCog,
+    )
+    for cog_type in cog_types:
+        for command in cog_type.__cog_app_commands__:
+            children = command.commands if isinstance(command, app_commands.Group) else (command,)
+            for child in children:
+                assert not japanese.search(child.description), child.qualified_name
+                for parameter in child.parameters:
+                    assert not japanese.search(parameter.description), (
+                        child.qualified_name,
+                        parameter.name,
+                    )
+
+
+def test_discord_capability_catalog_uses_the_official_english_surface() -> None:
+    japanese = re.compile(r"[ぁ-んァ-ヶ一-龯]")
+    endpoints = build_discord_endpoints(
+        cast(discord.Client, object()),
+        Mock(spec=SimajilordRuntime),
+    )
+
+    for item in endpoints:
+        assert not japanese.search(item.descriptor.summary), item.descriptor.name
+        for side_effect in item.descriptor.side_effects:
+            assert not japanese.search(side_effect), item.descriptor.name
+
+
+def test_help_categories_fit_discord_select_limits() -> None:
+    categories = {entry.category for entry in HELP_ENTRIES}
+    assert len(categories) <= 25
+    for category in categories:
+        entries = [entry for entry in HELP_ENTRIES if entry.category == category]
+        assert 1 <= len(entries) <= 25
+        assert all(len(entry.summary) <= 100 for entry in entries)
+
+
+def test_prefix_help_is_not_shadowed_by_capability_search() -> None:
+    assert PrefixCog.help.name == "help"
+    assert "help" not in PrefixCog.capabilities.aliases
+    assert PrefixCog.capabilities.name == "capabilities"
+
+
+def test_server_info_embed_contains_identity_population_channels_and_safety() -> None:
+    embed = server_info_embed(
+        DiscordServerResponse(
+            server_id="123",
+            name="Example server",
+            owner_id="7",
+            member_count=0,
+            text_channel_count=4,
+            voice_channel_count=2,
+            role_count=5,
+            created_at_iso="2025-09-10T09:01:00+00:00",
+            icon_url="https://cdn.example/icon.png",
+            description="A useful server description",
+            owner_name="Owner",
+            human_count=0,
+            bot_count=0,
+            category_count=2,
+            stage_channel_count=1,
+            forum_channel_count=1,
+            emoji_count=8,
+            sticker_count=3,
+            boost_level=2,
+            boost_count=6,
+            preferred_locale="ja",
+            verification_level="medium",
+            explicit_content_filter="all_members",
+            features=("COMMUNITY",),
+        )
+    )
+    fields = {field.name: field.value for field in embed.fields}
+    assert embed.title == "Example server"
+    assert "`123`" in (embed.description or "")
+    assert "**0** total" in fields["Population"]
+    assert "4 text" in fields["Channels"]
+    assert "8 emoji" in fields["Community"]
+    assert "Verification" in fields["Safety"]
+    assert embed.thumbnail.url == "https://cdn.example/icon.png"
+
+
+def test_user_info_embed_contains_account_membership_roles_and_permissions() -> None:
+    embed = user_info_embed(
+        DiscordUserResponse(
+            user_id="7",
+            display_name="Display",
+            bot=False,
+            created_at_iso="2024-01-02T03:04:00+00:00",
+            joined_at_iso="2025-01-02T03:04:00+00:00",
+            top_role="Moderator",
+            avatar_url="https://cdn.example/avatar.png",
+            username="account",
+            nickname="Nick",
+            role_names=("Member", "Moderator"),
+            role_count=2,
+            status="online",
+            key_permissions=("Manage Messages",),
+            colour_value=0x123456,
+        ),
+        mention="<@7>",
+    )
+    fields = {field.name: field.value for field in embed.fields}
+    assert embed.title == "Display"
+    assert "<@7>" in (embed.description or "")
+    assert "Created" in fields["Account"]
+    assert "Top role: **Moderator**" in fields["Server membership"]
+    assert "Nickname: **Nick**" in fields["Status"]
+    assert "Member" in fields["Roles · 2"]
+    assert fields["Key server permissions"] == "Manage Messages"
+    assert not next(field for field in embed.fields if field.name == "Account").inline
+    assert not next(
+        field for field in embed.fields if field.name == "Server membership"
+    ).inline
+    assert not next(field for field in embed.fields if field.name == "Status").inline
+    assert embed.thumbnail.url == "https://cdn.example/avatar.png"
 
 
 @pytest.mark.asyncio
@@ -682,9 +864,6 @@ def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
     )
     names = {command.name for command in group.commands}
     assert names == {
-        "play",
-        "queue",
-        "history",
         "pause",
         "resume",
         "skip",
@@ -699,8 +878,6 @@ def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
         "volume",
         "move",
         "clear-mine",
-        "radio",
-        "mix",
     }
 
 
@@ -733,16 +910,29 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
     assert [button.label for button in buttons] == [
         "Pause",
         "Skip",
-        "Loop: Off",
-        "Radio: Off",
         "Stop",
         "Add music",
-        "Read aloud",
-        "Leave",
     ]
-    assert sum(button.row == 0 for button in buttons) == 3
-    assert sum(button.row == 1 for button in buttons) == 5
-    custom_ids = [button.custom_id for button in buttons]
+    assert all(button.row == 0 for button in buttons)
+    selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
+    assert len(selects) == 1
+    assert selects[0].placeholder == "More actions"
+    assert {option.value for option in selects[0].options} == {
+        "radio",
+        "loop",
+        "queue",
+        "levels",
+        "read_aloud",
+        "history",
+        "clear_mine",
+        "refresh",
+        "leave",
+    }
+    custom_ids = [
+        child.custom_id
+        for child in view.children
+        if isinstance(child, (discord.ui.Button, discord.ui.Select))
+    ]
     assert None not in custom_ids
     assert len(custom_ids) == len(set(custom_ids))
 
@@ -776,7 +966,11 @@ async def test_music_pause_button_changes_to_resume_without_duplicate_control() 
     buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
     assert [button.label for button in buttons].count("Resume") == 1
     assert "Pause" not in [button.label for button in buttons]
-    assert "Radio: On" in [button.label for button in buttons]
+    assert any(
+        isinstance(child, discord.ui.Select)
+        and child.placeholder == "More actions"
+        for child in view.children
+    )
 
 
 @pytest.mark.asyncio
@@ -810,14 +1004,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
     labels = [
         child.label for child in view.children if isinstance(child, discord.ui.Button)
     ]
-    assert labels == [
-        "Start",
-        "Loop: Off",
-        "Radio: Off",
-        "Stop",
-        "Add music",
-        "Read aloud",
-    ]
+    assert labels == ["Start", "Add music"]
 
 
 @pytest.mark.asyncio
@@ -845,7 +1032,12 @@ async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() 
         child.label for child in view.children if isinstance(child, discord.ui.Button)
     ]
 
-    assert labels == ["Radio: On", "Add music", "Read aloud"]
+    assert labels == ["Add music"]
+    assert any(
+        isinstance(child, discord.ui.Select)
+        and child.placeholder == "More actions"
+        for child in view.children
+    )
 
 
 @pytest.mark.asyncio
@@ -1120,7 +1312,9 @@ def test_web_commands_are_short_direct_paths() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"search", "fetch", "find"}
-    assert commands["search"].description.startswith("Simajilordのローカル検索")
+    assert commands["search"].description == (
+        "Search the web through Simajilord's local search service."
+    )
 
 
 def test_quote_context_menu_uses_a_short_native_label() -> None:
@@ -1134,7 +1328,9 @@ def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"join"}
-    assert commands["join"].description == "選んだ会話チャンネルを、参加中のVCで読み上げます。"
+    assert commands["join"].description == (
+        "Choose conversation channels to read in your current VC."
+    )
     assert commands["join"].parameters == []
 
 
@@ -1345,7 +1541,7 @@ def test_youtube_card_has_three_direct_actions() -> None:
     ] == ["Play", "Add", "Radio"]
 
 
-def test_fresh_mix_is_hidden_while_radio_keeps_legacy_aliases() -> None:
+def test_fresh_mix_and_duplicate_music_aliases_are_hidden() -> None:
     top_level = {
         command.name
         for command in MusicCog.__cog_app_commands__
@@ -1358,10 +1554,10 @@ def test_fresh_mix_is_hidden_while_radio_keeps_legacy_aliases() -> None:
     ]
 
     assert "freshmix" not in top_level
-    assert {"radio", "mix"} <= top_level
+    assert top_level == {"audio", "play", "radio"}
     assert len(groups) == 1
-    assert {"radio", "mix"} <= {command.name for command in groups[0].commands}
-    assert "freshmix" not in {command.name for command in groups[0].commands}
+    grouped = {command.name for command in groups[0].commands}
+    assert {"freshmix", "radio", "mix", "play", "queue", "history"} & grouped == set()
 
 
 @pytest.mark.asyncio
@@ -1552,7 +1748,9 @@ def test_hive_analysis_is_one_direct_attachment_command() -> None:
         if isinstance(command, app_commands.Command)
     }
     assert set(commands) == {"detectai"}
-    assert commands["detectai"].description == "画像・動画がAI生成かどうかをHIVEで解析します。"
+    assert commands["detectai"].description == (
+        "Estimate AI-generation and deepfake likelihood with HIVE."
+    )
 
 
 def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
@@ -1570,7 +1768,7 @@ def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
         ),
     )
     buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
-    assert [button.label for button in buttons] == ["続きを読む"]
+    assert [button.label for button in buttons] == ["Continue"]
     assert buttons[0].custom_id == "simajilord:web:fetch:continue"
     assert view.next_offset == 3_500
 
@@ -1997,7 +2195,7 @@ def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:
         resource_ids=("50",),
     )
     _assert_agent_channel_scope(context, "50")
-    with pytest.raises(UserError, match="閲覧する権限"):
+    with pytest.raises(UserError, match="permission to view"):
         _assert_agent_channel_scope(context, "60")
 
 

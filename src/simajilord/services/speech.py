@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import re
 import shutil
+import struct
 import uuid
+import wave
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -208,6 +210,7 @@ class SpeechService:
         chunk_characters: int,
         max_concurrent: int,
         max_parallel_parts: int = 2,
+        max_provider_calls: int = 2,
         metric_hook: ServiceMetricHook | None = None,
         voice_presets: Mapping[str, int] | None = None,
         file_suffix: str = ".aiff",
@@ -218,6 +221,8 @@ class SpeechService:
             raise ValueError("Speech chunk size must be positive.")
         if not 1 <= max_parallel_parts <= 2:
             raise ValueError("Speech part concurrency must be between 1 and 2.")
+        if max_provider_calls < 1:
+            raise ValueError("Speech provider concurrency must be positive.")
         self.provider = provider
         self.output_dir = output_dir
         self.chunk_characters = chunk_characters
@@ -227,6 +232,10 @@ class SpeechService:
             metric_hook=metric_hook,
         )
         self._max_parallel_parts = max_parallel_parts
+        # This is intentionally separate from the fair job scheduler and the
+        # per-job part limit. It is the final, process-wide pressure valve for
+        # one SpeechService/provider instance shared by every workspace.
+        self._provider_limit = asyncio.Semaphore(max_provider_calls)
         self._cache_dir = output_dir / "cache"
         self._cache_locks: dict[str, asyncio.Lock] = {}
         self._voice_presets = dict(voice_presets or {})
@@ -405,10 +414,11 @@ class SpeechService:
         *,
         voice_id: int | None,
     ) -> None:
-        if voice_id is not None and isinstance(self.provider, SelectableSpeechProvider):
-            await self.provider.synthesize_voice(text, destination, voice_id)
-            return
-        await self.provider.synthesize(text, destination)
+        async with self._provider_limit:
+            if voice_id is not None and isinstance(self.provider, SelectableSpeechProvider):
+                await self.provider.synthesize_voice(text, destination, voice_id)
+                return
+            await self.provider.synthesize(text, destination)
 
     def _cache_path(
         self,
@@ -539,7 +549,7 @@ async def _audio_duration_seconds(path: Path) -> float:
 
     executable = shutil.which("ffprobe")
     if executable is None:
-        return 0.0
+        return await asyncio.to_thread(_header_duration_seconds, path)
     process = await asyncio.create_subprocess_exec(
         executable,
         "-v",
@@ -557,10 +567,88 @@ async def _audio_duration_seconds(path: Path) -> float:
     except TimeoutError:
         process.kill()
         await process.wait()
-        return 0.0
+        return await asyncio.to_thread(_header_duration_seconds, path)
     if process.returncode != 0:
-        return 0.0
+        return await asyncio.to_thread(_header_duration_seconds, path)
     try:
-        return max(0.0, float(stdout.decode().strip()))
+        duration = float(stdout.decode().strip())
     except ValueError:
+        duration = 0.0
+    if duration > 0:
+        return duration
+    return await asyncio.to_thread(_header_duration_seconds, path)
+
+
+def _header_duration_seconds(path: Path) -> float:
+    """Read PCM WAV/AIFF headers without depending on ffprobe.
+
+    Returning an invented tiny duration would truncate read-aloud playback. A
+    generated file whose duration cannot be established is therefore rejected
+    before it reaches the audio queue.
+    """
+
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        try:
+            with wave.open(str(path), "rb") as stream:
+                rate = stream.getframerate()
+                if rate > 0:
+                    duration = stream.getnframes() / rate
+                    if duration > 0:
+                        return duration
+        except (EOFError, OSError, wave.Error):
+            pass
+    elif suffix in {".aif", ".aiff", ".aifc"}:
+        duration = _aiff_duration_seconds(path)
+        if duration > 0:
+            return duration
+    raise RuntimeError(f"Could not determine generated speech duration: {path.name}")
+
+
+def _aiff_duration_seconds(path: Path) -> float:
+    """Parse the AIFF COMM chunk, including its 80-bit sample rate."""
+
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(12)
+            if len(header) != 12 or header[:4] != b"FORM" or header[8:12] not in {
+                b"AIFF",
+                b"AIFC",
+            }:
+                return 0.0
+            while True:
+                chunk_header = stream.read(8)
+                if len(chunk_header) != 8:
+                    return 0.0
+                chunk_id, size = struct.unpack(">4sI", chunk_header)
+                data = stream.read(size)
+                if len(data) != size:
+                    return 0.0
+                if size % 2:
+                    stream.read(1)
+                if chunk_id != b"COMM" or len(data) < 18:
+                    continue
+                frame_count = int(struct.unpack(">I", data[2:6])[0])
+                sample_rate = _decode_ieee_extended(data[8:18])
+                if frame_count > 0 and sample_rate > 0:
+                    return float(frame_count / sample_rate)
+                return 0.0
+    except OSError:
         return 0.0
+
+
+def _decode_ieee_extended(value: bytes) -> float:
+    """Decode the positive 80-bit extended float used by AIFF headers."""
+
+    if len(value) != 10:
+        return 0.0
+    sign_exponent, mantissa = (
+        int(part) for part in struct.unpack(">HQ", value)
+    )
+    sign = -1.0 if sign_exponent & 0x8000 else 1.0
+    exponent = sign_exponent & 0x7FFF
+    if exponent == 0 and mantissa == 0:
+        return 0.0
+    if exponent == 0x7FFF:
+        return 0.0
+    return float(sign * mantissa * (2.0 ** (exponent - 16383 - 63)))

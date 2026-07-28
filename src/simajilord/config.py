@@ -59,6 +59,7 @@ class Settings:
     max_pending_music: int
     max_pending_music_per_user: int
     max_concurrent_tts: int
+    max_concurrent_tts_provider_calls: int
     max_concurrent_media: int
     max_concurrent_media_per_guild: int
     max_active_voice_guilds: int
@@ -460,6 +461,11 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             maximum=100,
         ),
         max_concurrent_tts=_positive_int("MAX_CONCURRENT_TTS", 2, maximum=10),
+        max_concurrent_tts_provider_calls=_positive_int(
+            "MAX_CONCURRENT_TTS_PROVIDER_CALLS",
+            2,
+            maximum=10,
+        ),
         max_concurrent_media=max_concurrent_media,
         max_concurrent_media_per_guild=max_concurrent_media_per_guild,
         max_active_voice_guilds=_positive_int("MAX_ACTIVE_VOICE_GUILDS", 8, maximum=100),

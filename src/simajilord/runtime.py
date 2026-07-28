@@ -180,6 +180,7 @@ class SimajilordRuntime:
             output_dir=settings.data_dir / "speech",
             chunk_characters=settings.read_aloud_chunk_characters,
             max_concurrent=settings.max_concurrent_tts,
+            max_provider_calls=settings.max_concurrent_tts_provider_calls,
             metric_hook=record_service_metric,
             voice_presets={
                 "clear": settings.voicevox_preset_clear_id,

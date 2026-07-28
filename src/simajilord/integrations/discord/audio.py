@@ -7,13 +7,41 @@ import logging
 import shlex
 import shutil
 from dataclasses import replace
+from time import monotonic
 
 import discord
 
-from simajilord.core.errors import ProviderError, UserError
-from simajilord.domain.audio import AudioItem
+from simajilord.core.errors import EarlyPlaybackEnd, ProviderError, UserError
+from simajilord.domain.audio import AudioItem, AudioKind
 
 log = logging.getLogger(__name__)
+_SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
+_EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
+
+
+class _PrefetchedAudioSource(discord.AudioSource):
+    """Replay one packet consumed while validating a replacement source."""
+
+    def __init__(self, source: discord.AudioSource, first_packet: bytes) -> None:
+        self._source = source
+        self._first_packet = first_packet
+        self._cleaned = False
+
+    def read(self) -> bytes:
+        if self._first_packet:
+            packet = self._first_packet
+            self._first_packet = b""
+            return packet
+        return self._source.read()
+
+    def is_opus(self) -> bool:
+        return self._source.is_opus()
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        self._source.cleanup()
 
 
 async def verify_ffmpeg_opus() -> None:
@@ -62,6 +90,7 @@ class DiscordAudioOutput:
         self.destination_id: int | None = None
         self._voice: discord.VoiceClient | None = None
         self._source_lock = asyncio.Lock()
+        self._intentional_stop_generation = 0
 
     @property
     def connected(self) -> bool:
@@ -121,6 +150,8 @@ class DiscordAudioOutput:
         source = build_discord_audio_source(item)
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[None] = loop.create_future()
+        started_at = monotonic()
+        stop_generation = self._intentional_stop_generation
 
         def after(error: Exception | None) -> None:
             def finish() -> None:
@@ -138,6 +169,22 @@ class DiscordAudioOutput:
             # directly instead of constructing its native libopus PCM encoder.
             voice.play(source, after=after)
             await completed
+            elapsed = max(0.0, monotonic() - started_at)
+            expected = max(
+                0.0,
+                (item.duration_seconds - item.start_seconds) / max(item.speed, 0.01),
+            )
+            tolerance = max(5.0, expected * 0.1)
+            if (
+                item.kind is AudioKind.MUSIC
+                and expected >= _EARLY_EOF_MINIMUM_EXPECTED_SECONDS
+                and self._intentional_stop_generation == stop_generation
+                and elapsed + tolerance < expected
+            ):
+                raise EarlyPlaybackEnd(
+                    elapsed_seconds=elapsed,
+                    expected_seconds=expected,
+                )
         finally:
             source.cleanup()
 
@@ -208,13 +255,26 @@ class DiscordAudioOutput:
             if voice is None or not voice.is_connected() or not voice.is_playing():
                 raise ProviderError("The Discord music source is not active.")
             replacement = build_discord_audio_source(item)
+            prepared: _PrefetchedAudioSource | None = None
             previous = voice.source
             try:
-                voice.source = replacement
+                first_packet = await asyncio.wait_for(
+                    asyncio.to_thread(replacement.read),
+                    timeout=_SOURCE_PREFLIGHT_TIMEOUT_SECONDS,
+                )
+                if not first_packet:
+                    raise ProviderError(
+                        "The replacement audio source produced no Opus packet."
+                    )
+                prepared = _PrefetchedAudioSource(replacement, first_packet)
+                voice.source = prepared
             except Exception:
-                replacement.cleanup()
+                if prepared is None:
+                    replacement.cleanup()
+                else:
+                    prepared.cleanup()
                 raise
-            if previous is not None and previous is not replacement:
+            if previous is not None and previous is not prepared:
                 previous.cleanup()
 
     def pause(self) -> None:
@@ -230,6 +290,7 @@ class DiscordAudioOutput:
         voice.resume()
 
     def stop(self) -> None:
+        self._intentional_stop_generation += 1
         voice = self._adopt_voice_client()
         if voice is not None and (voice.is_playing() or voice.is_paused()):
             voice.stop()

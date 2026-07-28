@@ -18,12 +18,22 @@ import discord
 
 from simajilord.capabilities.audio import AudioQueueItem, AudioQueueResponse
 from simajilord.domain.audio import AudioKind
+from simajilord.integrations.discord.capabilities import (
+    DiscordServerResponse,
+    DiscordUserResponse,
+)
 from simajilord.integrations.discord.cogs import (
+    HelpView,
     MusicControlsView,
     QuoteComposerView,
     YouTubeLinkCardView,
+    _help_entry_embed,
+    _help_overview_embed,
     music_queue_embed,
+    server_info_embed,
+    user_info_embed,
 )
+from simajilord.integrations.discord.help_catalog import HELP_ENTRIES_BY_TOPIC
 from simajilord.providers.speech import MacOSSayProvider
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.speech import SpeechService
@@ -32,7 +42,7 @@ _MARKDOWN_LINK = re.compile(r"\[([^\]]+)]\((https?://[^)\s]+)\)")
 _BOLD = re.compile(r"\*\*([^*]+)\*\*")
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _CHANNEL = re.compile(r"&lt;#(\d+)&gt;")
-_RELATIVE_TIMESTAMP = re.compile(r"&lt;t:(\d+):R&gt;")
+_TIMESTAMP = re.compile(r"&lt;t:(\d+)(?::([tTdDfFR]))?&gt;")
 _LINK_PLACEHOLDER = "\u0000SIMAJILORD_LINK_{index}\u0000"
 
 
@@ -276,6 +286,26 @@ audio {{ width: 100%; height: 28px; }}
   grid-template-rows: auto;
   overflow: hidden;
   padding: 2px 16px 16px 12px;
+}}
+.embed-grid.has-thumbnail {{
+  grid-template-columns: minmax(0, 1fr) 80px;
+  column-gap: 16px;
+}}
+.embed-grid.has-thumbnail > :not(.embed-thumbnail) {{ grid-column: 1; }}
+.embed-thumbnail {{
+  grid-column: 2;
+  grid-row: 1 / span 4;
+  width: 80px;
+  height: 80px;
+  margin-top: 8px;
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(135deg, hsl(235 85.6% 64.7%), hsl(262 83% 58%));
+  color: white;
+  font-size: 26px;
+  font-weight: 700;
 }}
 .embed-title {{
   min-width: 0;
@@ -703,6 +733,102 @@ def _sample_panels() -> tuple[PreviewPanel, ...]:
             components=serialize_view(youtube_view),
         )
     )
+    panels.extend(
+        (
+            PreviewPanel(
+                name="Help · overview",
+                embed=cast(dict[str, Any], _help_overview_embed().to_dict()),
+                components=serialize_view(HelpView(requester_id=1)),
+            ),
+            PreviewPanel(
+                name="Help · /play",
+                embed=cast(
+                    dict[str, Any],
+                    _help_entry_embed(HELP_ENTRIES_BY_TOPIC["play"]).to_dict(),
+                ),
+                components=serialize_view(HelpView(requester_id=1)),
+            ),
+            PreviewPanel(
+                name="Server info · populated",
+                embed=cast(
+                    dict[str, Any],
+                    server_info_embed(
+                        DiscordServerResponse(
+                            server_id="1415260807494766627",
+                            name="Simajilord Audio Lab",
+                            owner_id="1300000000000000000",
+                            owner_name="Meteo",
+                            member_count=128,
+                            human_count=113,
+                            bot_count=15,
+                            text_channel_count=18,
+                            voice_channel_count=5,
+                            stage_channel_count=1,
+                            forum_channel_count=2,
+                            category_count=7,
+                            role_count=22,
+                            emoji_count=74,
+                            sticker_count=12,
+                            created_at_iso="2025-09-10T09:01:00+00:00",
+                            icon_url="https://cdn.discordapp.com/embed/avatars/0.png",
+                            description=(
+                                "A deliberately long public description used to verify "
+                                "wrapping, thumbnail spacing, and information density."
+                            ),
+                            boost_level=2,
+                            boost_count=17,
+                            preferred_locale="ja",
+                            verification_level="medium",
+                            explicit_content_filter="all_members",
+                            features=(
+                                "COMMUNITY",
+                                "ANIMATED_ICON",
+                                "BANNER",
+                                "MEMBER_VERIFICATION_GATE_ENABLED",
+                            ),
+                        )
+                    ).to_dict(),
+                ),
+                components=(),
+            ),
+            PreviewPanel(
+                name="User info · populated",
+                embed=cast(
+                    dict[str, Any],
+                    user_info_embed(
+                        DiscordUserResponse(
+                            user_id="1300000000000000000",
+                            display_name="Meteo in Simajilord",
+                            username="meteo_in_simajilord",
+                            global_name="Meteo",
+                            nickname="Meteo in Simajilord",
+                            bot=False,
+                            created_at_iso="2024-11-16T14:02:00+00:00",
+                            joined_at_iso="2025-09-10T09:03:00+00:00",
+                            top_role="Administrator",
+                            avatar_url="https://cdn.discordapp.com/embed/avatars/1.png",
+                            role_names=(
+                                "Member",
+                                "Audio tester",
+                                "Developer",
+                                "Administrator",
+                            ),
+                            role_count=4,
+                            status="online",
+                            key_permissions=(
+                                "Administrator",
+                                "Manage Server",
+                                "Manage Channels",
+                            ),
+                            colour_value=0x57F287,
+                        ),
+                        mention="<@1300000000000000000>",
+                    ).to_dict(),
+                ),
+                components=(),
+            ),
+        )
+    )
     return tuple(panels)
 
 
@@ -851,6 +977,13 @@ def _render_panel(panel: PreviewPanel) -> str:
     )
     controls = "\n".join(_render_component(component) for component in panel.components)
     timestamp = html.escape(_discord_timestamp(str(embed.get("timestamp", ""))))
+    thumbnail = embed.get("thumbnail")
+    has_thumbnail = isinstance(thumbnail, dict) and bool(thumbnail.get("url"))
+    thumbnail_markup = (
+        '<div class="embed-thumbnail" aria-label="Embed thumbnail">S</div>'
+        if has_thumbnail
+        else ""
+    )
     return f"""<section class="case" data-case-name="{html.escape(panel.name)}">
   <div class="message">
     <div class="avatar">S</div>
@@ -861,11 +994,12 @@ def _render_panel(panel: PreviewPanel) -> str:
       </div>
       <div class="embed-container">
         <div class="embed" style="--embed-color:{colour}">
-          <div class="embed-grid">
+          <div class="embed-grid{" has-thumbnail" if has_thumbnail else ""}">
         {f'<div class="embed-title">{title}</div>' if title else ''}
         {f'<div class="description">{description}</div>' if description else ''}
         {f'<div class="fields">{field_markup}</div>' if field_markup else ''}
         {f'<div class="timestamp">{timestamp}</div>' if timestamp else ''}
+        {thumbnail_markup}
           </div>
         </div>
       </div>
@@ -913,10 +1047,7 @@ def _discord_markdown(value: str) -> str:
     escaped = _BOLD.sub(r"<strong>\1</strong>", escaped)
     escaped = _INLINE_CODE.sub(r"<code>\1</code>", escaped)
     escaped = _CHANNEL.sub(r'<span class="channel">#voice-\1</span>', escaped)
-    escaped = _RELATIVE_TIMESTAMP.sub(
-        r'<time class="relative-time" data-unix="\1"></time>',
-        escaped,
-    )
+    escaped = _TIMESTAMP.sub(_render_discord_timestamp_tag, escaped)
     for index, (label, url) in enumerate(links):
         anchor = (
             f'<a href="{html.escape(url, quote=True)}">'
@@ -936,6 +1067,23 @@ def _discord_markdown(value: str) -> str:
         else:
             rendered.append(line)
     return "".join(rendered)
+
+
+def _render_discord_timestamp_tag(match: re.Match[str]) -> str:
+    epoch = int(match.group(1))
+    style = match.group(2) or "f"
+    if style == "R":
+        return f'<time class="relative-time" data-unix="{epoch}"></time>'
+    moment = datetime.fromtimestamp(epoch).astimezone()
+    formats = {
+        "t": "%H:%M",
+        "T": "%H:%M:%S",
+        "d": "%Y/%m/%d",
+        "D": "%Y年%m月%d日",
+        "f": "%Y年%m月%d日 %H:%M",
+        "F": "%Y年%m月%d日 %H:%M:%S",
+    }
+    return f"<time>{moment:{formats[style]}}</time>"
 
 
 def _discord_timestamp(value: str) -> str:

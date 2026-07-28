@@ -22,6 +22,17 @@ class ProviderError(RuntimeError):
     """An external or local provider failed."""
 
 
+class EarlyPlaybackEnd(ProviderError):
+    """A duration-known audio stream ended substantially before its expected end."""
+
+    def __init__(self, *, elapsed_seconds: float, expected_seconds: float) -> None:
+        super().__init__(
+            f"Audio ended after {elapsed_seconds:.2f}s; expected {expected_seconds:.2f}s."
+        )
+        self.elapsed_seconds = elapsed_seconds
+        self.expected_seconds = expected_seconds
+
+
 class MediaError(ProviderError):
     """A media operation failed with a stable provider-neutral category."""
 

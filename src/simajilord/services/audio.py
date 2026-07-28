@@ -12,7 +12,7 @@ from contextlib import suppress
 from time import monotonic, time
 from typing import Protocol
 
-from simajilord.core.errors import UserError
+from simajilord.core.errors import EarlyPlaybackEnd, UserError
 from simajilord.domain.audio import (
     AudioItem,
     AudioKind,
@@ -139,6 +139,7 @@ class AudioSession:
         resolver: AudioResolver | None = None,
         autoplay_supplier: AutoplaySupplier | None = None,
         state_hook: StateHook | None = None,
+        metric_hook: ServiceMetricHook | None = None,
     ) -> None:
         self.workspace_id = workspace_id
         self.output = output
@@ -150,6 +151,7 @@ class AudioSession:
         self._resolver = resolver
         self._autoplay_supplier = autoplay_supplier
         self._state_hook = state_hook
+        self._metric_hook = metric_hook
         self._music: deque[AudioItem] = deque()
         self._autoplay: deque[AudioItem] = deque()
         self._speech: deque[AudioItem] = deque()
@@ -175,6 +177,7 @@ class AudioSession:
         self._resume_confirmation_required = False
         self._closed = False
         self._lock = asyncio.Lock()
+        self._transport_lock = asyncio.Lock()
         self._started_at: float | None = None
         self._paused_at: float | None = None
         self._paused_seconds = 0.0
@@ -506,29 +509,31 @@ class AudioSession:
         await self._state_changed()
 
     async def seek(self, position_seconds: float) -> float:
-        current = self._current
-        if current is None or current.kind is not AudioKind.MUSIC:
-            raise UserError("audio.nothing_playing")
-        upper = current.duration_seconds if current.duration_seconds > 0 else position_seconds
-        bounded = max(0.0, min(position_seconds, upper))
-        current.start_seconds = bounded
-        self._restart_requested = True
-        self.output.stop()
-        await self._wait_for_current()
+        async with self._transport_lock:
+            current = self._current
+            if current is None or current.kind is not AudioKind.MUSIC:
+                raise UserError("audio.nothing_playing")
+            upper = current.duration_seconds if current.duration_seconds > 0 else position_seconds
+            bounded = max(0.0, min(position_seconds, upper))
+            current.start_seconds = bounded
+            self._restart_requested = True
+            self.output.stop()
+            await self._wait_for_current()
         return bounded
 
     async def tune(self, speed: float, pitch: float) -> None:
         if not 0.5 <= speed <= 2.0 or not 0.5 <= pitch <= 2.0:
             raise UserError("audio.tune_range_invalid")
-        current = self._current
-        if current is not None and current.kind is AudioKind.MUSIC:
-            current.start_seconds = self._position_seconds()
-            self._restart_requested = True
-        self._speed = speed
-        self._pitch = pitch
-        if self._restart_requested:
-            self.output.stop()
-            await self._wait_for_current()
+        async with self._transport_lock:
+            current = self._current
+            if current is not None and current.kind is AudioKind.MUSIC:
+                current.start_seconds = self._position_seconds()
+                self._restart_requested = True
+            self._speed = speed
+            self._pitch = pitch
+            if self._restart_requested:
+                self.output.stop()
+                await self._wait_for_current()
         await self._state_changed()
 
     async def set_volume(
@@ -545,23 +550,24 @@ class AudioSession:
             raise UserError("audio.volume_range_invalid")
         if speech is not None and not 0.0 <= speech <= 2.0:
             raise UserError("audio.volume_range_invalid")
-        restart_music = (
-            music is not None
-            and self._current is not None
-            and self._current.kind is AudioKind.MUSIC
-        )
-        if restart_music and self._current is not None:
-            self._current.start_seconds = self._position_seconds()
-            self._restart_requested = True
-        if music is not None:
-            self._music_volume = music
+        async with self._transport_lock:
+            restart_music = (
+                music is not None
+                and self._current is not None
+                and self._current.kind is AudioKind.MUSIC
+            )
             if restart_music and self._current is not None:
-                self._current.volume = music
-        if speech is not None:
-            self._speech_volume = speech
-        if restart_music:
-            self.output.stop()
-            await self._wait_for_current()
+                self._current.start_seconds = self._position_seconds()
+                self._restart_requested = True
+            if music is not None:
+                self._music_volume = music
+                if restart_music and self._current is not None:
+                    self._current.volume = music
+            if speech is not None:
+                self._speech_volume = speech
+            if restart_music:
+                self.output.stop()
+                await self._wait_for_current()
         await self._state_changed()
         return self._music_volume, self._speech_volume
 
@@ -607,14 +613,15 @@ class AudioSession:
         return removed
 
     async def skip(self) -> None:
-        if self._current is None:
-            raise UserError("audio.nothing_playing")
-        self._skip_requested = True
-        self.output.stop()
+        async with self._transport_lock:
+            if self._current is None:
+                raise UserError("audio.nothing_playing")
+            self._skip_requested = True
+            self.output.stop()
 
     async def clear(self) -> None:
         autoplay_task: asyncio.Task[None] | None
-        async with self._lock:
+        async with self._transport_lock, self._lock:
             self._discard_requested = True
             self._waiting_actor_ids.clear()
             self._resume_confirmation_required = False
@@ -636,19 +643,23 @@ class AudioSession:
         await self._wait_for_current()
         await self._state_changed()
 
-    def pause(self) -> None:
-        if self._current is None or self.output.paused:
-            raise UserError("audio.nothing_playing")
-        self.output.pause()
-        self._paused_at = monotonic()
+    async def pause(self) -> None:
+        async with self._transport_lock:
+            if self._current is None or self.output.paused:
+                raise UserError("audio.nothing_playing")
+            self.output.pause()
+            self._paused_at = monotonic()
+        await self._state_changed()
 
-    def resume(self) -> None:
-        if not self.output.paused:
-            raise UserError("audio.not_paused")
-        if self._paused_at is not None:
-            self._paused_seconds += monotonic() - self._paused_at
-        self._paused_at = None
-        self.output.resume()
+    async def resume(self) -> None:
+        async with self._transport_lock:
+            if not self.output.paused:
+                raise UserError("audio.not_paused")
+            if self._paused_at is not None:
+                self._paused_seconds += monotonic() - self._paused_at
+            self._paused_at = None
+            self.output.resume()
+        await self._state_changed()
 
     async def disconnect(self) -> None:
         """Explicitly leave and forget the queue."""
@@ -661,15 +672,16 @@ class AudioSession:
     async def suspend(self) -> None:
         """Leave voice and hold the audio route until a listener explicitly resumes it."""
 
-        self._suspended = True
-        self._resume_confirmation_required = True
-        self._suspend_requested = True
-        if self._current is not None:
-            if self._current.kind is AudioKind.MUSIC:
-                self._current.start_seconds = self._position_seconds()
-            self.output.stop()
-            await self._wait_for_current()
-        await self.output.disconnect()
+        async with self._transport_lock:
+            self._suspended = True
+            self._resume_confirmation_required = True
+            self._suspend_requested = True
+            if self._current is not None:
+                if self._current.kind is AudioKind.MUSIC:
+                    self._current.start_seconds = self._position_seconds()
+                self.output.stop()
+                await self._wait_for_current()
+            await self.output.disconnect()
         await self._state_changed()
 
     async def shutdown(self) -> None:
@@ -1194,6 +1206,17 @@ class AudioSession:
                 return playable
             except asyncio.CancelledError:
                 raise
+            except EarlyPlaybackEnd:
+                await self._record_metric(
+                    ServiceOperationMetric(
+                        operation="audio.early_eof_count",
+                        workspace_id=self.workspace_id,
+                        wait_ms=0.0,
+                        duration_ms=0.0,
+                        outcome="detected",
+                    )
+                )
+                raise
             except Exception as exc:
                 last_error = exc
                 log.warning(
@@ -1228,13 +1251,47 @@ class AudioSession:
                         self._wake.set()
                     return
                 speech.volume = self._speech_volume
+                preparation_started = monotonic()
                 try:
-                    await self.output.overlay_speech(
-                        music,
-                        speech,
-                        position_seconds=self._position_seconds(),
+                    if self._must_resolve(music, 1):
+                        resolved = await self._resolve(music.unresolved_copy())
+                        _adopt_resolved_stream(music, resolved)
+                    await self._record_metric(
+                        ServiceOperationMetric(
+                            operation="audio.overlay_prepare_ms",
+                            workspace_id=self.workspace_id,
+                            wait_ms=0.0,
+                            duration_ms=max(
+                                0.0,
+                                (monotonic() - preparation_started) * 1_000,
+                            ),
+                            outcome="succeeded",
+                        )
                     )
+                    try:
+                        async with self._transport_lock:
+                            await self.output.overlay_speech(
+                                music,
+                                speech,
+                                position_seconds=self._position_seconds(),
+                            )
+                    except Exception:
+                        # A signed URL can expire between preparation and FFmpeg
+                        # startup. Resolve exactly once more while the original
+                        # Discord source keeps playing, then retry the hot swap.
+                        resolved = await self._resolve(music.unresolved_copy())
+                        _adopt_resolved_stream(music, resolved)
+                        async with self._transport_lock:
+                            await self.output.overlay_speech(
+                                music,
+                                speech,
+                                position_seconds=self._position_seconds(),
+                            )
                 except asyncio.CancelledError:
+                    async with self._lock:
+                        self._speech.appendleft(speech)
+                        self._wake.set()
+                    speech = None
                     raise
                 except Exception:
                     log.exception(
@@ -1249,7 +1306,9 @@ class AudioSession:
                         self._restart_requested = True
                         self._speech_active = False
                         self._wake.set()
-                    self.output.stop()
+                    speech = None
+                    async with self._transport_lock:
+                        self.output.stop()
                     return
                 else:
                     speech.cleanup()
@@ -1259,9 +1318,20 @@ class AudioSession:
 
             if self._current is music and self.output.connected:
                 music.start_seconds = self._position_seconds()
-                await self.output.update_music(
-                    music,
-                    position_seconds=music.start_seconds,
+                swap_started = monotonic()
+                async with self._transport_lock:
+                    await self.output.update_music(
+                        music,
+                        position_seconds=music.start_seconds,
+                    )
+                await self._record_metric(
+                    ServiceOperationMetric(
+                        operation="audio.source_swap_ms",
+                        workspace_id=self.workspace_id,
+                        wait_ms=0.0,
+                        duration_ms=max(0.0, (monotonic() - swap_started) * 1_000),
+                        outcome="succeeded",
+                    )
                 )
                 self._started_at = monotonic()
                 self._paused_seconds = 0.0
@@ -1346,6 +1416,18 @@ class AudioSession:
         except Exception:
             log.exception("Could not persist audio state for %s", self.workspace_id)
 
+    async def _record_metric(self, metric: ServiceOperationMetric) -> None:
+        if self._metric_hook is None:
+            return
+        try:
+            await self._metric_hook(metric)
+        except Exception:
+            log.exception(
+                "Audio metric hook failed operation=%s workspace=%s",
+                metric.operation,
+                self.workspace_id,
+            )
+
 
 def _move_speech_overlay(source: AudioItem, destination: AudioItem) -> None:
     """Transfer ephemeral overlay ownership without persisting or duplicating it."""
@@ -1354,6 +1436,21 @@ def _move_speech_overlay(source: AudioItem, destination: AudioItem) -> None:
     destination.speech_overlay_owned_file = source.speech_overlay_owned_file
     destination.speech_overlay_duration_seconds = source.speech_overlay_duration_seconds
     source.speech_overlay_owned_file = None
+
+
+def _adopt_resolved_stream(destination: AudioItem, resolved: AudioItem) -> None:
+    """Refresh only transport fields while preserving the worker's item identity."""
+
+    destination.source = resolved.source
+    destination.http_headers = resolved.http_headers
+    destination.resolved_at = resolved.resolved_at
+    destination.duration_seconds = resolved.duration_seconds or destination.duration_seconds
+    destination.page_url = resolved.page_url or destination.page_url
+    destination.resolver_reference = (
+        resolved.resolver_reference or destination.resolver_reference
+    )
+    destination.uploader = resolved.uploader or destination.uploader
+    destination.thumbnail_url = resolved.thumbnail_url or destination.thumbnail_url
 
 
 def _resume_copy(item: AudioItem) -> AudioItem:
@@ -1453,6 +1550,7 @@ class AudioSessionManager:
             resolver=session_resolver,
             autoplay_supplier=session_autoplay_supplier,
             state_hook=self._state_changed,
+            metric_hook=self._metric_hook,
         )
         self._sessions[workspace_id] = session
         return session

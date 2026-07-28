@@ -562,9 +562,9 @@ def build_audio_endpoints(
         speech_volume_percent: int | None = None
         removed_count: int | None = None
         if request.action is AudioAction.PAUSE:
-            session.pause()
+            await session.pause()
         elif request.action is AudioAction.RESUME:
-            session.resume()
+            await session.resume()
         elif request.action is AudioAction.SKIP:
             await session.skip()
         elif request.action is AudioAction.STOP:
