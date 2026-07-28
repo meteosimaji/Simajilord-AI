@@ -23,8 +23,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes ffmpeg
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
+      - name: Secret scan
+        run: uv run python scripts/check_secrets.py
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
       - name: Type check
         run: uv run mypy src/simajilord
       - name: Test
@@ -33,3 +35,79 @@ jobs:
         run: uv run simajilord-audio-doctor
       - name: Compile
         run: uv run python -m compileall -q src
+      - name: Build distributable wheel
+        run: |
+          uv build
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("dist").glob("*.whl"))
+          with ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+          required = {
+              "simajilord/activity/static/index.html",
+              "simajilord/activity/server.py",
+          }
+          missing = required - names
+          if missing:
+              raise SystemExit(f"Wheel is missing: {sorted(missing)}")
+          PY
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+      - name: Build the on-device Translation helper
+        run: swift build --package-path native/macos/TranslationHelper -c release
+      - name: Smoke-test local language detection
+        run: |
+          printf '%s\n' '{"operation":"detect","text":"おはようございます"}' \
+            | native/macos/TranslationHelper/.build/release/TranslationHelper \
+            | python -c 'import json,sys; data=json.load(sys.stdin); assert data["ok"]'
+      - name: macOS integration tests
+        run: uv run pytest -q tests/test_translation.py tests/test_discord_audio.py
+      - name: Offline Discord preview
+        run: uv run simajilord-offline-preview --output-dir .data/ci-preview
+
+  activity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v6.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: activity/package-lock.json
+      - name: Install locked Activity dependencies
+        run: npm ci
+        working-directory: activity
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: activity
+      - name: Audit and build
+        run: |
+          npm audit
+          npm run build
+        working-directory: activity
+      - name: Desktop and mobile visual checks
+        run: npm run test:visual
+        working-directory: activity
+      - uses: actions/upload-artifact@v6.0.0
+        if: always()
+        with:
+          name: activity-visual-checks
+          path: activity/test-results/
+          if-no-files-found: error
