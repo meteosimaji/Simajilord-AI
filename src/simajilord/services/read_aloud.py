@@ -20,6 +20,15 @@ class ReadAloudMode(StrEnum):
     SKIP_DURING_MUSIC = "skip_during_music"
 
 
+class ReadAloudContentMode(StrEnum):
+    """Which durable input classes may enter a guild speech queue."""
+
+    ALL = "all"
+    MESSAGES = "messages"
+    EVENTS = "events"
+    OFF = "off"
+
+
 @dataclass(frozen=True, slots=True)
 class ReadAloudRoute:
     workspace_id: str
@@ -57,6 +66,7 @@ class ReadAloudPolicy:
     announce_join: bool = False
     announce_leave: bool = False
     announce_move: bool = False
+    read_messages: bool = True
     read_author_names: bool = True
     read_replies: bool = True
     read_attachments: bool = True
@@ -320,6 +330,35 @@ class ReadAloudService:
             await asyncio.to_thread(self._save)
             return updated
 
+    async def set_content_mode(
+        self,
+        *,
+        workspace_id: str,
+        mode: ReadAloudContentMode,
+    ) -> ReadAloudPolicy:
+        """Apply one explicit messages/events preset without deleting the route."""
+
+        read_messages = mode in {
+            ReadAloudContentMode.ALL,
+            ReadAloudContentMode.MESSAGES,
+        }
+        read_events = mode in {
+            ReadAloudContentMode.ALL,
+            ReadAloudContentMode.EVENTS,
+        }
+        async with self._lock:
+            current = self.policy(workspace_id)
+            updated = replace(
+                current,
+                read_messages=read_messages,
+                announce_join=read_events,
+                announce_leave=read_events,
+                announce_move=read_events,
+            )
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated
+
     async def set_semantic_options(
         self,
         *,
@@ -364,6 +403,8 @@ class ReadAloudService:
         """Reject excluded authors before text synthesis consumes resources."""
 
         policy = self.policy(workspace_id)
+        if not policy.read_messages:
+            return False
         if policy.ignore_bots and is_bot:
             return False
         if policy.ignore_webhooks and is_webhook:
@@ -525,6 +566,7 @@ class ReadAloudService:
             announce_join=bool(item.get("announce_join", False)),
             announce_leave=bool(item.get("announce_leave", False)),
             announce_move=bool(item.get("announce_move", False)),
+            read_messages=bool(item.get("read_messages", True)),
             read_author_names=bool(item.get("read_author_names", True)),
             read_replies=bool(item.get("read_replies", True)),
             read_attachments=bool(item.get("read_attachments", True)),
@@ -542,6 +584,7 @@ class ReadAloudService:
             "announce_join": policy.announce_join,
             "announce_leave": policy.announce_leave,
             "announce_move": policy.announce_move,
+            "read_messages": policy.read_messages,
             "read_author_names": policy.read_author_names,
             "read_replies": policy.read_replies,
             "read_attachments": policy.read_attachments,

@@ -35,15 +35,42 @@ def test_discord_source_is_preencoded_opus(tmp_path) -> None:
         source.cleanup()
 
 
+def test_discord_source_uses_bounded_fades(tmp_path) -> None:
+    path = tmp_path / "fade.wav"
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        output.writeframes(b"\0" * (48_000 // 10))
+    source = build_discord_audio_source(
+        AudioItem(
+            str(path),
+            "Fade",
+            path.as_uri(),
+            fade_in_seconds=0.4,
+            fade_out_seconds=0.4,
+        )
+    )
+    try:
+        arguments = " ".join(str(value) for value in source._process.args)
+        assert "afade=t=in:st=0:d=0.400" in arguments
+        assert "afade=t=out:st=0:d=0.400" in arguments
+    finally:
+        source.cleanup()
+
+
 def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> None:
     music = tmp_path / "music.wav"
     speech = tmp_path / "speech.wav"
-    for path in (music, speech):
+    for path, frame_count in (
+        (music, 48_000),
+        (speech, 4_800),
+    ):
         with wave.open(str(path), "wb") as output:
             output.setnchannels(2)
             output.setsampwidth(2)
             output.setframerate(48_000)
-            output.writeframes(b"\0" * (48_000 // 10))
+            output.writeframes(b"\0" * (frame_count * 4))
 
     source = build_discord_audio_source(
         AudioItem(
@@ -65,6 +92,11 @@ def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> N
         assert "aresample=48000,volume=1.250000" in arguments
         assert "[mixed]" in arguments
         assert str(speech) in arguments
-        assert source.read()
+        packets = 0
+        while source.read():
+            packets += 1
+        # Discord Opus packets are 20 ms. The old duration=longest graph ended
+        # after the 100 ms speech input; the music source must remain near 1 s.
+        assert packets >= 40
     finally:
         source.cleanup()

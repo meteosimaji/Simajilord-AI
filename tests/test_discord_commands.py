@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, Mock
 
@@ -25,6 +27,8 @@ from simajilord.capabilities.audio import (
     AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
+    AudioQueueItem,
+    AudioQueueResponse,
     AudioSearchItem,
     AudioSearchReason,
     AudioSearchResponse,
@@ -42,6 +46,7 @@ from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
 from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
+from simajilord.domain.audio import LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
     DiscordViewCustomEmojiRequest,
@@ -63,13 +68,16 @@ from simajilord.integrations.discord.capabilities import (
 )
 from simajilord.integrations.discord.cogs import (
     _QUOTE_CONTEXT_MENU_NAME,
+    LoopMixConflictView,
     ModerationCog,
     MusicCog,
     MusicControlsView,
+    MusicDashboardManager,
     MusicSearchChoiceView,
     QuoteCog,
     QuoteComposerView,
     ReadAloudChannelSelect,
+    ReadAloudChannelSelectView,
     ReadAloudCog,
     VoiceLifecycleCog,
     WebCog,
@@ -147,11 +155,14 @@ def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
         AGENT_FILE_GRANT,
         AGENT_IMAGE_GRANT,
     } <= requested
-    assert not {
-        AGENT_MESSAGE_GRANT,
-        AGENT_FILE_GRANT,
-        AGENT_IMAGE_GRANT,
-    } & autonomous
+    assert (
+        not {
+            AGENT_MESSAGE_GRANT,
+            AGENT_FILE_GRANT,
+            AGENT_IMAGE_GRANT,
+        }
+        & autonomous
+    )
 
 
 def test_common_music_actions_have_short_top_level_commands() -> None:
@@ -160,13 +171,25 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
         for command in MusicCog.__cog_app_commands__
         if isinstance(command, app_commands.Command)
     }
-    assert {"play", "queue", "history", "nowplaying"} <= commands.keys()
+    assert {
+        "audio",
+        "play",
+        "queue",
+        "history",
+        "nowplaying",
+        "mix",
+        "freshmix",
+    } <= commands.keys()
+    assert commands["audio"].description == (
+        "Open music controls and read-aloud setup in one panel."
+    )
     assert commands["play"].description == "URLまたは曲名から音楽を再生します。"
     assert commands["queue"].description == "再生中の曲とキューを表示します。"
-    assert commands["history"].description == (
-        "最近再生した曲と、追加したユーザーを表示します。"
-    )
+    assert commands["history"].description == ("最近再生した曲と、追加したユーザーを表示します。")
     assert commands["nowplaying"].description == "現在再生している曲を表示します。"
+    assert commands["freshmix"].description == (
+        "作業内容から履歴を使わず、新しいMixを組み立てます。"
+    )
 
 
 @pytest.mark.asyncio
@@ -429,9 +452,7 @@ async def test_read_aloud_self_mute_is_allowed_but_other_user_requires_admin(
     )
 
     assert own == response
-    assert runtime.registry.invoke.await_args.args[0] == (
-        "speech.read_aloud_exclusion_set"
-    )
+    assert runtime.registry.invoke.await_args.args[0] == ("speech.read_aloud_exclusion_set")
     runtime.registry.invoke.reset_mock()
     with pytest.raises(UserError, match=r"discord\.manage_guild_required"):
         await endpoint_by_name["discord.read_aloud_exclusion_set"].invoke(
@@ -547,9 +568,7 @@ async def test_join_self_service_is_limited_to_current_channel_and_voice(
 
     assert result == response
     runtime.registry.invoke.assert_awaited_once()
-    delegated_name, delegated_request, delegated_context = (
-        runtime.registry.invoke.await_args.args
-    )
+    delegated_name, delegated_request, delegated_context = runtime.registry.invoke.await_args.args
     assert delegated_name == "speech.manage_read_aloud"
     assert delegated_request == request
     assert delegated_context.origin_resource_id == "50"
@@ -679,28 +698,289 @@ def test_advanced_music_group_keeps_compatible_and_power_commands() -> None:
         "volume",
         "move",
         "clear-mine",
+        "mix",
+        "freshmix",
     }
 
 
 @pytest.mark.asyncio
 async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> None:
-    view = MusicControlsView(cast(SimajilordRuntime, object()))
-    buttons = [
-        child for child in view.children if isinstance(child, discord.ui.Button)
-    ]
+    response = AudioQueueResponse(
+        current=AudioQueueItem(
+            title="Track",
+            page_url="https://example.com/track",
+            kind="music",
+            duration_seconds=240,
+            requested_by_name="Requester",
+        ),
+        pending=(),
+        paused=False,
+        loop_mode="none",
+        destination_id="10",
+        auto_leave=True,
+        position_seconds=30,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=False,
+    )
+    view = MusicControlsView(
+        cast(SimajilordRuntime, object()),
+        response=response,
+    )
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
     assert [button.label for button in buttons] == [
-        "VCで開始",
-        "一時停止",
-        "再開",
-        "スキップ",
-        "ループ",
-        "退出",
+        "Pause",
+        "Skip",
+        "Loop: Off",
+        "Mix: Off",
+        "Stop",
+        "Add music",
+        "Read aloud",
+        "Leave",
     ]
-    assert sum(button.row == 0 for button in buttons) == 5
-    assert sum(button.row == 1 for button in buttons) == 1
+    assert sum(button.row == 0 for button in buttons) == 3
+    assert sum(button.row == 1 for button in buttons) == 5
     custom_ids = [button.custom_id for button in buttons]
     assert None not in custom_ids
     assert len(custom_ids) == len(set(custom_ids))
+
+
+@pytest.mark.asyncio
+async def test_music_pause_button_changes_to_resume_without_duplicate_control() -> None:
+    response = AudioQueueResponse(
+        current=AudioQueueItem(
+            title="Track",
+            page_url="https://example.com/track",
+            kind="music",
+            duration_seconds=240,
+            requested_by_name="Requester",
+        ),
+        pending=(),
+        paused=True,
+        loop_mode="none",
+        destination_id="10",
+        auto_leave=True,
+        position_seconds=30,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=False,
+        autoplay_enabled=True,
+    )
+    view = MusicControlsView(
+        cast(SimajilordRuntime, object()),
+        response=response,
+    )
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+    assert [button.label for button in buttons].count("Resume") == 1
+    assert "Pause" not in [button.label for button in buttons]
+    assert "Mix: On" in [button.label for button in buttons]
+
+
+@pytest.mark.asyncio
+async def test_music_resume_confirmation_uses_start_without_pause_resume_controls() -> None:
+    response = AudioQueueResponse(
+        current=None,
+        pending=(
+            AudioQueueItem(
+                title="Held track",
+                page_url="https://example.com/held",
+                kind="music",
+                duration_seconds=240,
+                requested_by_name="Requester",
+            ),
+        ),
+        paused=False,
+        loop_mode="none",
+        destination_id="10",
+        auto_leave=True,
+        position_seconds=30,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=False,
+        resume_confirmation_required=True,
+    )
+    view = MusicControlsView(
+        cast(SimajilordRuntime, object()),
+        response=response,
+    )
+    labels = [
+        child.label for child in view.children if isinstance(child, discord.ui.Button)
+    ]
+    assert labels == [
+        "Start",
+        "Loop: Off",
+        "Mix: Off",
+        "Stop",
+        "Add music",
+        "Read aloud",
+        "Leave",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_reposts_silently_then_deletes_old_panel() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    first = Mock(spec=discord.Message)
+    first.id = 101
+    first.delete = AsyncMock()
+    second = Mock(spec=discord.Message)
+    second.id = 102
+    second.delete = AsyncMock()
+    channel.send = AsyncMock(side_effect=(first, second))
+    bot.get_channel.return_value = channel
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    await manager._repost(session)
+    first_kwargs = channel.send.await_args_list[0].kwargs
+    assert first_kwargs["silent"] is True
+    allowed_mentions = first_kwargs["allowed_mentions"]
+    assert allowed_mentions.everyone is False
+    assert allowed_mentions.users is False
+    assert allowed_mentions.roles is False
+
+    session.snapshot.return_value = QueueSnapshot(
+        current=None,
+        pending=(),
+        history=(),
+        paused=False,
+        speech_active=False,
+        loop=LoopMode.TRACK,
+        destination_id="55",
+    )
+    await manager._repost(session)
+    second_kwargs = channel.send.await_args_list[1].kwargs
+    assert second_kwargs["silent"] is True
+    first.delete.assert_awaited_once_with()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_replaces_persisted_panel_after_restart(
+    tmp_path: Path,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings.data_dir = tmp_path
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    old = Mock(spec=discord.Message)
+    old.id = 201
+    old.delete = AsyncMock()
+    new = Mock(spec=discord.Message)
+    new.id = 202
+    new.delete = AsyncMock()
+    channel.send = AsyncMock(side_effect=(old, new))
+    channel.fetch_message = AsyncMock(return_value=old)
+    bot.get_channel.return_value = channel
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    first_manager = MusicDashboardManager(bot, runtime)
+    first_manager.bind(1, 2)
+    await first_manager._repost(session)
+    await first_manager.close()
+
+    second_manager = MusicDashboardManager(bot, runtime)
+    second_manager.bind(1, 2)
+    await second_manager._repost(session)
+
+    channel.fetch_message.assert_awaited_once_with(201)
+    old.delete.assert_awaited_once_with()
+    assert channel.send.await_args_list[1].kwargs["silent"] is True
+    state = json.loads((tmp_path / "discord_music_dashboards.json").read_text(encoding="utf-8"))
+    assert state["messages"]["1"] == {"channel_id": 2, "message_id": 202}
+    await second_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_removes_empty_panel_after_explicit_leave() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    bot = Mock(spec=commands.Bot)
+    panel = Mock(spec=discord.Message)
+    panel.id = 301
+    panel.delete = AsyncMock()
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    manager._messages["1"] = panel
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id=None,
+        )
+    )
+
+    await manager._repost(session)
+
+    panel.delete.assert_awaited_once_with()
+    assert "1" not in manager._messages
+    await manager.close()
+
+
+def test_loop_mix_conflict_view_offers_one_click_switch() -> None:
+    mix_view = LoopMixConflictView(
+        cast(SimajilordRuntime, object()),
+        None,
+        requester_id=7,
+    )
+    loop_view = LoopMixConflictView(
+        cast(SimajilordRuntime, object()),
+        None,
+        requester_id=7,
+        loop_mode=LoopMode.TRACK,
+    )
+
+    assert [
+        child.label
+        for child in mix_view.children
+        if isinstance(child, discord.ui.Button)
+    ] == ["Switch to Mix", "Keep current mode"]
+    assert [
+        child.label
+        for child in loop_view.children
+        if isinstance(child, discord.ui.Button)
+    ] == ["Switch to Loop", "Keep current mode"]
 
 
 def test_ambiguous_results_are_direct_one_click_buttons() -> None:
@@ -726,9 +1006,7 @@ def test_ambiguous_results_are_direct_one_click_buttons() -> None:
         requester_id=1,
         requester_name="Listener",
     )
-    buttons = [
-        child for child in view.children if isinstance(child, discord.ui.Button)
-    ]
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
     assert [button.label for button in buttons] == [
         "1 · Artist 1",
         "2 · Artist 2",
@@ -741,17 +1019,16 @@ def test_ambiguous_results_are_direct_one_click_buttons() -> None:
 
 
 def test_agent_conversation_key_is_shared_per_channel() -> None:
-    assert discord_conversation_id(guild_id=1, channel_id=2) == (
-        "discord:guild:1:channel:2"
+    assert discord_conversation_id(guild_id=1, channel_id=2) == ("discord:guild:1:channel:2")
+    assert discord_conversation_id(guild_id=None, channel_id=2) == ("discord:direct:channel:2")
+    assert (
+        discord_conversation_id(
+            guild_id=1,
+            channel_id=2,
+            grants=frozenset({AGENT_WEB_GRANT}),
+        )
+        == "discord:guild:1:channel:2:profile:web"
     )
-    assert discord_conversation_id(guild_id=None, channel_id=2) == (
-        "discord:direct:channel:2"
-    )
-    assert discord_conversation_id(
-        guild_id=1,
-        channel_id=2,
-        grants=frozenset({AGENT_WEB_GRANT}),
-    ) == "discord:guild:1:channel:2:profile:web"
 
 
 def test_web_commands_are_short_direct_paths() -> None:
@@ -780,12 +1057,13 @@ def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
 
 
 def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> None:
-    selector = ReadAloudChannelSelect(
+    view = ReadAloudChannelSelectView(
         cast(SimajilordRuntime, object()),
         requester_id=7,
         destination_id=55,
         default_values=(),
     )
+    selector = view.selector
 
     assert selector.custom_id == "simajilord:readaloud:channels"
     assert selector.min_values == 1
@@ -793,10 +1071,16 @@ def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> No
     assert discord.ChannelType.text in selector.channel_types
     assert discord.ChannelType.voice in selector.channel_types
     assert discord.ChannelType.public_thread in selector.channel_types
+    assert any(
+        isinstance(item, discord.ui.Button)
+        and item.label == "Start"
+        and item.style is discord.ButtonStyle.success
+        for item in view.children
+    )
 
 
 @pytest.mark.asyncio
-async def test_join_selection_connects_voice_before_reporting_ready() -> None:
+async def test_join_selection_is_staged_until_start_is_pressed() -> None:
     configured = ReadAloudResponse(
         action=ReadAloudAction.ADD_SOURCES.value,
         enabled=True,
@@ -830,6 +1114,13 @@ async def test_join_selection_connects_voice_before_reporting_ready() -> None:
 
     await selector.callback(interaction)
 
+    runtime.registry.invoke.assert_not_awaited()
+    interaction.response.defer.assert_awaited_once()
+    assert selector.selected_channel_ids == ("50", "51")
+
+    interaction.response.defer.reset_mock()
+    await selector.commit(interaction)
+
     assert [call.args[0] for call in runtime.registry.invoke.await_args_list] == [
         "discord.manage_read_aloud",
         "discord.connect_voice",
@@ -837,9 +1128,9 @@ async def test_join_selection_connects_voice_before_reporting_ready() -> None:
     interaction.response.defer.assert_awaited_once()
     interaction.edit_original_response.assert_awaited_once()
     embed = interaction.edit_original_response.await_args.kwargs["embed"]
-    assert embed.title == "読み上げを開始しました"
+    assert embed.title == "Read aloud is ready"
     assert any(
-        field.name == "接続" and field.value == "準備完了"
+        field.name == "Connection" and field.value == "Ready"
         for field in embed.fields
     )
 
@@ -911,6 +1202,7 @@ async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
     session = Mock()
     session.waiting_for_voice = False
     session.has_music = False
+    session.resume_confirmation_required = False
     session.destination_id = None
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
@@ -941,6 +1233,7 @@ async def test_startup_connects_read_aloud_when_listener_is_already_present() ->
     session = Mock()
     session.output.connected = False
     session.has_music = False
+    session.resume_confirmation_required = False
     session.destination_id = None
     runtime.audio.get_or_create.return_value = session
     runtime.audio.connect = AsyncMock()
@@ -959,6 +1252,67 @@ async def test_startup_connects_read_aloud_when_listener_is_already_present() ->
 
     runtime.audio.get_or_create.assert_called_once()
     runtime.audio.connect.assert_awaited_once_with("1", "55")
+
+
+@pytest.mark.asyncio
+async def test_listener_join_reposts_panel_without_restarting_held_music() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud.get.return_value = None
+    session = Mock()
+    session.waiting_for_voice = False
+    session.has_music = True
+    session.resume_confirmation_required = True
+    session.destination_id = "55"
+    session.output.connected = False
+    runtime.audio.find.return_value = session
+    runtime.audio.connect = AsyncMock()
+    member = Mock(spec=discord.Member)
+    member.bot = False
+    member.id = 7
+    member.guild.id = 1
+    before = Mock(spec=discord.VoiceState)
+    before.channel = None
+    after = Mock(spec=discord.VoiceState)
+    after.channel = Mock(spec=discord.VoiceChannel)
+    after.channel.id = 55
+    dashboard = Mock(spec=MusicDashboardManager)
+    cog = VoiceLifecycleCog(cast(commands.Bot, object()), runtime)
+    cog.dashboard = dashboard
+
+    await cog.on_voice_state_update(member, before, after)
+
+    dashboard.bind.assert_called_once_with(1, 55)
+    runtime.audio.connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_read_aloud_does_not_restart_held_music() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    route = Mock()
+    route.audio_destination_id = "55"
+    runtime.read_aloud.get.return_value = route
+    session = Mock()
+    session.output.connected = False
+    session.has_music = True
+    session.resume_confirmation_required = True
+    session.destination_id = "55"
+    runtime.audio.get_or_create.return_value = session
+    runtime.audio.connect = AsyncMock()
+    listener = Mock(spec=discord.Member)
+    listener.bot = False
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.members = [listener]
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = channel
+    bot = Mock(spec=SimajilordDiscordBot)
+    bot.runtime = runtime
+    bot.guilds = [guild]
+
+    await SimajilordDiscordBot._prepare_read_aloud_presence(bot)
+
+    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.connect.assert_not_awaited()
 
 
 def test_hive_analysis_is_one_direct_attachment_command() -> None:
@@ -985,9 +1339,7 @@ def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
             links=(),
         ),
     )
-    buttons = [
-        child for child in view.children if isinstance(child, discord.ui.Button)
-    ]
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
     assert [button.label for button in buttons] == ["続きを読む"]
     assert buttons[0].custom_id == "simajilord:web:fetch:continue"
     assert view.next_offset == 3_500
@@ -1023,9 +1375,7 @@ def test_discord_message_link_parser_accepts_only_one_bare_safe_link() -> None:
 
 def test_custom_emoji_metadata_is_deduplicated_and_keeps_animation() -> None:
     content = (
-        "a <:wave:111111111111111111> "
-        "<a:dance:222222222222222222> "
-        "<:wave_again:111111111111111111>"
+        "a <:wave:111111111111111111> <a:dance:222222222222222222> <:wave_again:111111111111111111>"
     )
     records = _custom_emoji_records(content)
     assert [(item.index, item.emoji_id, item.name) for item in records] == [
@@ -1039,10 +1389,7 @@ def test_custom_emoji_metadata_is_deduplicated_and_keeps_animation() -> None:
 
 
 def test_custom_emoji_metadata_is_bounded_to_25_unique_images() -> None:
-    content = " ".join(
-        f"<:e{index:02d}:{100000000000000000 + index}>"
-        for index in range(30)
-    )
+    content = " ".join(f"<:e{index:02d}:{100000000000000000 + index}>" for index in range(30))
     records = _custom_emoji_records(content)
     assert len(records) == 25
     assert records[0].index == 0
@@ -1050,10 +1397,7 @@ def test_custom_emoji_metadata_is_bounded_to_25_unique_images() -> None:
 
 
 def test_animated_media_can_return_full_gif_or_an_exact_frame() -> None:
-    frames = tuple(
-        Image.new("RGBA", (4, 4), colour)
-        for colour in ("red", "green", "blue")
-    )
+    frames = tuple(Image.new("RGBA", (4, 4), colour) for colour in ("red", "green", "blue"))
     source = io.BytesIO()
     frames[0].save(
         source,
@@ -1128,9 +1472,7 @@ async def test_custom_emoji_tool_fetches_only_selected_message_emoji(
     client.http.get_from_cdn = AsyncMock(return_value=image.getvalue())
     guild = Mock(spec=discord.Guild)
     message = Mock(spec=discord.Message)
-    message.content = (
-        "<:first:111111111111111111> <:second:222222222222222222>"
-    )
+    message.content = "<:first:111111111111111111> <:second:222222222222222222>"
     message.stickers = []
     channel = Mock(spec=discord.TextChannel)
     monkeypatch.setattr(
@@ -1172,8 +1514,7 @@ async def test_custom_emoji_tool_fetches_only_selected_message_emoji(
     assert response.frame_count == 1
     assert response.image_data_url.startswith("data:image/png;base64,")
     client.http.get_from_cdn.assert_awaited_once_with(
-        "https://cdn.discordapp.com/emojis/222222222222222222.png"
-        "?size=128&quality=lossless"
+        "https://cdn.discordapp.com/emojis/222222222222222222.png?size=128&quality=lossless"
     )
     fetch.assert_awaited_once()
 
@@ -1284,11 +1625,7 @@ def test_agent_response_chunks_prefer_readable_boundaries() -> None:
 
 
 def test_agent_can_request_separate_discord_messages_without_another_turn() -> None:
-    content = (
-        "こんにちは\n"
-        "<simajilord:message-break>\n"
-        "こんばんは"
-    )
+    content = "こんにちは\n<simajilord:message-break>\nこんばんは"
     assert _agent_message_groups(content) == ("こんにちは", "こんばんは")
     assert _agent_message_groups("first\n\nsecond") == ("first\n\nsecond",)
 
@@ -1326,9 +1663,7 @@ def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
     allowed.permissions_for.side_effect = lambda member: (
         readable if member in {bot_member, actor} else denied
     )
-    hidden.permissions_for.side_effect = lambda member: (
-        readable if member is bot_member else denied
-    )
+    hidden.permissions_for.side_effect = lambda member: readable if member is bot_member else denied
 
     assert agent_readable_channel_ids(
         guild,
@@ -1393,12 +1728,15 @@ def test_voice_chat_requires_message_history_and_connect_permission() -> None:
         read_message_history=True,
         connect=False,
     )
-    assert agent_readable_channel_ids(
-        guild,
-        actor,
-        trusted_guild=False,
-        trigger_channel_id=30,
-    ) == ()
+    assert (
+        agent_readable_channel_ids(
+            guild,
+            actor,
+            trusted_guild=False,
+            trigger_channel_id=30,
+        )
+        == ()
+    )
 
 
 def test_expanded_message_post_to_voice_chat_requires_connect() -> None:

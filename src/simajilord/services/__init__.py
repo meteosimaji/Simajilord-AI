@@ -3,6 +3,7 @@
 from .audio import AudioOutput, AudioSession, AudioSessionManager
 from .audio_state import AudioStateStore, StoredAudioItem, StoredAudioSession
 from .files import AgentFileSandbox
+from .fresh_mix import FreshMixService
 from .image import ImageGenerationService, ImageGenerationStore
 from .media import MediaService
 from .moderation import ModerationService, ModerationStatus, ModerationStore
@@ -13,7 +14,12 @@ from .quote import (
     QuoteRenderResult,
     QuoteStickerAsset,
 )
-from .read_aloud import ReadAloudMode, ReadAloudRoute, ReadAloudService
+from .read_aloud import (
+    ReadAloudContentMode,
+    ReadAloudMode,
+    ReadAloudRoute,
+    ReadAloudService,
+)
 from .speech import SpeechProvider, SpeechService
 from .web import WebService
 
@@ -23,6 +29,7 @@ __all__ = [
     "AudioSession",
     "AudioSessionManager",
     "AudioStateStore",
+    "FreshMixService",
     "ImageGenerationService",
     "ImageGenerationStore",
     "MediaService",
@@ -34,6 +41,7 @@ __all__ = [
     "QuoteRenderRequest",
     "QuoteRenderResult",
     "QuoteStickerAsset",
+    "ReadAloudContentMode",
     "ReadAloudMode",
     "ReadAloudRoute",
     "ReadAloudService",

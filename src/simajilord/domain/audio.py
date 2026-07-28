@@ -22,6 +22,13 @@ class LoopMode(StrEnum):
     QUEUE = "queue"
 
 
+class AudioQueueLane(StrEnum):
+    """Whether a track was explicitly requested or supplied automatically."""
+
+    REQUEST = "request"
+    AUTOPLAY = "autoplay"
+
+
 @dataclass(slots=True)
 class AudioItem:
     """Resolved audio accepted by any compatible output adapter."""
@@ -44,6 +51,10 @@ class AudioItem:
     speech_overlay_volume: float = 1.0
     requested_by_id: str | None = None
     requested_by_name: str | None = None
+    queue_lane: AudioQueueLane = AudioQueueLane.REQUEST
+    request_source: str | None = None
+    request_id: str | None = None
+    requested_at_epoch: int | None = None
     played_at_epoch: int | None = None
     uploader: str | None = None
     thumbnail_url: str | None = None
@@ -51,6 +62,8 @@ class AudioItem:
     speech_overlay_owned_file: Path | None = None
     speech_overlay_duration_seconds: float = 0.0
     resume_after_overlay: bool = False
+    fade_in_seconds: float = 0.0
+    fade_out_seconds: float = 0.0
 
     def clone_for_loop(self) -> AudioItem:
         """Return a loopable item without duplicating temporary-file ownership."""
@@ -58,6 +71,11 @@ class AudioItem:
         return replace(
             self,
             owned_file=None,
+            start_seconds=0.0,
+            retry_after=0.0,
+            played_at_epoch=None,
+            fade_in_seconds=0.0,
+            fade_out_seconds=0.0,
             speech_overlay_source=None,
             speech_overlay_owned_file=None,
             speech_overlay_duration_seconds=0.0,
@@ -115,6 +133,7 @@ class QueueSnapshot:
     pending: tuple[AudioItem, ...]
     history: tuple[AudioItem, ...]
     paused: bool
+    speech_active: bool
     loop: LoopMode
     destination_id: str | None = None
     waiting_actor_ids: tuple[str, ...] = ()
@@ -124,3 +143,7 @@ class QueueSnapshot:
     pitch: float = 1.0
     music_volume: float = 1.0
     speech_volume: float = 1.0
+    autoplay_enabled: bool = False
+    autoplay_next: AudioItem | None = None
+    mix_seed_references: tuple[str, ...] = ()
+    resume_confirmation_required: bool = False

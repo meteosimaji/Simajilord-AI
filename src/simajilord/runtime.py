@@ -39,6 +39,7 @@ from simajilord.capabilities import (
 from simajilord.capabilities.status import build_status_endpoint
 from simajilord.config import AgentFeatureAccess, Settings
 from simajilord.core.capabilities import CapabilityRegistry
+from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import YtDlpProvider
 from simajilord.observability import EventJournal
 from simajilord.providers.image import IdeogramMlxProvider
@@ -49,6 +50,7 @@ from simajilord.services import (
     AgentFileSandbox,
     AudioSessionManager,
     AudioStateStore,
+    FreshMixService,
     ImageGenerationService,
     ImageGenerationStore,
     MediaService,
@@ -69,6 +71,7 @@ class SimajilordRuntime:
     registry: CapabilityRegistry
     media: MediaService
     audio: AudioSessionManager
+    fresh_mix: FreshMixService
     speech: SpeechService
     read_aloud: ReadAloudService
     web: WebService
@@ -89,12 +92,36 @@ class SimajilordRuntime:
                 download_timeout_seconds=settings.download_timeout_seconds,
             )
         )
+
+        async def supply_autoplay(
+            seeds: tuple[str, ...],
+            limit: int,
+        ) -> tuple[AudioItem, ...]:
+            candidates = await media.mix_audio(seeds, limit=limit)
+            requested_at = int(datetime.now(UTC).timestamp())
+            return tuple(
+                AudioItem(
+                    source="",
+                    title=candidate.title,
+                    page_url=candidate.reference,
+                    duration_seconds=candidate.duration_seconds,
+                    resolver_reference=candidate.reference,
+                    queue_lane=AudioQueueLane.AUTOPLAY,
+                    request_source="youtube_mix",
+                    requested_at_epoch=requested_at,
+                    uploader=candidate.uploader,
+                    thumbnail_url=candidate.thumbnail_url,
+                )
+                for candidate in candidates
+            )
+
         audio = AudioSessionManager(
             max_active=settings.max_active_voice_guilds,
             max_pending_speech=settings.max_pending_speech,
             max_pending_music=settings.max_pending_music,
             max_pending_music_per_actor=settings.max_pending_music_per_user,
             resolver=media.resolve_audio,
+            autoplay_supplier=supply_autoplay,
             state_store=AudioStateStore(settings.data_dir / "audio_sessions.json"),
         )
         speech_provider = (
@@ -115,6 +142,7 @@ class SimajilordRuntime:
             max_concurrent=settings.max_concurrent_tts,
             file_suffix=".wav" if settings.tts_provider == "voicevox" else ".aiff",
         )
+        fresh_mix = FreshMixService(media)
         read_aloud = ReadAloudService(settings.data_dir / "read_aloud.json")
         web = WebService(
             search_provider=SearxngSearchProvider(
@@ -191,7 +219,11 @@ class SimajilordRuntime:
                 "discord.read_aloud_exclusion_set",
                 "discord.read_aloud_announcements_set",
                 "discord.read_aloud_semantics_set",
+                "discord.read_aloud_content_mode_set",
                 "discord.play_audio",
+                "discord.plan_fresh_mix",
+                "discord.revise_fresh_mix",
+                "discord.enqueue_fresh_mix",
                 *AGENT_AUDIO_CONTROL_CAPABILITIES,
                 "discord.read_messages",
                 "discord.send_message",
@@ -206,6 +238,9 @@ class SimajilordRuntime:
                 "audio.queue": AGENT_AUDIO_GRANT,
                 "audio.search": AGENT_AUDIO_GRANT,
                 "discord.play_audio": AGENT_AUDIO_GRANT,
+                "discord.plan_fresh_mix": AGENT_AUDIO_GRANT,
+                "discord.revise_fresh_mix": AGENT_AUDIO_GRANT,
+                "discord.enqueue_fresh_mix": AGENT_AUDIO_GRANT,
                 **{
                     name: AGENT_AUDIO_GRANT
                     for name in AGENT_AUDIO_CONTROL_CAPABILITIES
@@ -221,6 +256,7 @@ class SimajilordRuntime:
                 "discord.read_aloud_exclusion_set": AGENT_AUDIO_GRANT,
                 "discord.read_aloud_announcements_set": AGENT_AUDIO_GRANT,
                 "discord.read_aloud_semantics_set": AGENT_AUDIO_GRANT,
+                "discord.read_aloud_content_mode_set": AGENT_AUDIO_GRANT,
                 "discord.speak": AGENT_AUDIO_GRANT,
                 "discord.send_message": AGENT_MESSAGE_GRANT,
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
@@ -338,6 +374,7 @@ class SimajilordRuntime:
             registry=registry,
             media=media,
             audio=audio,
+            fresh_mix=fresh_mix,
             speech=speech,
             read_aloud=read_aloud,
             web=web,
@@ -357,7 +394,7 @@ class SimajilordRuntime:
                 started_monotonic=started_monotonic,
             ),
             *build_utility_endpoints(),
-            *build_audio_endpoints(media, audio),
+            *build_audio_endpoints(media, audio, fresh_mix),
             build_download_endpoint(media),
             build_read_aloud_endpoint(read_aloud),
             *build_read_aloud_route_endpoints(read_aloud),

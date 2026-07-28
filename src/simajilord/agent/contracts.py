@@ -30,11 +30,15 @@ AGENT_AUDIO_CONTROL_CAPABILITIES = (
     "discord.seek_audio",
     "discord.tune_audio",
     "discord.set_audio_volume",
+    "discord.set_audio_mix",
     "discord.move_audio",
     "discord.clear_my_audio",
 )
 AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.play_audio",
+    "discord.plan_fresh_mix",
+    "discord.revise_fresh_mix",
+    "discord.enqueue_fresh_mix",
     *AGENT_AUDIO_CONTROL_CAPABILITIES,
     "discord.read_aloud_add_sources",
     "discord.read_aloud_remove_source",
@@ -44,6 +48,7 @@ AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.read_aloud_exclusion_set",
     "discord.read_aloud_announcements_set",
     "discord.read_aloud_semantics_set",
+    "discord.read_aloud_content_mode_set",
     "discord.speak",
 )
 

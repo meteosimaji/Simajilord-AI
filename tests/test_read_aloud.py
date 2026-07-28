@@ -5,6 +5,7 @@ import json
 import pytest
 
 from simajilord.services.read_aloud import (
+    ReadAloudContentMode,
     ReadAloudDictionaryEntry,
     ReadAloudMode,
     ReadAloudPolicy,
@@ -357,3 +358,32 @@ def test_default_policy_is_not_stored_or_shared(tmp_path) -> None:
     assert service.policy("one") == ReadAloudPolicy("one")
     assert service.policy("two") == ReadAloudPolicy("two")
     assert not service.state_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_content_modes_are_durable_and_guild_scoped(
+    tmp_path,
+) -> None:
+    state_file = tmp_path / "read-aloud.json"
+    service = ReadAloudService(state_file)
+
+    events = await service.set_content_mode(
+        workspace_id="one",
+        mode=ReadAloudContentMode.EVENTS,
+    )
+    assert events.read_messages is False
+    assert events.announce_join is True
+    assert events.announce_leave is True
+    assert events.announce_move is True
+    assert not service.allows_message(workspace_id="one", author_id="7")
+    assert service.allows_message(workspace_id="two", author_id="7")
+
+    restored = ReadAloudService(state_file)
+    assert restored.policy("one").read_messages is False
+    off = await restored.set_content_mode(
+        workspace_id="one",
+        mode=ReadAloudContentMode.OFF,
+    )
+    assert off.announce_join is False
+    assert off.announce_leave is False
+    assert off.announce_move is False

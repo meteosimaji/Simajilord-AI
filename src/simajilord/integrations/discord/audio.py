@@ -6,7 +6,7 @@ import asyncio
 import logging
 import shlex
 import shutil
-from time import monotonic
+from dataclasses import replace
 
 import discord
 
@@ -61,6 +61,7 @@ class DiscordAudioOutput:
         self.guild_id = guild_id
         self.destination_id: int | None = None
         self._voice: discord.VoiceClient | None = None
+        self._source_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -136,34 +137,85 @@ class DiscordAudioOutput:
             # FFmpegOpusAudio reports is_opus=True, so discord.py sends the packets
             # directly instead of constructing its native libopus PCM encoder.
             voice.play(source, after=after)
-            started_at = monotonic()
-            item.cleanup_speech_overlay()
-            overlay_duration = item.speech_overlay_duration_seconds
-            if item.speech_overlay_source is None or overlay_duration <= 0:
-                await completed
-            else:
-                overlay_finished = asyncio.create_task(
-                    asyncio.sleep(overlay_duration + 0.35),
-                    name="simajilord-speech-overlay",
-                )
-                try:
-                    done, _ = await asyncio.wait(
-                        (completed, overlay_finished),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if overlay_finished in done and not completed.done():
-                        elapsed = max(0.0, monotonic() - started_at)
-                        voice.stop()
-                        await completed
-                        item.start_seconds += elapsed * item.speed
-                        item.resume_after_overlay = True
-                    else:
-                        await completed
-                finally:
-                    overlay_finished.cancel()
-                    await asyncio.gather(overlay_finished, return_exceptions=True)
+            await completed
         finally:
             source.cleanup()
+
+    async def overlay_speech(
+        self,
+        music: AudioItem,
+        speech: AudioItem,
+        *,
+        position_seconds: float,
+    ) -> None:
+        """Hot-swap the active source without completing the Discord player."""
+
+        overlay = replace(
+            music,
+            start_seconds=position_seconds,
+            speech_overlay_source=speech.source,
+            speech_overlay_owned_file=None,
+            speech_overlay_duration_seconds=speech.duration_seconds,
+            speech_overlay_volume=speech.volume,
+            resume_after_overlay=False,
+        )
+        await self._swap_music_source(overlay)
+        await asyncio.sleep(max(0.0, speech.duration_seconds) + 0.15)
+
+    async def update_music(
+        self,
+        music: AudioItem,
+        *,
+        position_seconds: float,
+    ) -> None:
+        """Apply a new gain/tuning position while retaining the current stream URL."""
+
+        updated = replace(
+            music,
+            start_seconds=position_seconds,
+            speech_overlay_source=None,
+            speech_overlay_owned_file=None,
+            speech_overlay_duration_seconds=0.0,
+            resume_after_overlay=False,
+        )
+        await self._swap_music_source(updated)
+
+    async def fade_out(
+        self,
+        music: AudioItem,
+        *,
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        """Replace the active source briefly with a bounded fade-out."""
+
+        faded = replace(
+            music,
+            start_seconds=position_seconds,
+            fade_in_seconds=0.0,
+            fade_out_seconds=max(0.0, duration_seconds),
+            speech_overlay_source=None,
+            speech_overlay_owned_file=None,
+            speech_overlay_duration_seconds=0.0,
+            resume_after_overlay=False,
+        )
+        await self._swap_music_source(faded)
+        await asyncio.sleep(max(0.0, duration_seconds))
+
+    async def _swap_music_source(self, item: AudioItem) -> None:
+        async with self._source_lock:
+            voice = self._adopt_voice_client()
+            if voice is None or not voice.is_connected() or not voice.is_playing():
+                raise ProviderError("The Discord music source is not active.")
+            replacement = build_discord_audio_source(item)
+            previous = voice.source
+            try:
+                voice.source = replacement
+            except Exception:
+                replacement.cleanup()
+                raise
+            if previous is not None and previous is not replacement:
+                previous.cleanup()
 
     def pause(self) -> None:
         voice = self._adopt_voice_client()
@@ -228,6 +280,10 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
         )
     tempo = item.speed / item.pitch
     filters.extend(_atempo_filters(tempo))
+    if item.fade_in_seconds > 0:
+        filters.append(f"afade=t=in:st=0:d={item.fade_in_seconds:.3f}")
+    if item.fade_out_seconds > 0:
+        filters.append(f"afade=t=out:st=0:d={item.fade_out_seconds:.3f}")
     options: list[str]
     if item.speech_overlay_source is not None:
         music_filter = ",".join(filters) if filters else "anull"
@@ -235,12 +291,15 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
         if item.speech_overlay_volume != 1.0:
             speech_filter += f",volume={item.speech_overlay_volume:.6f}"
         filter_graph = (
-            f"[0:a]{speech_filter},asplit=2[speech_sc][speech_mix];"
+            f"[0:a]{speech_filter},asplit=2[speech_sc_raw][speech_mix_raw];"
+            "[speech_sc_raw]apad[speech_sc];"
+            "[speech_mix_raw]apad[speech_mix];"
             f"[1:a]{music_filter}[music];"
             "[music][speech_sc]sidechaincompress="
             "threshold=0.015:ratio=8:attack=20:release=350[ducked];"
             "[ducked][speech_mix]amix="
-            "inputs=2:duration=longest:dropout_transition=0:normalize=0[mixed]"
+            "inputs=2:duration=shortest:dropout_transition=0:normalize=0[sum];"
+            "[sum]alimiter=limit=0.95:attack=5:release=50[mixed]"
         )
         options = ["-filter_complex", filter_graph, "-map", "[mixed]", "-vn"]
     else:

@@ -6,10 +6,10 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioItem
@@ -127,6 +127,88 @@ class YtDlpProvider:
                 return await asyncio.to_thread(extract)
         except TimeoutError as exc:
             raise MediaError("timeout", "Media search timed out.") from exc
+
+    async def mix_audio(
+        self,
+        seed_references: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
+        """Combine bounded YouTube Mix candidate pools without resolving streams."""
+
+        if not 1 <= len(seed_references) <= 8:
+            raise ValueError("seed_references must contain between 1 and 8 items")
+        if not 1 <= limit <= 50:
+            raise ValueError("limit must be between 1 and 50")
+        seed_ids = tuple(
+            dict.fromkeys(
+                video_id
+                for reference in seed_references
+                if (video_id := _youtube_video_id(reference)) is not None
+            )
+        )
+        if not seed_ids:
+            raise MediaError(
+                "unsupported",
+                "A YouTube track is required to start an automatic mix.",
+            )
+        per_seed_limit = min(30, max(10, (limit * 2 + len(seed_ids) - 1) // len(seed_ids)))
+
+        async def extract_seed(video_id: str) -> tuple[MediaCandidate, ...]:
+            def extract() -> tuple[MediaCandidate, ...]:
+                options: dict[str, Any] = {
+                    "allowed_extractors": _ALLOWED_EXTRACTORS,
+                    "extract_flat": "in_playlist",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "skip_download": True,
+                    "playlistend": per_seed_limit,
+                    "plugin_dirs": [],
+                }
+                if self.cookie_file is not None:
+                    options["cookiefile"] = str(self.cookie_file)
+                mix_url = (
+                    "https://www.youtube.com/watch?"
+                    + urlencode({"v": video_id, "list": f"RD{video_id}"})
+                )
+                try:
+                    with yt_dlp.YoutubeDL(options) as downloader:
+                        info = downloader.extract_info(mix_url, download=False)
+                    return _search_candidates(info, limit=per_seed_limit)
+                except yt_dlp.utils.DownloadError as exc:
+                    raise classify_yt_dlp_error(str(exc)) from exc
+
+            return await asyncio.to_thread(extract)
+
+        try:
+            async with asyncio.timeout(60):
+                pools = await asyncio.gather(*(extract_seed(seed) for seed in seed_ids))
+        except TimeoutError as exc:
+            raise MediaError("timeout", "YouTube Mix lookup timed out.") from exc
+
+        excluded = {
+            f"https://www.youtube.com/watch?v={video_id}" for video_id in seed_ids
+        }
+        merged: list[MediaCandidate] = []
+        seen = set(excluded)
+        iterators: list[Iterator[MediaCandidate]] = [iter(pool) for pool in pools]
+        while iterators and len(merged) < limit:
+            remaining: list[Iterator[MediaCandidate]] = []
+            for iterator in iterators:
+                candidate = next(iterator, None)
+                while candidate is not None and candidate.reference in seen:
+                    candidate = next(iterator, None)
+                if candidate is None:
+                    continue
+                seen.add(candidate.reference)
+                merged.append(candidate)
+                remaining.append(iterator)
+                if len(merged) >= limit:
+                    break
+            iterators = remaining
+        if not merged:
+            raise MediaError("unavailable", "YouTube Mix returned no new tracks.")
+        return tuple(merged)
 
     async def download(
         self,
@@ -272,6 +354,31 @@ def _candidate_reference(info: Mapping[str, Any]) -> str | None:
         return validate_media_url(reference)
     except UserError:
         return None
+
+
+def _youtube_video_id(reference: str) -> str | None:
+    """Return a conservative video id from a canonical YouTube page URL."""
+
+    try:
+        parsed = urlsplit(validate_media_url(reference))
+    except (UserError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host == "youtu.be":
+        candidate = parsed.path.strip("/").split("/", 1)[0]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        if parsed.path != "/watch":
+            return None
+        candidate = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        return None
+    if not candidate or len(candidate) > 32:
+        return None
+    return (
+        candidate
+        if all(character.isalnum() or character in "_-" for character in candidate)
+        else None
+    )
 
 
 def _optional_text(value: object) -> str | None:

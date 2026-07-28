@@ -46,6 +46,7 @@ from simajilord.integrations.discord.presenter import (
     expanded_message_view,
     quote_message_view,
 )
+from simajilord.services.read_aloud import ReadAloudMode, ReadAloudRoute
 
 
 def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
@@ -255,24 +256,76 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
             waiting_for_voice=False,
         )
     )
-    assert embed.title == "音楽"
+    assert embed.title == "Audio · Now playing"
     assert embed.timestamp is not None
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
-    upcoming = next(
-        field.value for field in embed.fields if field.name.startswith("次に再生")
-    )
-    assert "0:45 / 3:00" in fields["再生位置"]
+    upcoming = next(field.value for field in embed.fields if field.name.startswith("Up Next"))
+    assert "0:45 / 3:00" in (embed.description or "")
+    assert "ends <t:" in (embed.description or "")
     assert "Next" in upcoming
-    assert fields["状態"] == "再生中"
-    assert fields["ループ"] == "キュー全体"
-    assert fields["自動退出"] == "オン"
-    assert fields["再生先"] == "<#123>"
-    assert "速度 1.25倍" in fields["再生調整"]
-    assert fields["追加した人"] == "Alice"
-    assert fields["投稿者"] == "Current Artist"
+    assert "Queue **1**" in fields["Playback"]
+    assert "Loop **Queue**" in fields["Playback"]
+    assert "Mix **Off**" in fields["Playback"]
+    assert "Music **100%**" in fields["Levels"]
+    assert "Read aloud **100%**" in fields["Levels"]
+    assert "Select **Read aloud**" in fields["Read aloud"]
+    assert "requested by Alice" in (embed.description or "")
+    assert "Current Artist" in (embed.description or "")
+    assert "Speed 1.25x" in fields["Tuning"]
     assert "Bob" in upcoming
     assert embed.thumbnail.url == "https://img.example.com/current.jpg"
+
+
+def test_music_embed_explains_explicit_resume_after_voice_reentry() -> None:
+    embed = music_queue_embed(
+        AudioQueueResponse(
+            current=None,
+            pending=(),
+            paused=False,
+            loop_mode="none",
+            destination_id="123",
+            auto_leave=True,
+            position_seconds=0,
+            speed=1.0,
+            pitch=1.0,
+            waiting_for_voice=False,
+            resume_confirmation_required=True,
+        )
+    )
+
+    assert embed.title == "Audio"
+    assert "Ready to resume" in (embed.description or "")
+    assert "Start" in (embed.description or "")
+
+
+def test_audio_embed_shows_active_read_aloud_route_in_the_shared_panel() -> None:
+    embed = music_queue_embed(
+        AudioQueueResponse(
+            current=None,
+            pending=(),
+            paused=False,
+            loop_mode="none",
+            destination_id="123",
+            auto_leave=True,
+            position_seconds=0,
+            speed=1.0,
+            pitch=1.0,
+            waiting_for_voice=False,
+        ),
+        read_aloud_route=ReadAloudRoute(
+            workspace_id="1",
+            text_channel_id="10",
+            additional_text_channel_ids=("11",),
+            audio_destination_id="123",
+            mode=ReadAloudMode.QUEUE,
+        ),
+    )
+
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Read aloud"] == (
+        "On · **2 channels** → <#123>\nMode **Queue**"
+    )
 
 
 def test_waiting_play_embed_explains_that_no_reentry_is_needed() -> None:
@@ -290,11 +343,11 @@ def test_waiting_play_embed_explains_that_no_reentry_is_needed() -> None:
         )
     )
     fields = {field.name: field.value for field in embed.fields}
-    assert embed.title == "キューに追加しました"
-    assert "自動で再生" in fields["状態"]
-    assert fields["追加した人"] == "Alice"
-    assert fields["再生先"] == "追加したユーザーがVCに入ると接続"
-    assert fields["投稿者"] == "Artist"
+    assert embed.title == "Added to queue"
+    assert "Playback starts" in fields["Status"]
+    assert fields["Requested by"] == "Alice"
+    assert fields["Voice channel"] == "Connects when the requester joins"
+    assert fields["Source"] == "Artist"
     assert embed.thumbnail.url == "https://img.example.com/queued.jpg"
 
 

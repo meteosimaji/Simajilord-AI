@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import shutil
 import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, AudioKind
@@ -17,6 +22,124 @@ class SpeechProvider(Protocol):
     async def synthesize(self, text: str, destination: Path) -> None: ...
 
     async def close(self) -> None: ...
+
+
+class SpeechSegmentKind(StrEnum):
+    """Semantic role used for pacing, observability, and safe caching."""
+
+    AUTHOR = "author"
+    BODY = "body"
+    ATTACHMENT = "attachment"
+    EVENT = "event"
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechSegment:
+    kind: SpeechSegmentKind
+    text: str
+    cache_key: str | None = None
+
+
+_T = TypeVar("_T")
+
+
+@dataclass(slots=True)
+class _SpeechWork:
+    operation: Callable[[], Awaitable[object]]
+    future: asyncio.Future[object]
+
+
+class FairSpeechScheduler:
+    """Bounded guild round-robin scheduler for a shared TTS provider."""
+
+    def __init__(self, max_concurrent: int) -> None:
+        if max_concurrent < 1:
+            raise ValueError("TTS concurrency must be positive.")
+        self.max_concurrent = max_concurrent
+        self._condition = asyncio.Condition()
+        self._queues: dict[str, deque[_SpeechWork]] = {}
+        self._workspaces: deque[str] = deque()
+        self._workers: list[asyncio.Task[None]] = []
+        self._closed = False
+
+    async def run(
+        self,
+        workspace_id: str,
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        if not workspace_id.strip():
+            raise ValueError("Speech workspace ID is required.")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[object] = loop.create_future()
+
+        async def erased_operation() -> object:
+            return await operation()
+
+        async with self._condition:
+            if self._closed:
+                raise RuntimeError("Speech scheduler is closed.")
+            queue = self._queues.get(workspace_id)
+            if queue is None:
+                queue = deque()
+                self._queues[workspace_id] = queue
+                self._workspaces.append(workspace_id)
+            queue.append(_SpeechWork(erased_operation, future))
+            self._ensure_workers()
+            self._condition.notify()
+        return await future  # type: ignore[return-value]
+
+    async def close(self) -> None:
+        async with self._condition:
+            self._closed = True
+            workers = tuple(self._workers)
+            self._condition.notify_all()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        async with self._condition:
+            for queue in self._queues.values():
+                for work in queue:
+                    if not work.future.done():
+                        work.future.cancel()
+            self._queues.clear()
+            self._workspaces.clear()
+            self._workers.clear()
+
+    def _ensure_workers(self) -> None:
+        while len(self._workers) < self.max_concurrent:
+            worker = asyncio.create_task(
+                self._worker(),
+                name=f"simajilord-tts-worker-{len(self._workers) + 1}",
+            )
+            self._workers.append(worker)
+
+    async def _worker(self) -> None:
+        while True:
+            async with self._condition:
+                await self._condition.wait_for(lambda: self._closed or bool(self._workspaces))
+                if self._closed:
+                    return
+                workspace_id = self._workspaces.popleft()
+                queue = self._queues[workspace_id]
+                work = queue.popleft()
+                if queue:
+                    self._workspaces.append(workspace_id)
+                else:
+                    del self._queues[workspace_id]
+            if work.future.cancelled():
+                continue
+            try:
+                result = await work.operation()
+            except asyncio.CancelledError:
+                if not work.future.done():
+                    work.future.cancel()
+                raise
+            except Exception as exc:
+                if not work.future.done():
+                    work.future.set_exception(exc)
+            else:
+                if not work.future.done():
+                    work.future.set_result(result)
 
 
 class SpeechService:
@@ -37,25 +160,82 @@ class SpeechService:
         self.output_dir = output_dir
         self.chunk_characters = chunk_characters
         self.file_suffix = file_suffix
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._scheduler = FairSpeechScheduler(max_concurrent)
+        self._cache_dir = output_dir / "cache"
+        self._cache_locks: dict[str, asyncio.Lock] = {}
         self.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-    async def synthesize(self, text: str, *, title: str = "Read aloud") -> AudioItem:
-        normalized = normalize_speech(text)
-        if not normalized:
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        title: str = "Read aloud",
+        workspace_id: str = "default",
+    ) -> AudioItem:
+        return await self.synthesize_segments(
+            (SpeechSegment(SpeechSegmentKind.BODY, text),),
+            title=title,
+            workspace_id=workspace_id,
+        )
+
+    async def synthesize_segments(
+        self,
+        segments: tuple[SpeechSegment, ...],
+        *,
+        title: str = "Read aloud",
+        workspace_id: str,
+    ) -> AudioItem:
+        normalized_segments: list[SpeechSegment] = []
+        for segment in segments:
+            normalized_text = normalize_speech(segment.text)
+            if normalized_text:
+                normalized_segments.append(
+                    SpeechSegment(
+                        kind=segment.kind,
+                        text=normalized_text,
+                        cache_key=segment.cache_key,
+                    )
+                )
+        prepared = tuple(normalized_segments)
+        if not prepared:
             raise UserError("speech.no_readable_text")
 
         destination = self.output_dir / f"speech-{uuid.uuid4().hex}{self.file_suffix}"
-        chunks = speech_chunks(normalized, self.chunk_characters)
-        async with self._semaphore:
-            try:
-                if len(chunks) == 1:
-                    await self.provider.synthesize(chunks[0], destination)
-                else:
-                    await self._synthesize_chunks(chunks, destination)
-            except Exception:
-                destination.unlink(missing_ok=True)
-                raise
+        parts: list[Path] = []
+        manifest = destination.with_suffix(".concat.txt")
+        try:
+            for segment_index, segment in enumerate(prepared, start=1):
+                chunks = speech_chunks(segment.text, self.chunk_characters)
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    part = destination.with_name(
+                        f"{destination.stem}-part-{segment_index:03d}-"
+                        f"{chunk_index:03d}{self.file_suffix}"
+                    )
+                    await self._synthesize_part(
+                        segment,
+                        chunk=chunk,
+                        destination=part,
+                        workspace_id=workspace_id,
+                        cacheable=len(chunks) == 1,
+                    )
+                    parts.append(part)
+            if len(parts) == 1:
+                parts[0].replace(destination)
+                parts.clear()
+            else:
+                await _concatenate_audio(
+                    parts,
+                    manifest=manifest,
+                    destination=destination,
+                )
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            manifest.unlink(missing_ok=True)
+            for part in parts:
+                part.unlink(missing_ok=True)
         duration_seconds = await _audio_duration_seconds(destination)
         return AudioItem(
             source=str(destination),
@@ -67,37 +247,77 @@ class SpeechService:
         )
 
     async def close(self) -> None:
+        await self._scheduler.close()
         await self.provider.close()
 
-    async def _synthesize_chunks(
+    async def _synthesize_part(
         self,
-        chunks: tuple[str, ...],
+        segment: SpeechSegment,
+        *,
+        chunk: str,
         destination: Path,
+        workspace_id: str,
+        cacheable: bool,
     ) -> None:
-        parts: list[Path] = []
-        manifest = destination.with_suffix(".concat.txt")
-        try:
-            for index, chunk in enumerate(chunks, start=1):
-                part = destination.with_name(
-                    f"{destination.stem}-part-{index:04d}{self.file_suffix}"
+        cache_path = (
+            self._cache_path(segment, chunk)
+            if cacheable and segment.cache_key is not None
+            else None
+        )
+        if cache_path is not None:
+            lock = self._cache_locks.setdefault(cache_path.name, asyncio.Lock())
+            async with lock:
+                if not cache_path.is_file():
+                    temporary = cache_path.with_name(
+                        f".{cache_path.stem}.{uuid.uuid4().hex}{cache_path.suffix}"
+                    )
+                    try:
+                        await self._scheduler.run(
+                            workspace_id,
+                            lambda: self.provider.synthesize(chunk, temporary),
+                        )
+                        temporary.chmod(0o600)
+                        temporary.replace(cache_path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                await asyncio.to_thread(shutil.copyfile, cache_path, destination)
+                destination.chmod(0o600)
+            return
+        await self._scheduler.run(
+            workspace_id,
+            lambda: self.provider.synthesize(chunk, destination),
+        )
+
+    def _cache_path(self, segment: SpeechSegment, chunk: str) -> Path:
+        identity = str(
+            getattr(
+                self.provider,
+                "cache_identity",
+                type(self.provider).__qualname__,
+            )
+        )
+        digest = hashlib.sha256(
+            "\0".join(
+                (
+                    identity,
+                    segment.kind.value,
+                    segment.cache_key or "",
+                    chunk,
                 )
-                await self.provider.synthesize(chunk, part)
-                parts.append(part)
-            await _concatenate_audio(parts, manifest=manifest, destination=destination)
-        finally:
-            manifest.unlink(missing_ok=True)
-            for part in parts:
-                part.unlink(missing_ok=True)
+            ).encode()
+        ).hexdigest()
+        return self._cache_dir / f"{digest}{self.file_suffix}"
 
 
 def normalize_speech(text: str) -> str:
-    """Produce short, predictable speech without reading raw URLs."""
+    """Produce predictable speech without erasing meaningful line boundaries."""
 
     value = re.sub(r"https?://\S+", " link ", text)
     value = re.sub(r"<@!?\d+>", " mention ", value)
     value = re.sub(r"<#\d+>", " channel ", value)
     value = re.sub(r"<a?:[^:>]+:\d+>", " emoji ", value)
-    return " ".join(value.split()).strip()
+    lines = (" ".join(line.split()).strip() for line in value.splitlines())
+    return "\n".join(line for line in lines if line)
 
 
 def speech_chunks(text: str, maximum: int) -> tuple[str, ...]:
@@ -105,6 +325,13 @@ def speech_chunks(text: str, maximum: int) -> tuple[str, ...]:
 
     if maximum < 1:
         raise ValueError("Speech chunk size must be positive.")
+    paragraphs = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if len(paragraphs) > 1:
+        paragraph_chunks: list[str] = []
+        for paragraph in paragraphs:
+            paragraph_chunks.extend(speech_chunks(paragraph, maximum))
+        return tuple(paragraph_chunks)
+
     remaining = text.strip()
     chunks: list[str] = []
     while len(remaining) > maximum:

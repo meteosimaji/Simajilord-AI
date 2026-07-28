@@ -154,6 +154,12 @@ class SimajilordDiscordBot(commands.Bot):
             guild = self.get_guild(int(session.workspace_id))
             if guild is None:
                 continue
+            if session.resume_confirmation_required:
+                log.info(
+                    "Audio queue %s restored awaiting explicit listener resume",
+                    session.workspace_id,
+                )
+                continue
             if session.waiting_for_voice:
                 waiting_channel = next(
                     (
@@ -229,6 +235,12 @@ class SimajilordDiscordBot(commands.Bot):
                 create_output,
             )
             if session.output.connected:
+                continue
+            if session.has_music and session.resume_confirmation_required:
+                log.info(
+                    "Read-aloud route %s remains in standby until held music is resumed",
+                    workspace_id,
+                )
                 continue
             if (
                 session.has_music

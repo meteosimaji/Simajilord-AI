@@ -1,6 +1,6 @@
 """Transport-independent domain models."""
 
-from .audio import AudioItem, AudioKind, LoopMode, QueueSnapshot
+from .audio import AudioItem, AudioKind, AudioQueueLane, LoopMode, QueueSnapshot
 from .media import DownloadArtifact, DownloadFormat, MediaReference
 from .moderation import (
     SyntheticMediaAnalysis,
@@ -12,6 +12,7 @@ from .moderation import (
 __all__ = [
     "AudioItem",
     "AudioKind",
+    "AudioQueueLane",
     "DownloadArtifact",
     "DownloadFormat",
     "LoopMode",

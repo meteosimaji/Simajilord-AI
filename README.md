@@ -133,6 +133,7 @@ existing local file with mode `0600`. The platform never extracts cookies from a
 ## Commands
 
 - `/ping`, `/uptime`, `/about`, `/capabilities`
+- `/audio` opens the shared music and read-aloud control panel
 - `/play`, `/queue`, `/nowplaying`, `/history` for the shortest everyday paths
 - `/music play`, `/music queue`, `/music history`, `/music pause`, `/music resume`
 - `/music skip`, `/music stop`, `/music leave`, `/music loop`

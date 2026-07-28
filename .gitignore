@@ -41,6 +41,7 @@ artifacts/
 
 # Local-only research and planning notes
 notes/
+.codex/
 
 # Local media/session data
 cookies.txt

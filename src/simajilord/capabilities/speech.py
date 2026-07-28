@@ -13,13 +13,14 @@ from simajilord.core import (
 )
 from simajilord.core.errors import UserError
 from simajilord.services.audio import AudioSessionManager
-from simajilord.services.speech import SpeechService
+from simajilord.services.speech import SpeechSegment, SpeechService
 
 
 @dataclass(frozen=True, slots=True)
 class SpeechSpeakRequest:
-    text: str
+    text: str = ""
     title: str | None = None
+    segments: tuple[SpeechSegment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +43,19 @@ def build_speech_endpoint(
         if context.workspace_id is None:
             raise UserError("workspace.required")
         session = sessions.require(context.workspace_id)
-        item = await speech.synthesize(
-            request.text,
-            title=(request.title or "Spoken message").strip() or "Spoken message",
-        )
+        title = (request.title or "Spoken message").strip() or "Spoken message"
+        if request.segments:
+            item = await speech.synthesize_segments(
+                request.segments,
+                title=title,
+                workspace_id=context.workspace_id,
+            )
+        else:
+            item = await speech.synthesize(
+                request.text,
+                title=title,
+                workspace_id=context.workspace_id,
+            )
         item.requested_by_id = context.actor_id
         if not session.output.connected:
             await session.wait_for_listener(context.actor_id)

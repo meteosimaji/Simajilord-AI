@@ -67,6 +67,10 @@ class VoicevoxSpeechProvider:
         self._process: asyncio.subprocess.Process | None = None
         self._start_lock = asyncio.Lock()
 
+    @property
+    def cache_identity(self) -> str:
+        return f"voicevox:{self.base_url}:speaker={self.speaker_id}"
+
     async def synthesize(self, text: str, destination: Path) -> None:
         await self._ensure_ready()
         query = await self._audio_query(text)

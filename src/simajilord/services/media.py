@@ -19,6 +19,13 @@ class MediaProvider(Protocol):
         limit: int,
     ) -> tuple[MediaCandidate, ...]: ...
 
+    async def mix_audio(
+        self,
+        seed_references: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]: ...
+
     async def download(
         self,
         url: str,
@@ -43,6 +50,14 @@ class MediaService:
         limit: int,
     ) -> tuple[MediaCandidate, ...]:
         return await self.provider.search_audio(query, limit=limit)
+
+    async def mix_audio(
+        self,
+        seed_references: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> tuple[MediaCandidate, ...]:
+        return await self.provider.mix_audio(seed_references, limit=limit)
 
     async def download(
         self,

@@ -18,6 +18,10 @@ class MacOSSayProvider:
         self.voice = voice
         self.timeout_seconds = timeout_seconds
 
+    @property
+    def cache_identity(self) -> str:
+        return f"macos-say:voice={self.voice}"
+
     async def synthesize(self, text: str, destination: Path) -> None:
         executable = self.executable
         if executable is None:

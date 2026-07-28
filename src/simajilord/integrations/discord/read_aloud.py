@@ -13,6 +13,7 @@ from typing import Any
 import discord
 
 from simajilord.services.read_aloud import ReadAloudService
+from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
 _CUSTOM_EMOJI = re.compile(r"<a?:([^:>]+):\d+>")
 _USER_MENTION = re.compile(r"<@!?(\d+)>")
@@ -25,8 +26,12 @@ _AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
 
 @dataclass(frozen=True, slots=True)
 class ReadAloudMessageText:
-    text: str
+    segments: tuple[SpeechSegment, ...]
     title: str
+
+    @property
+    def text(self) -> str:
+        return "。".join(segment.text for segment in self.segments)
 
 
 class ReadAloudMessageFormatter:
@@ -51,29 +56,51 @@ class ReadAloudMessageFormatter:
         workspace_id = str(guild.id)
         policy = self.service.policy(workspace_id)
         author_name = _display_name(message.author)
-        parts: list[str] = []
+        segments: list[SpeechSegment] = []
 
         if policy.read_author_names and self._should_read_author(message):
-            parts.append(f"{author_name}さん")
+            segments.append(
+                SpeechSegment(
+                    SpeechSegmentKind.AUTHOR,
+                    f"{author_name}さん",
+                    cache_key=f"author:{message.author.id}:{author_name}",
+                )
+            )
 
         if policy.read_replies:
             reply_author = await _reply_author_name(message)
             if reply_author is not None:
-                parts.append(f"{reply_author}さんへの返信")
+                segments.append(
+                    SpeechSegment(
+                        SpeechSegmentKind.BODY,
+                        f"{reply_author}さんへの返信",
+                    )
+                )
 
         content = _resolve_discord_markup(message, message.content.strip())
         if content:
-            parts.append(content)
+            segments.append(SpeechSegment(SpeechSegmentKind.BODY, content))
 
         if policy.read_attachments:
-            parts.extend(_attachment_descriptions(message.attachments))
-            parts.extend(_sticker_descriptions(message.stickers))
+            segments.extend(
+                SpeechSegment(SpeechSegmentKind.ATTACHMENT, description)
+                for description in (
+                    *_attachment_descriptions(message.attachments),
+                    *_sticker_descriptions(message.stickers),
+                )
+            )
 
-        if not parts:
+        if not segments:
             return None
-        text = self.service.apply_dictionary(workspace_id, "。".join(parts))
         return ReadAloudMessageText(
-            text=text,
+            segments=tuple(
+                SpeechSegment(
+                    segment.kind,
+                    self.service.apply_dictionary(workspace_id, segment.text),
+                    segment.cache_key,
+                )
+                for segment in segments
+            ),
             title=f"{author_name}さんのメッセージ",
         )
 
@@ -136,7 +163,8 @@ def _resolve_discord_markup(message: discord.Message, content: str) -> str:
     )
     value = value.replace("@everyone", "全員へのメンション")
     value = value.replace("@here", "オンラインの皆さんへのメンション")
-    return " ".join(value.split())
+    lines = (" ".join(line.split()).strip() for line in value.splitlines())
+    return "\n".join(line for line in lines if line)
 
 
 async def _reply_author_name(message: discord.Message) -> str | None:

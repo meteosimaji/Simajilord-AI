@@ -67,12 +67,11 @@ async def test_public_url_dns_boundary_rejects_mixed_private_answers(
             self,
             host: str,
             port: int,
-            *,
-            type: int,
+            **options: int,
         ) -> list[tuple[int, int, int, str, tuple[str, int]]]:
             assert host == "media.example.org"
             assert port == 443
-            assert type
+            assert options["type"]
             return [
                 (2, 1, 6, "", ("203.0.113.10", 443)),
                 (2, 1, 6, "", ("10.0.0.4", 443)),
@@ -137,6 +136,60 @@ async def test_provider_search_returns_bounded_transport_neutral_candidates(
     assert results[0].reference == "https://www.youtube.com/watch?v=first"
     assert results[0].uploader == "Artist"
     assert captured_options["allowed_extractors"] == ["default", "-generic"]
+
+
+@pytest.mark.asyncio
+async def test_provider_combines_multiple_youtube_mix_seeds_without_stream_resolution(
+    monkeypatch,
+) -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, object]) -> None:
+            self.options = options
+
+        def __enter__(self) -> FakeYoutubeDL:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def extract_info(self, reference: str, *, download: bool) -> dict[str, object]:
+            captured.append((reference, self.options))
+            assert download is False
+            seed = "seed-a" if "RDseed-a" in reference else "seed-b"
+            other = "seed-b" if seed == "seed-a" else "seed-a"
+            return {
+                "entries": [
+                    {"id": seed, "title": f"Seed {seed}"},
+                    {"id": f"{seed}-one", "title": f"{seed} one"},
+                    {"id": "shared", "title": "Shared candidate"},
+                    {"id": f"{other}-one", "title": f"{other} one"},
+                ]
+            }
+
+    monkeypatch.setattr(
+        "simajilord.media.providers.yt_dlp.yt_dlp.YoutubeDL",
+        FakeYoutubeDL,
+    )
+    provider = YtDlpProvider(cookie_file=None, download_timeout_seconds=30)
+    results = await provider.mix_audio(
+        (
+            "https://www.youtube.com/watch?v=seed-a",
+            "https://youtu.be/seed-b",
+        ),
+        limit=5,
+    )
+
+    assert [item.reference for item in results] == [
+        "https://www.youtube.com/watch?v=seed-a-one",
+        "https://www.youtube.com/watch?v=seed-b-one",
+        "https://www.youtube.com/watch?v=shared",
+    ]
+    assert len(captured) == 2
+    assert all(options["extract_flat"] == "in_playlist" for _, options in captured)
+    assert all(options["skip_download"] is True for _, options in captured)
+    assert all("format" not in options for _, options in captured)
 
 
 @pytest.mark.parametrize(

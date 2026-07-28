@@ -19,7 +19,14 @@ from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.services.audio import AudioSessionManager
 from simajilord.services.audio_state import AudioStateStore
-from simajilord.services.speech import SpeechService, normalize_speech, speech_chunks
+from simajilord.services.speech import (
+    FairSpeechScheduler,
+    SpeechSegment,
+    SpeechSegmentKind,
+    SpeechService,
+    normalize_speech,
+    speech_chunks,
+)
 
 
 class WaveSpeechProvider:
@@ -66,6 +73,32 @@ async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> No
             del item
             await release.wait()
 
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, speech, position_seconds
+
+        async def update_music(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, position_seconds
+
+        async def fade_out(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+            duration_seconds: float,
+        ) -> None:
+            del music, position_seconds, duration_seconds
+
         def pause(self) -> None:
             self.paused = True
 
@@ -105,7 +138,7 @@ async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> No
 
     assert isinstance(response, SpeechSpeakResponse)
     assert response.title == "Greeting"
-    assert response.playback_state == "queued"
+    assert response.playback_state == "playing"
     assert response.duration_seconds == pytest.approx(0.1, abs=0.02)
     release.set()
     await sessions.close()
@@ -126,6 +159,96 @@ def test_speech_normalization_replaces_discord_markup_and_urls() -> None:
     )
 
     assert normalized == "See link mention channel emoji emoji"
+
+
+def test_speech_normalization_and_chunks_keep_newlines_as_strong_boundaries() -> None:
+    normalized = normalize_speech("投稿者\n一行目  です\n\n二行目です")
+
+    assert normalized == "投稿者\n一行目 です\n二行目です"
+    assert speech_chunks(normalized, 100) == (
+        "投稿者",
+        "一行目 です",
+        "二行目です",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fair_speech_scheduler_round_robins_waiting_guilds() -> None:
+    scheduler = FairSpeechScheduler(1)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    order: list[str] = []
+
+    async def operation(label: str, *, block: bool = False) -> str:
+        order.append(label)
+        if block:
+            first_started.set()
+            await release_first.wait()
+        return label
+
+    first = asyncio.create_task(scheduler.run("guild-a", lambda: operation("a1", block=True)))
+    await first_started.wait()
+    a2 = asyncio.create_task(scheduler.run("guild-a", lambda: operation("a2")))
+    a3 = asyncio.create_task(scheduler.run("guild-a", lambda: operation("a3")))
+    b1 = asyncio.create_task(scheduler.run("guild-b", lambda: operation("b1")))
+    await asyncio.sleep(0)
+    release_first.set()
+    assert await asyncio.gather(first, a2, a3, b1) == ["a1", "a2", "a3", "b1"]
+    assert order == ["a1", "a2", "b1", "a3"]
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_author_segment_cache_is_reused_but_outputs_are_owned(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+
+    class RecordingWaveProvider:
+        cache_identity = "recording:speaker=1"
+
+        async def synthesize(self, text: str, destination: Path) -> None:
+            assert destination.suffix == ".wav"
+            calls.append(text)
+            with wave.open(str(destination), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(48_000)
+                output.writeframes(b"\0" * 9_600)
+
+        async def close(self) -> None:
+            pass
+
+    service = SpeechService(
+        RecordingWaveProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        file_suffix=".wav",
+    )
+    segment = SpeechSegment(
+        SpeechSegmentKind.AUTHOR,
+        "めておさん",
+        cache_key="author:1:めてお",
+    )
+
+    first = await service.synthesize_segments(
+        (segment,),
+        workspace_id="guild-one",
+    )
+    second = await service.synthesize_segments(
+        (segment,),
+        workspace_id="guild-two",
+    )
+
+    assert calls == ["めておさん"]
+    assert first.owned_file != second.owned_file
+    assert first.owned_file is not None and first.owned_file.is_file()
+    assert second.owned_file is not None and second.owned_file.is_file()
+    first.cleanup()
+    second.cleanup()
+    assert tuple((tmp_path / "speech" / "cache").glob("*.wav"))
+    await service.close()
 
 
 @pytest.mark.asyncio

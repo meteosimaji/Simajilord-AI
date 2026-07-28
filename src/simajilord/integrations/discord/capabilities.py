@@ -21,6 +21,8 @@ from simajilord.capabilities.audio import (
     AudioControlRequest,
     AudioControlResponse,
     AudioLoopRequest,
+    AudioMixRequest,
+    AudioMixResponse,
     AudioMoveRequest,
     AudioNoArgsRequest,
     AudioPlayRequest,
@@ -29,6 +31,11 @@ from simajilord.capabilities.audio import (
     AudioSeekRequest,
     AudioTuneRequest,
     AudioVolumeRequest,
+    FreshMixEnqueueRequest,
+    FreshMixEnqueueResponse,
+    FreshMixPlanRequest,
+    FreshMixPreviewResponse,
+    FreshMixReviseRequest,
 )
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -38,6 +45,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
     ReadAloudAddSourcesRequest,
     ReadAloudAnnouncementsSetRequest,
+    ReadAloudContentModeSetRequest,
     ReadAloudDictionaryListRequest,
     ReadAloudDictionaryRemoveRequest,
     ReadAloudDictionarySetRequest,
@@ -80,10 +88,7 @@ from .presenter import (
 )
 
 DiscordMessageChannel: TypeAlias = (
-    discord.TextChannel
-    | discord.Thread
-    | discord.VoiceChannel
-    | discord.StageChannel
+    discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel
 )
 _CUSTOM_EMOJI_PATTERN = re.compile(
     r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>[0-9]{15,22})>"
@@ -635,15 +640,13 @@ def build_discord_endpoints(
             author_id=str(message.author.id),
             author_name=message.author.display_name,
             author_is_bot=message.author.bot,
-            content_chunk=message.content[request.offset:end],
+            content_chunk=message.content[request.offset : end],
             content_length=content_length,
             offset=request.offset,
             next_offset=next_offset,
             complete=next_offset is None,
             created_at_iso=message.created_at.isoformat(),
-            attachments=tuple(
-                _attachment_record(attachment) for attachment in message.attachments
-            ),
+            attachments=tuple(_attachment_record(attachment) for attachment in message.attachments),
             custom_emojis=_custom_emoji_records(message.content),
             stickers=_sticker_records(message.stickers),
             reference_message_id=(
@@ -684,8 +687,7 @@ def build_discord_endpoints(
                 message.edited_at.isoformat() if message.edited_at is not None else None
             ),
             attachments=tuple(
-                _expanded_attachment(attachment)
-                for attachment in message.attachments[:10]
+                _expanded_attachment(attachment) for attachment in message.attachments[:10]
             ),
             embeds=tuple(_expanded_embed(item) for item in message.embeds[:10]),
             sticker_names=tuple(sticker.name for sticker in message.stickers[:10]),
@@ -712,9 +714,9 @@ def build_discord_endpoints(
             _assert_agent_channel_scope(context, request.destination_channel_id)
         else:
             actor = await _actor_member(guild, context)
-            if not _can_read_messages(
+            if not _can_read_messages(destination, actor) or not _can_read_private_thread(
                 destination, actor
-            ) or not _can_read_private_thread(destination, actor):
+            ):
                 raise UserError("discord.expand_destination_unavailable")
         bot_member = guild.me
         if bot_member is None or not _can_post_expanded_message(destination, bot_member):
@@ -752,9 +754,9 @@ def build_discord_endpoints(
             _assert_agent_channel_scope(context, request.destination_channel_id)
         else:
             actor = await _actor_member(guild, context)
-            if not _can_read_messages(
+            if not _can_read_messages(destination, actor) or not _can_read_private_thread(
                 destination, actor
-            ) or not _can_read_private_thread(destination, actor):
+            ):
                 raise UserError("discord.quote_destination_unavailable")
         bot_member = guild.me
         if bot_member is None or not _can_post_quote_image(destination, bot_member):
@@ -845,11 +847,7 @@ def build_discord_endpoints(
             raise UserError("discord.custom_emoji_not_animated")
         if request.mode != "frame" and request.frame_index != 0:
             raise UserError("discord.custom_emoji_frame_mode_required")
-        extension = (
-            "gif"
-            if selected.animated and request.mode in {"animation", "frame"}
-            else "png"
-        )
+        extension = "gif" if selected.animated and request.mode in {"animation", "frame"} else "png"
         emoji_url = (
             f"https://cdn.discordapp.com/emojis/{selected.emoji_id}.{extension}"
             "?size=128&quality=lossless"
@@ -912,8 +910,7 @@ def build_discord_endpoints(
             if request.mode != "preview":
                 raise UserError("discord.sticker_lottie_animation_unavailable")
             sticker_url = (
-                f"https://media.discordapp.net/stickers/{selected.id}.png"
-                "?size=160&quality=lossless"
+                f"https://media.discordapp.net/stickers/{selected.id}.png?size=160&quality=lossless"
             )
         else:
             sticker_url = selected.url
@@ -962,9 +959,7 @@ def build_discord_endpoints(
         if not 0 <= request.attachment_index <= 9:
             raise UserError("discord.attachment_index_invalid")
         try:
-            message = await channel.fetch_message(
-                _snowflake(request.message_id, "message")
-            )
+            message = await channel.fetch_message(_snowflake(request.message_id, "message"))
         except discord.NotFound as exc:
             raise UserError("Discordメッセージが見つかりませんでした。") from exc
         except discord.DiscordException as exc:
@@ -1190,6 +1185,11 @@ def build_discord_endpoints(
         request: object,
         context: InvocationContext,
     ) -> AudioControlResponse:
+        await _assert_audio_control_access(context)
+        response = await runtime.registry.invoke(capability_name, request, context)
+        return cast(AudioControlResponse, response)
+
+    async def _assert_audio_control_access(context: InvocationContext) -> None:
         guild = _guild(client, context)
         member = await _actor_member(guild, context)
         session = runtime.audio.require(str(guild.id))
@@ -1198,12 +1198,8 @@ def build_discord_endpoints(
                 session.destination_id,
                 _member_voice_channel(member),
             )
-        elif session.waiting_for_voice and not session.can_control_while_waiting(
-            context.actor_id
-        ):
+        elif session.waiting_for_voice and not session.can_control_while_waiting(context.actor_id):
             raise UserError("audio.waiting_queue_restricted")
-        response = await runtime.registry.invoke(capability_name, request, context)
-        return cast(AudioControlResponse, response)
 
     async def pause_audio(
         request: AudioNoArgsRequest,
@@ -1277,6 +1273,50 @@ def build_discord_endpoints(
     ) -> AudioControlResponse:
         return await _invoke_audio_control("audio.set_volume", request, context)
 
+    async def set_audio_mix(
+        request: AudioMixRequest,
+        context: InvocationContext,
+    ) -> AudioMixResponse:
+        await _assert_audio_control_access(context)
+        response = await runtime.registry.invoke("audio.mix", request, context)
+        return cast(AudioMixResponse, response)
+
+    async def plan_fresh_mix(
+        request: FreshMixPlanRequest,
+        context: InvocationContext,
+    ) -> FreshMixPreviewResponse:
+        _guild(client, context)
+        response = await runtime.registry.invoke(
+            "audio.fresh_mix_plan",
+            request,
+            context,
+        )
+        return cast(FreshMixPreviewResponse, response)
+
+    async def revise_fresh_mix(
+        request: FreshMixReviseRequest,
+        context: InvocationContext,
+    ) -> FreshMixPreviewResponse:
+        _guild(client, context)
+        response = await runtime.registry.invoke(
+            "audio.fresh_mix_revise",
+            request,
+            context,
+        )
+        return cast(FreshMixPreviewResponse, response)
+
+    async def enqueue_fresh_mix(
+        request: FreshMixEnqueueRequest,
+        context: InvocationContext,
+    ) -> FreshMixEnqueueResponse:
+        await _assert_audio_control_access(context)
+        response = await runtime.registry.invoke(
+            "audio.fresh_mix_enqueue",
+            request,
+            context,
+        )
+        return cast(FreshMixEnqueueResponse, response)
+
     async def move_audio(
         request: AudioMoveRequest,
         context: InvocationContext,
@@ -1324,6 +1364,7 @@ def build_discord_endpoints(
             SpeechSpeakRequest(
                 text=request.text,
                 title=f"{member.display_name}さんの依頼",
+                segments=request.segments,
             ),
             context,
         )
@@ -1349,8 +1390,7 @@ def build_discord_endpoints(
                     and str(member_voice.id) == request.audio_destination_id
                     and (
                         current_route is None
-                        or current_route.audio_destination_id
-                        == request.audio_destination_id
+                        or current_route.audio_destination_id == request.audio_destination_id
                     )
                 )
             elif request.action in {
@@ -1393,9 +1433,7 @@ def build_discord_endpoints(
                     raise UserError("discord.message_channel_unavailable")
                 if guild.me is None or not _can_read_messages(source, guild.me):
                     raise UserError("discord.message_channel_unavailable")
-            voice = guild.get_channel(
-                _snowflake(request.audio_destination_id, "voice channel")
-            )
+            voice = guild.get_channel(_snowflake(request.audio_destination_id, "voice channel"))
             if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_required")
         elif request.action in {
@@ -1409,9 +1447,7 @@ def build_discord_endpoints(
                 raise UserError("discord.message_channel_unavailable")
             if guild.me is None or not _can_read_messages(source, guild.me):
                 raise UserError("discord.message_channel_unavailable")
-            voice = guild.get_channel(
-                _snowflake(request.audio_destination_id, "voice channel")
-            )
+            voice = guild.get_channel(_snowflake(request.audio_destination_id, "voice channel"))
             if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_required")
         elif request.action is ReadAloudAction.REMOVE_SOURCE:
@@ -1574,6 +1610,19 @@ def build_discord_endpoints(
         )
         return cast(ReadAloudPolicyResponse, response)
 
+    async def read_aloud_content_mode_set(
+        request: ReadAloudContentModeSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        member = await _actor_member(_guild(client, context), context)
+        _require_manage_guild(member)
+        response = await runtime.registry.invoke(
+            "speech.read_aloud_content_mode_set",
+            request,
+            context,
+        )
+        return cast(ReadAloudPolicyResponse, response)
+
     return (
         endpoint(
             CapabilityDescriptor(
@@ -1655,9 +1704,7 @@ def build_discord_endpoints(
                 ),
                 risk=RiskLevel.WRITE,
                 keywords=("discord", "message", "quote", "repost", "expand", "jump"),
-                side_effects=(
-                    "指定したDiscordチャンネルへ、元メッセージの引用を1件投稿します。",
-                ),
+                side_effects=("指定したDiscordチャンネルへ、元メッセージの引用を1件投稿します。",),
             ),
             DiscordPostExpandedMessageRequest,
             DiscordPostExpandedMessageResponse,
@@ -1679,9 +1726,7 @@ def build_discord_endpoints(
                     "引用画像",
                     "画像化",
                 ),
-                side_effects=(
-                    "指定したDiscordチャンネルへ引用画像を1件投稿します。",
-                ),
+                side_effects=("指定したDiscordチャンネルへ引用画像を1件投稿します。",),
             ),
             DiscordCreateQuoteImageRequest,
             DiscordCreateQuoteImageResponse,
@@ -1965,6 +2010,68 @@ def build_discord_endpoints(
             AudioVolumeRequest,
             set_audio_volume,
         ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.plan_fresh_mix",
+                summary="履歴を使わず実在候補を検証し、再生前Mix previewを作ります。",
+                risk=RiskLevel.EXTERNAL,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "music", "fresh mix", "plan", "preview"),
+                side_effects=("メディア検索を行いますが、キューは変更しません。",),
+            ),
+            FreshMixPlanRequest,
+            FreshMixPreviewResponse,
+            plan_fresh_mix,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.revise_fresh_mix",
+                summary="Fresh Mix preview内の指定曲を別の実在候補へ置換します。",
+                risk=RiskLevel.EXTERNAL,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "music", "fresh mix", "revise", "replace"),
+                side_effects=("メディア検索を行いますが、キューは変更しません。",),
+            ),
+            FreshMixReviseRequest,
+            FreshMixPreviewResponse,
+            revise_fresh_mix,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.enqueue_fresh_mix",
+                summary="承認済みFresh Mix previewをatomicにキューへ追加します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "music", "fresh mix", "play", "approve"),
+                side_effects=("検証済み複数曲を一括で音声キューへ追加します。",),
+            ),
+            FreshMixEnqueueRequest,
+            FreshMixEnqueueResponse,
+            enqueue_fresh_mix,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.set_audio_mix",
+                summary=(
+                    "複数のYouTube曲を起点に関連曲の自動選曲を開始または停止します。"
+                    "人が追加した希望曲は常に自動選曲より先に再生されます。"
+                ),
+                risk=RiskLevel.EXTERNAL,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "music",
+                    "mix",
+                    "autoplay",
+                    "radio",
+                    "related",
+                ),
+                side_effects=("サーバーの永続的な自動選曲設定を変更します。",),
+            ),
+            AudioMixRequest,
+            AudioMixResponse,
+            set_audio_mix,
+        ),
         discord_audio_endpoint(
             "discord.move_audio",
             "待機曲をキュー内の別の位置へ移動します。",
@@ -2121,6 +2228,19 @@ def build_discord_endpoints(
             ReadAloudAnnouncementsSetRequest,
             ReadAloudPolicyResponse,
             read_aloud_announcements_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_aloud_content_mode_set",
+                summary="読み上げ対象をall/messages/events/offから選びます。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("discord", "read aloud", "messages", "events", "off"),
+                side_effects=("読み上げ対象の種類を永続設定します。",),
+            ),
+            ReadAloudContentModeSetRequest,
+            ReadAloudPolicyResponse,
+            read_aloud_content_mode_set,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -2304,9 +2424,7 @@ def _message_record(
         content_length=len(message.content),
         preview_truncated=truncated,
         created_at_iso=message.created_at.isoformat(),
-        attachments=tuple(
-            _attachment_record(attachment) for attachment in message.attachments
-        ),
+        attachments=tuple(_attachment_record(attachment) for attachment in message.attachments),
         reference_message_id=(
             str(message.reference.message_id)
             if message.reference and message.reference.message_id
@@ -2383,11 +2501,7 @@ def _prepare_discord_animated_media(
             for index in range(frame_count):
                 image.seek(index)
                 raw_duration = image.info.get("duration")
-                durations.append(
-                    int(raw_duration)
-                    if isinstance(raw_duration, (int, float))
-                    else 0
-                )
+                durations.append(int(raw_duration) if isinstance(raw_duration, (int, float)) else 0)
             duration_ms = sum(durations) or None
             if mode == "animation":
                 if image_format == "GIF":
@@ -2414,9 +2528,7 @@ def _prepare_discord_animated_media(
                 content=output.getvalue(),
                 content_type="image/png",
                 preview_kind=(
-                    "selected_animation_frame"
-                    if mode == "frame"
-                    else "representative_static_frame"
+                    "selected_animation_frame" if mode == "frame" else "representative_static_frame"
                 ),
                 frame_index=selected_frame,
                 frame_count=frame_count,
@@ -2535,11 +2647,7 @@ def _image_media_type(content: bytes) -> str | None:
         return "image/jpeg"
     if content[:6] in {b"GIF87a", b"GIF89a"}:
         return "image/gif"
-    if (
-        len(content) >= 12
-        and content.startswith(b"RIFF")
-        and content[8:12] == b"WEBP"
-    ):
+    if len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return "image/webp"
     return None
 
@@ -2583,8 +2691,7 @@ async def _reply_context(
                 complete=len(chunk) == len(parent.content),
                 created_at_iso=parent.created_at.isoformat(),
                 attachments=tuple(
-                    _attachment_record(attachment)
-                    for attachment in parent.attachments
+                    _attachment_record(attachment) for attachment in parent.attachments
                 ),
                 reference_message_id=(
                     str(parent.reference.message_id)
@@ -2698,9 +2805,7 @@ async def _fetch_readable_message(
         _assert_agent_channel_scope(context, channel_id)
     else:
         actor = await _actor_member(guild, context)
-        if not _can_read_messages(channel, actor) or not _can_read_private_thread(
-            channel, actor
-        ):
+        if not _can_read_messages(channel, actor) or not _can_read_private_thread(channel, actor):
             raise UserError("discord.expand_unavailable")
     if not _can_read_messages(channel, bot_member) or not _can_read_private_thread(
         channel, bot_member
@@ -2763,12 +2868,7 @@ def _can_post_quote_image(
         if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
         else True
     )
-    return (
-        permissions.view_channel
-        and can_send
-        and permissions.attach_files
-        and can_connect
-    )
+    return permissions.view_channel and can_send and permissions.attach_files and can_connect
 
 
 def _quote_text(message: discord.Message) -> str:
@@ -2866,9 +2966,7 @@ async def _quote_stickers(
             content=payload,
         )
 
-    fetched = await asyncio.gather(
-        *(fetch(sticker) for sticker in message.stickers[:3])
-    )
+    fetched = await asyncio.gather(*(fetch(sticker) for sticker in message.stickers[:3]))
     return tuple(item for item in fetched if item is not None)
 
 

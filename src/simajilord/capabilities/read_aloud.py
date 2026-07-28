@@ -15,6 +15,7 @@ from simajilord.core.capabilities import (
 )
 from simajilord.core.errors import UserError
 from simajilord.services.read_aloud import (
+    ReadAloudContentMode,
     ReadAloudMode,
     ReadAloudPolicy,
     ReadAloudRoute,
@@ -125,6 +126,11 @@ class ReadAloudSemanticsSetRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadAloudContentModeSetRequest:
+    mode: ReadAloudContentMode
+
+
+@dataclass(frozen=True, slots=True)
 class ReadAloudDictionaryItem:
     surface: str
     reading: str
@@ -141,6 +147,8 @@ class ReadAloudPolicyResponse:
     read_author_names: bool
     read_replies: bool
     read_attachments: bool
+    read_messages: bool = True
+    content_mode: str = ReadAloudContentMode.MESSAGES.value
 
 
 def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
@@ -436,7 +444,30 @@ def build_read_aloud_policy_endpoints(
             raise UserError(str(exc)) from exc
         return _policy_response(policy)
 
+    async def content_mode_set(
+        request: ReadAloudContentModeSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        policy = await service.set_content_mode(
+            workspace_id=_workspace_id(context),
+            mode=request.mode,
+        )
+        return _policy_response(policy)
+
     return (
+        endpoint(
+            CapabilityDescriptor(
+                name="speech.read_aloud_content_mode_set",
+                summary="読み上げをall/messages/events/offのプリセットで設定します。",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("read aloud", "messages", "events", "off", "mode"),
+                side_effects=("読み上げ対象の種類を永続設定します。",),
+            ),
+            ReadAloudContentModeSetRequest,
+            ReadAloudPolicyResponse,
+            content_mode_set,
+        ),
         endpoint(
             CapabilityDescriptor(
                 name="speech.read_aloud_policy_status",
@@ -548,6 +579,23 @@ def _route_response(
 
 
 def _policy_response(policy: ReadAloudPolicy) -> ReadAloudPolicyResponse:
+    has_events = (
+        policy.announce_join
+        or policy.announce_leave
+        or policy.announce_move
+    )
+    if policy.read_messages:
+        content_mode = (
+            ReadAloudContentMode.ALL
+            if has_events
+            else ReadAloudContentMode.MESSAGES
+        )
+    else:
+        content_mode = (
+            ReadAloudContentMode.EVENTS
+            if has_events
+            else ReadAloudContentMode.OFF
+        )
     return ReadAloudPolicyResponse(
         dictionary=tuple(
             ReadAloudDictionaryItem(entry.surface, entry.reading)
@@ -558,6 +606,8 @@ def _policy_response(policy: ReadAloudPolicy) -> ReadAloudPolicyResponse:
         announce_join=policy.announce_join,
         announce_leave=policy.announce_leave,
         announce_move=policy.announce_move,
+        read_messages=policy.read_messages,
+        content_mode=content_mode.value,
         read_author_names=policy.read_author_names,
         read_replies=policy.read_replies,
         read_attachments=policy.read_attachments,

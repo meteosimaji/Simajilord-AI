@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from simajilord.domain.audio import LoopMode
+from simajilord.domain.audio import AudioQueueLane, LoopMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +24,10 @@ class StoredAudioItem:
     start_seconds: float = 0.0
     requested_by_id: str | None = None
     requested_by_name: str | None = None
+    queue_lane: AudioQueueLane = AudioQueueLane.REQUEST
+    request_source: str | None = None
+    request_id: str | None = None
+    requested_at_epoch: int | None = None
     played_at_epoch: int | None = None
     uploader: str | None = None
     thumbnail_url: str | None = None
@@ -44,6 +48,8 @@ class StoredAudioSession:
     history: tuple[StoredAudioItem, ...]
     music_volume: float = 1.0
     speech_volume: float = 1.0
+    autoplay_enabled: bool = False
+    mix_seed_references: tuple[str, ...] = ()
 
 
 class AudioStateStore:
@@ -145,8 +151,14 @@ def _decode_session(value: object) -> StoredAudioSession | None:
             for item in raw_history
             if isinstance(item, dict)
         )
-        if not items and not history:
+        raw_mix_seed_references = value.get("mix_seed_references", ())
+        if not isinstance(raw_mix_seed_references, (list, tuple)):
             return None
+        mix_seed_references = tuple(
+            reference
+            for reference in raw_mix_seed_references
+            if isinstance(reference, str) and reference.startswith("https://")
+        )[:8]
         return StoredAudioSession(
             workspace_id=workspace_id,
             destination_id=destination_id,
@@ -159,6 +171,8 @@ def _decode_session(value: object) -> StoredAudioSession | None:
             history=history,
             music_volume=_bounded_volume(value.get("music_volume", 1.0)),
             speech_volume=_bounded_volume(value.get("speech_volume", 1.0)),
+            autoplay_enabled=bool(value.get("autoplay_enabled", False)),
+            mix_seed_references=mix_seed_references,
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -188,6 +202,9 @@ def _bounded_volume(value: object) -> float:
 def _decode_item(value: dict[str, Any]) -> StoredAudioItem:
     requested_by_id = value.get("requested_by_id")
     requested_by_name = value.get("requested_by_name")
+    request_source = value.get("request_source")
+    request_id = value.get("request_id")
+    requested_at_epoch = value.get("requested_at_epoch")
     played_at_epoch = value.get("played_at_epoch")
     uploader = value.get("uploader")
     thumbnail_url = value.get("thumbnail_url")
@@ -206,6 +223,18 @@ def _decode_item(value: dict[str, Any]) -> StoredAudioItem:
         requested_by_name=(
             requested_by_name
             if isinstance(requested_by_name, str) and requested_by_name
+            else None
+        ),
+        queue_lane=AudioQueueLane(value.get("queue_lane", AudioQueueLane.REQUEST)),
+        request_source=(
+            request_source
+            if isinstance(request_source, str) and request_source
+            else None
+        ),
+        request_id=request_id if isinstance(request_id, str) and request_id else None,
+        requested_at_epoch=(
+            max(0, int(requested_at_epoch))
+            if isinstance(requested_at_epoch, (int, float, str))
             else None
         ),
         played_at_epoch=(

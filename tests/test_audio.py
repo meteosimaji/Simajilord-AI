@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -8,6 +9,8 @@ import pytest
 from simajilord.capabilities.audio import (
     AudioHistoryRequest,
     AudioHistoryResponse,
+    AudioMixRequest,
+    AudioMixResponse,
     AudioMoveRequest,
     AudioNoArgsRequest,
     AudioPlayRequest,
@@ -22,7 +25,7 @@ from simajilord.capabilities.audio import (
 )
 from simajilord.core import ApprovalMode, InvocationContext
 from simajilord.core.errors import UserError
-from simajilord.domain.audio import AudioItem, AudioKind, LoopMode
+from simajilord.domain.audio import AudioItem, AudioKind, AudioQueueLane, LoopMode
 from simajilord.domain.media import MediaCandidate
 from simajilord.services.audio import AudioSession, AudioSessionManager
 from simajilord.services.audio_state import AudioStateStore
@@ -35,6 +38,10 @@ class FakeOutput:
 
     def __init__(self) -> None:
         self.played: list[str] = []
+        self.played_items: list[AudioItem] = []
+        self.overlays: list[str] = []
+        self.music_updates: list[float] = []
+        self.fade_outs: list[tuple[str, float, float]] = []
         self.release = asyncio.Event()
 
     async def connect(self, destination_id: str) -> None:
@@ -42,8 +49,37 @@ class FakeOutput:
 
     async def play(self, item: AudioItem) -> None:
         self.played.append(item.title)
+        self.played_items.append(item)
         await self.release.wait()
         self.release.clear()
+
+    async def overlay_speech(
+        self,
+        music: AudioItem,
+        speech: AudioItem,
+        *,
+        position_seconds: float,
+    ) -> None:
+        del music, position_seconds
+        self.overlays.append(speech.source)
+
+    async def update_music(
+        self,
+        music: AudioItem,
+        *,
+        position_seconds: float,
+    ) -> None:
+        del music
+        self.music_updates.append(position_seconds)
+
+    async def fade_out(
+        self,
+        music: AudioItem,
+        *,
+        position_seconds: float,
+        duration_seconds: float,
+    ) -> None:
+        self.fade_outs.append((music.title, position_seconds, duration_seconds))
 
     def pause(self) -> None:
         self.paused = True
@@ -69,29 +105,30 @@ async def test_speech_is_prioritized_ahead_of_waiting_music() -> None:
     await session.enqueue(
         AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH)
     )
+    for _ in range(20):
+        if output.played[:2] == ["first", "speech"]:
+            break
+        await asyncio.sleep(0)
     output.release.set()
-    await asyncio.sleep(0.02)
-    assert output.played[:2] == ["first", "speech"]
+    for _ in range(20):
+        if output.played[:3] == ["first", "speech", "first"]:
+            break
+        await asyncio.sleep(0)
+    assert output.fade_outs and output.fade_outs[0][0] == "first"
+    assert output.played[:3] == ["first", "speech", "first"]
+    output.release.set()
+    for _ in range(20):
+        if output.played[:4] == ["first", "speech", "first", "second"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played[:4] == ["first", "speech", "first", "second"]
     await session.close()
 
 
 @pytest.mark.asyncio
-async def test_speech_ducks_current_music_then_resumes_from_saved_position() -> None:
-    class DuckingOutput(FakeOutput):
-        def __init__(self) -> None:
-            super().__init__()
-            self.overlays: list[str] = []
-
-        async def play(self, item: AudioItem) -> None:
-            self.played.append(item.title)
-            if item.speech_overlay_source is not None:
-                self.overlays.append(item.speech_overlay_source)
-                item.start_seconds += item.speech_overlay_duration_seconds
-                item.resume_after_overlay = True
-                return
-            await self.release.wait()
-            self.release.clear()
-
+async def test_speech_ducks_current_music_then_resumes_from_saved_position(
+    tmp_path: Path,
+) -> None:
     async def resolve(reference: str) -> AudioItem:
         return AudioItem(
             "fresh-music-stream",
@@ -100,7 +137,7 @@ async def test_speech_ducks_current_music_then_resumes_from_saved_position() -> 
             resolver_reference=reference,
         )
 
-    output = DuckingOutput()
+    output = FakeOutput()
     session = AudioSession(
         "one",
         output,
@@ -116,24 +153,38 @@ async def test_speech_ducks_current_music_then_resumes_from_saved_position() -> 
         )
     )
     await asyncio.sleep(0)
+    speech_file = tmp_path / "speech.wav"
+    speech_file.write_bytes(b"speech")
     await session.enqueue(
         AudioItem(
-            "speech-file",
+            str(speech_file),
             "speech",
             "local://speech",
-            duration_seconds=0.1,
+            duration_seconds=0.01,
             kind=AudioKind.SPEECH,
+            owned_file=speech_file,
         )
     )
-    await asyncio.sleep(0.02)
-
-    assert output.overlays == ["speech-file"]
-    assert output.played[:3] == ["music", "music", "music"]
+    for _ in range(50):
+        if output.played[:2] == ["music", "speech"]:
+            break
+        await asyncio.sleep(0)
+    assert output.fade_outs and output.fade_outs[0][0] == "music"
+    assert speech_file.exists()
+    output.release.set()
+    for _ in range(50):
+        if output.played[:3] == ["music", "speech", "music"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played[:3] == ["music", "speech", "music"]
+    assert not speech_file.exists()
+    assert output.played_items[2].fade_in_seconds == pytest.approx(0.4)
     snapshot = await session.snapshot()
     assert snapshot.current is not None
     assert snapshot.current.kind is AudioKind.MUSIC
     assert snapshot.current.speech_overlay_source is None
-    assert snapshot.position_seconds >= 0.1
+    assert snapshot.speech_active is False
+    assert snapshot.position_seconds >= 0
     await session.close()
 
 
@@ -146,6 +197,68 @@ async def test_snapshot_is_transport_neutral() -> None:
     snapshot = await session.snapshot()
     assert snapshot.loop is LoopMode.QUEUE
     assert snapshot.current is None or snapshot.current.title == "track"
+    await session.close()
+
+
+def test_loop_clone_restarts_from_the_beginning() -> None:
+    item = AudioItem(
+        "stream",
+        "track",
+        "https://example.com/track",
+        duration_seconds=249,
+        start_seconds=245.6,
+        retry_after=123.0,
+        played_at_epoch=456,
+    )
+
+    looped = item.clone_for_loop()
+
+    assert looped.start_seconds == 0
+    assert looped.retry_after == 0
+    assert looped.played_at_epoch is None
+
+
+@pytest.mark.asyncio
+async def test_mix_and_loop_require_explicit_conflict_replacement() -> None:
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        del seeds, limit
+        return ()
+
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession(
+        "conflict",
+        output,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    seed = ("https://www.youtube.com/watch?v=seed",)
+    await session.set_loop(LoopMode.TRACK)
+
+    with pytest.raises(UserError, match=r"audio\.mix_loop_conflict"):
+        await session.enable_autoplay(seed)
+    snapshot = await session.snapshot()
+    assert snapshot.loop is LoopMode.TRACK
+    assert snapshot.autoplay_enabled is False
+
+    await session.enable_autoplay(seed, replace_loop=True)
+    snapshot = await session.snapshot()
+    assert snapshot.loop is LoopMode.NONE
+    assert snapshot.autoplay_enabled is True
+
+    with pytest.raises(UserError, match=r"audio\.loop_mix_conflict"):
+        await session.set_loop(LoopMode.QUEUE)
+    snapshot = await session.snapshot()
+    assert snapshot.loop is LoopMode.NONE
+    assert snapshot.autoplay_enabled is True
+
+    await session.set_loop(LoopMode.QUEUE, replace_autoplay=True)
+    snapshot = await session.snapshot()
+    assert snapshot.loop is LoopMode.QUEUE
+    assert snapshot.autoplay_enabled is False
     await session.close()
 
 
@@ -720,7 +833,200 @@ async def test_music_queue_survives_manager_restart_without_signed_url(tmp_path)
     assert snapshot.pending[0].source == ""
     assert snapshot.music_volume == pytest.approx(0.7)
     assert snapshot.speech_volume == pytest.approx(1.2)
+    assert snapshot.resume_confirmation_required is True
     await restored_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_preferences_survive_restart_without_a_queue(tmp_path: Path) -> None:
+    state_path = tmp_path / "audio_sessions.json"
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(state_path),
+    )
+    session = manager.get_or_create("guild", lambda: output)
+    await session.set_volume(music=0.65, speech=1.15)
+    await session.set_auto_leave(False)
+    await session.set_loop(LoopMode.QUEUE)
+    await manager.close()
+
+    stored = AudioStateStore(state_path).all()
+    assert len(stored) == 1
+    assert stored[0].items == ()
+    assert stored[0].history == ()
+
+    restored_output = FakeOutput()
+    restored_output.connected = False
+    restored_manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(state_path),
+    )
+    (restored_session,) = restored_manager.restore(lambda _: restored_output)
+    snapshot = await restored_session.snapshot()
+    assert snapshot.music_volume == pytest.approx(0.65)
+    assert snapshot.speech_volume == pytest.approx(1.15)
+    assert snapshot.auto_leave is False
+    assert snapshot.loop is LoopMode.QUEUE
+    await restored_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_mix_uses_multiple_seeds_and_manual_requests_keep_priority() -> None:
+    supplied: list[tuple[str, ...]] = []
+
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        supplied.append(seeds)
+        assert limit == 30
+        return tuple(
+            AudioItem(
+                "",
+                f"automatic-{index}",
+                f"https://www.youtube.com/watch?v=auto{index}",
+                resolver_reference=f"https://www.youtube.com/watch?v=auto{index}",
+                queue_lane=AudioQueueLane.AUTOPLAY,
+            )
+            for index in range(3)
+        )
+
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession(
+        "guild",
+        output,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    await session.wait_for_listener("listener")
+    seeds = (
+        "https://www.youtube.com/watch?v=seed1",
+        "https://www.youtube.com/watch?v=seed2",
+    )
+    assert await session.enable_autoplay(seeds) == seeds
+    for _ in range(20):
+        if (await session.snapshot()).autoplay_next is not None:
+            break
+        await asyncio.sleep(0)
+    assert supplied == [seeds]
+    assert (await session.snapshot()).autoplay_next is not None
+
+    await session.enqueue(
+        AudioItem(
+            "",
+            "manual",
+            "https://www.youtube.com/watch?v=manual",
+            resolver_reference="https://www.youtube.com/watch?v=manual",
+            requested_by_id="listener",
+        )
+    )
+    waiting = await session.snapshot()
+    assert [item.title for item in waiting.pending] == ["manual"]
+    assert waiting.autoplay_next is None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_mix_refills_after_automatic_lane_is_consumed() -> None:
+    supplied: list[tuple[str, ...]] = []
+
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        supplied.append(seeds)
+        index = len(supplied)
+        assert limit == 30
+        return (
+            AudioItem(
+                f"stream-{index}",
+                f"automatic-{index}",
+                f"https://www.youtube.com/watch?v=auto{index}",
+                resolver_reference=f"https://www.youtube.com/watch?v=auto{index}",
+                queue_lane=AudioQueueLane.AUTOPLAY,
+            ),
+        )
+
+    output = FakeOutput()
+    session = AudioSession(
+        "guild",
+        output,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    await session.connect("voice")
+    seed = "https://www.youtube.com/watch?v=seed"
+    await session.enable_autoplay((seed,))
+    for _ in range(50):
+        if output.played == ["automatic-1"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played == ["automatic-1"]
+
+    output.release.set()
+    for _ in range(50):
+        if output.played[:2] == ["automatic-1", "automatic-2"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played[:2] == ["automatic-1", "automatic-2"]
+    assert len(supplied) >= 2
+    assert supplied[0] == (seed,)
+    assert supplied[1][-1] == "https://www.youtube.com/watch?v=auto1"
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_mix_capability_reports_station_state() -> None:
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        del seeds, limit
+        return (
+            AudioItem(
+                "",
+                "automatic",
+                "https://www.youtube.com/watch?v=automatic",
+                resolver_reference="https://www.youtube.com/watch?v=automatic",
+                queue_lane=AudioQueueLane.AUTOPLAY,
+            ),
+        )
+
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    manager.get_or_create("guild", lambda: output)
+    media = cast(MediaService, object())
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_audio_endpoints(media, manager)
+    }
+    context = InvocationContext(
+        actor_id="listener",
+        workspace_id="guild",
+        transport="discord",
+        request_id="mix",
+    )
+    response = await endpoints["audio.mix"].invoke(
+        AudioMixRequest(
+            enabled=True,
+            seed_references=("https://www.youtube.com/watch?v=seed",),
+        ),
+        context,
+    )
+    assert isinstance(response, AudioMixResponse)
+    assert response.enabled is True
+    assert response.seed_references == ("https://www.youtube.com/watch?v=seed",)
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -752,4 +1058,5 @@ async def test_auto_leave_suspends_voice_without_losing_current_track(tmp_path) 
     assert [item.title for item in snapshot.pending] == ["Keep me"]
     assert snapshot.pending[0].start_seconds > 0
     assert snapshot.destination_id == "voice"
+    assert snapshot.resume_confirmation_required is True
     await manager.close()
