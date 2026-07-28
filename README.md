@@ -57,8 +57,8 @@ Discord timestamp; implementation labels and decorative footer text are intentio
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
   `say` fallback; long messages are sentence-chunked and joined without truncation, while
   raw URLs and Discord mention markup are normalized before synthesis
-- Speech-over-music sidechain ducking, followed by stream re-resolution and playback
-  resumption from the saved position
+- Speech-over-music sidechain ducking in the active Discord player, without restarting
+  the music stream; standalone speech is used only as an overlay-failure fallback
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
 - Server, user, and avatar information
 - Native polls, dice, and bounded random choice

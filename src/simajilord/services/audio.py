@@ -31,7 +31,6 @@ _MAX_IDENTICAL_PENDING_REFERENCES = 2
 _MAX_MIX_SEEDS = 8
 _AUTOPLAY_REFILL_ITEMS = 30
 _AUTOPLAY_RETRY_SECONDS = 60.0
-_SPEECH_TRANSITION_SECONDS = 0.4
 
 
 class AudioOutput(Protocol):
@@ -164,7 +163,7 @@ class AudioSession:
 
     @property
     def resume_confirmation_required(self) -> bool:
-        """Whether held music must be explicitly resumed after leaving voice."""
+        """Whether a suspended voice route needs an explicit listener resume."""
 
         return self._resume_confirmation_required
 
@@ -181,8 +180,6 @@ class AudioSession:
     async def enqueue(self, item: AudioItem) -> int:
         """Queue an item, prioritizing speech ahead of waiting music."""
 
-        fading_music: AudioItem | None = None
-        fade_position = 0.0
         async with self._lock:
             if self._closed:
                 item.cleanup()
@@ -198,18 +195,19 @@ class AudioSession:
                     item.cleanup()
                     raise UserError("speech.queue_full")
                 position = pending_speech + 1
-                self._speech.append(item)
                 current = self._current
                 if (
                     current is not None
                     and current.kind is AudioKind.MUSIC
-                    and not self._restart_requested
+                    and self._overlay_task is None
                 ):
-                    fade_position = self._position_seconds()
-                    current.start_seconds = fade_position
-                    current.fade_in_seconds = _SPEECH_TRANSITION_SECONDS
-                    self._restart_requested = True
-                    fading_music = current
+                    self._speech_active = True
+                    self._overlay_task = asyncio.create_task(
+                        self._run_speech_overlays(current, item),
+                        name=f"simajilord-speech-overlay-{self.workspace_id}",
+                    )
+                else:
+                    self._speech.append(item)
             else:
                 if item.queue_lane is AudioQueueLane.AUTOPLAY:
                     self._autoplay.append(item)
@@ -226,28 +224,6 @@ class AudioSession:
                     position = len(self._music)
             self._wake.set()
             self._ensure_worker()
-        if fading_music is not None:
-            try:
-                await self.output.fade_out(
-                    fading_music,
-                    position_seconds=fade_position,
-                    duration_seconds=_SPEECH_TRANSITION_SECONDS,
-                )
-                if self._current is fading_music and self._restart_requested:
-                    resumed_at = (
-                        fade_position
-                        + _SPEECH_TRANSITION_SECONDS * max(fading_music.speed, 0.01)
-                    )
-                    if fading_music.duration_seconds > 0:
-                        resumed_at = min(resumed_at, fading_music.duration_seconds)
-                    fading_music.start_seconds = resumed_at
-            except Exception:
-                log.exception(
-                    "Could not fade music before read-aloud workspace=%s",
-                    self.workspace_id,
-                )
-            finally:
-                self.output.stop()
         await self._state_changed()
         return position
 
@@ -593,10 +569,10 @@ class AudioSession:
         await self._state_changed()
 
     async def suspend(self) -> None:
-        """Leave voice while preserving music until a listener explicitly resumes it."""
+        """Leave voice and hold the audio route until a listener explicitly resumes it."""
 
         self._suspended = True
-        self._resume_confirmation_required = self.has_music
+        self._resume_confirmation_required = True
         self._suspend_requested = True
         if self._current is not None:
             if self._current.kind is AudioKind.MUSIC:
@@ -729,9 +705,12 @@ class AudioSession:
             )
             for item in state.history[-_MAX_HISTORY_ITEMS:]
         )
+        self._resume_confirmation_required = state.resume_confirmation_required
         if (self._music or self._autoplay) and not self.output.connected:
             self._suspended = True
             self._resume_confirmation_required = True
+        elif self._resume_confirmation_required and not self.output.connected:
+            self._suspended = True
 
     async def persisted_state(self) -> StoredAudioSession:
         async with self._lock:
@@ -803,6 +782,7 @@ class AudioSession:
                 speech_volume=self._speech_volume,
                 autoplay_enabled=self._autoplay_enabled,
                 mix_seed_references=tuple(self._mix_seed_references),
+                resume_confirmation_required=self._resume_confirmation_required,
             )
 
     def _assert_music_queue_capacity(self, item: AudioItem) -> None:

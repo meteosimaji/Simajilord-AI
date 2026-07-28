@@ -46,7 +46,7 @@ from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
 from simajilord.core import InvocationContext
 from simajilord.core.errors import UserError
-from simajilord.domain.audio import LoopMode, QueueSnapshot
+from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
     DiscordViewCustomEmojiRequest,
@@ -818,7 +818,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
 
 
 @pytest.mark.asyncio
-async def test_music_dashboard_reposts_silently_then_deletes_old_panel() -> None:
+async def test_music_dashboard_edits_existing_panel_without_reposting() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.audio.add_state_listener = Mock()
     runtime.audio.remove_state_listener = Mock()
@@ -828,10 +828,8 @@ async def test_music_dashboard_reposts_silently_then_deletes_old_panel() -> None
     first = Mock(spec=discord.Message)
     first.id = 101
     first.delete = AsyncMock()
-    second = Mock(spec=discord.Message)
-    second.id = 102
-    second.delete = AsyncMock()
-    channel.send = AsyncMock(side_effect=(first, second))
+    first.edit = AsyncMock(return_value=first)
+    channel.send = AsyncMock(return_value=first)
     bot.get_channel.return_value = channel
     manager = MusicDashboardManager(bot, runtime)
     manager.bind(1, 2)
@@ -867,9 +865,63 @@ async def test_music_dashboard_reposts_silently_then_deletes_old_panel() -> None
         destination_id="55",
     )
     await manager._repost(session)
-    second_kwargs = channel.send.await_args_list[1].kwargs
-    assert second_kwargs["silent"] is True
-    first.delete.assert_awaited_once_with()
+    channel.send.assert_awaited_once()
+    first.edit.assert_awaited_once()
+    first.delete.assert_not_awaited()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_expires_only_after_audio_becomes_idle() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    panel = Mock(spec=discord.Message)
+    panel.id = 111
+    panel.delete = AsyncMock()
+    panel.edit = AsyncMock(return_value=panel)
+    channel.send = AsyncMock(return_value=panel)
+    bot.get_channel.return_value = channel
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=AudioItem(
+                source="stream",
+                title="Playing",
+                page_url="https://example.com/playing",
+                duration_seconds=120,
+            ),
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    await manager._repost(session)
+    assert "1" not in manager._expiry_tasks
+
+    session.snapshot.return_value = QueueSnapshot(
+        current=None,
+        pending=(),
+        history=(),
+        paused=False,
+        speech_active=False,
+        loop=LoopMode.NONE,
+        destination_id="55",
+    )
+    await manager._repost(session)
+    assert "1" in manager._expiry_tasks
+    panel.edit.assert_awaited_once()
+    channel.send.assert_awaited_once()
     await manager.close()
 
 
@@ -887,10 +939,8 @@ async def test_music_dashboard_replaces_persisted_panel_after_restart(
     old = Mock(spec=discord.Message)
     old.id = 201
     old.delete = AsyncMock()
-    new = Mock(spec=discord.Message)
-    new.id = 202
-    new.delete = AsyncMock()
-    channel.send = AsyncMock(side_effect=(old, new))
+    old.edit = AsyncMock(return_value=old)
+    channel.send = AsyncMock(return_value=old)
     channel.fetch_message = AsyncMock(return_value=old)
     bot.get_channel.return_value = channel
     session = Mock()
@@ -917,10 +967,11 @@ async def test_music_dashboard_replaces_persisted_panel_after_restart(
     await second_manager._repost(session)
 
     channel.fetch_message.assert_awaited_once_with(201)
-    old.delete.assert_awaited_once_with()
-    assert channel.send.await_args_list[1].kwargs["silent"] is True
+    old.edit.assert_awaited_once()
+    old.delete.assert_not_awaited()
+    channel.send.assert_awaited_once()
     state = json.loads((tmp_path / "discord_music_dashboards.json").read_text(encoding="utf-8"))
-    assert state["messages"]["1"] == {"channel_id": 2, "message_id": 202}
+    assert state["messages"]["1"] == {"channel_id": 2, "message_id": 201}
     await second_manager.close()
 
 
@@ -1207,6 +1258,7 @@ async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
     runtime.audio.connect = AsyncMock()
+    dashboard = Mock(spec=MusicDashboardManager)
     member = Mock(spec=discord.Member)
     member.bot = False
     member.id = 7
@@ -1217,11 +1269,13 @@ async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
     after.channel = Mock(spec=discord.VoiceChannel)
     after.channel.id = 55
     cog = VoiceLifecycleCog(cast(commands.Bot, object()), runtime)
+    cog.dashboard = dashboard
 
     await cog.on_voice_state_update(member, before, after)
 
     runtime.audio.get_or_create.assert_called_once()
     runtime.audio.connect.assert_awaited_once_with("1", "55")
+    dashboard.bind.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1286,14 +1340,14 @@ async def test_listener_join_reposts_panel_without_restarting_held_music() -> No
 
 
 @pytest.mark.asyncio
-async def test_startup_read_aloud_does_not_restart_held_music() -> None:
+async def test_startup_read_aloud_does_not_restart_held_read_aloud_route() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     route = Mock()
     route.audio_destination_id = "55"
     runtime.read_aloud.get.return_value = route
     session = Mock()
     session.output.connected = False
-    session.has_music = True
+    session.has_music = False
     session.resume_confirmation_required = True
     session.destination_id = "55"
     runtime.audio.get_or_create.return_value = session
@@ -1312,6 +1366,36 @@ async def test_startup_read_aloud_does_not_restart_held_music() -> None:
     await SimajilordDiscordBot._prepare_read_aloud_presence(bot)
 
     runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_listener_join_does_not_restart_held_read_aloud_route() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    route = Mock()
+    route.audio_destination_id = "55"
+    runtime.read_aloud.get.return_value = route
+    session = Mock()
+    session.waiting_for_voice = False
+    session.has_music = False
+    session.resume_confirmation_required = True
+    session.destination_id = "55"
+    session.output.connected = False
+    runtime.audio.find.return_value = session
+    runtime.audio.connect = AsyncMock()
+    member = Mock(spec=discord.Member)
+    member.bot = False
+    member.id = 7
+    member.guild.id = 1
+    before = Mock(spec=discord.VoiceState)
+    before.channel = None
+    after = Mock(spec=discord.VoiceState)
+    after.channel = Mock(spec=discord.VoiceChannel)
+    after.channel.id = 55
+    cog = VoiceLifecycleCog(cast(commands.Bot, object()), runtime)
+
+    await cog.on_voice_state_update(member, before, after)
+
     runtime.audio.connect.assert_not_awaited()
 
 

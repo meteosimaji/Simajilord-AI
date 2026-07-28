@@ -857,7 +857,7 @@ class MusicDashboardManager:
     """Keep one current, silent music panel near the bottom of each bound channel."""
 
     _DEBOUNCE_SECONDS = 0.8
-    _IDLE_SECONDS = 5 * 60
+    _IDLE_SECONDS = 10 * 60
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
@@ -1000,6 +1000,42 @@ class MusicDashboardManager:
                 with suppress(discord.DiscordException):
                     await obsolete_message.delete()
             return
+        embed = music_queue_embed(
+            response,
+            read_aloud_route=read_aloud_route,
+        )
+        view = MusicControlsView(self.runtime, self, response=response)
+        stored = self._stored_messages.get(workspace_id)
+        current_is_in_bound_channel = stored is None or stored[0] == channel_id
+        if current_message is not None and current_is_in_bound_channel and not force:
+            try:
+                edited = await current_message.edit(embed=embed, view=view)
+            except discord.DiscordException:
+                log.warning(
+                    "Could not edit music dashboard; posting a replacement guild=%s",
+                    workspace_id,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(edited, discord.Message):
+                    current_message = edited
+                self._messages[workspace_id] = current_message
+                self._fingerprints[workspace_id] = fingerprint
+                self._stored_messages[workspace_id] = (channel_id, current_message.id)
+                await self._persist_stored_messages()
+                if (
+                    obsolete_message is not None
+                    and obsolete_message.id != current_message.id
+                ):
+                    with suppress(discord.DiscordException):
+                        await obsolete_message.delete()
+                self._refresh_expiry(
+                    workspace_id,
+                    current_message,
+                    idle=_audio_dashboard_is_idle(response),
+                )
+                return
+
         channel = self.bot.get_channel(channel_id)
         if channel is None:
             with suppress(discord.DiscordException):
@@ -1009,11 +1045,8 @@ class MusicDashboardManager:
 
         # Sending first avoids losing the working panel when Discord rejects a post.
         new_message = await channel.send(
-            embed=music_queue_embed(
-                response,
-                read_aloud_route=read_aloud_route,
-            ),
-            view=MusicControlsView(self.runtime, self, response=response),
+            embed=embed,
+            view=view,
             silent=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1027,11 +1060,26 @@ class MusicDashboardManager:
             with suppress(discord.DiscordException):
                 await message.delete()
 
+        self._refresh_expiry(
+            workspace_id,
+            new_message,
+            idle=_audio_dashboard_is_idle(response),
+        )
+
+    def _refresh_expiry(
+        self,
+        workspace_id: str,
+        message: discord.Message,
+        *,
+        idle: bool,
+    ) -> None:
         expiry = self._expiry_tasks.pop(workspace_id, None)
         if expiry is not None and expiry is not asyncio.current_task():
             expiry.cancel()
+        if not idle:
+            return
         self._expiry_tasks[workspace_id] = asyncio.create_task(
-            self._expire(workspace_id, new_message),
+            self._expire(workspace_id, message),
             name=f"simajilord-music-dashboard-expiry-{workspace_id}",
         )
 
@@ -1176,6 +1224,21 @@ def _music_dashboard_fingerprint(
             read_aloud_route.audio_destination_id,
             read_aloud_route.mode.value,
         ),
+    )
+
+
+def _audio_dashboard_is_idle(response: AudioQueueResponse) -> bool:
+    """Expire only a connected shell with no active, queued, or held work."""
+
+    return (
+        response.current is None
+        and not any(
+            item.kind == AudioKind.MUSIC.value
+            for item in response.pending
+        )
+        and not response.autoplay_enabled
+        and not response.waiting_for_voice
+        and not response.resume_confirmation_required
     )
 
 
@@ -3887,11 +3950,7 @@ class ReadAloudCog(commands.Cog):
             workspace_id,
             lambda: DiscordAudioOutput(self.bot, guild_id),
         )
-        if (
-            session.has_music
-            and session.resume_confirmation_required
-            and not session.output.connected
-        ):
+        if session.resume_confirmation_required and not session.output.connected:
             return
         if (
             route.mode is ReadAloudMode.SKIP_DURING_MUSIC
@@ -3901,6 +3960,12 @@ class ReadAloudCog(commands.Cog):
             return
         output = cast(DiscordAudioOutput, session.output)
         try:
+            destination = message.guild.get_channel(int(route.audio_destination_id))
+            if not isinstance(
+                destination,
+                (discord.VoiceChannel, discord.StageChannel),
+            ) or not any(not listener.bot for listener in destination.members):
+                return
             if (
                 output.connected
                 and output.destination_id != int(route.audio_destination_id)
@@ -4037,11 +4102,7 @@ class ReadAloudCog(commands.Cog):
             workspace_id,
             lambda: DiscordAudioOutput(self.bot, member.guild.id),
         )
-        if (
-            session.has_music
-            and session.resume_confirmation_required
-            and not session.output.connected
-        ):
+        if session.resume_confirmation_required and not session.output.connected:
             return
         if (
             session.has_music
@@ -4120,7 +4181,11 @@ class VoiceLifecycleCog(commands.Cog):
             or joined_read_aloud_destination
         )
         if joined_expected_channel and after.channel is not None:
-            if self.dashboard is not None:
+            if self.dashboard is not None and (
+                session.has_music
+                or session.waiting_for_voice
+                or session.resume_confirmation_required
+            ):
                 self.dashboard.bind(member.guild.id, after.channel.id)
             task = self._leave_tasks.pop(workspace_id, None)
             if task is not None:

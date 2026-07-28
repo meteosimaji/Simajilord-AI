@@ -236,9 +236,9 @@ class SimajilordDiscordBot(commands.Bot):
             )
             if session.output.connected:
                 continue
-            if session.has_music and session.resume_confirmation_required:
+            if session.resume_confirmation_required:
                 log.info(
-                    "Read-aloud route %s remains in standby until held music is resumed",
+                    "Read-aloud route %s remains in standby until the audio session is resumed",
                     workspace_id,
                 )
                 continue

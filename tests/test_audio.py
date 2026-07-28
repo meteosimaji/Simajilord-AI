@@ -42,6 +42,8 @@ class FakeOutput:
         self.overlays: list[str] = []
         self.music_updates: list[float] = []
         self.fade_outs: list[tuple[str, float, float]] = []
+        self.overlay_error: Exception | None = None
+        self.stop_calls = 0
         self.release = asyncio.Event()
 
     async def connect(self, destination_id: str) -> None:
@@ -61,6 +63,8 @@ class FakeOutput:
         position_seconds: float,
     ) -> None:
         del music, position_seconds
+        if self.overlay_error is not None:
+            raise self.overlay_error
         self.overlays.append(speech.source)
 
     async def update_music(
@@ -88,6 +92,7 @@ class FakeOutput:
         self.paused = False
 
     def stop(self) -> None:
+        self.stop_calls += 1
         self.release.set()
 
     async def disconnect(self) -> None:
@@ -96,7 +101,7 @@ class FakeOutput:
 
 
 @pytest.mark.asyncio
-async def test_speech_is_prioritized_ahead_of_waiting_music() -> None:
+async def test_speech_overlays_current_music_before_waiting_music() -> None:
     output = FakeOutput()
     session = AudioSession("one", output, max_pending_speech=3)
     await session.enqueue(AudioItem("a", "first", "a"))
@@ -106,30 +111,32 @@ async def test_speech_is_prioritized_ahead_of_waiting_music() -> None:
         AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH)
     )
     for _ in range(20):
-        if output.played[:2] == ["first", "speech"]:
+        if output.overlays == ["speech"]:
             break
         await asyncio.sleep(0)
+    assert output.played == ["first"]
+    assert output.overlays == ["speech"]
+    assert output.fade_outs == []
+    assert output.music_updates
+    assert output.stop_calls == 0
+
     output.release.set()
     for _ in range(20):
-        if output.played[:3] == ["first", "speech", "first"]:
+        if output.played[:2] == ["first", "second"]:
             break
         await asyncio.sleep(0)
-    assert output.fade_outs and output.fade_outs[0][0] == "first"
-    assert output.played[:3] == ["first", "speech", "first"]
-    output.release.set()
-    for _ in range(20):
-        if output.played[:4] == ["first", "speech", "first", "second"]:
-            break
-        await asyncio.sleep(0)
-    assert output.played[:4] == ["first", "speech", "first", "second"]
+    assert output.played[:2] == ["first", "second"]
     await session.close()
 
 
 @pytest.mark.asyncio
-async def test_speech_ducks_current_music_then_resumes_from_saved_position(
+async def test_speech_ducks_current_music_without_restarting_the_player(
     tmp_path: Path,
 ) -> None:
+    resolved: list[str] = []
+
     async def resolve(reference: str) -> AudioItem:
+        resolved.append(reference)
         return AudioItem(
             "fresh-music-stream",
             "music",
@@ -166,25 +173,77 @@ async def test_speech_ducks_current_music_then_resumes_from_saved_position(
         )
     )
     for _ in range(50):
-        if output.played[:2] == ["music", "speech"]:
+        if output.overlays == [str(speech_file)] and output.music_updates:
             break
         await asyncio.sleep(0)
-    assert output.fade_outs and output.fade_outs[0][0] == "music"
-    assert speech_file.exists()
-    output.release.set()
-    for _ in range(50):
-        if output.played[:3] == ["music", "speech", "music"]:
-            break
-        await asyncio.sleep(0)
-    assert output.played[:3] == ["music", "speech", "music"]
+    assert output.played == ["music"]
+    assert output.fade_outs == []
+    assert output.overlays == [str(speech_file)]
+    assert output.stop_calls == 0
+    assert resolved == []
     assert not speech_file.exists()
-    assert output.played_items[2].fade_in_seconds == pytest.approx(0.4)
     snapshot = await session.snapshot()
     assert snapshot.current is not None
     assert snapshot.current.kind is AudioKind.MUSIC
     assert snapshot.current.speech_overlay_source is None
     assert snapshot.speech_active is False
     assert snapshot.position_seconds >= 0
+    assert snapshot.history == ()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_three_speech_overlays_keep_fifo_order_without_stopping_music() -> None:
+    output = FakeOutput()
+    session = AudioSession("one", output, max_pending_speech=4)
+    await session.enqueue(AudioItem("music", "music", "music"))
+    await asyncio.sleep(0)
+
+    for index in range(3):
+        await session.enqueue(
+            AudioItem(
+                f"speech-{index}",
+                f"speech-{index}",
+                f"local://speech-{index}",
+                kind=AudioKind.SPEECH,
+            )
+        )
+    for _ in range(50):
+        if output.overlays == ["speech-0", "speech-1", "speech-2"]:
+            break
+        await asyncio.sleep(0)
+
+    assert output.overlays == ["speech-0", "speech-1", "speech-2"]
+    assert output.played == ["music"]
+    assert output.stop_calls == 0
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_speech_overlay_falls_back_to_standalone_playback() -> None:
+    output = FakeOutput()
+    output.overlay_error = RuntimeError("overlay unavailable")
+    session = AudioSession("one", output, max_pending_speech=3)
+    await session.enqueue(AudioItem("music", "music", "music"))
+    await asyncio.sleep(0)
+    await session.enqueue(
+        AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH)
+    )
+
+    for _ in range(50):
+        if output.played[:2] == ["music", "speech"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played[:2] == ["music", "speech"]
+    assert output.overlays == []
+    assert output.stop_calls == 1
+
+    output.release.set()
+    for _ in range(50):
+        if output.played[:3] == ["music", "speech", "music"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played[:3] == ["music", "speech", "music"]
     await session.close()
 
 
@@ -1060,3 +1119,54 @@ async def test_auto_leave_suspends_voice_without_losing_current_track(tmp_path) 
     assert snapshot.destination_id == "voice"
     assert snapshot.resume_confirmation_required is True
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_leave_holds_read_aloud_only_route_for_explicit_resume() -> None:
+    output = FakeOutput()
+    session = AudioSession("read-aloud-only", output, max_pending_speech=3)
+    await session.connect("voice")
+
+    await session.suspend()
+
+    snapshot = await session.snapshot()
+    assert output.connected is False
+    assert snapshot.current is None
+    assert snapshot.pending == ()
+    assert snapshot.destination_id == "voice"
+    assert snapshot.resume_confirmation_required is True
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_only_resume_hold_survives_manager_restart(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "audio_sessions.json"
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(state_path),
+    )
+    session = manager.get_or_create("guild", lambda: output)
+    await session.connect("voice")
+    await session.suspend()
+    await manager.close()
+
+    restored_output = FakeOutput()
+    restored_output.connected = False
+    restored_manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(state_path),
+    )
+    restored = restored_manager.restore(lambda _: restored_output)
+
+    assert len(restored) == 1
+    snapshot = await restored[0].snapshot()
+    assert snapshot.pending == ()
+    assert snapshot.destination_id == "voice"
+    assert snapshot.resume_confirmation_required is True
+    await restored_manager.close()

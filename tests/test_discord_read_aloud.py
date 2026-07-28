@@ -174,6 +174,61 @@ async def test_formatter_avoids_repeating_same_author_until_timeout(
     assert third is not None and third.text == "めておさん。三つ目"
 
 
+@pytest.mark.asyncio
+async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure(
+        ReadAloudRoute("1", "2", "55", ReadAloudMode.QUEUE)
+    )
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    destination.members = []
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = destination
+    author = SimpleNamespace(
+        id=10,
+        display_name="めてお",
+        name="めてお",
+        bot=False,
+    )
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=99,
+            guild=guild,
+            channel=SimpleNamespace(id=2),
+            author=author,
+            content="誰もいないVCへ接続しない",
+            mentions=[],
+            role_mentions=[],
+            channel_mentions=[],
+            attachments=[],
+            stickers=[],
+            reference=None,
+            webhook_id=None,
+        ),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.audio = Mock()
+    session = Mock()
+    session.resume_confirmation_required = False
+    session.current = None
+    session.output.connected = False
+    runtime.audio.get_or_create.return_value = session
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+
+    await cog.on_message(message)
+
+    runtime.audio.get_or_create.assert_called_once()
+    runtime.registry.invoke.assert_not_awaited()
+
+
 async def _announcement_cog(tmp_path) -> tuple[
     ReadAloudCog,
     SimajilordRuntime,
@@ -198,6 +253,7 @@ async def _announcement_cog(tmp_path) -> tuple[
     runtime.audio.connect = AsyncMock()
     session = Mock()
     session.has_music = False
+    session.resume_confirmation_required = False
     session.destination_id = "55"
     session.output.connected = False
     runtime.audio.get_or_create.return_value = session
