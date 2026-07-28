@@ -52,7 +52,6 @@ from simajilord.services import (
     AudioSessionManager,
     AudioStateStore,
     FocusTimerService,
-    FreshMixService,
     ImageGenerationService,
     ImageGenerationStore,
     MediaPriority,
@@ -75,7 +74,6 @@ class SimajilordRuntime:
     registry: CapabilityRegistry
     media: MediaService
     audio: AudioSessionManager
-    fresh_mix: FreshMixService
     focus_timer: FocusTimerService
     speech: SpeechService
     read_aloud: ReadAloudService
@@ -191,7 +189,6 @@ class SimajilordRuntime:
             },
             file_suffix=".wav" if settings.tts_provider == "voicevox" else ".aiff",
         )
-        fresh_mix = FreshMixService(media)
         focus_timer = FocusTimerService(settings.data_dir / "focus_timers.sqlite3")
         read_aloud = ReadAloudService(settings.data_dir / "read_aloud.json")
         web = WebService(
@@ -425,7 +422,6 @@ class SimajilordRuntime:
             registry=registry,
             media=media,
             audio=audio,
-            fresh_mix=fresh_mix,
             focus_timer=focus_timer,
             speech=speech,
             read_aloud=read_aloud,
@@ -446,7 +442,7 @@ class SimajilordRuntime:
                 started_monotonic=started_monotonic,
             ),
             *build_utility_endpoints(),
-            *build_audio_endpoints(media, audio, fresh_mix),
+            *build_audio_endpoints(media, audio),
             *build_focus_timer_endpoints(focus_timer, read_aloud),
             build_download_endpoint(media),
             build_read_aloud_endpoint(read_aloud),

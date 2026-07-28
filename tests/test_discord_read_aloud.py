@@ -302,7 +302,7 @@ async def _announcement_cog(tmp_path) -> tuple[
 
 
 @pytest.mark.asyncio
-async def test_join_announcement_connects_and_uses_shared_speech_api(tmp_path) -> None:
+async def test_join_announcement_does_not_connect_a_passive_voice_route(tmp_path) -> None:
     cog, runtime, member, destination = await _announcement_cog(tmp_path)
 
     await cog._announce_voice_transition(
@@ -311,7 +311,24 @@ async def test_join_announcement_connects_and_uses_shared_speech_api(tmp_path) -
         after_channel=destination,
     )
 
-    runtime.audio.connect.assert_awaited_once_with("1", "55")
+    runtime.audio.connect.assert_not_awaited()
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_join_announcement_uses_shared_speech_api_when_already_connected(
+    tmp_path,
+) -> None:
+    cog, runtime, member, destination = await _announcement_cog(tmp_path)
+    runtime.audio.get_or_create.return_value.output.connected = True
+
+    await cog._announce_voice_transition(
+        member,
+        before_channel=None,
+        after_channel=destination,
+    )
+
+    runtime.audio.connect.assert_not_awaited()
     runtime.registry.invoke.assert_awaited_once()
     capability, request, context = runtime.registry.invoke.await_args.args
     assert capability == "speech.speak"

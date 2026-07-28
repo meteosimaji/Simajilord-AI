@@ -24,7 +24,7 @@ from simajilord.capabilities.audio import (
     build_audio_endpoints,
 )
 from simajilord.core import ApprovalMode, InvocationContext
-from simajilord.core.errors import UserError
+from simajilord.core.errors import EarlyPlaybackEnd, MediaError, UserError
 from simajilord.domain.audio import AudioItem, AudioKind, AudioQueueLane, LoopMode
 from simajilord.domain.media import MediaCandidate
 from simajilord.services.audio import AudioSession, AudioSessionManager
@@ -43,6 +43,7 @@ class FakeOutput:
         self.music_updates: list[float] = []
         self.fade_outs: list[tuple[str, float, float]] = []
         self.overlay_error: Exception | None = None
+        self.overlay_attempts = 0
         self.stop_calls = 0
         self.release = asyncio.Event()
 
@@ -63,6 +64,7 @@ class FakeOutput:
         position_seconds: float,
     ) -> None:
         del music, position_seconds
+        self.overlay_attempts += 1
         if self.overlay_error is not None:
             raise self.overlay_error
         self.overlays.append(speech.source)
@@ -220,7 +222,7 @@ async def test_three_speech_overlays_keep_fifo_order_without_stopping_music() ->
 
 
 @pytest.mark.asyncio
-async def test_failed_speech_overlay_falls_back_to_standalone_playback() -> None:
+async def test_failed_speech_overlay_never_stops_music() -> None:
     output = FakeOutput()
     output.overlay_error = RuntimeError("overlay unavailable")
     session = AudioSession("one", output, max_pending_speech=3)
@@ -231,19 +233,153 @@ async def test_failed_speech_overlay_falls_back_to_standalone_playback() -> None
     )
 
     for _ in range(50):
-        if output.played[:2] == ["music", "speech"]:
+        snapshot = await session.snapshot()
+        if output.overlay_attempts == 3 and not snapshot.speech_active:
             break
         await asyncio.sleep(0)
-    assert output.played[:2] == ["music", "speech"]
+    assert output.played == ["music"]
     assert output.overlays == []
-    assert output.stop_calls == 1
+    assert output.overlay_attempts == 3
+    assert output.stop_calls == 0
+    await session.close()
 
-    output.release.set()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lane", "initial_failures"),
+    (
+        (AudioQueueLane.REQUEST, 2),
+        (AudioQueueLane.AUTOPLAY, 1),
+    ),
+)
+async def test_failed_music_is_dropped_at_lane_retry_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    lane: AudioQueueLane,
+    initial_failures: int,
+) -> None:
+    class FailedOutput(FakeOutput):
+        async def play(self, item: AudioItem) -> None:
+            self.played.append(item.title)
+            raise RuntimeError("transport failed")
+
+    monkeypatch.setattr(
+        "simajilord.services.audio._IMMEDIATE_RETRY_DELAYS",
+        (0.0,),
+    )
+    output = FailedOutput()
+    session = AudioSession("bounded", output, max_pending_speech=3)
+    await session.enqueue(
+        AudioItem(
+            "stream",
+            "bounded failure",
+            "https://example.com/watch",
+            failure_count=initial_failures,
+            queue_lane=lane,
+        )
+    )
+
     for _ in range(50):
-        if output.played[:3] == ["music", "speech", "music"]:
+        snapshot = await session.snapshot()
+        if output.played and snapshot.current is None and not snapshot.pending:
             break
         await asyncio.sleep(0)
-    assert output.played[:3] == ["music", "speech", "music"]
+
+    snapshot = await session.snapshot()
+    assert output.played == ["bounded failure"]
+    assert snapshot.current is None
+    assert snapshot.pending == ()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_permanent_media_failure_is_not_requeued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableOutput(FakeOutput):
+        async def play(self, item: AudioItem) -> None:
+            self.played.append(item.title)
+            raise MediaError("unavailable", "private or deleted")
+
+    monkeypatch.setattr(
+        "simajilord.services.audio._IMMEDIATE_RETRY_DELAYS",
+        (0.0,),
+    )
+    output = UnavailableOutput()
+    session = AudioSession("permanent", output, max_pending_speech=3)
+    await session.enqueue(
+        AudioItem(
+            "stream",
+            "unavailable",
+            "https://example.com/watch",
+        )
+    )
+
+    for _ in range(50):
+        snapshot = await session.snapshot()
+        if snapshot.current is None and not snapshot.pending:
+            break
+        await asyncio.sleep(0)
+
+    snapshot = await session.snapshot()
+    assert output.played == ["unavailable"]
+    assert snapshot.current is None
+    assert snapshot.pending == ()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_early_playback_end_reresolves_once_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EarlyEndOutput(FakeOutput):
+        async def play(self, item: AudioItem) -> None:
+            self.played.append(item.source)
+            if len(self.played) == 1:
+                raise EarlyPlaybackEnd(
+                    elapsed_seconds=10.0,
+                    expected_seconds=120.0,
+                )
+
+    resolved: list[str] = []
+
+    async def resolve(reference: str) -> AudioItem:
+        resolved.append(reference)
+        return AudioItem(
+            "fresh-stream",
+            "recovered",
+            reference,
+            duration_seconds=120.0,
+            resolver_reference=reference,
+        )
+
+    monkeypatch.setattr(
+        "simajilord.services.audio._IMMEDIATE_RETRY_DELAYS",
+        (0.0, 0.0),
+    )
+    output = EarlyEndOutput()
+    session = AudioSession(
+        "early-eof",
+        output,
+        max_pending_speech=3,
+        resolver=resolve,
+    )
+    await session.enqueue(
+        AudioItem(
+            "old-stream",
+            "track",
+            "https://example.com/watch",
+            duration_seconds=120.0,
+            resolver_reference="https://example.com/watch",
+        )
+    )
+
+    for _ in range(50):
+        if output.played == ["old-stream", "fresh-stream"]:
+            break
+        await asyncio.sleep(0)
+
+    assert output.played == ["old-stream", "fresh-stream"]
+    assert resolved == ["https://example.com/watch"]
     await session.close()
 
 
@@ -1091,6 +1227,80 @@ async def test_mix_uses_multiple_seeds_and_manual_requests_keep_priority() -> No
     assert [item.title for item in waiting.pending] == ["manual"]
     assert waiting.autoplay_next is None
     await session.close()
+
+
+def test_radio_reservoir_is_bounded_deduplicated_and_deterministic() -> None:
+    session = AudioSession(
+        "guild",
+        FakeOutput(),
+        max_pending_speech=3,
+    )
+    session._history.extend(
+        (
+            AudioItem(
+                "",
+                "Recently played song",
+                "https://www.youtube.com/watch?v=recent",
+                uploader="Repeated Artist",
+            ),
+        )
+    )
+    candidates = (
+        AudioItem(
+            "",
+            "Recently played song",
+            "https://www.youtube.com/watch?v=recent-again",
+            uploader="Repeated Artist",
+        ),
+        AudioItem(
+            "",
+            "Fresh Song",
+            "https://www.youtube.com/watch?v=fresh",
+            uploader="Fresh Artist",
+        ),
+        AudioItem(
+            "",
+            "Fresh Song (Official Video)",
+            "https://www.youtube.com/watch?v=fresh-duplicate",
+            uploader="Fresh Artist",
+        ),
+        AudioItem(
+            "",
+            "Another Song (Nightcore)",
+            "https://www.youtube.com/watch?v=variant",
+            uploader="Another Artist",
+        ),
+        AudioItem(
+            "",
+            "Third Song",
+            "https://www.youtube.com/watch?v=third",
+            uploader="Third Artist",
+        ),
+        AudioItem(
+            "",
+            "Two Hour Compilation",
+            "https://www.youtube.com/watch?v=long",
+            duration_seconds=7_200,
+            uploader="Long Artist",
+        ),
+    )
+
+    first = session._select_radio_candidates(
+        candidates,
+        generation=4,
+        recent_references={"https://www.youtube.com/watch?v=recent"},
+    )
+    second = session._select_radio_candidates(
+        candidates,
+        generation=4,
+        recent_references={"https://www.youtube.com/watch?v=recent"},
+    )
+
+    assert [item.page_url for item in first] == [item.page_url for item in second]
+    assert len(first) == 3
+    assert first[0].title == "Fresh Song"
+    assert len({item.title for item in first}) == 3
+    assert all(item.title != "Recently played song" for item in first)
 
 
 @pytest.mark.asyncio

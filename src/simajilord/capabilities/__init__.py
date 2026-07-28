@@ -21,11 +21,6 @@ from .audio import (
     AudioSeekRequest,
     AudioTuneRequest,
     AudioVolumeRequest,
-    FreshMixEnqueueRequest,
-    FreshMixEnqueueResponse,
-    FreshMixPlanRequest,
-    FreshMixPreviewResponse,
-    FreshMixReviseRequest,
     build_audio_endpoints,
 )
 from .files import build_file_endpoints
@@ -126,11 +121,6 @@ __all__ = [
     "FocusTimerListRequest",
     "FocusTimerListResponse",
     "FocusTimerResponse",
-    "FreshMixEnqueueRequest",
-    "FreshMixEnqueueResponse",
-    "FreshMixPlanRequest",
-    "FreshMixPreviewResponse",
-    "FreshMixReviseRequest",
     "ImageGenerateRequest",
     "ImageGenerateResponse",
     "ImageStatusRequest",

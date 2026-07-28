@@ -1086,11 +1086,13 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
+    { name = "davey" },
     { name = "discord-py", extra = ["voice"] },
     { name = "pillow" },
     { name = "pypdf" },
     { name = "python-dotenv" },
     { name = "yt-dlp" },
+    { name = "yt-dlp-ejs" },
 ]
 
 [package.dev-dependencies]
@@ -1104,11 +1106,13 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14,<4" },
+    { name = "davey", specifier = "==0.1.6" },
     { name = "discord-py", extras = ["voice"], specifier = "==2.7.1" },
     { name = "pillow", specifier = ">=11.3,<13" },
     { name = "pypdf", specifier = ">=6.6,<7" },
     { name = "python-dotenv", specifier = ">=1.1.1,<2" },
     { name = "yt-dlp", directory = "vendor/yt-dlp" },
+    { name = "yt-dlp-ejs", specifier = "==0.8.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -1299,3 +1303,12 @@ test = [
     { name = "pytest-rerunfailures", specifier = "~=16.0" },
 ]
 uv = [{ name = "uv", specifier = ">=0.10" }]
+
+[[package]]
+name = "yt-dlp-ejs"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/e6/cceb9530e8f4e5940f6f7822d90e9d94f1b85343329a16baaf47bbbb3de1/yt_dlp_ejs-0.8.0.tar.gz", hash = "sha256:d5fa1639f63b5c4af8d932495f60689d5370f1a095782c944f7f62a303eb104e", size = 96571, upload-time = "2026-03-17T22:49:19.299Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e3/bd/520769863744b669440a924271a6159ddd82ad5ae26b4ac4d4b69e9f8d44/yt_dlp_ejs-0.8.0-py3-none-any.whl", hash = "sha256:79300e5fca7f937a1eeede11f0456862c1b41107ce1d726871e0207424f4bdb4", size = 53443, upload-time = "2026-03-17T22:49:17.736Z" },
+]

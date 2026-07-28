@@ -31,11 +31,6 @@ from simajilord.capabilities.audio import (
     AudioSeekRequest,
     AudioTuneRequest,
     AudioVolumeRequest,
-    FreshMixEnqueueRequest,
-    FreshMixEnqueueResponse,
-    FreshMixPlanRequest,
-    FreshMixPreviewResponse,
-    FreshMixReviseRequest,
 )
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -1368,42 +1363,6 @@ def build_discord_endpoints(
         response = await runtime.registry.invoke("audio.mix", request, context)
         return cast(AudioMixResponse, response)
 
-    async def plan_fresh_mix(
-        request: FreshMixPlanRequest,
-        context: InvocationContext,
-    ) -> FreshMixPreviewResponse:
-        _guild(client, context)
-        response = await runtime.registry.invoke(
-            "audio.fresh_mix_plan",
-            request,
-            context,
-        )
-        return cast(FreshMixPreviewResponse, response)
-
-    async def revise_fresh_mix(
-        request: FreshMixReviseRequest,
-        context: InvocationContext,
-    ) -> FreshMixPreviewResponse:
-        _guild(client, context)
-        response = await runtime.registry.invoke(
-            "audio.fresh_mix_revise",
-            request,
-            context,
-        )
-        return cast(FreshMixPreviewResponse, response)
-
-    async def enqueue_fresh_mix(
-        request: FreshMixEnqueueRequest,
-        context: InvocationContext,
-    ) -> FreshMixEnqueueResponse:
-        await _assert_audio_control_access(context)
-        response = await runtime.registry.invoke(
-            "audio.fresh_mix_enqueue",
-            request,
-            context,
-        )
-        return cast(FreshMixEnqueueResponse, response)
-
     async def move_audio(
         request: AudioMoveRequest,
         context: InvocationContext,
@@ -2095,50 +2054,6 @@ def build_discord_endpoints(
             ("volume", "speech"),
             AudioVolumeRequest,
             set_audio_volume,
-        ),
-        endpoint(
-            CapabilityDescriptor(
-                name="discord.plan_fresh_mix",
-                summary=(
-                    "Build a pre-playback Fresh Mix preview from verified real tracks "
-                    "without using listening history."
-                ),
-                risk=RiskLevel.EXTERNAL,
-                approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "music", "fresh mix", "plan", "preview"),
-                side_effects=("Searches media without changing the queue.",),
-            ),
-            FreshMixPlanRequest,
-            FreshMixPreviewResponse,
-            plan_fresh_mix,
-        ),
-        endpoint(
-            CapabilityDescriptor(
-                name="discord.revise_fresh_mix",
-                summary="Replace a selected Fresh Mix preview track with another verified result.",
-                risk=RiskLevel.EXTERNAL,
-                approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "music", "fresh mix", "revise", "replace"),
-                side_effects=("Searches media without changing the queue.",),
-            ),
-            FreshMixReviseRequest,
-            FreshMixPreviewResponse,
-            revise_fresh_mix,
-        ),
-        endpoint(
-            CapabilityDescriptor(
-                name="discord.enqueue_fresh_mix",
-                summary="Atomically enqueue an approved Fresh Mix preview.",
-                risk=RiskLevel.WRITE,
-                approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "music", "fresh mix", "play", "approve"),
-                side_effects=(
-                    "Adds multiple verified tracks to the audio queue as one operation.",
-                ),
-            ),
-            FreshMixEnqueueRequest,
-            FreshMixEnqueueResponse,
-            enqueue_fresh_mix,
         ),
         endpoint(
             CapabilityDescriptor(

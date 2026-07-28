@@ -56,11 +56,6 @@ from simajilord.capabilities.audio import (
     AudioSearchItem,
     AudioSearchRequest,
     AudioSearchResponse,
-    FreshMixEnqueueRequest,
-    FreshMixEnqueueResponse,
-    FreshMixPlanRequest,
-    FreshMixPreviewResponse,
-    FreshMixReviseRequest,
     audio_queue_response,
 )
 from simajilord.capabilities.focus_timer import (
@@ -123,7 +118,6 @@ from simajilord.observability import EventRecord
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.audio import AudioSession
 from simajilord.services.focus_timer import FocusTimer
-from simajilord.services.fresh_mix import FreshMixEnergy, FreshMixVocals
 from simajilord.services.read_aloud import (
     ReadAloudContentMode,
     ReadAloudMode,
@@ -196,25 +190,6 @@ _ERROR_MESSAGES = {
     "audio.duplicate_limit": (
         "That track is already queued several times. Use Loop for repeated playback."
     ),
-    "audio.fresh_mix_artist_limit_invalid": "Per-artist limit must be between 1 and 4.",
-    "audio.fresh_mix_draft_busy": "That Fresh Mix draft is being updated.",
-    "audio.fresh_mix_draft_capacity": (
-        "Too many Fresh Mix drafts are active. Try again shortly."
-    ),
-    "audio.fresh_mix_draft_not_found": "That preview expired or was already used.",
-    "audio.fresh_mix_duration_invalid": "Fresh Mix duration must be 15-240 minutes.",
-    "audio.fresh_mix_history_must_be_off": "Fresh Mix cannot use playback history.",
-    "audio.fresh_mix_no_candidates": (
-        "Not enough real tracks matched. Make the request more specific."
-    ),
-    "audio.fresh_mix_no_replacement": "No verified replacement matched.",
-    "audio.fresh_mix_phase_duration_mismatch": "Phase durations do not match the total.",
-    "audio.fresh_mix_phase_invalid": "Each phase needs a duration and 1-4 search intents.",
-    "audio.fresh_mix_phase_limit": "Fresh Mix supports at most six phases.",
-    "audio.fresh_mix_position_invalid": "Choose a valid preview track number.",
-    "audio.fresh_mix_prompt_required": "Describe the activity or desired atmosphere.",
-    "audio.fresh_mix_query_invalid": "A search intent is empty or too long.",
-    "audio.fresh_mix_query_limit": "Fresh Mix supports at most eight search intents.",
     "audio.seek_position_required": "Provide a playback position.",
     "audio.search_empty": "No matching track was found.",
     "audio.search_limit_invalid": "Search limit must be between 1 and 10.",
@@ -532,11 +507,16 @@ def music_queue_embed(
         current = response.current
         elapsed = min(response.position_seconds, current.duration_seconds)
         uploader = discord.utils.escape_markdown(current.uploader or "Unknown uploader")
-        timing = f"`{_duration(elapsed)} / {_duration(current.duration_seconds)}`"
-        if not response.paused and current.duration_seconds > elapsed:
+        if response.paused:
+            timing = f"Paused at `{_duration(elapsed)}`"
+        elif current.duration_seconds > elapsed:
             remaining = (current.duration_seconds - elapsed) / max(response.speed, 0.01)
             ends_at = int(time.time() + remaining)
-            timing += f" · ends <t:{ends_at}:T> · <t:{ends_at}:R>"
+            timing = f"Ends <t:{ends_at}:R>"
+        elif current.duration_seconds <= 0:
+            timing = "Playing"
+        else:
+            timing = "Finishing"
         description_lines = [
             (
                 "### ["
@@ -641,241 +621,57 @@ def music_now_playing_embed(response: AudioQueueResponse) -> discord.Embed:
     return music_queue_embed(response)
 
 
-def fresh_mix_preview_embed(response: FreshMixPreviewResponse) -> discord.Embed:
-    lines: list[str] = []
-    used = 0
-    for index, track in enumerate(response.tracks, start=1):
-        line = (
-            f"`{index:02d}` [{discord.utils.escape_markdown(track.title)}]"
-            f"({_safe_markdown_url(track.reference)}) · "
-            f"`{_duration(track.duration_seconds)}` · "
-            f"{discord.utils.escape_markdown(track.artist)}"
+def music_details_embed(response: AudioQueueResponse) -> discord.Embed:
+    """Render on-demand playback details without bloating the canonical panel."""
+
+    current = response.current
+    if current is None:
+        return command_embed(
+            "Audio details",
+            description="No track is playing.",
         )
-        if used + len(line) + 1 > 3_300:
-            remaining = len(response.tracks) - len(lines)
-            lines.append(f"ほか **{remaining}曲**")
-            break
-        lines.append(line)
-        used += len(line) + 1
-    duration_delta = round(response.duration_seconds / 60 - response.target_minutes)
-    duration_note = (
-        "目標範囲内"
-        if abs(duration_delta) <= 5
-        else f"目標より {abs(duration_delta)}分{'長い' if duration_delta > 0 else '短い'}"
-    )
-    return command_embed(
-        "Fresh Mix preview",
-        description="\n".join(lines),
-        fields=(
-            EmbedField(
-                "構成",
-                f"**{len(response.tracks)}曲・{_duration(response.duration_seconds)}**\n"
-                f"目標 {response.target_minutes}分・{duration_note}",
-                inline=False,
+    fields = (
+        EmbedField(
+            "Playback",
+            (
+                f"Position `{_duration(response.position_seconds)}` · "
+                f"Duration `{_duration(current.duration_seconds)}`"
             ),
-            EmbedField(
-                "検証",
-                "履歴不使用・実在候補を検索済み・重複/同一投稿者/版を検査済み",
-                inline=False,
-            ),
+            inline=False,
         ),
-        tone=(
-            EmbedTone.SUCCESS
-            if "duration_within_5_minutes" in response.checks
-            else EmbedTone.WARNING
+        EmbedField(
+            "Source",
+            (
+                f"{discord.utils.escape_markdown(current.uploader or 'Unknown uploader')}\n"
+                f"[Open source]({current.page_url})"
+            ),
+            inline=False,
+        ),
+        EmbedField("Requested by", _queue_requester(current)),
+        EmbedField(
+            "Settings",
+            (
+                f"Speed **{response.speed:.2f}x** · Pitch **{response.pitch:.2f}x**\n"
+                f"Music **{response.music_volume_percent}%** · "
+                f"Read aloud **{response.speech_volume_percent}%**"
+            ),
+            inline=False,
         ),
     )
-
-
-class FreshMixPreviewView(discord.ui.View):
-    """Require an explicit click before a verified draft changes the queue."""
-
-    def __init__(
-        self,
-        runtime: SimajilordRuntime,
-        dashboard: MusicDashboardManager,
-        response: FreshMixPreviewResponse,
-        *,
-        requester_id: int,
-        requester_name: str,
-    ) -> None:
-        super().__init__(timeout=10 * 60)
-        self.runtime = runtime
-        self.dashboard = dashboard
-        self.response = response
-        self.requester_id = requester_id
-        self.requester_name = requester_name
-        self._lock = asyncio.Lock()
-        self._finished = False
-
-    async def _require_requester(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.requester_id:
-            return True
-        await interaction.response.send_message(
-            embed=command_embed(
-                "このpreviewはほかのユーザーが作成しました",
-                description="自分用のMixは `/freshmix` から作成できます。",
-                tone=EmbedTone.WARNING,
-            ),
-            ephemeral=True,
-        )
-        return False
-
-    async def revise(
-        self,
-        interaction: discord.Interaction,
-        *,
-        position: int,
-        query: str,
-    ) -> None:
-        if not await self._require_requester(interaction):
-            return
-        async with self._lock:
-            if self._finished:
-                await interaction.response.send_message(
-                    "このpreviewは処理済みです。",
-                    ephemeral=True,
-                )
-                return
-            await interaction.response.defer(thinking=True)
-            try:
-                self.response = cast(
-                    FreshMixPreviewResponse,
-                    await self.runtime.registry.invoke(
-                        "discord.revise_fresh_mix",
-                        FreshMixReviseRequest(
-                            draft_id=self.response.draft_id,
-                            position=position,
-                            query=query,
-                        ),
-                        invocation_context(interaction),
-                    ),
-                )
-                await interaction.edit_original_response(
-                    embed=fresh_mix_preview_embed(self.response),
-                    view=self,
-                )
-            except Exception as exc:
-                await send_error(interaction, exc)
-
-    @discord.ui.button(
-        label="Replace Track",
-        style=discord.ButtonStyle.primary,
-        custom_id="simajilord:fresh-mix:revise",
+    embed = command_embed(
+        "Audio details",
+        description=(
+            "### ["
+            f"{discord.utils.escape_markdown(_compact_panel_text(current.title, maximum=120))}"
+            "]"
+            f"({current.page_url})"
+        ),
+        fields=fields,
     )
-    async def revise_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[FreshMixPreviewView],
-    ) -> None:
-        if not await self._require_requester(interaction):
-            return
-        await interaction.response.send_modal(FreshMixReviseModal(self))
-
-    @discord.ui.button(
-        label="Play Mix",
-        style=discord.ButtonStyle.success,
-        custom_id="simajilord:fresh-mix:enqueue",
-    )
-    async def enqueue_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[FreshMixPreviewView],
-    ) -> None:
-        if not await self._require_requester(interaction):
-            return
-        async with self._lock:
-            if self._finished:
-                await interaction.response.send_message(
-                    "このpreviewは処理済みです。",
-                    ephemeral=True,
-                )
-                return
-            await interaction.response.defer(thinking=True)
-            try:
-                self.dashboard.bind(interaction.guild_id, interaction.channel_id)
-                response = cast(
-                    FreshMixEnqueueResponse,
-                    await self.runtime.registry.invoke(
-                        "discord.enqueue_fresh_mix",
-                        FreshMixEnqueueRequest(
-                            draft_id=self.response.draft_id,
-                            requested_by_name=self.requester_name,
-                        ),
-                        invocation_context(interaction),
-                    ),
-                )
-                self._finished = True
-                self.stop()
-                await interaction.edit_original_response(
-                    embed=command_embed(
-                        "Fresh Mixをキューに追加しました",
-                        description=(
-                            f"**{response.track_count}曲・"
-                            f"{_duration(response.duration_seconds)}**\n"
-                            f"キュー {response.first_queue_position}〜"
-                            f"{response.last_queue_position}番"
-                        ),
-                        tone=EmbedTone.SUCCESS,
-                    ),
-                    view=None,
-                )
-            except Exception as exc:
-                await send_error(interaction, exc)
-
-    @discord.ui.button(
-        label="Cancel",
-        style=discord.ButtonStyle.secondary,
-        custom_id="simajilord:fresh-mix:cancel",
-    )
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[FreshMixPreviewView],
-    ) -> None:
-        if not await self._require_requester(interaction):
-            return
-        self._finished = True
-        self.stop()
-        await interaction.response.edit_message(view=None)
-
-    async def on_timeout(self) -> None:
-        self._finished = True
-        self.stop()
-
-
-class FreshMixReviseModal(discord.ui.Modal, title="Fresh Mixの1曲を変更"):
-    position: discord.ui.TextInput[FreshMixReviseModal] = discord.ui.TextInput(
-        label="曲番号",
-        placeholder="preview左側の番号 (例: 3)",
-        min_length=1,
-        max_length=2,
-    )
-    query: discord.ui.TextInput[FreshMixReviseModal] = discord.ui.TextInput(
-        label="代わりに探す曲",
-        placeholder="曲名、投稿者、雰囲気など",
-        min_length=1,
-        max_length=150,
-    )
-
-    def __init__(self, preview: FreshMixPreviewView) -> None:
-        super().__init__()
-        self.preview = preview
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            position = int(str(self.position).strip())
-        except ValueError:
-            await interaction.response.send_message(
-                "曲番号は数字で入力してください。",
-                ephemeral=True,
-            )
-            return
-        await self.preview.revise(
-            interaction,
-            position=position,
-            query=str(self.query).strip(),
-        )
+    embed.timestamp = None
+    if current.thumbnail_url:
+        embed.set_image(url=current.thumbnail_url)
+    return embed
 
 
 class MusicDashboardManager:
@@ -1033,17 +829,65 @@ class MusicDashboardManager:
         stored = self._stored_messages.get(workspace_id)
         current_is_in_bound_channel = stored is None or stored[0] == channel_id
         if current_message is not None and current_is_in_bound_channel and not force:
+            edit_error: discord.DiscordException | None = None
             try:
                 edited = await current_message.edit(embed=embed, view=view)
             except discord.DiscordException as exc:
+                edit_error = exc
                 if getattr(exc, "status", None) == 429:
                     await self._record_metric("discord.dashboard_429", "rate_limited")
-                if getattr(exc, "code", None) == 30046:
+                    retry_after = max(
+                        0.0,
+                        min(float(getattr(exc, "retry_after", 1.0) or 1.0), 30.0),
+                    )
+                    await asyncio.sleep(retry_after)
+                    try:
+                        edited = await current_message.edit(embed=embed, view=view)
+                    except discord.DiscordException as retry_exc:
+                        edit_error = retry_exc
+                        await self._record_metric(
+                            "discord.dashboard_429",
+                            "retry_failed",
+                        )
+                    else:
+                        edit_error = None
+                        await self._record_metric(
+                            "discord.dashboard_429",
+                            "retry_succeeded",
+                        )
+            if edit_error is not None:
+                status = getattr(edit_error, "status", None)
+                code = getattr(edit_error, "code", None)
+                if status == 403:
+                    await self._record_metric("discord.dashboard_403", "stopped")
+                    self._channel_ids.pop(workspace_id, None)
+                    log.warning(
+                        "Stopping music dashboard updates after Discord denied access "
+                        "guild=%s channel=%s",
+                        workspace_id,
+                        channel_id,
+                    )
+                    return
+                if status == 429:
+                    log.warning(
+                        "Music dashboard edit remained rate-limited after one retry "
+                        "guild=%s",
+                        workspace_id,
+                    )
+                    return
+                if status == 404:
+                    await self._record_metric("discord.dashboard_404", "reset")
+                    self._messages.pop(workspace_id, None)
+                    current_message = None
+                    if self._stored_messages.pop(workspace_id, None) is not None:
+                        await self._persist_stored_messages()
+                if code == 30046:
                     await self._record_metric("discord.dashboard_30046", "rollover")
                 log.warning(
-                    "Could not edit music dashboard; posting a replacement guild=%s",
+                    "Could not edit music dashboard; posting a replacement "
+                    "guild=%s error=%s",
                     workspace_id,
-                    exc_info=True,
+                    edit_error,
                 )
             else:
                 await self._record_metric("discord.dashboard_edits", "succeeded")
@@ -1246,10 +1090,22 @@ def _music_dashboard_fingerprint(
     current = response.current
     autoplay_next = response.autoplay_next
     return (
-        None if current is None else current.page_url,
+        None
+        if current is None
+        else (
+            current.page_url,
+            current.title,
+            current.uploader,
+            current.thumbnail_url,
+            current.duration_seconds,
+        ),
         tuple(
             (
                 item.page_url,
+                item.title,
+                item.uploader,
+                item.thumbnail_url,
+                item.duration_seconds,
                 item.requested_by_name,
                 item.queue_lane,
             )
@@ -1268,7 +1124,15 @@ def _music_dashboard_fingerprint(
         response.speed,
         response.pitch,
         response.autoplay_enabled,
-        None if autoplay_next is None else autoplay_next.page_url,
+        None
+        if autoplay_next is None
+        else (
+            autoplay_next.page_url,
+            autoplay_next.title,
+            autoplay_next.uploader,
+            autoplay_next.thumbnail_url,
+            autoplay_next.duration_seconds,
+        ),
         None
         if read_aloud_route is None
         else (
@@ -1749,7 +1613,6 @@ class MusicControlsView(discord.ui.View):
             self.remove_item(self.pause_button)
             self.remove_item(self.skip_button)
             self.remove_item(self.stop_button)
-            self.remove_item(self.more_actions)
 
     def _bind_dashboard(self, interaction: discord.Interaction) -> None:
         dashboard = self._dashboard_manager(interaction)
@@ -1977,10 +1840,10 @@ class MusicControlsView(discord.ui.View):
                 emoji="🧹",
             ),
             discord.SelectOption(
-                label="Refresh",
-                value="refresh",
-                description="Refresh this panel now",
-                emoji="🔄",
+                label="Details",
+                value="details",
+                description="Show track and playback details",
+                emoji="🔎",
             ),
             discord.SelectOption(
                 label="Leave",
@@ -2055,19 +1918,8 @@ class MusicControlsView(discord.ui.View):
         if action == "leave":
             await self._run(interaction, AudioAction.LEAVE)
             return
-        if action == "refresh":
+        if action == "details":
             self._bind_dashboard(interaction)
-            workspace_id = str(interaction.guild_id or "")
-            session = self.runtime.audio.require(workspace_id)
-            await interaction.response.defer()
-            dashboard = self._dashboard_manager(interaction)
-            if dashboard is not None:
-                await dashboard.publish(
-                    session,
-                    force=True,
-                    obsolete_message=interaction.message,
-                )
-                return
             response = cast(
                 AudioQueueResponse,
                 await self.runtime.registry.invoke(
@@ -2076,7 +1928,11 @@ class MusicControlsView(discord.ui.View):
                     invocation_context(interaction),
                 ),
             )
-            await self._publish_dashboard(interaction, session, response)
+            await interaction.response.send_message(
+                embed=music_details_embed(response),
+                ephemeral=True,
+                silent=True,
+            )
             return
         await interaction.response.send_message(
             "That audio action is no longer available.",
@@ -3410,78 +3266,6 @@ class MusicCog(commands.Cog):
         seeds: str | None = None,
     ) -> None:
         await self._send_mix(interaction, enabled=enabled, seeds=seeds)
-
-    async def _send_fresh_mix(
-        self,
-        interaction: discord.Interaction,
-        *,
-        prompt: str,
-        minutes: int,
-        energy: Literal["calm", "steady", "rising"],
-        vocals: Literal["low", "balanced", "any"],
-    ) -> None:
-        try:
-            await interaction.response.defer(thinking=True)
-            self.dashboard.bind(interaction.guild_id, interaction.channel_id)
-            _discord_audio_session(self.bot, self.runtime, interaction.guild_id)
-            response = cast(
-                FreshMixPreviewResponse,
-                await self.runtime.registry.invoke(
-                    "discord.plan_fresh_mix",
-                    FreshMixPlanRequest(
-                        prompt=prompt,
-                        target_minutes=minutes,
-                        energy=FreshMixEnergy(energy),
-                        vocals=FreshMixVocals(vocals),
-                        history_policy="ignore",
-                    ),
-                    invocation_context(interaction),
-                ),
-            )
-            await interaction.edit_original_response(
-                embed=fresh_mix_preview_embed(response),
-                view=FreshMixPreviewView(
-                    self.runtime,
-                    self.dashboard,
-                    response,
-                    requester_id=interaction.user.id,
-                    requester_name=interaction.user.display_name,
-                ),
-            )
-        except Exception as exc:
-            await send_error(interaction, exc)
-
-    async def quick_fresh_mix(
-        self,
-        interaction: discord.Interaction,
-        prompt: str,
-        minutes: app_commands.Range[int, 15, 240] = 60,
-        energy: Literal["calm", "steady", "rising"] = "steady",
-        vocals: Literal["low", "balanced", "any"] = "balanced",
-    ) -> None:
-        await self._send_fresh_mix(
-            interaction,
-            prompt=prompt,
-            minutes=int(minutes),
-            energy=energy,
-            vocals=vocals,
-        )
-
-    async def fresh_mix(
-        self,
-        interaction: discord.Interaction,
-        prompt: str,
-        minutes: app_commands.Range[int, 15, 240] = 60,
-        energy: Literal["calm", "steady", "rising"] = "steady",
-        vocals: Literal["low", "balanced", "any"] = "balanced",
-    ) -> None:
-        await self._send_fresh_mix(
-            interaction,
-            prompt=prompt,
-            minutes=int(minutes),
-            energy=energy,
-            vocals=vocals,
-        )
 
     async def _control(
         self,
@@ -5017,6 +4801,10 @@ class ReadAloudCog(commands.Cog):
         )
         if session.resume_confirmation_required and not session.output.connected:
             return
+        if not session.output.connected:
+            # A channel message is content to read, not consent to join voice.
+            # The listener must use Start, /audio, /join, or an approved agent action.
+            return
         if (
             route.mode is ReadAloudMode.SKIP_DURING_MUSIC
             and session.current is not None
@@ -5031,16 +4819,6 @@ class ReadAloudCog(commands.Cog):
                 and session.current is not None
             ):
                 return
-            await self.runtime.registry.invoke(
-                "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=route.audio_destination_id),
-                InvocationContext(
-                    actor_id=str(message.author.id),
-                    workspace_id=workspace_id,
-                    transport="discord",
-                    request_id=f"read-aloud:{message.id}",
-                ),
-            )
             await self.runtime.registry.invoke(
                 "speech.speak",
                 SpeechSpeakRequest(
@@ -5174,7 +4952,7 @@ class ReadAloudCog(commands.Cog):
         ):
             return
         if not session.output.connected:
-            await self.runtime.audio.connect(workspace_id, route.audio_destination_id)
+            return
         spoken_text = self.runtime.read_aloud.apply_dictionary(workspace_id, text)
         await self.runtime.registry.invoke(
             "speech.speak",
@@ -5259,26 +5037,16 @@ class VoiceLifecycleCog(commands.Cog):
                 and session.destination_id is not None
                 and str(after.channel.id) != session.destination_id
             )
-            should_connect = (
-                session.has_music or joined_read_aloud_destination
-            ) and not music_targets_another_channel and not session.resume_confirmation_required
-            if should_connect and not session.output.connected:
-                try:
-                    await self.runtime.audio.connect(
-                        workspace_id,
-                        str(after.channel.id),
-                    )
-                    log.info(
-                        "Prepared audio after a listener joined guild=%s read_aloud=%s music=%s",
-                        workspace_id,
-                        joined_read_aloud_destination,
-                        session.has_music,
-                    )
-                except Exception:
-                    log.exception(
-                        "Could not prepare audio after a listener joined guild=%s",
-                        workspace_id,
-                    )
+            if (
+                (session.has_music or joined_read_aloud_destination)
+                and not music_targets_another_channel
+                and not session.output.connected
+            ):
+                log.info(
+                    "Listener joined while audio is in standby guild=%s; "
+                    "waiting for an explicit Start, play, join, or approved agent action",
+                    workspace_id,
+                )
             return
 
         if destination_id is None:

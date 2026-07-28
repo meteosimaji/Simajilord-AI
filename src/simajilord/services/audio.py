@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import random
+import re
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -12,7 +14,7 @@ from contextlib import suppress
 from time import monotonic, time
 from typing import Protocol
 
-from simajilord.core.errors import EarlyPlaybackEnd, UserError
+from simajilord.core.errors import EarlyPlaybackEnd, MediaError, UserError
 from simajilord.domain.audio import (
     AudioItem,
     AudioKind,
@@ -32,7 +34,25 @@ _MAX_HISTORY_ITEMS = 25
 _MAX_IDENTICAL_PENDING_REFERENCES = 2
 _MAX_MIX_SEEDS = 8
 _AUTOPLAY_REFILL_ITEMS = 30
+_AUTOPLAY_QUEUE_TARGET = 3
 _AUTOPLAY_RETRY_SECONDS = 60.0
+MAX_MANUAL_PLAYBACK_FAILURES = 3
+MAX_RADIO_PLAYBACK_FAILURES = 2
+_PERMANENT_MEDIA_FAILURES = frozenset(
+    {
+        "geo_restricted",
+        "too_large",
+        "unavailable",
+        "unsupported",
+        "unsafe_path",
+    }
+)
+_OVERLAY_ATTEMPTS = 3
+_RADIO_VARIANT_PATTERN = re.compile(
+    r"(?i)(?:\bcover\b|\blive\b|\bremix\b|\bnightcore\b|"
+    r"\bslowed\b|\bsped[ -]?up\b|\bkaraoke\b|\binstrumental\b|"
+    r"\bofficial\b|\bvideo\b|\blyrics?\b|\bremaster(?:ed)?\b)"
+)
 
 
 class AudioOutput(Protocol):
@@ -951,7 +971,7 @@ class AudioSession:
         ):
             return
         generation = self._autoplay_generation
-        seeds = tuple(self._mix_seed_references)
+        seeds = self._radio_seed_sample(generation)
         self._autoplay_refill_task = asyncio.create_task(
             self._run_autoplay_refill(generation, seeds),
             name=f"simajilord-audio-autoplay-{self.workspace_id}",
@@ -986,8 +1006,17 @@ class AudioSession:
                     )
                     if (reference := queued.resolver_reference or queued.page_url)
                 }
+                selected = self._select_radio_candidates(
+                    candidates,
+                    generation=generation,
+                    recent_references=recent_references,
+                )
                 added = 0
+                selected_ids = {id(item) for item in selected}
                 for item in candidates:
+                    if id(item) not in selected_ids:
+                        item.cleanup()
+                for item in selected:
                     reference = item.resolver_reference or item.page_url
                     if (
                         item.kind is not AudioKind.MUSIC
@@ -1022,6 +1051,80 @@ class AudioSession:
             if self._autoplay_refill_task is current_task:
                 self._autoplay_refill_task = None
             await self._state_changed()
+
+    def _radio_seed_sample(self, generation: int) -> tuple[str, ...]:
+        """Use the newest seed plus up to two deterministic recency-weighted seeds."""
+
+        references = tuple(self._mix_seed_references)
+        if len(references) <= 3:
+            return references
+        primary = references[-1]
+        older = list(reversed(references[:-1]))
+        randomizer = random.Random(
+            _stable_radio_seed(self.workspace_id, generation, "seeds")
+        )
+        selected = [primary]
+        while older and len(selected) < 3:
+            weights = tuple(range(len(older), 0, -1))
+            choice = randomizer.choices(older, weights=weights, k=1)[0]
+            older.remove(choice)
+            selected.append(choice)
+        return tuple(selected)
+
+    def _select_radio_candidates(
+        self,
+        candidates: tuple[AudioItem, ...],
+        *,
+        generation: int,
+        recent_references: set[str],
+    ) -> tuple[AudioItem, ...]:
+        """Score a bounded reservoir and queue only the next three radio items."""
+
+        recent_items = tuple(self._history)[-25:]
+        recent_titles = {
+            _normalize_radio_title(item.title)
+            for item in recent_items
+            if item.title
+        }
+        recent_artists = {
+            _normalize_radio_text(item.uploader)
+            for item in recent_items[-5:]
+            if item.uploader
+        }
+        randomizer = random.Random(
+            _stable_radio_seed(self.workspace_id, generation, "candidates")
+        )
+        ranked: list[tuple[float, int, AudioItem]] = []
+        seen_references: set[str] = set()
+        seen_titles: set[str] = set()
+        for rank, item in enumerate(candidates):
+            reference = item.resolver_reference or item.page_url
+            normalized_title = _normalize_radio_title(item.title)
+            if (
+                not reference
+                or reference in seen_references
+                or (normalized_title and normalized_title in seen_titles)
+            ):
+                continue
+            seen_references.add(reference)
+            if normalized_title:
+                seen_titles.add(normalized_title)
+            score = 100.0 - (rank * 1.5)
+            if reference not in recent_references:
+                score += 12.0
+            if normalized_title in recent_titles:
+                score -= 80.0
+            artist = _normalize_radio_text(item.uploader)
+            if artist and artist in recent_artists:
+                score -= 20.0
+            if _RADIO_VARIANT_PATTERN.search(item.title):
+                score -= 8.0
+            if item.duration_seconds > 12 * 60:
+                score -= min(25.0, (item.duration_seconds - 12 * 60) / 120)
+            score += randomizer.uniform(-2.0, 2.0)
+            ranked.append((score, -rank, item))
+        ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        return tuple(item for _, _, item in ranked[:_AUTOPLAY_QUEUE_TARGET])
 
     async def _next_item(self) -> AudioItem | None:
         async with self._lock:
@@ -1098,6 +1201,7 @@ class AudioSession:
             await self._state_changed()
             completed = False
             playable = item
+            playback_error: Exception | None = None
             try:
                 if not self.output.connected:
                     raise UserError("audio.output_disconnected")
@@ -1105,7 +1209,8 @@ class AudioSession:
                 completed = True
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                playback_error = exc
                 log.exception(
                     "Audio playback exhausted immediate retries workspace=%s item=%s",
                     self.workspace_id,
@@ -1170,22 +1275,56 @@ class AudioSession:
                 not completed and not skipped and not discarded and playable.kind is AudioKind.MUSIC
             ):
                 retry = playable.unresolved_copy(failure_count=playable.failure_count + 1)
-                delay = min(300.0, 15.0 * (2 ** min(retry.failure_count - 1, 4)))
-                retry.retry_after = monotonic() + delay
-                async with self._lock:
-                    target = (
-                        self._autoplay
-                        if retry.queue_lane is AudioQueueLane.AUTOPLAY
-                        else self._music
-                    )
-                    target.append(retry)
-                keep_item = True
-                log.warning(
-                    "Keeping failed track queued for retry in %.0fs workspace=%s item=%s",
-                    delay,
-                    self.workspace_id,
-                    retry.title,
+                failure_limit = (
+                    MAX_RADIO_PLAYBACK_FAILURES
+                    if retry.queue_lane is AudioQueueLane.AUTOPLAY
+                    else MAX_MANUAL_PLAYBACK_FAILURES
                 )
+                permanent = _is_permanent_playback_error(playback_error)
+                if not permanent and retry.failure_count < failure_limit:
+                    delay = min(300.0, 15.0 * (2 ** min(retry.failure_count - 1, 4)))
+                    retry.retry_after = monotonic() + delay
+                    async with self._lock:
+                        target = (
+                            self._autoplay
+                            if retry.queue_lane is AudioQueueLane.AUTOPLAY
+                            else self._music
+                        )
+                        target.append(retry)
+                    keep_item = True
+                    log.warning(
+                        "Keeping failed track queued for retry %s/%s in %.0fs "
+                        "workspace=%s item=%s",
+                        retry.failure_count,
+                        failure_limit,
+                        delay,
+                        self.workspace_id,
+                        retry.title,
+                    )
+                else:
+                    log.error(
+                        "Dropping failed track after bounded retries workspace=%s "
+                        "item=%s lane=%s failures=%s permanent=%s error=%s",
+                        self.workspace_id,
+                        retry.title,
+                        retry.queue_lane.value,
+                        retry.failure_count,
+                        permanent,
+                        type(playback_error).__name__ if playback_error is not None else "unknown",
+                    )
+                    await self._record_metric(
+                        ServiceOperationMetric(
+                            operation="audio.playback_dropped",
+                            workspace_id=self.workspace_id,
+                            wait_ms=0.0,
+                            duration_ms=0.0,
+                            outcome=(
+                                "permanent"
+                                if permanent
+                                else f"{retry.queue_lane.value}_retry_exhausted"
+                            ),
+                        )
+                    )
             if not keep_item:
                 playable.cleanup()
             self._ensure_autoplay_refill()
@@ -1194,7 +1333,20 @@ class AudioSession:
     async def _play_with_recovery(self, item: AudioItem) -> AudioItem:
         playable = item
         last_error: Exception | None = None
-        for attempt, delay in enumerate(_IMMEDIATE_RETRY_DELAYS, start=1):
+        early_eof_retried = False
+        retry_delays = iter(_IMMEDIATE_RETRY_DELAYS)
+        retry_early_eof_now = False
+        attempt = 0
+        while True:
+            if retry_early_eof_now:
+                delay = 0.0
+                retry_early_eof_now = False
+            else:
+                try:
+                    delay = next(retry_delays)
+                except StopIteration:
+                    break
+            attempt += 1
             if delay:
                 await asyncio.sleep(delay)
             try:
@@ -1206,7 +1358,7 @@ class AudioSession:
                 return playable
             except asyncio.CancelledError:
                 raise
-            except EarlyPlaybackEnd:
+            except EarlyPlaybackEnd as exc:
                 await self._record_metric(
                     ServiceOperationMetric(
                         operation="audio.early_eof_count",
@@ -1216,13 +1368,23 @@ class AudioSession:
                         outcome="detected",
                     )
                 )
-                raise
+                if early_eof_retried:
+                    raise
+                early_eof_retried = True
+                retry_early_eof_now = True
+                last_error = exc
+                unresolved = playable.unresolved_copy(
+                    failure_count=playable.failure_count
+                )
+                unresolved.start_seconds = self._position_seconds()
+                _move_speech_overlay(playable, unresolved)
+                playable = unresolved
+                continue
             except Exception as exc:
                 last_error = exc
                 log.warning(
-                    "Audio attempt %s/%s failed workspace=%s item=%s error=%s",
+                    "Audio attempt %s failed workspace=%s item=%s error=%s",
                     attempt,
-                    len(_IMMEDIATE_RETRY_DELAYS),
                     self.workspace_id,
                     item.title,
                     type(exc).__name__,
@@ -1253,9 +1415,38 @@ class AudioSession:
                 speech.volume = self._speech_volume
                 preparation_started = monotonic()
                 try:
-                    if self._must_resolve(music, 1):
-                        resolved = await self._resolve(music.unresolved_copy())
-                        _adopt_resolved_stream(music, resolved)
+                    overlay_error: Exception | None = None
+                    for attempt in range(1, _OVERLAY_ATTEMPTS + 1):
+                        if self._resolver is not None and (
+                            self._must_resolve(music, 1) or attempt > 1
+                        ):
+                            resolved = await self._resolve(music.unresolved_copy())
+                            _adopt_resolved_stream(music, resolved)
+                        try:
+                            async with self._transport_lock:
+                                await self.output.overlay_speech(
+                                    music,
+                                    speech,
+                                    position_seconds=self._position_seconds(),
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            overlay_error = exc
+                            log.warning(
+                                "Speech overlay attempt %s/%s failed workspace=%s "
+                                "item=%s error=%s",
+                                attempt,
+                                _OVERLAY_ATTEMPTS,
+                                self.workspace_id,
+                                speech.title,
+                                type(exc).__name__,
+                            )
+                            continue
+                        overlay_error = None
+                        break
+                    if overlay_error is not None:
+                        raise overlay_error
                     await self._record_metric(
                         ServiceOperationMetric(
                             operation="audio.overlay_prepare_ms",
@@ -1268,25 +1459,6 @@ class AudioSession:
                             outcome="succeeded",
                         )
                     )
-                    try:
-                        async with self._transport_lock:
-                            await self.output.overlay_speech(
-                                music,
-                                speech,
-                                position_seconds=self._position_seconds(),
-                            )
-                    except Exception:
-                        # A signed URL can expire between preparation and FFmpeg
-                        # startup. Resolve exactly once more while the original
-                        # Discord source keeps playing, then retry the hot swap.
-                        resolved = await self._resolve(music.unresolved_copy())
-                        _adopt_resolved_stream(music, resolved)
-                        async with self._transport_lock:
-                            await self.output.overlay_speech(
-                                music,
-                                speech,
-                                position_seconds=self._position_seconds(),
-                            )
                 except asyncio.CancelledError:
                     async with self._lock:
                         self._speech.appendleft(speech)
@@ -1295,21 +1467,25 @@ class AudioSession:
                     raise
                 except Exception:
                     log.exception(
-                        "Speech overlay failed; falling back to standalone speech "
+                        "Speech overlay failed after bounded retries; keeping music "
+                        "uninterrupted and dropping only this speech item "
                         "workspace=%s item=%s",
                         self.workspace_id,
                         speech.title,
                     )
-                    async with self._lock:
-                        self._speech.appendleft(speech)
-                        music.start_seconds = self._position_seconds()
-                        self._restart_requested = True
-                        self._speech_active = False
-                        self._wake.set()
-                    speech = None
-                    async with self._transport_lock:
-                        self.output.stop()
-                    return
+                    await self._record_metric(
+                        ServiceOperationMetric(
+                            operation="audio.overlay_failed",
+                            workspace_id=self.workspace_id,
+                            wait_ms=0.0,
+                            duration_ms=max(
+                                0.0,
+                                (monotonic() - preparation_started) * 1_000,
+                            ),
+                            outcome="dropped_speech",
+                        )
+                    )
+                    speech.cleanup()
                 else:
                     speech.cleanup()
                 async with self._lock:
@@ -1429,6 +1605,24 @@ class AudioSession:
             )
 
 
+def _stable_radio_seed(workspace_id: str, generation: int, purpose: str) -> int:
+    digest = hashlib.sha256(
+        f"{workspace_id}\0{generation}\0{purpose}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _normalize_radio_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    return " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
+
+
+def _normalize_radio_title(value: str) -> str:
+    without_variants = _RADIO_VARIANT_PATTERN.sub(" ", value)
+    return _normalize_radio_text(without_variants)
+
+
 def _move_speech_overlay(source: AudioItem, destination: AudioItem) -> None:
     """Transfer ephemeral overlay ownership without persisting or duplicating it."""
 
@@ -1436,6 +1630,10 @@ def _move_speech_overlay(source: AudioItem, destination: AudioItem) -> None:
     destination.speech_overlay_owned_file = source.speech_overlay_owned_file
     destination.speech_overlay_duration_seconds = source.speech_overlay_duration_seconds
     source.speech_overlay_owned_file = None
+
+
+def _is_permanent_playback_error(error: Exception | None) -> bool:
+    return isinstance(error, MediaError) and error.category in _PERMANENT_MEDIA_FAILURES
 
 
 def _adopt_resolved_stream(destination: AudioItem, resolved: AudioItem) -> None:

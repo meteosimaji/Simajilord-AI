@@ -10,17 +10,20 @@ readme = "README.md"
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "aiohttp>=3.14,<4",
+  "davey==0.1.6",
   "discord.py[voice]==2.7.1",
   "pillow>=11.3,<13",
   "pypdf>=6.6,<7",
   "python-dotenv>=1.1.1,<2",
   "yt-dlp",
+  "yt-dlp-ejs==0.8.0",
 ]
 
 [project.scripts]
 simajilord-discord = "simajilord.integrations.discord.__main__:main"
 simajilord-audio-doctor = "simajilord.diagnostics.audio:main"
 simajilord-offline-preview = "simajilord.diagnostics.offline_discord:main"
+simajilord-video-doctor = "simajilord.diagnostics.video:main"
 simajilord-web-doctor = "simajilord.diagnostics.web:main"
 
 [dependency-groups]

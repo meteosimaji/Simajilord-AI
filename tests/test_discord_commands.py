@@ -925,7 +925,7 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         "read_aloud",
         "history",
         "clear_mine",
-        "refresh",
+        "details",
         "leave",
     }
     custom_ids = [
@@ -1005,6 +1005,11 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         child.label for child in view.children if isinstance(child, discord.ui.Button)
     ]
     assert labels == ["Start", "Add music"]
+    assert any(
+        isinstance(child, discord.ui.Select)
+        and child.placeholder == "More actions"
+        for child in view.children
+    )
 
 
 @pytest.mark.asyncio
@@ -1091,6 +1096,209 @@ async def test_music_dashboard_edits_existing_panel_without_reposting() -> None:
     channel.send.assert_awaited_once()
     first.edit.assert_awaited_once()
     first.delete.assert_not_awaited()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_retries_the_same_message_once_after_429() -> None:
+    class DashboardError(discord.DiscordException):
+        def __init__(self) -> None:
+            super().__init__("rate limited")
+            self.status = 429
+            self.code = 0
+            self.retry_after = 0.0
+
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    runtime.journal.append = AsyncMock()
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    panel = Mock(spec=discord.Message)
+    panel.id = 121
+    panel.delete = AsyncMock()
+    panel.edit = AsyncMock(side_effect=[DashboardError(), panel])
+    channel.send = AsyncMock(return_value=panel)
+    bot.get_channel.return_value = channel
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    await manager._repost(session)
+    session.snapshot.return_value = QueueSnapshot(
+        current=None,
+        pending=(),
+        history=(),
+        paused=False,
+        speech_active=False,
+        loop=LoopMode.TRACK,
+        destination_id="55",
+    )
+    await manager._repost(session)
+
+    assert panel.edit.await_count == 2
+    channel.send.assert_awaited_once()
+    outcomes = [
+        call.kwargs["payload"]["outcome"]
+        for call in runtime.journal.append.await_args_list
+        if call.kwargs["payload"]["operation"] == "discord.dashboard_429"
+    ]
+    assert outcomes == ["rate_limited", "retry_succeeded"]
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_music_dashboard_stops_updates_after_403() -> None:
+    class DashboardError(discord.DiscordException):
+        def __init__(self) -> None:
+            super().__init__("forbidden")
+            self.status = 403
+            self.code = 0
+
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    runtime.journal.append = AsyncMock()
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    panel = Mock(spec=discord.Message)
+    panel.id = 131
+    panel.delete = AsyncMock()
+    panel.edit = AsyncMock(side_effect=DashboardError())
+    channel.send = AsyncMock(return_value=panel)
+    bot.get_channel.return_value = channel
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    await manager._repost(session)
+    session.snapshot.return_value = QueueSnapshot(
+        current=None,
+        pending=(),
+        history=(),
+        paused=False,
+        speech_active=False,
+        loop=LoopMode.TRACK,
+        destination_id="55",
+    )
+    await manager._repost(session)
+
+    panel.edit.assert_awaited_once()
+    channel.send.assert_awaited_once()
+    assert "1" not in manager._channel_ids
+    runtime.journal.append.assert_any_await(
+        kind="service.operation",
+        workspace_id=None,
+        payload={
+            "operation": "discord.dashboard_403",
+            "wait_ms": 0.0,
+            "duration_ms": 0.0,
+            "outcome": "stopped",
+        },
+    )
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "code", "metric"),
+    (
+        (404, 0, "discord.dashboard_404"),
+        (400, 30046, "discord.dashboard_30046"),
+    ),
+)
+async def test_music_dashboard_replaces_missing_or_expired_canonical_panel(
+    status: int,
+    code: int,
+    metric: str,
+) -> None:
+    class DashboardError(discord.DiscordException):
+        def __init__(self) -> None:
+            super().__init__("panel cannot be edited")
+            self.status = status
+            self.code = code
+
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    runtime.journal.append = AsyncMock()
+    bot = Mock(spec=commands.Bot)
+    channel = Mock(spec=discord.TextChannel)
+    old_panel = Mock(spec=discord.Message)
+    old_panel.id = 141
+    old_panel.delete = AsyncMock()
+    old_panel.edit = AsyncMock(side_effect=DashboardError())
+    replacement = Mock(spec=discord.Message)
+    replacement.id = 142
+    replacement.delete = AsyncMock()
+    replacement.edit = AsyncMock(return_value=replacement)
+    channel.send = AsyncMock(side_effect=[old_panel, replacement])
+    bot.get_channel.return_value = channel
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 2)
+    session = Mock()
+    session.workspace_id = "1"
+    session.snapshot = AsyncMock(
+        return_value=QueueSnapshot(
+            current=None,
+            pending=(),
+            history=(),
+            paused=False,
+            speech_active=False,
+            loop=LoopMode.NONE,
+            destination_id="55",
+        )
+    )
+
+    await manager._repost(session)
+    session.snapshot.return_value = QueueSnapshot(
+        current=None,
+        pending=(),
+        history=(),
+        paused=False,
+        speech_active=False,
+        loop=LoopMode.TRACK,
+        destination_id="55",
+    )
+    await manager._repost(session)
+
+    assert channel.send.await_count == 2
+    assert manager._messages["1"] is replacement
+    outcomes = [
+        call.kwargs["payload"]["outcome"]
+        for call in runtime.journal.append.await_args_list
+        if call.kwargs["payload"]["operation"] == metric
+    ]
+    assert outcomes
+    if code == 30046:
+        old_panel.delete.assert_awaited_once()
     await manager.close()
 
 
@@ -1586,7 +1794,7 @@ async def test_youtube_message_listener_posts_silent_temporary_card() -> None:
 
 
 @pytest.mark.asyncio
-async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
+async def test_listener_join_keeps_persisted_read_aloud_route_in_standby() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     route = Mock()
     route.audio_destination_id = "55"
@@ -1616,12 +1824,12 @@ async def test_listener_join_reconnects_a_persisted_read_aloud_route() -> None:
     await cog.on_voice_state_update(member, before, after)
 
     runtime.audio.get_or_create.assert_called_once()
-    runtime.audio.connect.assert_awaited_once_with("1", "55")
+    runtime.audio.connect.assert_not_awaited()
     dashboard.bind.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_startup_connects_read_aloud_when_listener_is_already_present() -> None:
+async def test_startup_keeps_read_aloud_passive_when_listener_is_already_present() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     route = Mock()
     route.audio_destination_id = "55"
@@ -1646,8 +1854,8 @@ async def test_startup_connects_read_aloud_when_listener_is_already_present() ->
 
     await SimajilordDiscordBot._prepare_read_aloud_presence(bot)
 
-    runtime.audio.get_or_create.assert_called_once()
-    runtime.audio.connect.assert_awaited_once_with("1", "55")
+    runtime.audio.get_or_create.assert_not_called()
+    runtime.audio.connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1707,7 +1915,7 @@ async def test_startup_read_aloud_does_not_restart_held_read_aloud_route() -> No
 
     await SimajilordDiscordBot._prepare_read_aloud_presence(bot)
 
-    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.get_or_create.assert_not_called()
     runtime.audio.connect.assert_not_awaited()
 
 

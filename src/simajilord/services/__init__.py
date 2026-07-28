@@ -4,7 +4,6 @@ from .audio import AudioOutput, AudioSession, AudioSessionManager, SpeechQueueRe
 from .audio_state import AudioStateStore, StoredAudioItem, StoredAudioSession
 from .files import AgentFileSandbox
 from .focus_timer import FocusTimer, FocusTimerService, FocusTimerStatus
-from .fresh_mix import FreshMixService
 from .image import ImageGenerationService, ImageGenerationStore
 from .media import MediaPriority, MediaService
 from .metrics import ServiceMetricHook, ServiceOperationMetric
@@ -23,6 +22,14 @@ from .read_aloud import (
     ReadAloudService,
 )
 from .speech import SpeechProvider, SpeechService
+from .video import (
+    EncodedVideoSource,
+    IdentityVideoEncryptor,
+    VideoFrameEncryptor,
+    VideoSession,
+    VideoSessionState,
+    VideoTransport,
+)
 from .web import WebService
 
 __all__ = [
@@ -31,10 +38,11 @@ __all__ = [
     "AudioSession",
     "AudioSessionManager",
     "AudioStateStore",
+    "EncodedVideoSource",
     "FocusTimer",
     "FocusTimerService",
     "FocusTimerStatus",
-    "FreshMixService",
+    "IdentityVideoEncryptor",
     "ImageGenerationService",
     "ImageGenerationStore",
     "MediaPriority",
@@ -58,5 +66,9 @@ __all__ = [
     "SpeechService",
     "StoredAudioItem",
     "StoredAudioSession",
+    "VideoFrameEncryptor",
+    "VideoSession",
+    "VideoSessionState",
+    "VideoTransport",
     "WebService",
 ]

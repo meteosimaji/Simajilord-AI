@@ -105,6 +105,26 @@ One independent audio session is created per Discord server. Different servers m
 concurrently up to the configured process limit; one server never owns multiple Discord voice
 connections.
 
+## Experimental video foundation
+
+The repository contains a transport-neutral, testable video media foundation:
+
+- H.264 Annex-B and VP8 encoding through FFmpeg, including Apple VideoToolbox when available
+- RFC 6184 H.264 and RFC 7741 VP8 RTP packetization
+- DAVE video-frame encryption through `davey`
+- Discord voice UDP `aead_xchacha20_poly1305_rtpsize` transport encryption
+- RTCP sender reports, PLI/FIR keyframe requests, NACK retransmission, stop, and reconnect
+
+Run `uv run simajilord-video-doctor` to exercise both codecs entirely offline.
+
+This is deliberately **not exposed as a camera or Go Live command**. Discord's public Bot
+Voice documentation describes audio SSRC negotiation and audio RTP transmission, but does
+not document a Bot operation that starts a camera/Go Live stream or allocates a video SSRC.
+The public Voice State object reports `self_video` and `self_stream`; those fields are not
+accepted by the documented voice-state update operation. Simajilord does not guess private
+client opcodes or inspect/copy the proprietary client protocol. A live adapter can be added
+without changing the codec/session layer if Discord publishes the required Bot signaling.
+
 The optional agent is default-off. Its Codex runtime has browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 
@@ -185,6 +205,7 @@ uv run ruff check src tests
 uv run mypy src/simajilord
 uv run pytest
 uv run simajilord-audio-doctor
+uv run simajilord-video-doctor
 uv run simajilord-web-doctor "Python"
 uv run python -m compileall -q src
 ```

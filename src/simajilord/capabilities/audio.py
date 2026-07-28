@@ -22,21 +22,11 @@ from simajilord.core.errors import UserError
 from simajilord.domain.audio import (
     AudioItem,
     AudioKind,
-    AudioQueueLane,
     LoopMode,
     QueueSnapshot,
 )
 from simajilord.domain.media import MediaCandidate
 from simajilord.services.audio import AudioSessionManager
-from simajilord.services.fresh_mix import (
-    FreshMixBrief,
-    FreshMixDraft,
-    FreshMixEnergy,
-    FreshMixPhase,
-    FreshMixService,
-    FreshMixTrack,
-    FreshMixVocals,
-)
 from simajilord.services.media import MediaPriority, MediaService
 
 
@@ -185,53 +175,6 @@ class AudioMixResponse:
 
 
 @dataclass(frozen=True, slots=True)
-class FreshMixPlanRequest:
-    prompt: str
-    target_minutes: int = 60
-    phases: tuple[FreshMixPhase, ...] = ()
-    vocals: FreshMixVocals = FreshMixVocals.BALANCED
-    energy: FreshMixEnergy = FreshMixEnergy.STEADY
-    max_tracks_per_artist: int = 2
-    allow_variants: bool = False
-    explicit: bool = False
-    history_policy: str = "ignore"
-
-
-@dataclass(frozen=True, slots=True)
-class FreshMixReviseRequest:
-    draft_id: str
-    position: int
-    query: str
-
-
-@dataclass(frozen=True, slots=True)
-class FreshMixEnqueueRequest:
-    draft_id: str
-    requested_by_name: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class FreshMixPreviewResponse:
-    draft_id: str
-    prompt: str
-    target_minutes: int
-    duration_seconds: float
-    tracks: tuple[FreshMixTrack, ...]
-    checks: tuple[str, ...]
-    history_used: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class FreshMixEnqueueResponse:
-    draft_id: str
-    track_count: int
-    first_queue_position: int
-    last_queue_position: int
-    duration_seconds: float
-    playback_state: str
-
-
-@dataclass(frozen=True, slots=True)
 class AudioControlRequest:
     action: AudioAction
     loop_mode: LoopMode | None = None
@@ -307,10 +250,7 @@ class AudioVolumeRequest:
 def build_audio_endpoints(
     media: MediaService,
     sessions: AudioSessionManager,
-    fresh_mix: FreshMixService | None = None,
 ) -> tuple[CapabilityEndpoint, ...]:
-    mix_planner = fresh_mix or FreshMixService(media)
-
     async def search(
         request: AudioSearchRequest,
         context: InvocationContext,
@@ -419,112 +359,6 @@ def build_audio_endpoints(
             next_item=(
                 _queue_item(snapshot.autoplay_next) if snapshot.autoplay_next is not None else None
             ),
-        )
-
-    async def plan_fresh_mix(
-        request: FreshMixPlanRequest,
-        context: InvocationContext,
-    ) -> FreshMixPreviewResponse:
-        workspace_id = _workspace(context)
-        session = sessions.find(workspace_id)
-        excluded: tuple[str, ...] = ()
-        if session is not None:
-            snapshot = await session.snapshot()
-            excluded = tuple(
-                dict.fromkeys(
-                    item.resolver_reference or item.page_url
-                    for item in (
-                        *((snapshot.current,) if snapshot.current is not None else ()),
-                        *snapshot.pending,
-                    )
-                    if item.kind is AudioKind.MUSIC and (item.resolver_reference or item.page_url)
-                )
-            )
-        draft = await mix_planner.plan(
-            workspace_id=workspace_id,
-            actor_id=context.actor_id,
-            brief=FreshMixBrief(
-                prompt=request.prompt,
-                target_minutes=request.target_minutes,
-                phases=request.phases,
-                vocals=request.vocals,
-                energy=request.energy,
-                max_tracks_per_artist=request.max_tracks_per_artist,
-                allow_variants=request.allow_variants,
-                explicit=request.explicit,
-                history_policy=request.history_policy,
-            ),
-            excluded_references=excluded,
-        )
-        return _fresh_mix_preview(draft)
-
-    async def revise_fresh_mix(
-        request: FreshMixReviseRequest,
-        context: InvocationContext,
-    ) -> FreshMixPreviewResponse:
-        workspace_id = _workspace(context)
-        draft = await mix_planner.revise_track(
-            draft_id=request.draft_id,
-            workspace_id=workspace_id,
-            actor_id=context.actor_id,
-            position=request.position,
-            query=request.query,
-        )
-        return _fresh_mix_preview(draft)
-
-    async def enqueue_fresh_mix(
-        request: FreshMixEnqueueRequest,
-        context: InvocationContext,
-    ) -> FreshMixEnqueueResponse:
-        workspace_id = _workspace(context)
-        session = sessions.require(workspace_id)
-        draft = await mix_planner.claim(
-            request.draft_id,
-            workspace_id,
-            context.actor_id,
-        )
-        try:
-            requested_at = int(time())
-            items = tuple(
-                AudioItem(
-                    source="",
-                    title=track.title,
-                    page_url=track.reference,
-                    duration_seconds=track.duration_seconds,
-                    resolver_reference=track.reference,
-                    requested_by_id=context.actor_id,
-                    requested_by_name=request.requested_by_name,
-                    queue_lane=AudioQueueLane.REQUEST,
-                    request_source="fresh_mix",
-                    request_id=context.request_id,
-                    requested_at_epoch=requested_at,
-                    uploader=track.artist,
-                    thumbnail_url=track.thumbnail_url,
-                )
-                for track in draft.tracks
-            )
-            wait_for_actor_id = context.actor_id if not session.output.connected else None
-            first_position, last_position = await session.enqueue_many(
-                items,
-                wait_for_actor_id=wait_for_actor_id,
-            )
-        except BaseException:
-            await mix_planner.release(draft.draft_id)
-            raise
-        await mix_planner.consume(draft.draft_id)
-        snapshot = await session.snapshot()
-        playback_state = (
-            "playing"
-            if snapshot.current is not None
-            else ("waiting_for_voice" if snapshot.waiting_actor_ids else "queued")
-        )
-        return FreshMixEnqueueResponse(
-            draft_id=draft.draft_id,
-            track_count=len(items),
-            first_queue_position=first_position,
-            last_queue_position=last_position,
-            duration_seconds=draft.duration_seconds,
-            playback_state=playback_state,
         )
 
     async def history(
@@ -775,46 +609,6 @@ def build_audio_endpoints(
     return (
         endpoint(
             CapabilityDescriptor(
-                name="audio.fresh_mix_plan",
-                summary=(
-                    "履歴を使わず、構造化した検索意図から実在候補だけのMixを"
-                    "検証し、再生前previewを作ります。"
-                ),
-                risk=RiskLevel.EXTERNAL,
-                keywords=("music", "fresh mix", "plan", "preview", "focus"),
-                side_effects=("メディア検索を行いますが、音声キューは変更しません。",),
-            ),
-            FreshMixPlanRequest,
-            FreshMixPreviewResponse,
-            plan_fresh_mix,
-        ),
-        endpoint(
-            CapabilityDescriptor(
-                name="audio.fresh_mix_revise",
-                summary="検証済みMix draftの指定曲を別の実在候補へ置換します。",
-                risk=RiskLevel.EXTERNAL,
-                keywords=("music", "fresh mix", "revise", "replace"),
-                side_effects=("メディア検索を行いますが、音声キューは変更しません。",),
-            ),
-            FreshMixReviseRequest,
-            FreshMixPreviewResponse,
-            revise_fresh_mix,
-        ),
-        endpoint(
-            CapabilityDescriptor(
-                name="audio.fresh_mix_enqueue",
-                summary="明示承認された検証済みMix draftを一括でキューへ追加します。",
-                risk=RiskLevel.WRITE,
-                approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("music", "fresh mix", "play", "enqueue", "approve"),
-                side_effects=("検証済み複数曲をatomicに音声キューへ追加します。",),
-            ),
-            FreshMixEnqueueRequest,
-            FreshMixEnqueueResponse,
-            enqueue_fresh_mix,
-        ),
-        endpoint(
-            CapabilityDescriptor(
                 name="audio.search",
                 summary="音楽を検索し、候補を自動選択できるか確認します。",
                 risk=RiskLevel.EXTERNAL,
@@ -1044,17 +838,6 @@ def _workspace(context: InvocationContext) -> str:
     if context.workspace_id is None:
         raise UserError("workspace.required")
     return context.workspace_id
-
-
-def _fresh_mix_preview(draft: FreshMixDraft) -> FreshMixPreviewResponse:
-    return FreshMixPreviewResponse(
-        draft_id=draft.draft_id,
-        prompt=draft.brief.prompt,
-        target_minutes=draft.brief.target_minutes,
-        duration_seconds=draft.duration_seconds,
-        tracks=draft.tracks,
-        checks=draft.checks,
-    )
 
 
 def _search_item(candidate: MediaCandidate) -> AudioSearchItem:

@@ -261,8 +261,9 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
     upcoming = next(field.value for field in embed.fields if field.name.startswith("Up Next"))
-    assert "0:45 / 3:00" in (embed.description or "")
-    assert "ends <t:" in (embed.description or "")
+    assert "Ends <t:" in (embed.description or "")
+    assert "0:45 / 3:00" not in (embed.description or "")
+    assert ":T>" not in (embed.description or "")
     assert "Next" in upcoming
     assert "Queue **1**" in fields["Playback"]
     assert "Loop **Queue**" in fields["Playback"]

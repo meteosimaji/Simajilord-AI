@@ -8,6 +8,7 @@ from .moderation import (
     SyntheticMediaProviderResult,
     SyntheticMediaVerdict,
 )
+from .video import EncodedVideoFrame, VideoCodec, VideoProfile
 
 __all__ = [
     "AudioItem",
@@ -15,6 +16,7 @@ __all__ = [
     "AudioQueueLane",
     "DownloadArtifact",
     "DownloadFormat",
+    "EncodedVideoFrame",
     "LoopMode",
     "MediaReference",
     "QueueSnapshot",
@@ -22,4 +24,6 @@ __all__ = [
     "SyntheticMediaModality",
     "SyntheticMediaProviderResult",
     "SyntheticMediaVerdict",
+    "VideoCodec",
+    "VideoProfile",
 ]
