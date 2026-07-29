@@ -39,9 +39,20 @@ class AgentProviderLimitError(AgentProviderError):
 class AgentTimeoutError(AgentProviderError):
     """The host interrupted a turn after its configured execution deadline."""
 
-    def __init__(self, message: str, *, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        timeout_seconds: float,
+        auto_retry_attempted: bool = False,
+        runtime_restarted: bool = False,
+        write_attempted: bool = False,
+    ) -> None:
         super().__init__(message)
         self.timeout_seconds = timeout_seconds
+        self.auto_retry_attempted = auto_retry_attempted
+        self.runtime_restarted = runtime_restarted
+        self.write_attempted = write_attempted
 
 
 class AgentThreadError(AgentProviderError):

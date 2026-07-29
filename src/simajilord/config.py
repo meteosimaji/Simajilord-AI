@@ -748,7 +748,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         agent_timeout_seconds=_positive_float(
             "AGENT_TIMEOUT_SECONDS",
-            600.0,
+            1_800.0,
             maximum=1_800.0,
         ),
         agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "medium"),

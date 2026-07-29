@@ -2448,6 +2448,63 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
     assert '"job_id":"image:cat"' in nested_result
 
 
+@pytest.mark.asyncio
+async def test_generated_image_tool_result_is_visible_to_model_without_inline_base64() -> None:
+    @dataclass(frozen=True)
+    class ImageResult:
+        path: str
+        image_data_url: str
+
+    registry = CapabilityRegistry()
+
+    async def generate(
+        request: WriteRequest,
+        _: InvocationContext,
+    ) -> ImageResult:
+        return ImageResult(
+            path=f"generated/{request.subject}.png",
+            image_data_url="data:image/png;base64,aGVsbG8=",
+        )
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "image.generate",
+                "Generate one image.",
+                RiskLevel.WRITE,
+            ),
+            WriteRequest,
+            ImageResult,
+            generate,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("image.generate",),
+        required_grants={"image.generate": AGENT_IMAGE_GRANT},
+        write_capabilities=("image.generate",),
+        image_output_capabilities=("image.generate",),
+    )
+    output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="image_generate",
+        arguments={"subject": "quiz"},
+        context=InvocationContext(
+            "actor",
+            "workspace",
+            "agent",
+            "request",
+            grants=frozenset({AGENT_IMAGE_GRANT}),
+        ),
+        max_output_characters=2_000,
+    )
+
+    assert output.image_url == "data:image/png;base64,aGVsbG8="
+    assert '"image_data_url":"[attached to this tool result]"' in output.text
+    assert "aGVsbG8=" not in output.text
+    assert '"path":"generated/quiz.png"' in output.text
+
+
 def test_agent_tool_catalog_rejects_duplicate_allowlist_entries() -> None:
     registry = CapabilityRegistry()
 
@@ -3321,6 +3378,8 @@ async def test_provider_reports_outer_deadline_as_dedicated_timeout(
         "_respond_with_deadline",
         AsyncMock(side_effect=TimeoutError),
     )
+    reset = AsyncMock()
+    monkeypatch.setattr(provider, "_reset_after_timeout", reset)
 
     with pytest.raises(AgentTimeoutError) as raised:
         await provider.respond(
@@ -3330,7 +3389,50 @@ async def test_provider_reports_outer_deadline_as_dedicated_timeout(
         )
 
     assert raised.value.timeout_seconds == 125
-    assert "execution deadline" in str(raised.value)
+    assert raised.value.auto_retry_attempted is True
+    assert "automatic retry" in str(raised.value)
+    assert provider._respond_with_deadline.await_count == 2
+    assert reset.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_replay_timeout_after_write_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-write-timeout",
+        timeout_seconds=125,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+
+    async def timeout_after_write(**kwargs: object) -> ProviderTurnResult:
+        attempt_state = kwargs["attempt_state"]
+        assert hasattr(attempt_state, "write_attempted")
+        attempt_state.write_attempted = True
+        raise TimeoutError
+
+    respond = AsyncMock(side_effect=timeout_after_write)
+    reset = AsyncMock()
+    monkeypatch.setattr(provider, "_respond_with_deadline", respond)
+    monkeypatch.setattr(provider, "_reset_after_timeout", reset)
+
+    with pytest.raises(AgentTimeoutError) as raised:
+        await provider.respond(
+            provider_thread_id="saved-thread",
+            event_prompt="SIMAJILORD_EVENT_V1",
+            context=InvocationContext("actor", "workspace", "agent", "event"),
+        )
+
+    assert raised.value.write_attempted is True
+    assert raised.value.auto_retry_attempted is False
+    assert respond.await_count == 1
+    reset.assert_awaited_once()
 
 
 @pytest.mark.asyncio

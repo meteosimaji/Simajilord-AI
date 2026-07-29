@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 from dataclasses import dataclass, field
 
 from simajilord.core import (
@@ -15,23 +17,18 @@ from simajilord.core import (
 from simajilord.core.errors import UserError
 from simajilord.domain.image import (
     ImageAspectRatio,
+    ImageGenerationJob,
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
 )
+from simajilord.services.files import AgentFileSandbox
 from simajilord.services.image import ImageGenerationService
 
 
 @dataclass(frozen=True, slots=True)
 class ImageGenerateRequest:
-    """A structured prompt plus a transport-owned delivery route."""
-
-    delivery_target_id: str = field(
-        metadata={"description": "The authorized Discord channel ID from this event."}
-    )
-    reply_to_event_id: str = field(
-        metadata={"description": "The exact triggering Discord event/message ID."}
-    )
+    """A structured prompt for one turn-owned generated image."""
     subject: str = field(
         metadata={
             "description": (
@@ -102,13 +99,16 @@ class ImageGenerateRequest:
 @dataclass(frozen=True, slots=True)
 class ImageGenerateResponse:
     job_id: str
-    accepted: bool
     status: ImageJobStatus
+    path: str
+    size_bytes: int
+    sha256: str
+    kind: str
+    image_data_url: str
     width: int
     height: int
-    seed: int
-    progress_delivery: str
-    retryable: bool
+    provider_model: str
+    generation_seconds: float
     next_action: str
 
 
@@ -123,7 +123,10 @@ class ImageStatusResponse:
     status: ImageJobStatus
     progress_step: int
     progress_total: int
-    delivered: bool
+    auto_delivery_enabled: bool
+    runtime_delivery_completed: bool
+    workspace_handoff_completed: bool
+    workspace_path: str | None
     error_code: str | None
     terminal: bool
     retryable: bool
@@ -132,6 +135,7 @@ class ImageStatusResponse:
 
 def build_image_endpoints(
     service: ImageGenerationService,
+    files: AgentFileSandbox | None,
 ) -> tuple[CapabilityEndpoint, ...]:
     async def generate(
         request: ImageGenerateRequest,
@@ -139,27 +143,13 @@ def build_image_endpoints(
     ) -> ImageGenerateResponse:
         if context.workspace_id is None:
             raise UserError("image.workspace_required")
-        if (
-            context.transport == "agent"
-            and request.delivery_target_id not in context.resource_ids
-        ):
-            raise UserError("image.delivery_target_forbidden")
-        expected_event = _request_event_id(context.request_id)
-        normalized_reply_event = _normalized_reply_event(
-            request.reply_to_event_id,
-            context=context,
-        )
-        if (
-            context.transport == "agent"
-            and expected_event is not None
-            and normalized_reply_event != expected_event
-        ):
-            raise UserError("image.reply_target_forbidden")
+        if files is None:
+            raise UserError("files.disabled")
         job = await service.submit(
             actor_id=context.actor_id,
             workspace_id=context.workspace_id,
-            delivery_target_id=request.delivery_target_id,
-            reply_to_message_id=normalized_reply_event,
+            delivery_target_id=context.origin_resource_id or "",
+            reply_to_message_id=_request_event_id(context.request_id),
             prompt=ImageGenerationPrompt(
                 subject=request.subject,
                 scene=request.scene,
@@ -172,24 +162,17 @@ def build_image_endpoints(
                 rendering=request.rendering,
                 seed=request.seed,
             ),
+            auto_deliver=False,
+            idempotency_key=context.request_id,
         )
-        return ImageGenerateResponse(
-            job_id=job.job_id,
-            accepted=True,
-            status=job.status,
-            width=job.width,
-            height=job.height,
-            seed=job.seed,
-            progress_delivery=(
-                "The runtime will post a start update and deliver the image "
-                "in this Discord channel when complete."
-            ),
-            retryable=False,
-            next_action=(
-                "Do not submit a duplicate. Wait for runtime progress, or call "
-                "image.status with this job_id when the user asks for an update."
-            ),
-        )
+        terminal = await service.wait_for_terminal(job.job_id)
+        if terminal.status is not ImageJobStatus.COMPLETED:
+            raise UserError(
+                "image.generation_failed",
+                job_id=terminal.job_id,
+                error_code=terminal.error_code,
+            )
+        return await _agent_image_result(terminal, files=files, service=service)
 
     async def status(
         request: ImageStatusRequest,
@@ -202,12 +185,31 @@ def build_image_endpoints(
             "generation_timeout",
             "provider_failed",
         }
+        workspace_path: str | None = None
+        if (
+            job.status is ImageJobStatus.COMPLETED
+            and files is not None
+            and job.output_path is not None
+            and job.output_path.is_file()
+        ):
+            content = await asyncio.to_thread(job.output_path.read_bytes)
+            record = await asyncio.to_thread(
+                files.import_bytes,
+                job.workspace_id,
+                _agent_image_path(job.job_id),
+                content,
+            )
+            workspace_path = record.path
+            await service.mark_handed_off(job.job_id)
         if job.status in {ImageJobStatus.QUEUED, ImageJobStatus.RUNNING}:
-            next_action = "Wait for runtime progress; do not submit a duplicate."
-        elif job.status is ImageJobStatus.COMPLETED and not job.delivered:
-            next_action = "The runtime is preparing Discord delivery."
+            next_action = "Wait for generation completion; do not submit a duplicate."
+        elif job.status is ImageJobStatus.COMPLETED and workspace_path is not None:
+            next_action = (
+                "Use discord.send_file with workspace_path when the requested image "
+                "should be posted."
+            )
         elif job.status is ImageJobStatus.COMPLETED:
-            next_action = "No further action is required."
+            next_action = "The result exists but is not available in the agent workspace."
         elif retryable:
             next_action = "Report the failure accurately and retry only when requested."
         else:
@@ -217,7 +219,12 @@ def build_image_endpoints(
             status=job.status,
             progress_step=job.progress_step,
             progress_total=job.progress_total,
-            delivered=job.delivered,
+            auto_delivery_enabled=job.auto_deliver,
+            runtime_delivery_completed=job.delivered,
+            workspace_handoff_completed=(
+                job.handoff_completed or workspace_path is not None
+            ),
+            workspace_path=workspace_path,
             error_code=job.error_code,
             terminal=terminal,
             retryable=retryable,
@@ -230,7 +237,8 @@ def build_image_endpoints(
                 name="image.generate",
                 summary=(
                     "Generate one image through Codex OAuth from a production-ready "
-                    "visual brief, import the file, and deliver it asynchronously."
+                    "visual brief, wait for completion in this turn, and return both "
+                    "the visible image and a workspace file."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -247,17 +255,17 @@ def build_image_endpoints(
                 side_effects=(
                     "Starts hosted GPT Image generation through the saved Codex login.",
                     "Imports the generated file into Simajilord local storage.",
-                    "Posts progress and the result to the approved channel.",
+                    "Does not post to Discord; the agent chooses whether and how to send it.",
                 ),
                 requires_workspace=True,
-                idempotency="non_idempotent_write",
+                idempotency="idempotent_write",
                 expected_errors=(
                     "image.provider_unavailable",
-                    "image.reply_target_forbidden",
+                    "image.generation_failed",
                 ),
-                timeout_seconds=30,
+                timeout_seconds=900,
                 user_visible_effect=(
-                    "Posts progress, then delivers the generated image asynchronously."
+                    "Creates a generated image file but does not post it automatically."
                 ),
             ),
             ImageGenerateRequest,
@@ -282,16 +290,47 @@ def build_image_endpoints(
     )
 
 
+async def _agent_image_result(
+    job: ImageGenerationJob,
+    *,
+    files: AgentFileSandbox,
+    service: ImageGenerationService,
+) -> ImageGenerateResponse:
+    if job.output_path is None or not job.output_path.is_file():
+        raise UserError("image.output_unavailable", job_id=job.job_id)
+    content = await asyncio.to_thread(job.output_path.read_bytes)
+    record = await asyncio.to_thread(
+        files.import_bytes,
+        job.workspace_id,
+        _agent_image_path(job.job_id),
+        content,
+    )
+    await service.mark_handed_off(job.job_id)
+    return ImageGenerateResponse(
+        job_id=job.job_id,
+        status=job.status,
+        path=record.path,
+        size_bytes=record.size_bytes,
+        sha256=record.sha256,
+        kind=record.kind,
+        image_data_url="data:image/png;base64," + base64.b64encode(content).decode(),
+        width=job.width,
+        height=job.height,
+        provider_model=job.provider_model or "GPT Image 2・Codex OAuth",
+        generation_seconds=job.generation_seconds or 0.0,
+        next_action=(
+            "Inspect the image attached to this tool result. If it fulfills the request, "
+            "call discord.send_file with path and the authorized current channel. If it "
+            "does not, revise the brief deliberately. Never claim Discord delivery until "
+            "discord.send_file succeeds."
+        ),
+    )
+
+
+def _agent_image_path(job_id: str) -> str:
+    return f"generated/simajilord-{job_id[:12]}.png"
+
+
 def _request_event_id(request_id: str) -> str | None:
     prefix = "discord:message:"
     return request_id[len(prefix) :] if request_id.startswith(prefix) else None
-
-
-def _normalized_reply_event(
-    reply_to_event_id: str,
-    *,
-    context: InvocationContext,
-) -> str:
-    if reply_to_event_id == context.request_id:
-        return _request_event_id(context.request_id) or reply_to_event_id
-    return reply_to_event_id

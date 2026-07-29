@@ -3622,25 +3622,30 @@ def test_agent_rate_limit_message_includes_exact_retry_time() -> None:
         "limited",
         retry_after_seconds=125,
     )
-    assert _agent_error_text(error).endswith("あと2分5秒ほどお待ちください。")
+    assert _agent_error_text(error).endswith("2 minutes 5 seconds.")
     assert _retry_after_text(3_661) == "1時間1分1秒"
 
 
 def test_agent_provider_limit_message_explains_the_actual_failure() -> None:
     message = _agent_error_text(AgentProviderLimitError("usage limit"))
-    assert "AIプロバイダーの利用上限" in message
-    assert "もう一度お試しください" in message
+    assert "AI provider usage limit" in message
+    assert "Please try again" in message
 
 
 def test_agent_timeout_message_explains_interruption_and_uncertain_results() -> None:
     message = _agent_error_text(
-        AgentTimeoutError("deadline reached", timeout_seconds=125)
+        AgentTimeoutError(
+            "deadline reached",
+            timeout_seconds=125,
+            runtime_restarted=True,
+            write_attempted=True,
+        )
     )
-    assert "設定上限(2分5秒)" in message
-    assert "中断" in message
-    assert "途中の回答は確定していません" in message
-    assert "成功した操作は自動では元に戻りません" in message
-    assert "もう一度メンション" in message
+    assert "2 minutes 5 seconds execution limit" in message
+    assert "stopped" in message
+    assert "runtime was restarted automatically" in message
+    assert "could create a duplicate" in message
+    assert "partial response or operation result is unconfirmed" in message
 
 
 def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:

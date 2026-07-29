@@ -600,6 +600,11 @@ class SimajilordRuntime:
                     "web.fetch",
                     "web.find",
                     *(
+                        ("image.generate", "image.status")
+                        if "image.generate" in agent_capabilities
+                        else ()
+                    ),
+                    *(
                         ("workflow.search",)
                         if curated_workflow_endpoint is not None
                         else ()
@@ -667,6 +672,11 @@ class SimajilordRuntime:
                     "discord.view_custom_emoji",
                     "discord.view_image_attachment",
                     "discord.view_sticker",
+                    *(
+                        ("image.generate",)
+                        if "image.generate" in agent_capabilities
+                        else ()
+                    ),
                 ),
                 action_receipts=action_receipts,
             )
@@ -767,7 +777,7 @@ class SimajilordRuntime:
             build_speech_endpoint(speech, audio),
             *build_web_endpoints(web),
             *build_moderation_endpoints(moderation),
-            *build_image_endpoints(image),
+            *build_image_endpoints(image, files),
             *(build_file_endpoints(files) if files is not None else ()),
             *(build_compute_endpoints(compute) if compute is not None else ()),
             *build_memory_endpoints(memory),

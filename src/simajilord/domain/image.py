@@ -64,3 +64,5 @@ class ImageGenerationJob:
     progress_total: int = 12
     delivery_message_id: str | None = None
     delivered: bool = False
+    auto_deliver: bool = True
+    handoff_completed: bool = False

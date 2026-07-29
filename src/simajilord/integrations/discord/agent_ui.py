@@ -86,29 +86,57 @@ def agent_delivery_nonce(
 
 def agent_error_text(error: Exception) -> str:
     if isinstance(error, AgentBusyError):
-        return "AIへの依頼が混み合っています。少し待ってからもう一度お試しください。"
+        return "The AI request queue is full. Please try again shortly."
     if isinstance(error, AgentRateLimitError):
         if error.retry_after_seconds is not None:
             return (
-                "AIの利用間隔を調整しています。"
-                f"あと{retry_after_text(error.retry_after_seconds)}ほどお待ちください。"
+                "This AI request is rate-limited. Please wait about "
+                f"{_english_duration(error.retry_after_seconds)}."
             )
-        return "AIの利用間隔を調整しています。時間を空けてもう一度お試しください。"
+        return "This AI request is rate-limited. Please try again later."
     if isinstance(error, AgentUnavailableError):
-        return "現在、このホストではSimajilord AIを利用できません。"
+        return "Simajilord AI is currently unavailable on this host."
     if isinstance(error, AgentProviderLimitError):
         return (
-            "AIプロバイダーの利用上限に達しています。"
-            "上限がリセットされてから、もう一度お試しください。"
+            "The AI provider usage limit has been reached. "
+            "Please try again after the provider limit resets."
         )
     if isinstance(error, AgentTimeoutError):
-        limit = retry_after_text(max(1, round(error.timeout_seconds)))
-        return (
-            f"AIの処理が設定上限({limit})に達したため、中断しました。"
-            "途中の回答は確定していません。すでに成功した操作は自動では元に戻りません。"
-            "続きから進める場合は、もう一度メンションしてください。"
+        limit = _english_duration(max(1, round(error.timeout_seconds)))
+        recovery = (
+            " The execution runtime was restarted automatically."
+            if error.runtime_restarted
+            else ""
         )
-    return "AIの処理を完了できませんでした。"
+        if error.write_attempted:
+            retry = (
+                " The request was not replayed automatically because an external "
+                "write may have started and replaying it could create a duplicate."
+            )
+        elif error.auto_retry_attempted:
+            retry = " A safe automatic retry before any write also timed out."
+        else:
+            retry = ""
+        return (
+            f"The AI turn reached its {limit} execution limit and was stopped."
+            f"{recovery}{retry}"
+            " Any partial response or operation result is unconfirmed."
+        )
+    return "The AI request could not be completed."
+
+
+def _english_duration(total_seconds: int) -> str:
+    seconds = max(1, total_seconds)
+    hours, remainder = divmod(seconds, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours} hour" + ("" if hours == 1 else "s"))
+    if minutes:
+        parts.append(f"{minutes} minute" + ("" if minutes == 1 else "s"))
+    if seconds or not parts:
+        parts.append(f"{seconds} second" + ("" if seconds == 1 else "s"))
+    return " ".join(parts)
 
 
 def retry_after_text(total_seconds: int) -> str:
@@ -132,7 +160,7 @@ _PROGRESS_MESSAGES = {
     AgentProgressStage.SEARCHING_WEB: "Searching the web…",
     AgentProgressStage.COMPUTING: "Running the calculation…",
     AgentProgressStage.ANALYZING_MEDIA: "Analyzing the attachment with HIVE…",
-    AgentProgressStage.GENERATING_IMAGE: "Preparing local image generation…",
+    AgentProgressStage.GENERATING_IMAGE: "Generating image with GPT Image 2…",
     AgentProgressStage.USING_AUDIO: "Preparing the server audio controls…",
     AgentProgressStage.PREPARING_RESPONSE: "Preparing the response…",
 }

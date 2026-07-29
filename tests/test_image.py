@@ -32,6 +32,7 @@ from simajilord.integrations.discord.bot import (
 )
 from simajilord.observability import EventJournal
 from simajilord.providers.image import ImageProviderResult
+from simajilord.services.files import AgentFileSandbox
 from simajilord.services.image import (
     ImageGenerationService,
     ImageGenerationStore,
@@ -40,6 +41,9 @@ from simajilord.services.image import (
 
 
 class FakeImageProvider:
+    def __init__(self) -> None:
+        self.generate_calls = 0
+
     async def generate(
         self,
         *,
@@ -51,6 +55,7 @@ class FakeImageProvider:
         on_progress: object = None,
     ) -> ImageProviderResult:
         del brief_json, seed
+        self.generate_calls += 1
         if callable(on_progress):
             await on_progress(6, 12)
             await on_progress(12, 12)
@@ -248,6 +253,8 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
         }
     assert "delivery_message_id" in columns
     assert "provider_model" in columns
+    assert "auto_deliver" in columns
+    assert "handoff_completed" in columns
     job = _job(
         tmp_path,
         job_id="post-migration",
@@ -258,6 +265,8 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
     migrated = store.require(job.job_id)
     assert migrated.delivery_message_id == "123"
     assert migrated.delivered is True
+    assert migrated.auto_deliver is True
+    assert migrated.handoff_completed is False
 
 
 @pytest.mark.asyncio
@@ -704,14 +713,17 @@ async def test_image_limits_exempt_only_configured_actor(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_image_capability_enforces_agent_delivery_scope(tmp_path: Path) -> None:
+async def test_image_capability_returns_agent_file_without_auto_delivery(
+    tmp_path: Path,
+) -> None:
     service = _service(tmp_path)
+    delivery = AsyncMock()
+    await service.start(delivery)
+    files = AgentFileSandbox(tmp_path / "files")
     registry = CapabilityRegistry()
-    for item in build_image_endpoints(service):
+    for item in build_image_endpoints(service, files):
         registry.register(item)
     request = ImageGenerateRequest(
-        delivery_target_id="forbidden-channel",
-        reply_to_event_id="123",
         subject="a friendly shiba inu",
         scene="a park",
         composition="full-body portrait",
@@ -724,25 +736,41 @@ async def test_image_capability_enforces_agent_delivery_scope(tmp_path: Path) ->
         transport="agent",
         request_id="discord:message:123",
         resource_ids=("allowed-channel",),
+        origin_resource_id="allowed-channel",
     )
-    with pytest.raises(UserError, match=r"image\.delivery_target_forbidden"):
-        await registry.invoke("image.generate", request, context)
+    raw_responses = await asyncio.gather(
+        registry.invoke("image.generate", request, context),
+        registry.invoke("image.generate", request, context),
+    )
+    responses = tuple(cast(ImageGenerateResponse, item) for item in raw_responses)
+    response = responses[0]
+    job = service.store.require(response.job_id)
+    assert responses[1].job_id == response.job_id
+    provider = cast(FakeImageProvider, service.provider)
+    assert provider.generate_calls == 1
+    assert response.status is ImageJobStatus.COMPLETED
+    assert response.image_data_url.startswith("data:image/png;base64,")
+    assert files.path_for_delivery("guild", response.path).is_file()
+    assert job.auto_deliver is False
+    assert job.delivery_message_id is None
+    assert job.delivered is False
+    assert job.handoff_completed is True
+    delivery.assert_not_awaited()
     await service.close()
 
 
 @pytest.mark.asyncio
 async def test_image_capability_normalizes_exact_agent_event_id(tmp_path: Path) -> None:
     service = _service(tmp_path)
+    files = AgentFileSandbox(tmp_path / "files")
     registry = CapabilityRegistry()
-    for item in build_image_endpoints(service):
+    for item in build_image_endpoints(service, files):
         registry.register(item)
     response = cast(
         ImageGenerateResponse,
         await registry.invoke(
             "image.generate",
             ImageGenerateRequest(
-                delivery_target_id="channel",
-                reply_to_event_id="discord:message:123",
                 subject="a friendly shiba inu",
                 scene="a park",
                 composition="full-body portrait",
@@ -755,11 +783,13 @@ async def test_image_capability_normalizes_exact_agent_event_id(tmp_path: Path) 
                 transport="agent",
                 request_id="discord:message:123",
                 resource_ids=("channel",),
+                origin_resource_id="channel",
             ),
         ),
     )
     job = service.store.require(response.job_id)
     assert job.reply_to_message_id == "123"
+    assert job.delivery_target_id == "channel"
     await service.close()
 
 

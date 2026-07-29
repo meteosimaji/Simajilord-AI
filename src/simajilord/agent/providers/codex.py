@@ -151,6 +151,7 @@ class _ToolTurnBudget:
     last_progress: AgentProgressStage | None = None
     write_successes: set[str] = field(default_factory=set)
     write_failures: list[tuple[str, str]] = field(default_factory=list)
+    write_attempts: set[str] = field(default_factory=set)
     last_write_authorization_event_id: str | None = None
     discord_disclosure_observations: list[tuple[str, str, str]] = field(
         default_factory=list
@@ -161,6 +162,12 @@ class _ProtocolRequestError(RuntimeError):
     def __init__(self, code: int | None, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(slots=True)
+class _TurnAttemptState:
+    process: asyncio.subprocess.Process | None = None
+    write_attempted: bool = False
 
 
 class CodexAppServerProvider:
@@ -226,17 +233,46 @@ class CodexAppServerProvider:
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
     ) -> ProviderTurnResult:
+        first_attempt = _TurnAttemptState()
         try:
             return await self._respond_with_deadline(
                 provider_thread_id=provider_thread_id,
                 event_prompt=event_prompt,
                 context=context,
                 on_progress=on_progress,
+                attempt_state=first_attempt,
             )
         except TimeoutError:
+            await self._reset_after_timeout(first_attempt.process)
+            if not first_attempt.write_attempted:
+                log.warning(
+                    "Retrying timed-out read-only agent attempt on a fresh app-server "
+                    "request=%s",
+                    context.request_id,
+                )
+                retry_attempt = _TurnAttemptState()
+                try:
+                    return await self._respond_with_deadline(
+                        provider_thread_id=None,
+                        event_prompt=event_prompt,
+                        context=context,
+                        on_progress=on_progress,
+                        attempt_state=retry_attempt,
+                    )
+                except TimeoutError:
+                    await self._reset_after_timeout(retry_attempt.process)
+                    raise AgentTimeoutError(
+                        "The fresh automatic retry also reached its execution deadline.",
+                        timeout_seconds=self.timeout_seconds,
+                        auto_retry_attempted=True,
+                        runtime_restarted=True,
+                        write_attempted=retry_attempt.write_attempted,
+                    ) from None
             raise AgentTimeoutError(
                 "The agent turn reached its configured execution deadline.",
                 timeout_seconds=self.timeout_seconds,
+                runtime_restarted=True,
+                write_attempted=True,
             ) from None
 
     async def _respond_with_deadline(
@@ -246,12 +282,15 @@ class CodexAppServerProvider:
         event_prompt: str,
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
+        attempt_state: _TurnAttemptState | None = None,
     ) -> ProviderTurnResult:
         lock_key = provider_thread_id or f"request:{context.request_id}"
         thread_lock = self._thread_locks.setdefault(lock_key, asyncio.Lock())
         async with thread_lock:
             async with asyncio.timeout(self.timeout_seconds):
                 await self._ensure_started()
+                if attempt_state is not None:
+                    attempt_state.process = self._process
                 thread_id = await self._ensure_thread(provider_thread_id, context)
                 self._notification_queues.setdefault(thread_id, asyncio.Queue())
                 authorization_event_id, provider_prompt = (
@@ -500,7 +539,12 @@ class CodexAppServerProvider:
                     active_route = self._active_routes.get(route_key)
                     if active_route is not None and active_route[0] == thread_id:
                         self._active_routes.pop(route_key, None)
-                    self._active_tool_budgets.pop(thread_id, None)
+                    finished_budget = self._active_tool_budgets.pop(thread_id, None)
+                    if attempt_state is not None and finished_budget is not None:
+                        attempt_state.write_attempted = any(
+                            not self.tools.write_is_safe_to_retry(capability)
+                            for capability in finished_budget.write_attempts
+                        )
                     for active_turn_id, active_thread_id in tuple(
                         self._thread_by_turn.items()
                     ):
@@ -569,6 +613,10 @@ class CodexAppServerProvider:
                 budget.follow_up_message_ids.discard(follow_up_message_id)
 
     async def close(self) -> None:
+        async with self._start_lock:
+            await self._close_unlocked()
+
+    async def _close_unlocked(self) -> None:
         process = self._process
         self._process = None
         if process is not None and process.returncode is None:
@@ -656,8 +704,23 @@ class CodexAppServerProvider:
                 )
                 await self._notify("initialized")
             except Exception:
-                await self.close()
+                await self._close_unlocked()
                 raise
+
+    async def _reset_after_timeout(
+        self,
+        expected_process: asyncio.subprocess.Process | None,
+    ) -> None:
+        """Discard only the app-server generation that owned the stalled turn."""
+
+        async with self._start_lock:
+            if (
+                expected_process is not None
+                and self._process is not expected_process
+            ):
+                return
+            log.warning("Resetting Codex app-server after an agent turn timeout.")
+            await self._close_unlocked()
 
     async def _ensure_thread(
         self,
@@ -1143,6 +1206,8 @@ class CodexAppServerProvider:
             )
             return
         try:
+            if write_capability is not None:
+                budget.write_attempts.add(write_capability)
             output = await self.tools.invoke(
                 namespace=namespace if isinstance(namespace, str) else None,
                 tool_name=tool_name,

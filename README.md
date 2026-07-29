@@ -227,9 +227,11 @@ with Discord's generic “interaction failed” banner.
   Timer/audio system events do not consume the human-source cap. No built-in GitHub or RSS
   adapter is connected yet; a future adapter can publish through the same typed
   `AutonomyEventQueue` without adding a second scheduler
-- Restart-safe local image generation with atomic user/server/pending admission and a resident
-  exponential-backoff Discord delivery retry loop. A completed image is not considered
-  delivered until Discord accepts it, without waiting for the next service restart
+- Restart-safe GPT Image 2 generation through the saved Codex OAuth login, with atomic
+  user/server/pending admission. Agent requests wait in the same turn, receive the generated
+  image as model-visible media plus a server-scoped workspace file, and explicitly choose
+  whether to post it with `discord.send_file`; the legacy delivery worker remains only for
+  jobs that were explicitly submitted with automatic delivery enabled
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls

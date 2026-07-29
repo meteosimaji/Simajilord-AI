@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -78,6 +79,13 @@ class ImageGenerationStore:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT 1 FROM image_generation_jobs WHERE job_id = ?",
+                (job.job_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.commit()
+                return "image.idempotent_replay"
             if enforce_rate_limits:
                 actor_count = self._count_recent(
                     connection,
@@ -236,6 +244,17 @@ class ImageGenerationStore:
                 (message_id, job_id),
             )
 
+    def mark_handed_off(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE image_generation_jobs
+                SET handoff_completed = 1
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+
     def get(self, job_id: str) -> ImageGenerationJob | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -293,7 +312,7 @@ class ImageGenerationStore:
         *,
         before: datetime,
     ) -> tuple[int, tuple[Path, ...]]:
-        """Forget old terminal jobs only after their Discord delivery completed."""
+        """Forget old terminal jobs after delivery or agent file handoff."""
 
         if before.tzinfo is None:
             raise ValueError("Retention cutoffs must be timezone-aware.")
@@ -305,7 +324,7 @@ class ImageGenerationStore:
                 SELECT output_path
                 FROM image_generation_jobs
                 WHERE status IN (?, ?)
-                  AND delivered = 1
+                  AND (delivered = 1 OR handoff_completed = 1)
                   AND COALESCE(completed_at, created_at) < ?
                 """,
                 (
@@ -318,7 +337,7 @@ class ImageGenerationStore:
                 """
                 DELETE FROM image_generation_jobs
                 WHERE status IN (?, ?)
-                  AND delivered = 1
+                  AND (delivered = 1 OR handoff_completed = 1)
                   AND COALESCE(completed_at, created_at) < ?
                 """,
                 (
@@ -338,7 +357,7 @@ class ImageGenerationStore:
         )
 
     def prune_oldest_delivered_terminal(self) -> tuple[bool, tuple[Path, ...]]:
-        """Remove one oldest safely delivered terminal job under storage pressure."""
+        """Remove one oldest safely handed-off terminal job under storage pressure."""
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -346,7 +365,8 @@ class ImageGenerationStore:
                 """
                 SELECT job_id, output_path
                 FROM image_generation_jobs
-                WHERE status IN (?, ?) AND delivered = 1
+                WHERE status IN (?, ?)
+                  AND (delivered = 1 OR handoff_completed = 1)
                 ORDER BY COALESCE(completed_at, created_at), job_id
                 LIMIT 1
                 """,
@@ -397,7 +417,9 @@ class ImageGenerationStore:
                     progress_step INTEGER NOT NULL DEFAULT 0,
                     progress_total INTEGER NOT NULL DEFAULT 12,
                     delivery_message_id TEXT,
-                    delivered INTEGER NOT NULL DEFAULT 0
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    auto_deliver INTEGER NOT NULL DEFAULT 1,
+                    handoff_completed INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS image_jobs_status_created
                 ON image_generation_jobs(status, created_at);
@@ -434,6 +456,16 @@ class ImageGenerationStore:
                         ImageJobStatus.COMPLETED.value,
                     ),
                 )
+            if "auto_deliver" not in columns:
+                connection.execute(
+                    "ALTER TABLE image_generation_jobs "
+                    "ADD COLUMN auto_deliver INTEGER NOT NULL DEFAULT 1"
+                )
+            if "handoff_completed" not in columns:
+                connection.execute(
+                    "ALTER TABLE image_generation_jobs "
+                    "ADD COLUMN handoff_completed INTEGER NOT NULL DEFAULT 0"
+                )
         self.path.chmod(0o600)
 
     def _connect(self) -> sqlite3.Connection:
@@ -455,8 +487,9 @@ class ImageGenerationStore:
                 reply_to_message_id, prompt_json, caption_json, status,
                 output_path, width, height, seed, created_at, completed_at,
                 generation_seconds, provider_model, error_code,
-                progress_step, progress_total, delivery_message_id, delivered
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                progress_step, progress_total, delivery_message_id, delivered,
+                auto_deliver, handoff_completed
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _job_values(job),
         )
@@ -519,6 +552,7 @@ class ImageGenerationService:
         self._delivery_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._delivery_retry_requested: set[str] = set()
         self._delivery_locks: dict[str, _DeliveryLockState] = {}
+        self._terminal_events: dict[str, asyncio.Event] = {}
         self._closed = False
 
     async def start(self, delivery_handler: ImageDeliveryHandler) -> None:
@@ -528,6 +562,8 @@ class ImageGenerationService:
             log.warning("Requeued %s interrupted image generation job(s)", requeued)
         self._ensure_worker()
         for job in await asyncio.to_thread(self.store.undelivered_terminal):
+            if not job.auto_deliver:
+                continue
             self._schedule_delivery_retry(job.job_id, immediate=True)
         if await asyncio.to_thread(self.store.pending_count):
             self._wake.set()
@@ -540,7 +576,22 @@ class ImageGenerationService:
         delivery_target_id: str,
         reply_to_message_id: str | None,
         prompt: ImageGenerationPrompt,
+        auto_deliver: bool = True,
+        idempotency_key: str | None = None,
     ) -> ImageGenerationJob:
+        job_id = (
+            _idempotent_job_id(
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                idempotency_key=idempotency_key,
+            )
+            if idempotency_key is not None
+            else uuid.uuid4().hex
+        )
+        if idempotency_key is not None:
+            existing = await asyncio.to_thread(self.store.get, job_id)
+            if existing is not None:
+                return existing
         if self.provider is None:
             raise UserError("image.not_configured")
         _validate_prompt(prompt)
@@ -550,7 +601,7 @@ class ImageGenerationService:
         if not 0 <= seed <= 2_147_483_647:
             raise UserError("image.seed_invalid")
         job = ImageGenerationJob(
-            job_id=uuid.uuid4().hex,
+            job_id=job_id,
             actor_id=actor_id,
             workspace_id=workspace_id,
             delivery_target_id=delivery_target_id,
@@ -563,6 +614,7 @@ class ImageGenerationService:
             height=height,
             seed=seed,
             created_at_iso=now.isoformat(),
+            auto_deliver=auto_deliver,
         )
         rejection_code = await asyncio.to_thread(
             self.store.admit,
@@ -574,6 +626,8 @@ class ImageGenerationService:
             workspace_limit=self.per_workspace_requests,
             pending_limit=self.max_pending_jobs,
         )
+        if rejection_code == "image.idempotent_replay":
+            return await asyncio.to_thread(self.store.require, job_id)
         if rejection_code is not None:
             raise UserError(rejection_code)
         self._ensure_worker()
@@ -596,6 +650,25 @@ class ImageGenerationService:
             self._wake.set()
         return job
 
+    async def wait_for_terminal(self, job_id: str) -> ImageGenerationJob:
+        """Wait for durable generation completion independently of delivery."""
+
+        event = self._terminal_events.setdefault(job_id, asyncio.Event())
+        while not self._closed:
+            job = await asyncio.to_thread(self.store.require, job_id)
+            if job.status in {ImageJobStatus.COMPLETED, ImageJobStatus.FAILED}:
+                self._terminal_events.pop(job_id, None)
+                return job
+            event.clear()
+            # Recheck after clearing so completion in this race window cannot
+            # leave the waiter asleep forever.
+            job = await asyncio.to_thread(self.store.require, job_id)
+            if job.status in {ImageJobStatus.COMPLETED, ImageJobStatus.FAILED}:
+                self._terminal_events.pop(job_id, None)
+                return job
+            await event.wait()
+        raise RuntimeError("Image generation service closed before completion.")
+
     async def mark_delivered(
         self,
         job_id: str,
@@ -610,6 +683,9 @@ class ImageGenerationService:
 
     async def set_delivery_message(self, job_id: str, message_id: str) -> None:
         await asyncio.to_thread(self.store.set_delivery_message, job_id, message_id)
+
+    async def mark_handed_off(self, job_id: str) -> None:
+        await asyncio.to_thread(self.store.mark_handed_off, job_id)
 
     async def owned_job(
         self,
@@ -637,6 +713,9 @@ class ImageGenerationService:
         self._delivery_retry_tasks.clear()
         self._delivery_retry_requested.clear()
         self._delivery_locks.clear()
+        for event in self._terminal_events.values():
+            event.set()
+        self._terminal_events.clear()
         if self.provider is not None:
             await self.provider.close()
 
@@ -711,6 +790,9 @@ class ImageGenerationService:
                         "model": result.model,
                     },
                 )
+            event = self._terminal_events.get(job.job_id)
+            if event is not None:
+                event.set()
             await self._notify(terminal)
 
     def _progress_callback(self, job_id: str) -> ImageProgressCallback:
@@ -726,7 +808,7 @@ class ImageGenerationService:
         return progress
 
     async def _notify(self, job: ImageGenerationJob) -> None:
-        if self._delivery_handler is None:
+        if self._delivery_handler is None or not job.auto_deliver:
             return
         try:
             await self._deliver_latest(job.job_id)
@@ -760,7 +842,7 @@ class ImageGenerationService:
                     await asyncio.sleep(delay)
                 self._delivery_retry_requested.discard(job_id)
                 job = await asyncio.to_thread(self.store.get, job_id)
-                if job is None or job.delivered:
+                if job is None or job.delivered or not job.auto_deliver:
                     return
                 handler = self._delivery_handler
                 if handler is None:
@@ -805,7 +887,7 @@ class ImageGenerationService:
 
         async with self._delivery_lock(job_id):
             job = await asyncio.to_thread(self.store.get, job_id)
-            if job is None or job.delivered:
+            if job is None or job.delivered or not job.auto_deliver:
                 return
             handler = self._delivery_handler
             if handler is None:
@@ -922,6 +1004,16 @@ def _image_error_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _idempotent_job_id(
+    *,
+    actor_id: str,
+    workspace_id: str,
+    idempotency_key: str,
+) -> str:
+    material = f"image.generate\0{actor_id}\0{workspace_id}\0{idempotency_key}"
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
 def _job_values(job: ImageGenerationJob) -> tuple[object, ...]:
     prompt_json = json.dumps(
         {
@@ -953,6 +1045,8 @@ def _job_values(job: ImageGenerationJob) -> tuple[object, ...]:
         job.progress_total,
         job.delivery_message_id,
         int(job.delivered),
+        int(job.auto_deliver),
+        int(job.handoff_completed),
     )
 
 
@@ -1005,4 +1099,6 @@ def _row_job(row: sqlite3.Row) -> ImageGenerationJob:
             str(row["delivery_message_id"]) if row["delivery_message_id"] else None
         ),
         delivered=bool(row["delivered"]),
+        auto_deliver=bool(row["auto_deliver"]),
+        handoff_completed=bool(row["handoff_completed"]),
     )
