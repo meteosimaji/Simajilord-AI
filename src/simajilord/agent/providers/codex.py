@@ -98,8 +98,8 @@ After reading the trigger, choose the next step without stalling:
    available, use files.download_url then files.read page_start/next_page.
 3. For Discord state, files, or actions, use a matching shown Simajilord tool.
 4. If no shown tool fits, capability_search a concrete action-and-object query; read its schema and
-   call capability_invoke with only fields defined by that schema. For a general ability question,
-   browse with an empty query and page it.
+   call capability_invoke with only fields defined by that schema. For general abilities, browse
+   compact empty-query pages, limit 25.
    Otherwise refine once with a synonym if the result is empty or ambiguous.
 5. If no match or a tool rejects the request, use its availability/error reason to explain the
    real limit; never guess or claim success.
@@ -1040,6 +1040,14 @@ class CodexAppServerProvider:
             tool_name=tool_name,
             arguments=raw_params.get("arguments"),
         )
+        canonical_tool_name = self.tools.canonical_tool_name_for_call(
+            tool_name=tool_name,
+            arguments=raw_params.get("arguments"),
+        )
+        capability_arguments = self.tools.capability_arguments_for_call(
+            tool_name=tool_name,
+            arguments=raw_params.get("arguments"),
+        )
         tool_context = budget.context
         if write_capability is not None:
             authorization_event_id = self.tools.authorization_event_id_for_call(
@@ -1121,7 +1129,7 @@ class CodexAppServerProvider:
             return
         memory_evidence_failure = _memory_evidence_failure(
             capability_name=write_capability,
-            arguments=raw_params.get("arguments"),
+            arguments=capability_arguments,
             budget=budget,
             context=tool_context,
         )
@@ -1153,14 +1161,14 @@ class CodexAppServerProvider:
                 output=output.text,
             )
             _record_exact_message_reads(
-                tool_name=tool_name,
-                arguments=raw_params.get("arguments"),
+                tool_name=canonical_tool_name,
+                arguments=capability_arguments,
                 output=output.text,
                 read_states=budget.exact_message_reads,
             )
             if _tool_read_exact_event(
-                tool_name=tool_name,
-                arguments=raw_params.get("arguments"),
+                tool_name=canonical_tool_name,
+                arguments=capability_arguments,
                 output=output.text,
                 required_message_id=budget.required_message_id,
                 read_states=budget.exact_message_reads,
@@ -1172,8 +1180,8 @@ class CodexAppServerProvider:
                 )
             for message_id in budget.follow_up_message_ids:
                 if _tool_read_exact_event(
-                    tool_name=tool_name,
-                    arguments=raw_params.get("arguments"),
+                    tool_name=canonical_tool_name,
+                    arguments=capability_arguments,
                     output=output.text,
                     required_message_id=message_id,
                     read_states=budget.exact_message_reads,
@@ -1230,7 +1238,12 @@ class CodexAppServerProvider:
                 ),
             )
         except AgentToolError as exc:
-            log.info("Agent dynamic tool contract rejected: %s", exc)
+            log.info(
+                "Agent dynamic tool contract rejected tool=%s capability=%s reason=%s",
+                tool_name,
+                capability_name,
+                exc,
+            )
             if write_capability is not None:
                 budget.write_failures.append(
                     (write_capability, "agent.tool_contract_rejected")

@@ -31,6 +31,7 @@ _SEARCH_TOOL = "capability_search"
 _INVOKE_TOOL = "capability_invoke"
 _AUTHORIZATION_EVENT_ID = "authorization_event_id"
 _MAX_CAPABILITY_SEARCH_OFFSET = 10_000
+_MAX_CAPABILITY_SEARCH_LIMIT = 25
 _CAPABILITY_BROWSE_QUERIES = frozenset(
     {
         "abilities",
@@ -251,7 +252,15 @@ class AgentToolCatalog:
         if not isinstance(arguments, dict):
             return None
         value = arguments.get(_AUTHORIZATION_EVENT_ID)
-        return value if isinstance(value, str) and value else None
+        if isinstance(value, str) and value:
+            return value
+        if tool_name == _INVOKE_TOOL:
+            capability_arguments = arguments.get("arguments")
+            if isinstance(capability_arguments, dict):
+                nested_value = capability_arguments.get(_AUTHORIZATION_EVENT_ID)
+                if isinstance(nested_value, str) and nested_value:
+                    return nested_value
+        return None
 
     def write_is_safe_to_retry(self, capability_name: str) -> bool:
         """Return whether an already failed write may be repeated automatically."""
@@ -279,6 +288,36 @@ class AgentToolCatalog:
                 else None
             )
         return self._aliases.get(tool_name)
+
+    def canonical_tool_name_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> str:
+        """Return the dedicated alias even when a call used the broker."""
+
+        capability_name = self.capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        return (
+            _tool_alias(capability_name)
+            if capability_name is not None
+            else tool_name
+        )
+
+    def capability_arguments_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> object:
+        """Return request arguments independent of dedicated or brokered routing."""
+
+        if tool_name == _INVOKE_TOOL and isinstance(arguments, dict):
+            return arguments.get("arguments")
+        return arguments
 
     def dynamic_specs(
         self,
@@ -393,8 +432,15 @@ class AgentToolCatalog:
                 "Capability search offset must be between 0 and "
                 f"{_MAX_CAPABILITY_SEARCH_OFFSET}."
             )
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 5:
-            raise AgentToolError("Capability search limit must be between 1 and 5.")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= _MAX_CAPABILITY_SEARCH_LIMIT
+        ):
+            raise AgentToolError(
+                "Capability search limit must be between 1 and "
+                f"{_MAX_CAPABILITY_SEARCH_LIMIT}."
+            )
         browse = _is_capability_browse_query(query)
         registered = self._registry.all()
         candidates = (
@@ -434,14 +480,25 @@ class AgentToolCatalog:
         payload = {
             "query": query,
             "browse": browse,
+            "detail": "summary" if browse else "schema",
             "offset": offset,
             "matches": [
                 {
                     "name": item.descriptor.name,
                     "summary": item.descriptor.summary,
                     "risk": item.descriptor.risk.value,
-                    "metadata": _descriptor_metadata(item.descriptor),
-                    "input_schema": _dataclass_schema(item.request_type),
+                    "invoke_with": _INVOKE_TOOL,
+                    "authorization_event_id_required": (
+                        item.descriptor.name in self._write_capabilities
+                    ),
+                    **(
+                        {}
+                        if browse
+                        else {
+                            "metadata": _descriptor_metadata(item.descriptor),
+                            "input_schema": _dataclass_schema(item.request_type),
+                        }
+                    ),
                 }
                 for item in page
             ],
@@ -480,11 +537,9 @@ class AgentToolCatalog:
             raise AgentToolError("Capability name must be text.")
         if capability_name not in self._allowed_capabilities:
             raise AgentToolError("The capability is not allowed.")
-        if capability_name in self._eager_capabilities:
-            raise AgentToolError("Use the dedicated dynamic tool for this capability.")
         return await self._invoke_capability(
             capability_name,
-            capability_arguments,
+            _without_authorization_event_id(capability_arguments),
             context=context,
             max_output_characters=max_output_characters,
         )
@@ -688,8 +743,10 @@ def _search_spec() -> Mapping[str, object]:
         "name": _SEARCH_TOOL,
         "description": (
             "Search available Simajilord capabilities, or browse them with an empty/general "
-            "ability query. Follow next_offset until has_more is false. Unavailable tools "
-            "are reported only as coarse reason counts; their names and schemas stay hidden."
+            "ability query. Browse pages are compact summaries so a full catalog can be paged "
+            "without loading every schema. Concrete searches include invocation schemas. "
+            "Follow next_offset until has_more is false. Unavailable tools are reported only "
+            "as coarse reason counts; their names and schemas stay hidden."
         ),
         "inputSchema": {
             "type": "object",
@@ -710,7 +767,15 @@ def _search_spec() -> Mapping[str, object]:
                     "default": 0,
                     "description": "Copy next_offset from the previous result page.",
                 },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 5},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _MAX_CAPABILITY_SEARCH_LIMIT,
+                    "description": (
+                        "Use up to 25 for compact catalog browsing; use a small value for "
+                        "concrete schema searches."
+                    ),
+                },
             },
             "additionalProperties": False,
         },
@@ -726,7 +791,10 @@ def _invoke_spec() -> Mapping[str, object]:
     return {
         "type": "function",
         "name": _INVOKE_TOOL,
-        "description": "Invoke one capability returned by capability_search.",
+        "description": (
+            "Invoke one capability returned by capability_search. This remains valid when "
+            "the same capability also has a dedicated tool alias."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {

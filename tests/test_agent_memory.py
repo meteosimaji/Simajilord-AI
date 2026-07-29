@@ -787,6 +787,27 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
     )
     payload = json.loads(search_output.text)
     assert payload["memories"][0]["memory_id"] == remembered.memory.memory_id
+    brokered_search_output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_invoke",
+        arguments={
+            "name": "memory.search",
+            "arguments": {
+                "query": "Japanese",
+                "scopes": ["user"],
+                "basis": "user_stated",
+                "min_confidence": 0.9,
+                "offset": 0,
+                "limit": 1,
+            },
+        },
+        context=context,
+        max_output_characters=10_000,
+    )
+    assert (
+        json.loads(brokered_search_output.text)["memories"][0]["memory_id"]
+        == remembered.memory.memory_id
+    )
     assert payload["memories"][0]["source_message_ids"] == ["400"]
     assert payload["memories"][0]["source_message_locators"] == [
         {

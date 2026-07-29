@@ -1960,6 +1960,14 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
         max_output_characters=1_000,
     )
     assert '"content":"bc"' in output
+    brokered_output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_invoke",
+        arguments={"name": "test.read", "arguments": {"offset": 2}},
+        context=InvocationContext("actor", "workspace", "agent", "request"),
+        max_output_characters=1_000,
+    )
+    assert '"content":"cd"' in brokered_output
 
 
 def test_dynamic_tool_catalog_exposes_operational_metadata() -> None:
@@ -2207,10 +2215,29 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         )
         == "image.generate"
     )
+    nested_authorization = {
+        "name": "image.generate",
+        "arguments": {
+            "subject": "cat",
+            "authorization_event_id": "discord:message:123",
+        },
+    }
+    assert catalog.authorization_event_id_for_call(
+        tool_name="capability_invoke",
+        arguments=nested_authorization,
+    ) == "discord:message:123"
     assert catalog.capability_for_call(
         tool_name="capability_invoke",
         arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
     ) == "image.generate"
+    assert catalog.canonical_tool_name_for_call(
+        tool_name="capability_invoke",
+        arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
+    ) == "image_generate"
+    assert catalog.capability_arguments_for_call(
+        tool_name="capability_invoke",
+        arguments=nested_authorization,
+    ) == nested_authorization["arguments"]
     assert catalog.capability_for_call(
         tool_name="test_read",
         arguments={"offset": 0},
@@ -2237,6 +2264,8 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         max_output_characters=2_000,
     )
     assert '"name":"image.generate"' in search
+    assert '"input_schema"' in search
+    assert '"invoke_with":"capability_invoke"' in search
     result = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
@@ -2245,6 +2274,14 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         max_output_characters=2_000,
     )
     assert '"job_id":"image:cat"' in result
+    nested_result = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_invoke",
+        arguments=nested_authorization,
+        context=granted,
+        max_output_characters=2_000,
+    )
+    assert '"job_id":"image:cat"' in nested_result
 
 
 def test_agent_tool_catalog_rejects_duplicate_allowlist_entries() -> None:
@@ -2446,12 +2483,15 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
     first = await browse({"limit": 2})
     second = await browse({"query": "", "offset": first["next_offset"], "limit": 2})
     general = await browse({"query": "何ができますか?", "limit": 2})
+    wide = await browse({"query": "", "limit": 6})
 
     assert first["browse"] is True
+    assert first["detail"] == "summary"
     assert [item["name"] for item in first["matches"]] == [
         "test.alpha",
         "test.beta",
     ]
+    assert all("input_schema" not in item for item in first["matches"])
     assert first["next_offset"] == 2
     assert first["has_more"] is True
     assert first["total_results"] == 3
@@ -2459,6 +2499,58 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
     assert second["next_offset"] is None
     assert second["has_more"] is False
     assert general["matches"] == first["matches"]
+    assert len(wide["matches"]) == 3
+    assert all(
+        item["invoke_with"] == "capability_invoke"
+        for item in wide["matches"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_browse_compacts_large_catalog_into_few_pages() -> None:
+    registry = CapabilityRegistry()
+
+    async def read(
+        request: ReadRequest,
+        _: InvocationContext,
+    ) -> ReadResponse:
+        return ReadResponse(str(request.offset), None)
+
+    names = tuple(f"test.capability_{index:02d}" for index in range(30))
+    for name in names:
+        registry.register(
+            endpoint(
+                CapabilityDescriptor(name, f"Read {name}.", RiskLevel.READ),
+                ReadRequest,
+                ReadResponse,
+                read,
+            )
+        )
+    catalog = AgentToolCatalog(registry, names, eager_capabilities=())
+    context = InvocationContext("actor", "workspace", "agent", "browse-large")
+
+    async def page(offset: int) -> dict[str, object]:
+        output = await catalog.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "", "offset": offset, "limit": 25},
+            context=context,
+            max_output_characters=8_000,
+        )
+        decoded = json.loads(output.text)
+        assert isinstance(decoded, dict)
+        return decoded
+
+    first = await page(0)
+    second = await page(25)
+
+    assert len(first["matches"]) == 25
+    assert first["next_offset"] == 25
+    assert first["has_more"] is True
+    assert len(second["matches"]) == 5
+    assert second["next_offset"] is None
+    assert second["has_more"] is False
+    assert all("input_schema" not in item for item in first["matches"])
 
 
 @pytest.mark.asyncio
@@ -2867,10 +2959,13 @@ async def test_provider_executes_write_with_authorizing_contributor_context(
         1,
         {
             "namespace": "simajilord",
-            "tool": "test_write",
+            "tool": "capability_invoke",
             "arguments": {
-                "subject": "authorized",
-                "authorization_event_id": contributor_context.request_id,
+                "name": "test.write",
+                "arguments": {
+                    "subject": "authorized",
+                    "authorization_event_id": contributor_context.request_id,
+                },
             },
             "threadId": "thread",
         },
