@@ -13,6 +13,7 @@ const elements = {
   loop: document.querySelector("#loop"),
   mode: document.querySelector("#mode"),
   progress: document.querySelector("#progress"),
+  progressTrack: document.querySelector(".progress-track"),
   queueCount: document.querySelector("#queue-count"),
   radio: document.querySelector("#radio"),
   readAloud: document.querySelector("#read-aloud"),
@@ -33,7 +34,7 @@ function formatTime(value) {
 function estimatePosition(audio) {
   if (!audio?.current) return 0;
   const base = Number(audio.position_seconds) || 0;
-  if (audio.paused || audio.speech_active) return base;
+  if (audio.paused) return base;
   return base + Math.max(0, Date.now() - Number(audio.sampled_at_ms || Date.now())) / 1000;
 }
 
@@ -42,15 +43,31 @@ function renderProgress() {
     elements.elapsed.textContent = "0:00";
     elements.duration.textContent = "0:00";
     elements.progress.style.width = "0%";
+    elements.progressTrack.setAttribute("aria-valuenow", "0");
+    elements.progressTrack.setAttribute("aria-valuetext", "No track playing");
     return;
   }
   const duration = Math.max(0, Number(latest.current.duration_seconds) || 0);
   const position = Math.min(duration || Infinity, estimatePosition(latest));
+  const percentage = duration > 0
+    ? Math.min(100, (position / duration) * 100)
+    : null;
   elements.elapsed.textContent = formatTime(position);
   elements.duration.textContent = duration > 0 ? formatTime(duration) : "LIVE";
-  elements.progress.style.width = duration > 0
-    ? `${Math.min(100, (position / duration) * 100)}%`
-    : "100%";
+  elements.progress.style.width = percentage === null ? "100%" : `${percentage}%`;
+  if (percentage === null) {
+    elements.progressTrack.removeAttribute("aria-valuenow");
+    elements.progressTrack.setAttribute(
+      "aria-valuetext",
+      `Live stream, elapsed ${formatTime(position)}`,
+    );
+  } else {
+    elements.progressTrack.setAttribute("aria-valuenow", String(Math.round(percentage)));
+    elements.progressTrack.setAttribute(
+      "aria-valuetext",
+      `${formatTime(position)} of ${formatTime(duration)}`,
+    );
+  }
 }
 
 function renderQueue(items) {
@@ -90,7 +107,8 @@ function render(audio) {
   elements.loop.textContent = audio.loop === "none" ? "Off" : audio.loop;
   elements.readAloud.textContent = audio.read_aloud ? "On" : "Off";
   elements.levels.textContent =
-    `${audio.levels.music_percent} / ${audio.levels.read_aloud_percent}`;
+    `Music ${audio.levels.music_percent}% · ` +
+    `Read aloud ${audio.levels.read_aloud_percent}%`;
   elements.mode.textContent = audio.speech_active
     ? "READ ALOUD"
     : audio.paused
@@ -107,7 +125,8 @@ function render(audio) {
       : "";
     if (audio.current.thumbnail_url) {
       elements.artwork.style.backgroundImage =
-        `linear-gradient(145deg, transparent, rgb(0 0 0 / 45%)), url("${audio.current.thumbnail_url}")`;
+        "linear-gradient(145deg, transparent, rgb(0 0 0 / 45%)), " +
+        `url(${JSON.stringify(audio.current.thumbnail_url)})`;
     } else {
       elements.artwork.style.backgroundImage = "";
     }
@@ -129,12 +148,12 @@ function showFatal(message) {
   elements.connection.textContent = "Offline";
 }
 
-function preview() {
+function preview({ speechActive = false } = {}) {
   render({
     sampled_at_ms: Date.now(),
     connected: true,
     paused: false,
-    speech_active: false,
+    speech_active: speechActive,
     position_seconds: 132,
     loop: "none",
     radio: true,
@@ -156,8 +175,9 @@ function preview() {
 }
 
 async function connect() {
-  if (new URLSearchParams(location.search).get("preview") === "1") {
-    preview();
+  const parameters = new URLSearchParams(location.search);
+  if (parameters.get("preview") === "1") {
+    preview({ speechActive: parameters.get("speech") === "1" });
     return;
   }
   const configResponse = await fetch("/api/config", { cache: "no-store" });

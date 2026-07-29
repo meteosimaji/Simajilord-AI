@@ -27,6 +27,7 @@ from simajilord.integrations.discord.bot import _image_result_embed
 from simajilord.integrations.discord.capabilities import (
     DiscordExpandedAttachmentRecord,
     DiscordExpandedEmbedRecord,
+    DiscordExpandedPollRecord,
     DiscordExpandMessageResponse,
 )
 from simajilord.integrations.discord.cogs import (
@@ -160,6 +161,57 @@ def test_expanded_embed_only_message_preserves_original_title_and_description() 
     assert embed.description == "A fluffy cat"
     assert embed.url == "https://example.com/result"
     assert embed.author.name == "Alice"
+
+
+def test_expanded_message_never_exceeds_discord_aggregate_character_limit() -> None:
+    response = DiscordExpandMessageResponse(
+        guild_id="1",
+        channel_id="2",
+        channel_name="general-" + ("c" * 90),
+        message_id="3",
+        jump_url="https://discord.com/channels/1/2/3",
+        author_id="4",
+        author_name="Alice " + ("a" * 200),
+        author_avatar_url="https://cdn.example.com/avatar.png",
+        author_is_bot=False,
+        content="本文" * 2_000,
+        created_at_iso="2026-07-27T00:00:00+00:00",
+        edited_at_iso="2026-07-27T00:01:00+00:00",
+        attachments=tuple(
+            DiscordExpandedAttachmentRecord(
+                filename=("attachment-" + ("x" * 100) + f"-{index}.txt"),
+                content_type="text/plain",
+                size_bytes=1_000,
+                url=f"https://cdn.example.com/{index}.txt",
+                proxy_url=f"https://proxy.example.com/{index}.txt",
+                spoiler=False,
+            )
+            for index in range(8)
+        ),
+        embeds=(
+            DiscordExpandedEmbedRecord(
+                title="元Embed" * 100,
+                description="説明" * 1_000,
+                url="https://example.com",
+                image_url=None,
+                thumbnail_url=None,
+            ),
+        ),
+        sticker_names=tuple("スタンプ" * 100 for _ in range(10)),
+        poll=DiscordExpandedPollRecord(
+            question="質問" * 100,
+            answers=tuple("選択肢" * 100 for _ in range(10)),
+        ),
+        reply_author_name="Bob " + ("b" * 200),
+        reply_content_preview="返信" * 400,
+    )
+
+    embed = expanded_message_embeds(response)[0]
+
+    assert len(embed) <= 6_000
+    assert len(embed.description or "") <= 4_096
+    assert all(len(field.name) <= 256 for field in embed.fields)
+    assert all(len(field.value) <= 1_024 for field in embed.fields)
 
 
 def test_generated_image_embed_shows_the_actual_creative_brief() -> None:

@@ -54,18 +54,55 @@ class ImageGenerationStore:
 
     def insert(self, job: ImageGenerationJob) -> None:
         with self._connect() as connection:
-            connection.execute(
+            self._insert(connection, job)
+
+    def admit(
+        self,
+        job: ImageGenerationJob,
+        *,
+        enforce_rate_limits: bool,
+        actor_since: datetime,
+        actor_limit: int,
+        workspace_since: datetime,
+        workspace_limit: int,
+        pending_limit: int,
+    ) -> str | None:
+        """Atomically validate every queue limit and reserve the accepted job."""
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if enforce_rate_limits:
+                actor_count = self._count_recent(
+                    connection,
+                    actor_id=job.actor_id,
+                    workspace_id=None,
+                    since=actor_since,
+                )
+                if actor_count >= actor_limit:
+                    connection.rollback()
+                    return "image.user_limit_reached"
+                workspace_count = self._count_recent(
+                    connection,
+                    actor_id=None,
+                    workspace_id=job.workspace_id,
+                    since=workspace_since,
+                )
+                if workspace_count >= workspace_limit:
+                    connection.rollback()
+                    return "image.workspace_limit_reached"
+            pending = connection.execute(
                 """
-                INSERT INTO image_generation_jobs (
-                    job_id, actor_id, workspace_id, delivery_target_id,
-                    reply_to_message_id, prompt_json, caption_json, status,
-                    output_path, width, height, seed, created_at, completed_at,
-                    generation_seconds, error_code, progress_step, progress_total,
-                    delivery_message_id, delivered
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT COUNT(*) AS count FROM image_generation_jobs
+                WHERE status IN (?, ?)
                 """,
-                _job_values(job),
-            )
+                (ImageJobStatus.QUEUED.value, ImageJobStatus.RUNNING.value),
+            ).fetchone()
+            if int(pending["count"]) >= pending_limit:
+                connection.rollback()
+                return "image.queue_full"
+            self._insert(connection, job)
+            connection.commit()
+        return None
 
     def requeue_running(self) -> int:
         with self._connect() as connection:
@@ -219,21 +256,13 @@ class ImageGenerationStore:
         workspace_id: str | None,
         since: datetime,
     ) -> int:
-        clauses = ["created_at >= ?"]
-        values: list[object] = [since.isoformat()]
-        if actor_id is not None:
-            clauses.append("actor_id = ?")
-            values.append(actor_id)
-        if workspace_id is not None:
-            clauses.append("workspace_id = ?")
-            values.append(workspace_id)
         with self._connect() as connection:
-            row = connection.execute(
-                f"SELECT COUNT(*) AS count FROM image_generation_jobs "
-                f"WHERE {' AND '.join(clauses)}",
-                values,
-            ).fetchone()
-        return int(row["count"])
+            return self._count_recent(
+                connection,
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                since=since,
+            )
 
     def prune_delivered_terminal(
         self,
@@ -373,6 +402,47 @@ class ImageGenerationStore:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @staticmethod
+    def _insert(
+        connection: sqlite3.Connection,
+        job: ImageGenerationJob,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO image_generation_jobs (
+                job_id, actor_id, workspace_id, delivery_target_id,
+                reply_to_message_id, prompt_json, caption_json, status,
+                output_path, width, height, seed, created_at, completed_at,
+                generation_seconds, error_code, progress_step, progress_total,
+                delivery_message_id, delivered
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _job_values(job),
+        )
+
+    @staticmethod
+    def _count_recent(
+        connection: sqlite3.Connection,
+        *,
+        actor_id: str | None,
+        workspace_id: str | None,
+        since: datetime,
+    ) -> int:
+        clauses = ["created_at >= ?"]
+        values: list[object] = [since.isoformat()]
+        if actor_id is not None:
+            clauses.append("actor_id = ?")
+            values.append(actor_id)
+        if workspace_id is not None:
+            clauses.append("workspace_id = ?")
+            values.append(workspace_id)
+        row = connection.execute(
+            f"SELECT COUNT(*) AS count FROM image_generation_jobs "
+            f"WHERE {' AND '.join(clauses)}",
+            values,
+        ).fetchone()
+        return int(row["count"])
+
 
 class ImageGenerationService:
     """One restart-safe local generation worker shared by all transports."""
@@ -405,6 +475,8 @@ class ImageGenerationService:
         self._delivery_handler: ImageDeliveryHandler | None = None
         self._wake = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
+        self._delivery_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._delivery_retry_requested: set[str] = set()
         self._closed = False
 
     async def start(self, delivery_handler: ImageDeliveryHandler) -> None:
@@ -412,9 +484,9 @@ class ImageGenerationService:
         requeued = await asyncio.to_thread(self.store.requeue_running)
         if requeued:
             log.warning("Requeued %s interrupted image generation job(s)", requeued)
-        for job in await asyncio.to_thread(self.store.undelivered_terminal):
-            await self._notify(job)
         self._ensure_worker()
+        for job in await asyncio.to_thread(self.store.undelivered_terminal):
+            self._schedule_delivery_retry(job.job_id, immediate=True)
         if await asyncio.to_thread(self.store.pending_count):
             self._wake.set()
 
@@ -431,25 +503,6 @@ class ImageGenerationService:
             raise UserError("image.not_configured")
         _validate_prompt(prompt)
         now = datetime.now(UTC)
-        if actor_id not in self.rate_limit_exempt_actor_ids:
-            actor_count = await asyncio.to_thread(
-                self.store.recent_count,
-                actor_id=actor_id,
-                workspace_id=None,
-                since=now - timedelta(seconds=self.per_user_window_seconds),
-            )
-            if actor_count >= self.per_user_requests:
-                raise UserError("image.user_limit_reached")
-            workspace_count = await asyncio.to_thread(
-                self.store.recent_count,
-                actor_id=None,
-                workspace_id=workspace_id,
-                since=now - timedelta(seconds=self.per_workspace_window_seconds),
-            )
-            if workspace_count >= self.per_workspace_requests:
-                raise UserError("image.workspace_limit_reached")
-        if await asyncio.to_thread(self.store.pending_count) >= self.max_pending_jobs:
-            raise UserError("image.queue_full")
         width, height = _DIMENSIONS[prompt.aspect_ratio]
         seed = prompt.seed if prompt.seed is not None else secrets.randbelow(1_000_000_000)
         if not 0 <= seed <= 2_147_483_647:
@@ -469,7 +522,18 @@ class ImageGenerationService:
             seed=seed,
             created_at_iso=now.isoformat(),
         )
-        await asyncio.to_thread(self.store.insert, job)
+        rejection_code = await asyncio.to_thread(
+            self.store.admit,
+            job,
+            enforce_rate_limits=actor_id not in self.rate_limit_exempt_actor_ids,
+            actor_since=now - timedelta(seconds=self.per_user_window_seconds),
+            actor_limit=self.per_user_requests,
+            workspace_since=now - timedelta(seconds=self.per_workspace_window_seconds),
+            workspace_limit=self.per_workspace_requests,
+            pending_limit=self.max_pending_jobs,
+        )
+        if rejection_code is not None:
+            raise UserError(rejection_code)
         await self.journal.append(
             kind="image.job.queued",
             actor_id=actor_id,
@@ -512,6 +576,13 @@ class ImageGenerationService:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
             self._worker = None
+        retry_tasks = tuple(self._delivery_retry_tasks.values())
+        for task in retry_tasks:
+            task.cancel()
+        if retry_tasks:
+            await asyncio.gather(*retry_tasks, return_exceptions=True)
+        self._delivery_retry_tasks.clear()
+        self._delivery_retry_requested.clear()
 
     def _ensure_worker(self) -> None:
         if self._closed or self.provider is None:
@@ -601,6 +672,59 @@ class ImageGenerationService:
             await self._delivery_handler(job)
         except Exception:
             log.exception("Image job delivery update failed job=%s", job.job_id)
+            self._schedule_delivery_retry(job.job_id)
+
+    def _schedule_delivery_retry(
+        self,
+        job_id: str,
+        *,
+        immediate: bool = False,
+    ) -> None:
+        if self._closed or self._delivery_handler is None:
+            return
+        current = self._delivery_retry_tasks.get(job_id)
+        if current is not None and not current.done():
+            self._delivery_retry_requested.add(job_id)
+            return
+        self._delivery_retry_requested.discard(job_id)
+        self._delivery_retry_tasks[job_id] = asyncio.create_task(
+            self._retry_delivery(job_id, immediate=immediate),
+            name=f"simajilord-image-delivery-{job_id}",
+        )
+
+    async def _retry_delivery(self, job_id: str, *, immediate: bool) -> None:
+        delay = 0.0 if immediate else 1.0
+        try:
+            while not self._closed:
+                if delay:
+                    await asyncio.sleep(delay)
+                self._delivery_retry_requested.discard(job_id)
+                job = await asyncio.to_thread(self.store.get, job_id)
+                if job is None or job.delivered:
+                    return
+                handler = self._delivery_handler
+                if handler is None:
+                    return
+                try:
+                    await handler(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "Image job delivery retry failed job=%s delay=%s",
+                        job_id,
+                        delay,
+                    )
+                    delay = min(max(1.0, delay * 2), 60.0)
+                    continue
+                if job_id in self._delivery_retry_requested:
+                    delay = 0.0
+                    continue
+                return
+        finally:
+            if self._delivery_retry_tasks.get(job_id) is asyncio.current_task():
+                self._delivery_retry_tasks.pop(job_id, None)
+            self._delivery_retry_requested.discard(job_id)
 
 
 def build_ideogram_caption(prompt: ImageGenerationPrompt) -> str:

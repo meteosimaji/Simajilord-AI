@@ -114,6 +114,14 @@ class AgentProgressStage(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class AgentProgressUpdate:
+    """Public execution state with optional same-server FIFO position."""
+
+    stage: AgentProgressStage
+    queue_position: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRequest:
     """A compact event pointer.
 

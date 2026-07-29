@@ -8,7 +8,7 @@
   </head>
   <body>
     <main id="app">
-      <section class="shell" aria-live="polite">
+      <section class="shell">
         <header class="topbar">
           <div class="brand">
             <span class="brand-mark" aria-hidden="true">S</span>
@@ -17,7 +17,9 @@
               <h1>Now Playing</h1>
             </div>
           </div>
-          <span id="connection" class="status">Connecting</span>
+          <span id="connection" class="status" role="status" aria-live="polite">
+            Connecting
+          </span>
         </header>
 
         <section class="hero">
@@ -30,7 +32,15 @@
             <p id="artist" class="muted">Open this player from an active voice channel.</p>
             <div class="progress-row">
               <span id="elapsed">0:00</span>
-              <div class="progress-track">
+              <div
+                class="progress-track"
+                role="progressbar"
+                aria-label="Playback progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow="0"
+                aria-valuetext="No track playing"
+              >
                 <span id="progress"></span>
               </div>
               <span id="duration">0:00</span>
@@ -61,13 +71,16 @@
               <div><dt>Radio</dt><dd id="radio">Off</dd></div>
               <div><dt>Loop</dt><dd id="loop">Off</dd></div>
               <div><dt>Read aloud</dt><dd id="read-aloud">Off</dd></div>
-              <div><dt>Levels</dt><dd id="levels">100 / 100</dd></div>
+              <div>
+                <dt>Levels</dt>
+                <dd id="levels">Music 100% · Read aloud 100%</dd>
+              </div>
             </dl>
             <p class="read-only">Display only · controls stay in Discord</p>
           </article>
         </section>
 
-        <section id="fatal" class="fatal" hidden>
+        <section id="fatal" class="fatal" role="alert" aria-live="assertive" hidden>
           <h2>Player unavailable</h2>
           <p id="fatal-message"></p>
         </section>

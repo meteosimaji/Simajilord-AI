@@ -108,13 +108,13 @@ class DiscordAudioOutput:
         try:
             channel_id = int(destination_id)
         except ValueError as exc:
-            raise UserError("音声の出力先が正しくありません。") from exc
+            raise UserError("discord.voice_destination_invalid") from exc
         guild = self.bot.get_guild(self.guild_id)
         if guild is None:
-            raise UserError("Discordサーバーを利用できません。")
+            raise UserError("discord.guild_unavailable")
         channel = guild.get_channel(channel_id)
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            raise UserError("設定されたボイスチャンネルは現在存在しません。")
+            raise UserError("discord.voice_channel_unavailable")
 
         voice = self._adopt_voice_client()
         if voice is not None and voice.is_connected():
@@ -135,7 +135,7 @@ class DiscordAudioOutput:
                 self_deaf=True,
             )
         except (TimeoutError, discord.DiscordException) as exc:
-            raise UserError("ボイスチャンネルへ接続できませんでした。") from exc
+            raise UserError("discord.voice_connect_failed") from exc
         if not isinstance(protocol, discord.VoiceClient):
             await protocol.disconnect(force=True)
             raise ProviderError("Discord returned an unsupported voice protocol.")
@@ -145,7 +145,7 @@ class DiscordAudioOutput:
     async def play(self, item: AudioItem) -> None:
         voice = self._adopt_voice_client()
         if voice is None or not voice.is_connected():
-            raise UserError("BOTはボイスチャンネルに接続していません。")
+            raise UserError("audio.output_disconnected")
         if voice.is_playing() or voice.is_paused():
             raise ProviderError("The Discord audio output is already busy.")
 
@@ -282,13 +282,13 @@ class DiscordAudioOutput:
     def pause(self) -> None:
         voice = self._adopt_voice_client()
         if voice is None or not voice.is_playing():
-            raise UserError("現在再生している曲はありません。")
+            raise UserError("audio.nothing_playing")
         voice.pause()
 
     def resume(self) -> None:
         voice = self._adopt_voice_client()
         if voice is None or not voice.is_paused():
-            raise UserError("現在、一時停止していません。")
+            raise UserError("audio.not_paused")
         voice.resume()
 
     def stop(self) -> None:

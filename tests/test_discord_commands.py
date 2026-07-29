@@ -22,6 +22,8 @@ from simajilord.agent import (
     AGENT_MODERATION_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
+    AgentProgressStage,
+    AgentProgressUpdate,
     AgentRateLimitError,
 )
 from simajilord.capabilities.audio import (
@@ -98,6 +100,7 @@ from simajilord.integrations.discord.cogs import (
     ReadAloudChannelSelect,
     ReadAloudChannelSelectView,
     ReadAloudCog,
+    SafeView,
     SystemCog,
     TranslationCog,
     TranslationLanguagePickerView,
@@ -112,6 +115,7 @@ from simajilord.integrations.discord.cogs import (
     _agent_error_text,
     _agent_grants,
     _agent_message_groups,
+    _agent_progress_text,
     _AgentProgressMessage,
     _discord_message_chunks,
     _help_category_embed,
@@ -172,9 +176,56 @@ async def test_agent_no_action_sentinel_is_never_published() -> None:
     assert progress.message is None
 
 
+def test_agent_queue_progress_shows_same_server_wait_position() -> None:
+    text = _agent_progress_text(
+        AgentProgressUpdate(
+            AgentProgressStage.QUEUED,
+            queue_position=3,
+        )
+    )
+
+    assert "Requests ahead of you" in text
+    assert "**3**" in text
+
+
 def test_member_lookup_error_is_clear_and_english() -> None:
     message = error_message(UserError("discord.member_required"))
     assert message == "Could not resolve that member in this server."
+
+
+def test_unexpected_error_displays_the_logged_reference_id(caplog) -> None:
+    message = error_message(
+        RuntimeError("unexpected"),
+        request_id="interaction-42",
+    )
+
+    assert "Reference ID: `interaction-42`" in message
+    assert "Share this ID with the administrator." in message
+    assert any(
+        "request_id=interaction-42" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_error_boundary_returns_reference_id_to_user() -> None:
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 987
+    interaction.response = Mock()
+    interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
+
+    await SafeView().on_error(
+        interaction,
+        RuntimeError("callback failed"),
+        Mock(spec=discord.ui.Item),
+    )
+
+    interaction.response.send_message.assert_awaited_once()
+    call = interaction.response.send_message.await_args
+    assert call is not None
+    assert call.kwargs["ephemeral"] is True
+    assert "Reference ID: `987`" in (call.kwargs["embed"].description or "")
 
 
 def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
@@ -1807,7 +1858,7 @@ async def test_music_dashboard_retries_the_same_message_once_after_429() -> None
 
 
 @pytest.mark.asyncio
-async def test_music_dashboard_stops_updates_after_403() -> None:
+async def test_music_dashboard_stops_updates_after_403(tmp_path: Path) -> None:
     class DashboardError(discord.DiscordException):
         def __init__(self) -> None:
             super().__init__("forbidden")
@@ -1819,6 +1870,8 @@ async def test_music_dashboard_stops_updates_after_403() -> None:
     runtime.audio.remove_state_listener = Mock()
     runtime.audio.find.return_value = None
     runtime.journal.append = AsyncMock()
+    runtime.settings = Mock()
+    runtime.settings.data_dir = tmp_path
     bot = Mock(spec=commands.Bot)
     channel = Mock(spec=discord.TextChannel)
     panel = Mock(spec=discord.Message)
@@ -1858,6 +1911,7 @@ async def test_music_dashboard_stops_updates_after_403() -> None:
     panel.edit.assert_awaited_once()
     channel.send.assert_awaited_once()
     assert "1" not in manager._channel_ids
+    assert "1" not in manager._stored_messages
     runtime.journal.append.assert_any_await(
         kind="service.operation",
         workspace_id=None,
@@ -1869,6 +1923,9 @@ async def test_music_dashboard_stops_updates_after_403() -> None:
         },
     )
     await manager.close()
+    restored = MusicDashboardManager(bot, runtime)
+    assert "1" not in restored._channel_ids
+    await restored.close()
 
 
 @pytest.mark.asyncio
@@ -2162,6 +2219,67 @@ def test_ambiguous_results_are_direct_one_click_buttons() -> None:
     custom_ids = [button.custom_id for button in buttons]
     assert None not in custom_ids
     assert len(custom_ids) == len(set(custom_ids))
+
+
+@pytest.mark.asyncio
+async def test_music_search_selection_updates_the_component_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = AudioSearchResponse(
+        query="Same",
+        candidates=(
+            AudioSearchItem(
+                reference="https://example.com/track",
+                title="Artist - Same",
+                duration_seconds=180,
+                uploader="Artist",
+            ),
+        ),
+        selected_index=None,
+        selection_required=True,
+        reason=AudioSearchReason.AMBIGUOUS_TITLE,
+    )
+    view = MusicSearchChoiceView(
+        cast(commands.Bot, object()),
+        cast(SimajilordRuntime, object()),
+        response,
+        requester_id=1,
+        requester_name="Listener",
+    )
+    interaction = Mock(spec=discord.Interaction)
+    interaction.user = Mock()
+    interaction.user.id = 1
+    interaction.response = Mock()
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._enqueue_interaction_track",
+        AsyncMock(
+            return_value=AudioPlayResponse(
+                title="Artist - Same",
+                page_url="https://example.com/track",
+                queue_position=1,
+                duration_seconds=180,
+                destination_id="voice",
+                playback_state="playing",
+                requested_by_name="Listener",
+            )
+        ),
+    )
+
+    await view.choose(interaction, 0)
+
+    interaction.response.defer.assert_awaited_once_with()
+    assert interaction.edit_original_response.await_count == 2
+    first_edit = interaction.edit_original_response.await_args_list[0]
+    assert first_edit.kwargs["view"] is view
+    assert all(
+        child.disabled
+        for child in view.children
+        if isinstance(child, discord.ui.Button)
+    )
+    final_edit = interaction.edit_original_response.await_args_list[1]
+    assert final_edit.kwargs["view"] is None
 
 
 def test_agent_conversation_key_is_shared_per_channel() -> None:
@@ -3119,7 +3237,7 @@ def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:
         resource_ids=("50",),
     )
     _assert_agent_channel_scope(context, "50")
-    with pytest.raises(UserError, match="permission to view"):
+    with pytest.raises(UserError, match=r"discord\.agent_read_channel_forbidden"):
         _assert_agent_channel_scope(context, "60")
 
 

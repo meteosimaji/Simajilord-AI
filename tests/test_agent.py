@@ -14,6 +14,7 @@ from simajilord.agent import (
     AGENT_WEB_GRANT,
     AgentBusyError,
     AgentProgressStage,
+    AgentProgressUpdate,
     AgentRateLimitError,
     AgentRequest,
     AgentTokenUsage,
@@ -112,6 +113,9 @@ def _request(
     *,
     actor_id: str = "3",
     conversation_id: str = "discord:guild:1:channel:2",
+    workspace_id: str = "1",
+    channel_id: str = "2",
+    message_id: str = "4",
 ) -> AgentRequest:
     return AgentRequest(
         conversation_id=conversation_id,
@@ -119,9 +123,9 @@ def _request(
         trigger=AgentTrigger.MENTION,
         actor_id=actor_id,
         actor_name="person",
-        workspace_id="1",
-        channel_id="2",
-        message_id="4",
+        workspace_id=workspace_id,
+        channel_id=channel_id,
+        message_id=message_id,
         occurred_at=datetime.now(UTC),
         resource_ids=("2",),
     )
@@ -285,19 +289,80 @@ async def test_agent_emits_only_structured_progress_stages(tmp_path) -> None:
         journal=EventJournal(tmp_path / "events.sqlite3"),
         limits=_limits(),
     )
-    stages: list[AgentProgressStage] = []
+    stages: list[AgentProgressUpdate] = []
 
-    async def record(stage: AgentProgressStage) -> None:
-        stages.append(stage)
+    async def record(update: AgentProgressUpdate) -> None:
+        stages.append(update)
 
     await service.respond(_request(), on_progress=record)
-    assert stages == [AgentProgressStage.STARTING]
+    assert stages == [AgentProgressUpdate(AgentProgressStage.STARTING)]
 
 
 @pytest.mark.asyncio
-async def test_agent_queues_parallel_server_turns_instead_of_dropping_them(
+async def test_agent_runs_different_server_turns_concurrently(
     tmp_path,
 ) -> None:
+    both_entered = asyncio.Event()
+    release = asyncio.Event()
+    active_workspaces: set[str | None] = set()
+
+    class BlockingProvider(FakeProvider):
+        async def respond(
+            self,
+            *,
+            provider_thread_id: str | None,
+            event_prompt: str,
+            context: InvocationContext,
+            on_progress: object = None,
+        ) -> ProviderTurnResult:
+            active_workspaces.add(context.workspace_id)
+            if len(active_workspaces) == 2:
+                both_entered.set()
+            await release.wait()
+            return await super().respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+            )
+
+    provider = BlockingProvider()
+    service = AgentService(
+        provider=provider,
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+    first = asyncio.create_task(service.respond(_request("one")))
+    queued_stages: list[AgentProgressUpdate] = []
+
+    async def record_queued(update: AgentProgressUpdate) -> None:
+        queued_stages.append(update)
+
+    second = asyncio.create_task(
+        service.respond(
+            _request(
+                "two",
+                actor_id="4",
+                conversation_id="discord:guild:9:channel:8",
+                workspace_id="9",
+                channel_id="8",
+            ),
+            on_progress=record_queued,
+        )
+    )
+    await asyncio.wait_for(both_entered.wait(), timeout=1)
+    assert active_workspaces == {"1", "9"}
+    assert queued_stages == [AgentProgressUpdate(AgentProgressStage.STARTING)]
+
+    release.set()
+    await asyncio.gather(first, second)
+    assert len(provider.calls) == 2
+    assert queued_stages == [AgentProgressUpdate(AgentProgressStage.STARTING)]
+
+
+@pytest.mark.asyncio
+async def test_agent_keeps_turns_from_one_server_in_fifo_order(tmp_path) -> None:
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -328,12 +393,12 @@ async def test_agent_queues_parallel_server_turns_instead_of_dropping_them(
     )
     first = asyncio.create_task(service.respond(_request("one")))
     await entered.wait()
-    queued_stages: list[AgentProgressStage] = []
+    queued_stages: list[AgentProgressUpdate] = []
     queued_notified = asyncio.Event()
 
-    async def record_queued(stage: AgentProgressStage) -> None:
-        queued_stages.append(stage)
-        if stage is AgentProgressStage.QUEUED:
+    async def record_queued(update: AgentProgressUpdate) -> None:
+        queued_stages.append(update)
+        if update.stage is AgentProgressStage.QUEUED:
             queued_notified.set()
 
     second = asyncio.create_task(
@@ -341,22 +406,92 @@ async def test_agent_queues_parallel_server_turns_instead_of_dropping_them(
             _request(
                 "two",
                 actor_id="4",
-                conversation_id="discord:guild:9:channel:8",
+                conversation_id="discord:guild:1:channel:8",
+                channel_id="8",
             ),
             on_progress=record_queued,
         )
     )
     await asyncio.wait_for(queued_notified.wait(), timeout=1)
     assert not second.done()
-    assert queued_stages == [AgentProgressStage.QUEUED]
+    assert queued_stages == [
+        AgentProgressUpdate(AgentProgressStage.QUEUED, queue_position=1)
+    ]
 
     release.set()
     await asyncio.gather(first, second)
-    assert len(provider.calls) == 2
     assert queued_stages == [
-        AgentProgressStage.QUEUED,
-        AgentProgressStage.STARTING,
+        AgentProgressUpdate(AgentProgressStage.QUEUED, queue_position=1),
+        AgentProgressUpdate(AgentProgressStage.STARTING),
     ]
+
+
+@pytest.mark.asyncio
+async def test_agent_steers_same_channel_follow_up_with_distinct_actor_identity(
+    tmp_path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    steered: list[tuple[str, InvocationContext]] = []
+
+    class SteerableProvider(FakeProvider):
+        async def respond(
+            self,
+            *,
+            provider_thread_id: str | None,
+            event_prompt: str,
+            context: InvocationContext,
+            on_progress: object = None,
+        ) -> ProviderTurnResult:
+            entered.set()
+            await release.wait()
+            return await super().respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+            )
+
+        async def steer(
+            self,
+            *,
+            event_prompt: str,
+            context: InvocationContext,
+        ) -> bool:
+            steered.append((event_prompt, context))
+            return True
+
+    provider = SteerableProvider()
+    service = AgentService(
+        provider=provider,
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+    original = _request("original")
+    active = asyncio.create_task(service.respond(original))
+    await entered.wait()
+    follow_up = _request(
+        "follow-up",
+        actor_id="different-user",
+        conversation_id="discord:guild:1:channel:2",
+        workspace_id="1",
+        channel_id="2",
+        message_id="follow-up-message",
+    )
+
+    assert await service.try_follow_up(follow_up) is True
+    assert len(steered) == 1
+    prompt, context = steered[0]
+    assert "SIMAJILORD_FOLLOW_UP_V1" in prompt
+    assert "actor_id=different-user" in prompt
+    assert "same_actor_as_original=false" in prompt
+    assert "message_id=follow-up-message" in prompt
+    assert context.actor_id == "different-user"
+    assert context.grants == original.grants
+
+    release.set()
+    await active
 
 
 @pytest.mark.asyncio
@@ -920,19 +1055,21 @@ async def test_provider_rejects_write_before_exact_event_is_read(
         grants=frozenset({"write-scope"}),
         approvals=frozenset({"test.write"}),
     )
-    provider._active_tool_budget = _ToolTurnBudget(
+    budget = _ToolTurnBudget(
         context=context,
         calls_remaining=4,
         output_characters_remaining=4_000,
         on_progress=None,
         required_message_id="123",
     )
+    provider._active_tool_budgets["thread-one"] = budget
     response = AsyncMock()
     monkeypatch.setattr(provider, "_tool_response", response)
     request = {
         "namespace": "simajilord",
         "tool": "test_write",
         "arguments": {"subject": "requested"},
+        "threadId": "thread-one",
     }
 
     await provider._handle_dynamic_tool(1, request)
@@ -941,15 +1078,204 @@ async def test_provider_rejects_write_before_exact_event_is_read(
     first_response = response.await_args
     assert first_response is not None
     assert first_response.kwargs["success"] is False
-    assert provider._active_tool_budget.write_failures == [
+    assert budget.write_failures == [
         ("test.write", "agent.event_message_not_read")
     ]
-    provider._active_tool_budget.event_message_read = True
+    budget.event_message_read = True
     await provider._handle_dynamic_tool(2, request)
     assert invoked == ["requested"]
     second_response = response.await_args
     assert second_response is not None
     assert second_response.kwargs["success"] is True
+
+    provider._active_tool_budgets["thread-two"] = _ToolTurnBudget(
+        context=InvocationContext("other", "other", "agent", "other-event"),
+        calls_remaining=1,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id=None,
+    )
+    assert provider._tool_budget({"threadId": "thread-one"}) is budget
+    assert provider._tool_budget({}) is None
+
+
+@pytest.mark.asyncio
+async def test_provider_routes_interleaved_notifications_to_each_thread(
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    first = asyncio.create_task(provider._await_turn("thread-one", "turn-one"))
+    second = asyncio.create_task(provider._await_turn("thread-two", "turn-two"))
+    await asyncio.sleep(0)
+
+    await provider._handle_notification(
+        "item/completed",
+        {
+            "threadId": "thread-two",
+            "turnId": "turn-two",
+            "item": {"type": "agentMessage", "text": "second"},
+        },
+    )
+    await provider._handle_notification(
+        "item/completed",
+        {
+            "threadId": "thread-one",
+            "turnId": "turn-one",
+            "item": {"type": "agentMessage", "text": "first"},
+        },
+    )
+    await provider._handle_notification(
+        "turn/completed",
+        {
+            "threadId": "thread-one",
+            "turnId": "turn-one",
+            "turn": {"id": "turn-one", "status": "completed", "items": []},
+        },
+    )
+    assert (await asyncio.wait_for(first, timeout=1))[0] == "first"
+    assert not second.done()
+    await provider._handle_notification(
+        "turn/completed",
+        {
+            "threadId": "thread-two",
+            "turnId": "turn-two",
+            "turn": {"id": "turn-two", "status": "completed", "items": []},
+        },
+    )
+    assert (await asyncio.wait_for(second, timeout=1))[0] == "second"
+
+
+@pytest.mark.asyncio
+async def test_provider_steers_active_turn_and_requires_follow_up_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    context = InvocationContext(
+        actor_id="follow-up-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:follow-up",
+        origin_resource_id="channel",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=4,
+        output_characters_remaining=4_000,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+    )
+    provider._active_routes[("guild", "channel")] = (
+        "thread",
+        "turn",
+        "original-user",
+    )
+    provider._active_tool_budgets["thread"] = budget
+    request = AsyncMock(return_value={"turnId": "turn"})
+    monkeypatch.setattr(provider, "_request", request)
+
+    accepted = await provider.steer(
+        event_prompt=(
+            "SIMAJILORD_FOLLOW_UP_V1\n"
+            "message_id=follow-up\n"
+            "actor_id=follow-up-user"
+        ),
+        context=context,
+    )
+
+    assert accepted is True
+    request.assert_awaited_once_with(
+        "turn/steer",
+        {
+            "threadId": "thread",
+            "expectedTurnId": "turn",
+            "input": [
+                {
+                    "type": "text",
+                    "text": (
+                        "SIMAJILORD_FOLLOW_UP_V1\n"
+                        "message_id=follow-up\n"
+                        "actor_id=follow-up-user"
+                    ),
+                }
+            ],
+            "clientUserMessageId": "discord:message:follow-up",
+        },
+    )
+    assert budget.required_message_id == "original"
+    assert budget.event_message_read is True
+    assert budget.follow_up_message_ids == {"follow-up"}
+    assert budget.read_follow_up_message_ids == set()
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_require_a_rejected_follow_up_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    context = InvocationContext(
+        actor_id="follow-up-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:follow-up",
+        origin_resource_id="channel",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=4,
+        output_characters_remaining=4_000,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+    )
+    provider._active_routes[("guild", "channel")] = (
+        "thread",
+        "turn",
+        "original-user",
+    )
+    provider._active_tool_budgets["thread"] = budget
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(return_value={"turnId": "different-turn"}),
+    )
+
+    accepted = await provider.steer(
+        event_prompt="SIMAJILORD_FOLLOW_UP_V1\nmessage_id=follow-up",
+        context=context,
+    )
+
+    assert accepted is False
+    assert budget.follow_up_message_ids == set()
 
 
 def test_base_instructions_are_short_and_use_runtime_identity() -> None:

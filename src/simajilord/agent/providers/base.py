@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from simajilord.core import InvocationContext
 
-from ..contracts import AgentProgressStage, AgentTokenUsage
+from ..contracts import AgentProgressUpdate, AgentTokenUsage
 
-AgentProgressCallback = Callable[[AgentProgressStage], Awaitable[None]]
+AgentProgressCallback = Callable[[AgentProgressUpdate], Awaitable[None]]
 
 @dataclass(frozen=True, slots=True)
 class ProviderTurnResult:
@@ -37,3 +37,15 @@ class AgentProvider(Protocol):
     ) -> ProviderTurnResult: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class SteerableAgentProvider(Protocol):
+    """Optional provider extension for same-turn Discord follow-ups."""
+
+    async def steer(
+        self,
+        *,
+        event_prompt: str,
+        context: InvocationContext,
+    ) -> bool: ...

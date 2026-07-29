@@ -38,6 +38,9 @@ yt-dlp = { path = "vendor/yt-dlp" }
 [tool.hatch.build.targets.wheel]
 packages = ["src/simajilord"]
 
+[tool.hatch.build.targets.sdist.force-include]
+"src/simajilord/activity/static" = "src/simajilord/activity/static"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"

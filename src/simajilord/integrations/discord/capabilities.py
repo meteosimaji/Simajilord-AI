@@ -83,6 +83,21 @@ from simajilord.services.quote import (
 
 from .audio import DiscordAudioOutput
 from .local_media import attachment_can_play, import_discord_attachment
+from .permissions import (
+    agent_readable_channel_ids as agent_readable_channel_ids,
+)
+from .permissions import (
+    can_post_expanded_message as _can_post_expanded_message,
+)
+from .permissions import (
+    can_post_quote_image as _can_post_quote_image,
+)
+from .permissions import (
+    can_read_messages as _can_read_messages,
+)
+from .permissions import (
+    can_read_private_thread as _can_read_private_thread,
+)
 from .presenter import (
     expanded_message_embeds,
     expanded_message_view,
@@ -617,14 +632,14 @@ def build_discord_endpoints(
         try:
             user_id = int(request.user_id)
         except ValueError as exc:
-            raise UserError("The user ID is invalid.") from exc
+            raise UserError("discord.user_id_invalid") from exc
         member = guild.get_member(user_id)
         user = member or client.get_user(user_id)
         if user is None:
             try:
                 user = await client.fetch_user(user_id)
             except discord.DiscordException as exc:
-                raise UserError("The Discord user could not be found.") from exc
+                raise UserError("discord.user_not_found") from exc
         key_permission_labels = {
             "administrator": "Administrator",
             "manage_guild": "Manage Server",
@@ -744,9 +759,9 @@ def build_discord_endpoints(
         try:
             message = await channel.fetch_message(message_id)
         except discord.NotFound as exc:
-            raise UserError("The Discord message could not be found.") from exc
+            raise UserError("discord.message_not_found") from exc
         except discord.DiscordException as exc:
-            raise UserError("The Discord message could not be retrieved.") from exc
+            raise UserError("discord.message_fetch_failed") from exc
         content_length = len(message.content)
         if request.offset > content_length:
             raise UserError("discord.message_offset_invalid")
@@ -1071,7 +1086,7 @@ def build_discord_endpoints(
                 frame_index=request.frame_index,
             )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("discord.custom_emoji_decode_failed") from exc
         return DiscordViewCustomEmojiResponse(
             emoji_index=selected.index,
             emoji_id=selected.emoji_id,
@@ -1164,9 +1179,9 @@ def build_discord_endpoints(
         try:
             message = await channel.fetch_message(_snowflake(request.message_id, "message"))
         except discord.NotFound as exc:
-            raise UserError("The Discord message could not be found.") from exc
+            raise UserError("discord.message_not_found") from exc
         except discord.DiscordException as exc:
-            raise UserError("The Discord message could not be retrieved.") from exc
+            raise UserError("discord.message_fetch_failed") from exc
         try:
             attachment = message.attachments[request.attachment_index]
         except IndexError as exc:
@@ -1257,11 +1272,11 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         _assert_agent_update_scope(context, request.channel_id)
         if not 1 <= len(request.content) <= 2_000:
-            raise UserError("Discord messages must contain between 1 and 2,000 characters.")
+            raise UserError("discord.message_length_invalid")
         try:
             channel_id = int(request.channel_id)
         except ValueError as exc:
-            raise UserError("The channel ID is invalid.") from exc
+            raise UserError("discord.channel_id_invalid") from exc
         channel = guild.get_channel_or_thread(channel_id)
         if not isinstance(
             channel,
@@ -1272,7 +1287,7 @@ def build_discord_endpoints(
                 discord.StageChannel,
             ),
         ):
-            raise UserError("The destination is not a Discord channel that accepts messages.")
+            raise UserError("discord.message_destination_invalid")
         message = await channel.send(
             request.content,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1319,13 +1334,13 @@ def build_discord_endpoints(
         question = request.question.strip()
         options = tuple(option.strip() for option in request.options if option.strip())
         if not 1 <= len(question) <= 300:
-            raise UserError("Poll questions must contain between 1 and 300 characters.")
+            raise UserError("discord.poll_question_invalid")
         if not 2 <= len(options) <= 10:
-            raise UserError("Polls must contain between 2 and 10 choices.")
+            raise UserError("discord.poll_option_count_invalid")
         if any(len(option) > 55 for option in options):
-            raise UserError("Each poll choice must contain no more than 55 characters.")
+            raise UserError("discord.poll_option_too_long")
         if not 1 <= request.duration_hours <= 168:
-            raise UserError("Poll duration must be between 1 and 168 hours.")
+            raise UserError("discord.poll_duration_invalid")
         poll = discord.Poll(
             question,
             duration=timedelta(hours=request.duration_hours),
@@ -1343,7 +1358,7 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         channel = guild.get_channel(_snowflake(request.channel_id, "voice channel"))
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-            raise UserError("The destination is not a voice channel.")
+            raise UserError("discord.voice_channel_unavailable")
         workspace_id = str(guild.id)
         session = runtime.audio.get_or_create(
             workspace_id,
@@ -1352,7 +1367,7 @@ def build_discord_endpoints(
         if session.current is not None:
             output = session.output
             if isinstance(output, DiscordAudioOutput) and output.destination_id != channel.id:
-                raise UserError("Audio is already playing in another voice channel.")
+                raise UserError("audio.other_voice_active")
         await runtime.audio.connect(workspace_id, str(channel.id))
         return DiscordConnectVoiceResponse(channel_id=str(channel.id), connected=True)
 
@@ -2702,14 +2717,14 @@ def build_discord_endpoints(
 
 def _guild(client: discord.Client, context: InvocationContext) -> discord.Guild:
     if context.workspace_id is None:
-        raise UserError("This Discord capability must be used inside a server.")
+        raise UserError("workspace.required")
     try:
         guild_id = int(context.workspace_id)
     except ValueError as exc:
-        raise UserError("The Discord server ID is invalid.") from exc
+        raise UserError("discord.guild_id_invalid") from exc
     guild = client.get_guild(guild_id)
     if guild is None:
-        raise UserError("The Discord server is unavailable.")
+        raise UserError("discord.guild_unavailable")
     return guild
 
 
@@ -2783,12 +2798,12 @@ def _snowflake(value: str, label: str) -> int:
     try:
         return int(value)
     except ValueError as exc:
-        display_label = {
-            "message": "message",
-            "channel": "channel",
-            "voice channel": "voice channel",
-        }.get(label, label)
-        raise UserError(f"The {display_label} ID is invalid.") from exc
+        code = {
+            "message": "discord.message_id_invalid",
+            "channel": "discord.channel_id_invalid",
+            "voice channel": "discord.voice_channel_id_invalid",
+        }.get(label, "discord.snowflake_invalid")
+        raise UserError(code) from exc
 
 
 def _assert_agent_update_scope(
@@ -2810,7 +2825,7 @@ def _text_channel(
 ) -> discord.TextChannel | discord.Thread:
     channel = guild.get_channel_or_thread(_snowflake(channel_id, "channel"))
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        raise UserError("The destination is not a writable text channel.")
+        raise UserError("discord.text_destination_invalid")
     return channel
 
 
@@ -2828,7 +2843,7 @@ def _message_channel(
             discord.StageChannel,
         ),
     ):
-        raise UserError("The destination is not a Discord message channel.")
+        raise UserError("discord.message_destination_invalid")
     return channel
 
 
@@ -3132,9 +3147,9 @@ async def _attachment(
     try:
         message = await channel.fetch_message(_snowflake(message_id, "message"))
     except discord.NotFound as exc:
-        raise UserError("The Discord message could not be found.") from exc
+        raise UserError("discord.message_not_found") from exc
     except discord.DiscordException as exc:
-        raise UserError("The Discord message could not be retrieved.") from exc
+        raise UserError("discord.message_fetch_failed") from exc
     try:
         attachment = message.attachments[attachment_index]
     except IndexError as exc:
@@ -3234,60 +3249,7 @@ def _assert_agent_channel_scope(
     channel_id: str,
 ) -> None:
     if context.transport == "agent" and channel_id not in context.resource_ids:
-        raise UserError("The agent does not have permission to view this Discord channel.")
-
-
-def agent_readable_channel_ids(
-    guild: discord.Guild,
-    actor: discord.Member | None,
-    *,
-    trusted_guild: bool,
-    trigger_channel_id: int | None,
-) -> tuple[str, ...]:
-    """Resolve a non-forgeable read scope before an agent turn begins.
-
-    A trusted private guild and an autonomous turn use the bot's own Discord
-    visibility. Other user-triggered turns require both the bot and the actor
-    to have View Channel and Read Message History. Private threads are only
-    included for a regular user when they are the triggering thread.
-    """
-
-    bot_member = guild.me
-    if bot_member is None:
-        return ()
-    use_bot_scope = trusted_guild or actor is None
-    readable: list[str] = []
-    channels: tuple[DiscordMessageChannel, ...] = (
-        *guild.text_channels,
-        *guild.threads,
-        *guild.voice_channels,
-        *guild.stage_channels,
-    )
-    for channel in channels:
-        if not _can_read_messages(channel, bot_member):
-            continue
-        if not use_bot_scope:
-            if actor is None or not _can_read_messages(channel, actor):
-                continue
-            if (
-                isinstance(channel, discord.Thread)
-                and channel.type is discord.ChannelType.private_thread
-                and channel.id != trigger_channel_id
-            ):
-                continue
-        readable.append(str(channel.id))
-    return tuple(sorted(readable, key=int))
-
-
-def _can_read_messages(
-    channel: DiscordMessageChannel,
-    member: discord.Member,
-) -> bool:
-    permissions = channel.permissions_for(member)
-    can_read = permissions.view_channel and permissions.read_message_history
-    if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-        return can_read and permissions.connect
-    return can_read
+        raise UserError("discord.agent_read_channel_forbidden")
 
 
 async def _fetch_readable_message(
@@ -3320,57 +3282,6 @@ async def _fetch_readable_message(
     except discord.DiscordException as exc:
         raise UserError("discord.expand_failed") from exc
     return channel, message
-
-
-def _can_read_private_thread(
-    channel: DiscordMessageChannel,
-    member: discord.Member,
-) -> bool:
-    if (
-        not isinstance(channel, discord.Thread)
-        or channel.type is not discord.ChannelType.private_thread
-    ):
-        return True
-    permissions = channel.permissions_for(member)
-    if permissions.administrator or permissions.manage_threads:
-        return True
-    return any(thread_member.id == member.id for thread_member in channel.members)
-
-
-def _can_post_expanded_message(
-    channel: DiscordMessageChannel,
-    member: discord.Member,
-) -> bool:
-    permissions = channel.permissions_for(member)
-    can_send = (
-        permissions.send_messages_in_threads
-        if isinstance(channel, discord.Thread)
-        else permissions.send_messages
-    )
-    can_connect = (
-        permissions.connect
-        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
-        else True
-    )
-    return permissions.view_channel and can_send and permissions.embed_links and can_connect
-
-
-def _can_post_quote_image(
-    channel: DiscordMessageChannel,
-    member: discord.Member,
-) -> bool:
-    permissions = channel.permissions_for(member)
-    can_send = (
-        permissions.send_messages_in_threads
-        if isinstance(channel, discord.Thread)
-        else permissions.send_messages
-    )
-    can_connect = (
-        permissions.connect
-        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
-        else True
-    )
-    return permissions.view_channel and can_send and permissions.attach_files and can_connect
 
 
 def _quote_text(message: discord.Message) -> str:

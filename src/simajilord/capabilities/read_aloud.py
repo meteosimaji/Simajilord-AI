@@ -402,7 +402,7 @@ def build_read_aloud_policy_endpoints(
                 reading=request.reading,
             )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("read_aloud.dictionary_invalid") from exc
         return _policy_response(policy)
 
     async def dictionary_remove(
@@ -415,7 +415,7 @@ def build_read_aloud_policy_endpoints(
                 surface=request.surface,
             )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("read_aloud.dictionary_invalid") from exc
         return _policy_response(policy)
 
     async def exclusion_set(
@@ -436,7 +436,7 @@ def build_read_aloud_policy_endpoints(
                     ignored=request.ignored,
                 )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("read_aloud.exclusion_invalid") from exc
         return _policy_response(policy)
 
     async def announcements_set(
@@ -451,7 +451,7 @@ def build_read_aloud_policy_endpoints(
                 move=request.move,
             )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("read_aloud.announcement_value_invalid") from exc
         return _policy_response(policy)
 
     async def semantics_set(
@@ -467,7 +467,7 @@ def build_read_aloud_policy_endpoints(
                 vc_members_only=request.vc_members_only,
             )
         except ValueError as exc:
-            raise UserError(str(exc)) from exc
+            raise UserError("read_aloud.semantic_value_invalid") from exc
         return _policy_response(policy)
 
     async def content_mode_set(

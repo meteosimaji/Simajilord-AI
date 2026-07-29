@@ -1534,8 +1534,8 @@ class AudioSession:
                     raise
                 except Exception:
                     log.exception(
-                        "Speech overlay failed after bounded retries; keeping music "
-                        "uninterrupted and dropping only this speech item "
+                        "Speech overlay failed after bounded retries; switching to "
+                        "standalone speech and then resuming music "
                         "workspace=%s item=%s",
                         self.workspace_id,
                         speech.title,
@@ -1549,10 +1549,15 @@ class AudioSession:
                                 0.0,
                                 (monotonic() - preparation_started) * 1_000,
                             ),
-                            outcome="dropped_speech",
+                            outcome="fallback_standalone",
                         )
                     )
-                    speech.cleanup()
+                    await self._fallback_to_standalone_speech(music, speech)
+                    # Ownership moved back to the main queue. Stopping the
+                    # current transport wakes the worker, which prioritizes
+                    # this speech item and then resumes the saved music.
+                    speech = None
+                    return
                 else:
                     speech.cleanup()
                 async with self._lock:
@@ -1585,6 +1590,26 @@ class AudioSession:
             if self._overlay_task is asyncio.current_task():
                 self._overlay_task = None
             await self._state_changed()
+
+    async def _fallback_to_standalone_speech(
+        self,
+        music: AudioItem,
+        speech: AudioItem,
+    ) -> None:
+        """Hand a failed overlay back to the normal speech playback path."""
+
+        async with self._transport_lock, self._lock:
+            if self._overlay_task is asyncio.current_task():
+                # The main worker must not cancel this task after the intentional
+                # stop below; ownership has already moved back to its queue.
+                self._overlay_task = None
+            self._speech.appendleft(speech)
+            self._speech_active = False
+            self._wake.set()
+            if self._current is music and self.output.connected:
+                music.start_seconds = self._position_seconds()
+                self._restart_requested = True
+                self.output.stop()
 
     async def _cancel_overlay_for(self, music: AudioItem) -> None:
         task = self._overlay_task

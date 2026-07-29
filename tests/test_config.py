@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core.errors import ConfigurationError
@@ -72,6 +73,25 @@ def _prepare_environment(
     monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
     return tmp_path / "missing.env"
+
+
+def test_checked_in_env_example_loads_without_optional_voicevox_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    example = Path(__file__).parents[1] / ".env.example"
+    values = dotenv_values(example)
+    for name in values:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+
+    settings = load_settings(dotenv_path=example)
+
+    assert settings.tts_provider == "macos"
+    assert settings.voicevox_auto_start is False
+    assert settings.agent_model == "gpt-5.6-terra"
+    assert settings.agent_escalation_model == "gpt-5.6-terra"
+    assert settings.agent_reasoning_effort == "medium"
 
 
 def test_agent_security_policies_are_explicit_and_typed(

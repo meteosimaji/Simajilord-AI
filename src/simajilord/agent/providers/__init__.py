@@ -1,6 +1,11 @@
 """Agent model providers."""
 
-from .base import AgentProgressCallback, AgentProvider, ProviderTurnResult
+from .base import (
+    AgentProgressCallback,
+    AgentProvider,
+    ProviderTurnResult,
+    SteerableAgentProvider,
+)
 from .codex import CodexAppServerProvider
 
 __all__ = [
@@ -8,4 +13,5 @@ __all__ = [
     "AgentProvider",
     "CodexAppServerProvider",
     "ProviderTurnResult",
+    "SteerableAgentProvider",
 ]

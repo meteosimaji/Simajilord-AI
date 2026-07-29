@@ -680,7 +680,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_file_sandbox_enabled=_boolean("AGENT_FILE_SANDBOX_ENABLED", False),
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
-        agent_model=_text("AGENT_MODEL", "gpt-5.6-luna"),
+        agent_model=_text("AGENT_MODEL", "gpt-5.6-terra"),
         agent_escalation_model=_text(
             "AGENT_ESCALATION_MODEL",
             "gpt-5.6-terra",
@@ -691,7 +691,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             120.0,
             maximum=600.0,
         ),
-        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "low"),
+        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "medium"),
         agent_max_tool_calls=_positive_int(
             "AGENT_MAX_TOOL_CALLS",
             8,

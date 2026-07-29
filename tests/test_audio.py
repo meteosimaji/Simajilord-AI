@@ -223,7 +223,7 @@ async def test_three_speech_overlays_keep_fifo_order_without_stopping_music() ->
 
 
 @pytest.mark.asyncio
-async def test_failed_speech_overlay_never_stops_music() -> None:
+async def test_failed_speech_overlay_falls_back_then_resumes_music() -> None:
     output = FakeOutput()
     output.overlay_error = RuntimeError("overlay unavailable")
     session = AudioSession("one", output, max_pending_speech=3)
@@ -234,14 +234,20 @@ async def test_failed_speech_overlay_never_stops_music() -> None:
     )
 
     for _ in range(50):
-        snapshot = await session.snapshot()
-        if output.overlay_attempts == 3 and not snapshot.speech_active:
+        if output.played == ["music", "speech"]:
             break
         await asyncio.sleep(0)
-    assert output.played == ["music"]
+    assert output.played == ["music", "speech"]
     assert output.overlays == []
     assert output.overlay_attempts == 3
-    assert output.stop_calls == 0
+    assert output.stop_calls == 1
+
+    output.release.set()
+    for _ in range(50):
+        if output.played == ["music", "speech", "music"]:
+            break
+        await asyncio.sleep(0)
+    assert output.played == ["music", "speech", "music"]
     await session.close()
 
 

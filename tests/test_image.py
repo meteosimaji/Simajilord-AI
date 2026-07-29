@@ -218,6 +218,128 @@ async def test_image_worker_persists_progress_and_terminal_delivery(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_image_terminal_delivery_retries_without_service_restart(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    terminal_attempts = 0
+
+    async def delivery(job: ImageGenerationJob) -> None:
+        nonlocal terminal_attempts
+        if job.status is not ImageJobStatus.COMPLETED:
+            return
+        terminal_attempts += 1
+        if terminal_attempts == 1:
+            raise ConnectionError("temporary Discord outage")
+        await service.mark_delivered(job.job_id)
+
+    await service.start(delivery)
+    job = await service.submit(
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt(),
+    )
+    for _ in range(250):
+        if service.store.require(job.job_id).delivered:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("terminal image delivery was not retried")
+
+    assert terminal_attempts == 2
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_retry_is_not_lost_while_an_older_retry_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    first_delivery_started = asyncio.Event()
+    release_first_delivery = asyncio.Event()
+    delivered = asyncio.Event()
+    seen: list[ImageJobStatus] = []
+
+    async def delivery(job: ImageGenerationJob) -> None:
+        seen.append(job.status)
+        if len(seen) == 1:
+            first_delivery_started.set()
+            await release_first_delivery.wait()
+            return
+        if job.status is ImageJobStatus.COMPLETED:
+            await service.mark_delivered(job.job_id)
+            delivered.set()
+
+    await service.start(delivery)
+    job = ImageGenerationJob(
+        job_id="retry-race",
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt(),
+        caption_json=build_ideogram_caption(_prompt()),
+        status=ImageJobStatus.RUNNING,
+        output_path=None,
+        width=512,
+        height=512,
+        seed=1,
+        created_at_iso=datetime.now(UTC).isoformat(),
+    )
+    service.store.insert(job)
+    service._schedule_delivery_retry(job.job_id, immediate=True)
+    await asyncio.wait_for(first_delivery_started.wait(), timeout=1)
+
+    output = tmp_path / "output" / "retry-race.png"
+    output.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    service.store.complete(
+        job.job_id,
+        output_path=output,
+        generation_seconds=0.01,
+    )
+    service._schedule_delivery_retry(job.job_id)
+    release_first_delivery.set()
+
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+    assert seen == [ImageJobStatus.RUNNING, ImageJobStatus.COMPLETED]
+    assert service.store.require(job.job_id).delivered is True
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_rate_limit_check_and_insert_are_atomic(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+
+    async def submit(index: int) -> ImageGenerationJob | UserError:
+        try:
+            return await service.submit(
+                actor_id="same-user",
+                workspace_id="same-guild",
+                delivery_target_id="channel",
+                reply_to_message_id="message",
+                prompt=_prompt(f"subject {index}"),
+            )
+        except UserError as exc:
+            return exc
+
+    results = await asyncio.gather(*(submit(index) for index in range(8)))
+    accepted = [result for result in results if isinstance(result, ImageGenerationJob)]
+    rejected = [result for result in results if isinstance(result, UserError)]
+
+    assert len(accepted) == 1
+    assert len(rejected) == 7
+    assert {error.code for error in rejected} == {"image.user_limit_reached"}
+    assert service.store.recent_count(
+        actor_id="same-user",
+        workspace_id=None,
+        since=datetime.now(UTC) - timedelta(minutes=1),
+    ) == 1
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_image_limits_exempt_only_configured_actor(tmp_path: Path) -> None:
     service = _service(tmp_path, exempt=frozenset({"admin"}))
     for subject in ("one", "two"):

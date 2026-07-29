@@ -40,7 +40,7 @@ try {
     page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
 
     await page.goto(
-      `http://127.0.0.1:${address.port}/?preview=1`,
+      `http://127.0.0.1:${address.port}/?preview=1&speech=1`,
       { waitUntil: "networkidle" },
     );
     await page.evaluate(() => document.fonts.ready);
@@ -52,6 +52,10 @@ try {
       fatalHidden: document.querySelector("#fatal")?.hidden === true,
       title: document.querySelector("#title")?.textContent,
       nextCount: document.querySelectorAll("#up-next > li").length,
+      shellAriaLive: document.querySelector(".shell")?.getAttribute("aria-live"),
+      connectionRole: document.querySelector("#connection")?.getAttribute("role"),
+      progressRole: document.querySelector(".progress-track")?.getAttribute("role"),
+      levels: document.querySelector("#levels")?.textContent,
     }));
 
     if (errors.length) {
@@ -65,6 +69,16 @@ try {
     }
     if (geometry.title !== "Primary Colors" || geometry.nextCount !== 3) {
       throw new Error(`${scenario.name} did not render the complete fixture.`);
+    }
+    if (
+      geometry.shellAriaLive !== null ||
+      geometry.connectionRole !== "status" ||
+      geometry.progressRole !== "progressbar"
+    ) {
+      throw new Error(`${scenario.name} did not expose focused status semantics.`);
+    }
+    if (geometry.levels !== "Music 82% · Read aloud 110%") {
+      throw new Error(`${scenario.name} did not label both volume levels.`);
     }
     if (before === after) {
       throw new Error(`${scenario.name} progress did not advance client-side.`);

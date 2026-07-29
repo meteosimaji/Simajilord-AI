@@ -27,7 +27,6 @@ from simajilord.agent import (
     AGENT_AUTONOMY_ACTOR_ID,
     AGENT_FILE_GRANT,
     AGENT_IMAGE_GRANT,
-    AGENT_MESSAGE_BREAK,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_NO_ACTION_CONTENT,
@@ -35,11 +34,9 @@ from simajilord.agent import (
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
     AgentBusyError,
-    AgentProgressStage,
     AgentRateLimitError,
     AgentRequest,
     AgentTrigger,
-    AgentUnavailableError,
 )
 from simajilord.capabilities.audio import (
     AudioAction,
@@ -142,6 +139,14 @@ from simajilord.services.read_aloud import (
 )
 from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
+from .agent_ui import (
+    AgentProgressMessage,
+    agent_error_text,
+    agent_message_groups,
+    agent_progress_text,
+    discord_message_chunks,
+    retry_after_text,
+)
 from .application_emojis import (
     ApplicationEmojiName,
     application_emoji,
@@ -161,7 +166,6 @@ from .capabilities import (
     DiscordTranslateMessageResponse,
     DiscordUserRequest,
     DiscordUserResponse,
-    agent_readable_channel_ids,
     discord_translation_segments,
     parse_discord_message_link,
     quote_message_has_animation,
@@ -173,6 +177,7 @@ from .help_catalog import (
     PublicCommandSpec,
 )
 from .local_media import attachment_can_play, import_discord_attachment
+from .permissions import agent_readable_channel_ids
 from .presenter import (
     EmbedField,
     EmbedTone,
@@ -192,6 +197,31 @@ _TRANSLATE_CONTEXT_MENU_NAME = "Translate"
 _MUSIC_DASHBOARD_ATTRIBUTE = "_simajilord_music_dashboard"
 _MUSIC_DASHBOARD_STATE_FILE = "discord_music_dashboards.json"
 
+
+class SafeView(discord.ui.View):
+    """Final interaction boundary shared by every Discord component view."""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        del item
+        await handle_interaction_error(interaction, error)
+
+
+class SafeModal(discord.ui.Modal):
+    """Final interaction boundary shared by every Discord modal."""
+
+    async def on_error(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+    ) -> None:
+        await handle_interaction_error(interaction, error)
+
+
 _ERROR_MESSAGES = {
     "audio.auto_leave_value_required": "Choose whether auto-leave is enabled.",
     "audio.capacity_reached": "The concurrent voice-server limit has been reached.",
@@ -205,6 +235,7 @@ _ERROR_MESSAGES = {
     "audio.not_paused": "Playback is not paused.",
     "audio.nothing_playing": "No track is playing.",
     "audio.output_disconnected": "The BOT is not connected to voice.",
+    "audio.other_voice_active": "Audio is already playing in another voice channel.",
     "audio.queue_position_invalid": "Choose a valid position shown in the queue.",
     "audio.queue_full": "This server's music queue is full.",
     "audio.user_queue_full": "You have reached your pending-request limit.",
@@ -212,6 +243,7 @@ _ERROR_MESSAGES = {
         "That track is already queued several times. Use Loop for repeated playback."
     ),
     "audio.seek_position_required": "Provide a playback position.",
+    "audio.seek_position_invalid": "Enter a position such as `1:23`, `+30`, or `-10`.",
     "audio.search_empty": "No matching track was found.",
     "audio.search_limit_invalid": "Search limit must be between 1 and 10.",
     "audio.session_closed": "This audio session has ended.",
@@ -223,6 +255,7 @@ _ERROR_MESSAGES = {
     "audio.tune_range_invalid": "Speed and pitch must each be between 0.5 and 2.0.",
     "audio.tune_values_required": "Provide both speed and pitch.",
     "audio.volume_range_invalid": "Volume must be between 0% and 200%.",
+    "audio.volume_number_invalid": "Volume must be a number from 0 to 200.",
     "audio.volume_value_required": "Provide music or read-aloud volume.",
     "media.reference_required": "Provide a media URL or search query.",
     "media.reference_too_long": "The URL or search query is too long.",
@@ -271,6 +304,33 @@ _ERROR_MESSAGES = {
     "moderation.media_type_unsupported": "HIVE accepts common image and video files.",
     "moderation.not_configured": "HIVE Moderation is not configured.",
     "discord.message_limit_invalid": "History limit must be between 1 and 100.",
+    "discord.message_not_found": "The Discord message could not be found.",
+    "discord.message_fetch_failed": "The Discord message could not be retrieved.",
+    "discord.message_id_invalid": "The message ID is invalid.",
+    "discord.message_length_invalid": "Messages must contain between 1 and 2,000 characters.",
+    "discord.channel_id_invalid": "The channel ID is invalid.",
+    "discord.voice_channel_id_invalid": "The voice-channel ID is invalid.",
+    "discord.snowflake_invalid": "That Discord ID is invalid.",
+    "discord.message_destination_invalid": (
+        "The destination is not a Discord channel that accepts messages."
+    ),
+    "discord.text_destination_invalid": "The destination is not a writable text channel.",
+    "discord.user_id_invalid": "The user ID is invalid.",
+    "discord.user_not_found": "The Discord user could not be found.",
+    "discord.guild_id_invalid": "The Discord server ID is invalid.",
+    "discord.guild_unavailable": "The Discord server is unavailable.",
+    "discord.voice_destination_invalid": "The configured voice destination is invalid.",
+    "discord.voice_channel_unavailable": "That voice channel is unavailable.",
+    "discord.voice_connect_failed": "Could not connect to the voice channel.",
+    "discord.voice_join_required": "Join the intended voice channel first.",
+    "discord.agent_read_channel_forbidden": (
+        "The AI does not have permission to view this Discord channel."
+    ),
+    "discord.custom_emoji_decode_failed": "Could not decode that custom emoji.",
+    "discord.poll_question_invalid": "Poll questions must contain 1-300 characters.",
+    "discord.poll_option_count_invalid": "Polls must contain 2-10 choices.",
+    "discord.poll_option_too_long": "Each poll choice must be at most 55 characters.",
+    "discord.poll_duration_invalid": "Poll duration must be between 1 and 168 hours.",
     "discord.message_chunk_limit_invalid": "Message chunk size must be 1-1,000 characters.",
     "discord.message_offset_invalid": "Provide a valid message offset.",
     "discord.member_lookup_failed": (
@@ -304,6 +364,10 @@ _ERROR_MESSAGES = {
     "read_aloud.dictionary_surface_too_long": "Written form must be at most 100 characters.",
     "read_aloud.dictionary_reading_required": "Provide its pronunciation.",
     "read_aloud.dictionary_reading_too_long": "Pronunciation must be at most 200 characters.",
+    "read_aloud.dictionary_invalid": "The dictionary entry is invalid.",
+    "read_aloud.exclusion_invalid": "The read-aloud exclusion is invalid.",
+    "read_aloud.announcement_value_invalid": "The announcement settings are invalid.",
+    "read_aloud.semantic_value_invalid": "The message-reading settings are invalid.",
     "read_aloud.announcement_value_required": "Choose at least one voice event to update.",
     "read_aloud.semantic_value_required": "Choose at least one message setting to update.",
     "read_aloud.ignore_bot_unnecessary": "BOT messages are already excluded.",
@@ -327,6 +391,7 @@ _ERROR_MESSAGES = {
     "web.query_too_long": "The query must be at most 500 characters.",
     "web.safesearch_invalid": "SafeSearch must be 0, 1, or 2.",
     "web.time_range_invalid": "Time range must be day, month, or year.",
+    "media.download_cooldown": "Wait 30 seconds before starting another download.",
     "workspace.required": "Run this command inside a Discord server.",
 }
 
@@ -493,7 +558,7 @@ def _parse_position(value: str) -> tuple[float, bool]:
     unsigned = text[1:] if relative else text
     parts = unsigned.split(":")
     if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
-        raise UserError("Enter a position such as `1:23`, `+30`, or `-10`.")
+        raise UserError("audio.seek_position_invalid")
     numbers = [int(part) for part in parts]
     seconds = 0
     for number in numbers:
@@ -1048,6 +1113,10 @@ class MusicDashboardManager:
                 if status == 403:
                     await self._record_metric("discord.dashboard_403", "stopped")
                     self._channel_ids.pop(workspace_id, None)
+                    self._messages.pop(workspace_id, None)
+                    self._fingerprints.pop(workspace_id, None)
+                    if self._stored_messages.pop(workspace_id, None) is not None:
+                        await self._persist_stored_messages()
                     log.warning(
                         "Stopping music dashboard updates after Discord denied access "
                         "guild=%s channel=%s",
@@ -1480,7 +1549,7 @@ def web_fetch_embed(response: WebFetchResponse) -> discord.Embed:
     )
 
 
-class WebFetchContinueView(discord.ui.View):
+class WebFetchContinueView(SafeView):
     """Continue a bounded Fetch result without making the user re-enter its URL."""
 
     def __init__(
@@ -1533,7 +1602,10 @@ class WebFetchContinueView(discord.ui.View):
             await interaction.followup.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(interaction.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 ),
                 ephemeral=True,
@@ -1651,7 +1723,7 @@ class MusicCandidateButton(discord.ui.Button["MusicSearchChoiceView"]):
             await self.view.choose(interaction, self.index)
 
 
-class MusicSearchChoiceView(discord.ui.View):
+class MusicSearchChoiceView(SafeView):
     """One-click disambiguation used only when zero-click selection is unsafe."""
 
     def __init__(
@@ -1711,8 +1783,11 @@ class MusicSearchChoiceView(discord.ui.View):
                 )
                 return
             self._selected = True
-            await interaction.response.defer(thinking=True)
             self._set_disabled(True)
+            # Component deferral must target the existing search message. A
+            # thinking response creates a separate interaction response and
+            # leaves the visible selection controls stale.
+            await interaction.response.defer()
             await interaction.edit_original_response(view=self)
             try:
                 response = await _enqueue_interaction_track(
@@ -1744,7 +1819,7 @@ class MusicSearchChoiceView(discord.ui.View):
                 child.disabled = disabled
 
 
-class MusicControlsView(discord.ui.View):
+class MusicControlsView(SafeView):
     """Persistent controls backed by the same capability API as commands and agents."""
 
     def __init__(
@@ -2159,7 +2234,7 @@ class MusicControlsView(discord.ui.View):
             self._bind_dashboard(interaction)
             channel = _member_voice_channel(interaction.user)
             if channel is None:
-                raise UserError("Join a voice channel first.")
+                raise UserError("discord.voice_join_required")
             workspace_id = str(interaction.guild_id) if interaction.guild_id else ""
             session = self.runtime.audio.require(workspace_id)
             if session.output.connected:
@@ -2304,7 +2379,7 @@ class MusicControlsView(discord.ui.View):
         await self._run(interaction, AudioAction.LEAVE)
 
 
-class MusicAddModal(discord.ui.Modal, title="Add music"):
+class MusicAddModal(SafeModal, title="Add music"):
     reference: discord.ui.TextInput[MusicAddModal] = discord.ui.TextInput(
         label="Song, artist, or public URL",
         placeholder="What would you like to hear?",
@@ -2372,7 +2447,7 @@ class MusicAddModal(discord.ui.Modal, title="Add music"):
             await edit_deferred_error(interaction, exc)
 
 
-class AudioLevelsModal(discord.ui.Modal, title="Mix levels"):
+class AudioLevelsModal(SafeModal, title="Mix levels"):
     music: discord.ui.TextInput[AudioLevelsModal] = discord.ui.TextInput(
         label="Music volume (0-200%)",
         placeholder="100",
@@ -2430,13 +2505,13 @@ def _bounded_percent(value: str, *, label: str) -> int:
     try:
         percent = int(value.strip().removesuffix("%"))
     except ValueError as exc:
-        raise UserError(f"{label} volume must be a number from 0 to 200.") from exc
+        raise UserError("audio.volume_number_invalid") from exc
     if not 0 <= percent <= 200:
-        raise UserError(f"{label} volume must be between 0 and 200.")
+        raise UserError("audio.volume_range_invalid")
     return percent
 
 
-class LoopMixConflictView(discord.ui.View):
+class LoopMixConflictView(SafeView):
     """Ask before replacing one mutually exclusive playback mode."""
 
     _TIMEOUT_SECONDS = 60
@@ -2603,7 +2678,12 @@ def async_progress_embed(
     )
 
 
-def error_message(error: Exception) -> str:
+def error_message(
+    error: Exception,
+    *,
+    request_id: str | None = None,
+) -> str:
+    error = _unwrap_discord_error(error)
     if isinstance(error, MediaError):
         return _MEDIA_ERROR_MESSAGES.get(error.category, _MEDIA_ERROR_MESSAGES["unknown"])
     if isinstance(error, WebError):
@@ -2618,14 +2698,60 @@ def error_message(error: Exception) -> str:
         )
     if isinstance(error, UserError):
         return _ERROR_MESSAGES.get(error.code, error.code)
-    log.exception("Unhandled Discord command error", exc_info=error)
-    return "An unexpected error occurred. Check the host log for the request ID."
+    reference_id = request_id or secrets.token_hex(8)
+    log.error(
+        "Unhandled Discord command error request_id=%s",
+        reference_id,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    return (
+        "An unexpected error occurred. "
+        f"Reference ID: `{reference_id}`. Share this ID with the administrator."
+    )
+
+
+def _unwrap_discord_error(error: Exception) -> Exception:
+    if isinstance(
+        error,
+        (app_commands.CommandInvokeError, commands.CommandInvokeError),
+    ):
+        return error.original
+    return error
+
+
+async def handle_interaction_error(
+    interaction: discord.Interaction,
+    error: Exception,
+) -> None:
+    """Ensure every command, button, select, and modal has user-visible failure UX."""
+
+    embed = command_embed(
+        "Could not complete the request",
+        description=error_message(error, request_id=str(interaction.id)),
+        tone=EmbedTone.ERROR,
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=None)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except discord.NotFound:
+        log.warning(
+            "Could not publish interaction error because the response expired "
+            "request_id=%s",
+            interaction.id,
+        )
+    except discord.DiscordException:
+        log.exception(
+            "Could not publish interaction error request_id=%s",
+            interaction.id,
+        )
 
 
 async def send_error(interaction: discord.Interaction, error: Exception) -> None:
     embed = command_embed(
         "Could not complete the request",
-        description=error_message(error),
+        description=error_message(error, request_id=str(interaction.id)),
         tone=EmbedTone.ERROR,
     )
     if interaction.response.is_done():
@@ -2645,7 +2771,7 @@ async def edit_deferred_error(
         await interaction.edit_original_response(
             embed=command_embed(
                 "Could not complete the request",
-                description=error_message(error),
+                description=error_message(error, request_id=str(interaction.id)),
                 tone=EmbedTone.ERROR,
             )
         )
@@ -2659,7 +2785,7 @@ async def edit_deferred_error(
         )
 
 
-class FocusTimerCancelView(discord.ui.View):
+class FocusTimerCancelView(SafeView):
     """Short-lived convenience control; timer state itself remains persistent."""
 
     def __init__(
@@ -2965,7 +3091,7 @@ def _help_entry_embed(entry: PublicCommandSpec) -> discord.Embed:
     )
 
 
-class HelpView(discord.ui.View):
+class HelpView(SafeView):
     def __init__(self, requester_id: int) -> None:
         super().__init__(timeout=5 * 60)
         self.requester_id = requester_id
@@ -3839,7 +3965,7 @@ def _youtube_card_reference(content: str) -> str | None:
     return references[0] if len(dict.fromkeys(references)) == 1 else None
 
 
-class YouTubeLinkCardView(discord.ui.View):
+class YouTubeLinkCardView(SafeView):
     """Short-lived, zero-search entry points for one explicit YouTube link."""
 
     def __init__(
@@ -4141,7 +4267,13 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                             "Speaking in",
                             f"<#{configured.audio_destination_id}>",
                         ),
-                        EmbedField("Connection", error_message(exc)),
+                        EmbedField(
+                            "Connection",
+                            error_message(
+                                exc,
+                                request_id=str(interaction.id),
+                            ),
+                        ),
                     ),
                     tone=EmbedTone.WARNING,
                 ),
@@ -4149,7 +4281,7 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             )
 
 
-class ReadAloudChannelSelectView(discord.ui.View):
+class ReadAloudChannelSelectView(SafeView):
     def __init__(
         self,
         runtime: SimajilordRuntime,
@@ -4188,7 +4320,7 @@ def _read_aloud_setup(
     member = interaction.user
     source = interaction.channel
     if not isinstance(member, discord.Member):
-        raise UserError("Use this control inside a server.")
+        raise UserError("workspace.required")
     if not isinstance(
         source,
         (
@@ -4198,10 +4330,10 @@ def _read_aloud_setup(
             discord.StageChannel,
         ),
     ):
-        raise UserError("Open this control in a server conversation channel.")
+        raise UserError("discord.message_channel_unavailable")
     destination = member.voice.channel if member.voice is not None else None
     if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
-        raise UserError("Join the voice channel where read aloud should speak first.")
+        raise UserError("discord.voice_join_required")
 
     defaults: list[discord.abc.GuildChannel | discord.Thread] = []
     route = _active_read_aloud_route(runtime, str(member.guild.id))
@@ -4318,7 +4450,7 @@ class ReadAloudCog(commands.Cog):
         try:
             member = interaction.user
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
-                raise UserError("Manage Server permission is required.")
+                raise UserError("discord.manage_guild_required")
             selected_text = text_channel
             if selected_text is None and isinstance(
                 interaction.channel,
@@ -4326,14 +4458,14 @@ class ReadAloudCog(commands.Cog):
             ):
                 selected_text = interaction.channel
             if selected_text is None:
-                raise UserError("Choose a conversation channel to read.")
+                raise UserError("read_aloud.source_channel_required")
             selected_voice = voice_channel
             if selected_voice is None and member.voice is not None:
                 candidate = member.voice.channel
                 if isinstance(candidate, discord.VoiceChannel):
                     selected_voice = candidate
             if selected_voice is None:
-                raise UserError("Choose a voice channel or join one first.")
+                raise UserError("discord.voice_join_required")
 
             response = cast(
                 ReadAloudResponse,
@@ -4843,7 +4975,7 @@ class ReadAloudCog(commands.Cog):
         try:
             member = interaction.user
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
-                raise UserError("Manage Server permission is required.")
+                raise UserError("discord.manage_guild_required")
             policy = cast(
                 ReadAloudPolicyResponse,
                 await self.runtime.registry.invoke(
@@ -4932,7 +5064,7 @@ class ReadAloudCog(commands.Cog):
             ):
                 selected = interaction.channel
             if selected is None:
-                raise UserError("Choose a source channel to remove.")
+                raise UserError("read_aloud.source_channel_required")
             response = cast(
                 ReadAloudResponse,
                 await self.runtime.registry.invoke(
@@ -4974,7 +5106,7 @@ class ReadAloudCog(commands.Cog):
         try:
             member = interaction.user
             if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
-                raise UserError("Manage Server permission is required.")
+                raise UserError("discord.manage_guild_required")
             await self.runtime.registry.invoke(
                 "discord.manage_read_aloud",
                 ReadAloudRequest(action=ReadAloudAction.DISABLE),
@@ -6151,7 +6283,7 @@ class TranslationLanguageSelect(discord.ui.Select["TranslationLanguagePickerView
         await self.view.choose_language(interaction, self.values[0])
 
 
-class TranslationLanguagePickerView(discord.ui.View):
+class TranslationLanguagePickerView(SafeView):
     """Region-first language picker without pagination or Next buttons."""
 
     def __init__(
@@ -6276,7 +6408,7 @@ class TranslationLanguagePickerView(discord.ui.View):
         )
 
 
-class TranslationPostView(discord.ui.View):
+class TranslationPostView(SafeView):
     def __init__(
         self,
         cog: TranslationCog,
@@ -6400,7 +6532,7 @@ class TranslationPostView(discord.ui.View):
         )
 
 
-class TranslationPreferenceScopeView(discord.ui.View):
+class TranslationPreferenceScopeView(SafeView):
     def __init__(
         self,
         cog: TranslationCog,
@@ -6496,7 +6628,7 @@ class TranslationPreferenceScopeView(discord.ui.View):
         )
 
 
-class TranslationLanguageOverrideModal(discord.ui.Modal):
+class TranslationLanguageOverrideModal(SafeModal):
     """Resolve source and target by name or BCP-47 without paginated menus."""
 
     def __init__(
@@ -6566,7 +6698,7 @@ class TranslationLanguageOverrideModal(discord.ui.Modal):
             await edit_deferred_error(interaction, exc)
 
 
-class TranslationDetectionReviewView(discord.ui.View):
+class TranslationDetectionReviewView(SafeView):
     """Let the requester correct uncertain automatic language detection."""
 
     def __init__(
@@ -7190,7 +7322,7 @@ class MediaCog(commands.Cog):
             now = time.monotonic()
             previous = self._last_request.get(interaction.user.id, 0.0)
             if now - previous < 30:
-                raise UserError("Wait 30 seconds before starting another download.")
+                raise UserError("media.download_cooldown")
             self._last_request[interaction.user.id] = now
             await interaction.response.defer(thinking=True)
             download_root = self.runtime.settings.data_dir / "downloads"
@@ -7332,7 +7464,7 @@ class UtilityCog(commands.Cog):
     ) -> None:
         try:
             if interaction.channel_id is None:
-                raise UserError("Run this command in a server conversation channel.")
+                raise UserError("discord.message_channel_unavailable")
             response = cast(
                 DiscordPollResponse,
                 await self.runtime.registry.invoke(
@@ -7632,7 +7764,10 @@ class MessageExpandCog(commands.Cog):
             await message.reply(
                 embed=command_embed(
                     "Could not expand the message",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(message.id),
+                    ),
                     tone=EmbedTone.WARNING,
                 ),
                 mention_author=False,
@@ -7664,7 +7799,7 @@ class QuoteCog(commands.Cog):
         if interaction.guild_id is None or interaction.channel_id is None:
             await send_error(
                 interaction,
-                UserError("Use this action on a message inside a server."),
+                UserError("workspace.required"),
             )
             return
         view = QuoteComposerView(
@@ -7682,7 +7817,7 @@ class QuoteCog(commands.Cog):
         )
 
 
-class QuoteComposerView(discord.ui.View):
+class QuoteComposerView(SafeView):
     """Private, short-lived quote options without cluttering the result message."""
 
     def __init__(
@@ -7955,7 +8090,10 @@ class QuoteComposerView(discord.ui.View):
             await interaction.edit_original_response(
                 embed=command_embed(
                     "Could not generate the quote",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(interaction.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 ),
                 view=self,
@@ -8032,212 +8170,12 @@ def _agent_grants(
     return frozenset(grants)
 
 
-def _discord_message_chunks(content: str, *, maximum: int = 1_900) -> tuple[str, ...]:
-    """Bound Discord output without asking the model to repeat a long answer."""
-
-    text = content.strip()
-    if not text:
-        return ()
-    chunks: list[str] = []
-    while text:
-        if len(text) <= maximum:
-            chunks.append(text)
-            break
-        boundary = text.rfind("\n", 0, maximum + 1)
-        if boundary < maximum // 2:
-            boundary = text.rfind(" ", 0, maximum + 1)
-        if boundary < maximum // 2:
-            boundary = maximum
-        chunks.append(text[:boundary].rstrip())
-        text = text[boundary:].lstrip()
-    return tuple(chunk for chunk in chunks if chunk)
-
-
-def _agent_message_groups(content: str) -> tuple[str, ...]:
-    """Convert every explicit boundary into an independent Discord post."""
-
-    groups = content.split(AGENT_MESSAGE_BREAK)
-    messages: list[str] = []
-    for group in groups:
-        messages.extend(_discord_message_chunks(group))
-    return tuple(messages)
-
-
-def _agent_error_text(error: Exception) -> str:
-    if isinstance(error, AgentBusyError):
-        return "AIへの依頼が混み合っています。少し待ってからもう一度お試しください。"
-    if isinstance(error, AgentRateLimitError):
-        if error.retry_after_seconds is not None:
-            return (
-                "AIの利用間隔を調整しています。"
-                f"あと{_retry_after_text(error.retry_after_seconds)}ほどお待ちください。"
-            )
-        return "AIの利用間隔を調整しています。時間を空けてもう一度お試しください。"
-    if isinstance(error, AgentUnavailableError):
-        return "現在、このホストではSimajilord AIを利用できません。"
-    return "AIの処理を完了できませんでした。"
-
-
-def _retry_after_text(total_seconds: int) -> str:
-    seconds = max(1, total_seconds)
-    hours, remainder = divmod(seconds, 3_600)
-    minutes, seconds = divmod(remainder, 60)
-    parts: list[str] = []
-    if hours:
-        parts.append(f"{hours}時間")
-    if minutes:
-        parts.append(f"{minutes}分")
-    if seconds or not parts:
-        parts.append(f"{seconds}秒")
-    return "".join(parts)
-
-
-_AGENT_PROGRESS_MESSAGES = {
-    AgentProgressStage.QUEUED: "先に受け付けたAI処理が終わるのを待っています…",
-    AgentProgressStage.STARTING: "依頼内容を確認しています…",
-    AgentProgressStage.READING_DISCORD: "必要なDiscord上の会話を確認しています…",
-    AgentProgressStage.SEARCHING_WEB: "Webを検索しています…",
-    AgentProgressStage.COMPUTING: "計算を実行しています…",
-    AgentProgressStage.ANALYZING_MEDIA: "添付ファイルをHIVEで解析しています…",
-    AgentProgressStage.GENERATING_IMAGE: "ローカル画像生成の準備をしています…",
-    AgentProgressStage.USING_AUDIO: "サーバーの音声機能を準備しています…",
-    AgentProgressStage.PREPARING_RESPONSE: "回答をまとめています…",
-}
-
-
-class _AgentProgressMessage:
-    """Coalesce real execution stages into one low-frequency Discord message."""
-
-    def __init__(
-        self,
-        source: discord.Message,
-        *,
-        initial_delay_seconds: float = 1.0,
-        minimum_update_seconds: float = 2.5,
-    ) -> None:
-        self.source = source
-        self.initial_delay_seconds = initial_delay_seconds
-        self.minimum_update_seconds = minimum_update_seconds
-        self.message: discord.Message | None = None
-        self._latest: AgentProgressStage | None = None
-        self._published: AgentProgressStage | None = None
-        self._last_update = 0.0
-        self._task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
-        self._closed = False
-
-    async def update(self, stage: AgentProgressStage) -> None:
-        if self._closed:
-            return
-        self._latest = stage
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(
-                self._flush_later(),
-                name=f"simajilord-agent-progress-{self.source.id}",
-            )
-
-    async def finish(self, content: str) -> None:
-        self._closed = True
-        await self._cancel_pending()
-        if content.strip() == AGENT_NO_ACTION_CONTENT:
-            async with self._lock:
-                if self.message is not None:
-                    with suppress(discord.DiscordException):
-                        await self.message.delete()
-                    self.message = None
-            return
-        messages = _agent_message_groups(content)
-        if not messages:
-            return
-        async with self._lock:
-            if self.message is None:
-                self.message = await self.source.reply(
-                    messages[0],
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await self.message.edit(
-                    content=messages[0],
-                    embed=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-        for message in messages[1:]:
-            await self.source.channel.send(
-                message,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-    async def fail(self, content: str) -> None:
-        self._closed = True
-        await self._cancel_pending()
-        async with self._lock:
-            if self.message is None:
-                self.message = await self.source.reply(
-                    content,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await self.message.edit(
-                    content=content,
-                    embed=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-
-    async def _flush_later(self) -> None:
-        try:
-            if self.message is None:
-                delay = self.initial_delay_seconds
-            else:
-                elapsed = time.monotonic() - self._last_update
-                delay = max(0.0, self.minimum_update_seconds - elapsed)
-            if delay:
-                await asyncio.sleep(delay)
-            if self._closed or self._latest is None or self._latest is self._published:
-                return
-            stage = self._latest
-            embed = command_embed(
-                "処理中",
-                description=_AGENT_PROGRESS_MESSAGES[stage],
-                tone=EmbedTone.INFO,
-            )
-            async with self._lock:
-                if self._closed:
-                    return
-                if self.message is None:
-                    self.message = await self.source.reply(
-                        embed=embed,
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                else:
-                    await self.message.edit(content=None, embed=embed)
-                self._published = stage
-                self._last_update = time.monotonic()
-        except asyncio.CancelledError:
-            raise
-        except discord.DiscordException:
-            log.exception("Could not publish agent progress message.")
-        finally:
-            self._task = None
-            if (
-                not self._closed
-                and self._latest is not None
-                and self._latest is not self._published
-            ):
-                self._task = asyncio.create_task(
-                    self._flush_later(),
-                    name=f"simajilord-agent-progress-{self.source.id}",
-                )
-
-    async def _cancel_pending(self) -> None:
-        task = self._task
-        self._task = None
-        if task is None or task.done():
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+_discord_message_chunks = discord_message_chunks
+_agent_message_groups = agent_message_groups
+_agent_error_text = agent_error_text
+_retry_after_text = retry_after_text
+_agent_progress_text = agent_progress_text
+_AgentProgressMessage = AgentProgressMessage
 
 
 class AgentCog(commands.Cog):
@@ -8307,6 +8245,29 @@ class AgentCog(commands.Cog):
             grants=grants,
             approvals=approvals,
         )
+        try:
+            follow_up_added = await agent.try_follow_up(request)
+        except AgentBusyError as exc:
+            await message.reply(
+                _agent_error_text(exc),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if follow_up_added:
+            await message.reply(
+                embed=command_embed(
+                    "Added to the active AI request",
+                    description=(
+                        "The AI will read this message before it finishes. "
+                        "Your Discord identity remains attached to the follow-up."
+                    ),
+                    tone=EmbedTone.INFO,
+                ),
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
         progress = _AgentProgressMessage(message)
         try:
             async with message.channel.typing():
@@ -8619,7 +8580,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8655,7 +8619,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8682,7 +8649,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8717,7 +8687,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8780,7 +8753,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8812,7 +8788,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8835,7 +8814,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8866,7 +8848,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )
@@ -8930,7 +8915,10 @@ class PrefixCog(commands.Cog):
             await context.send(
                 embed=command_embed(
                     "Could not complete the request",
-                    description=error_message(exc),
+                    description=error_message(
+                        exc,
+                        request_id=str(context.message.id),
+                    ),
                     tone=EmbedTone.ERROR,
                 )
             )

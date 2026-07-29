@@ -12,13 +12,13 @@ agent call the same APIs.
 The dependency direction is one-way:
 
 ```text
-local agent / human commands / future transports
-                         |
-                  capability registry
-                         |
-        domain + services + provider boundaries
-                         |
-       Discord adapter / future transport adapters
+Discord adapter / local agent / human commands / future transports
+                              |
+                       capability registry
+                              |
+                    domain + services
+                              |
+                     provider boundaries
 ```
 
 - `src/simajilord/capabilities` defines transport-neutral request and response APIs.
@@ -26,7 +26,8 @@ local agent / human commands / future transports
 - `src/simajilord/services` owns media, speech, read-aloud, audio, and web orchestration.
 - `src/simajilord/providers` and `src/simajilord/media/providers` isolate concrete providers.
 - `src/simajilord/integrations/discord` converts Discord input into API requests and presents
-  structured results back to Discord.
+  structured results back to Discord. AI progress delivery and Discord permission policy live
+  in separate `agent_ui` and `permissions` modules rather than the command Cog.
 - `src/simajilord/agent` holds model-independent event, conversation, context-budget,
   permission-grant, and action contracts.
 - `vendor/yt-dlp` is a platform-owned upstream snapshot. Discord never imports it directly.
@@ -36,15 +37,22 @@ operational feedback such as command success, validation, and permission errors.
 generates conversational text and chooses `discord.send_message` separately.
 Explicit human commands use compact English embeds with useful result fields and a Discord
 timestamp; implementation labels and decorative footer text are intentionally omitted.
+Unexpected command errors show the same reference ID that is recorded in the host log, so a
+user and an administrator can correlate one failed request without exposing internal details.
+Every slash command, prefix command, button, select, and modal also has a final error boundary;
+validation failures use stable machine codes and unexpected callback failures cannot end only
+with Discord's generic “interaction failed” banner.
 
 ## Current Discord capabilities
 
 - Health, uptime, and searchable capability discovery
 - Per-server durable music queues with play, pause, resume, seek, tuning, separate
   music/read-aloud volume, shuffle, move, requester-only clearing, skip, stop, leave, loop,
-  bounded per-server/per-user admission, and persistent button controls
+  bounded per-server/per-user admission, and persistent button controls. A Discord 403 removes
+  the denied dashboard binding from both memory and durable state so restart does not revive it
 - Zero-click track search when one result is clear, with direct one-click choices only for
-  genuinely ambiguous same-name tracks
+  genuinely ambiguous same-name tracks. A selection disables and updates the same visible
+  result message while the track is being added
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
   queue-preserving auto-leave
 - Globally bounded, priority-aware media work and guild-fair TTS work, with per-guild
@@ -76,7 +84,8 @@ timestamp; implementation labels and decorative footer text are intentionally om
   voice-channel chat—for the agent without injecting entire messages into its initial context
 - A bare Discord message link expands in place only after actor and BOT permission checks;
   the replacement preserves a Jump link and the original link post is deleted only after the
-  replacement succeeds
+  replacement succeeds. The complete Embed text budget, including author, footer, title,
+  description, field names, and field values, is kept within Discord's 6,000-character limit
 - Discord audio/video attachments can be imported through `/play file:` or
   `Apps` → `Play Audio`. Files are probed before admission, stored under a private
   content-addressed local cache, and retained while a durable queue still references them
@@ -99,9 +108,18 @@ timestamp; implementation labels and decorative footer text are intentionally om
   third parties outside the active VC cannot control playback. Capability scope and
   per-turn write approval are separate, and the exact triggering message must be read before
   any approved write
-- A bounded FIFO AI-turn queue with durable conversation IDs, context-budget rotation,
-  exact-message verification, progressive status updates, and corrective retries after
-  failed writes
+- Bounded per-server FIFO AI-turn queues with durable conversation IDs, context-budget
+  rotation, exact-message verification, progressive status updates, and corrective retries
+  after failed writes. Separate servers can run turns concurrently without allowing two turns
+  from the same server to overtake each other. Codex notifications and tool budgets are routed
+  per thread/turn, so concurrent servers cannot consume each other's completion events.
+  Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
+  as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
+  remain attached so another user's read-only contribution is distinguishable. Queue and
+  execution progress uses short English status messages
+- Restart-safe local image generation with atomic user/server/pending admission and a resident
+  exponential-backoff Discord delivery retry loop. A completed image is not considered
+  delivered until Discord accepts it, without waiting for the next service restart
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls
@@ -116,6 +134,9 @@ connections.
 
 The optional agent is default-off. Its Codex runtime has browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
+The default runtime profile is `gpt-5.6-terra` with `medium` reasoning. Context protection is
+rotation, not lossy in-place compression: when the configured turn or context-ratio limit is
+reached, a new provider thread starts while durable audit records remain stored.
 
 ## Requirements
 
@@ -231,8 +252,11 @@ uv run simajilord-web-doctor "Python"
 uv run python -m compileall -q src
 ```
 
-The same gate runs automatically on every GitHub push and pull request. Startup also performs
-a real FFmpeg-to-Opus self-test before Discord commands become available.
+The code-quality commands above are the local gate; the web doctor additionally requires the
+configured SearXNG endpoint. GitHub Actions runs lint, type checks, pytest, the audio doctor,
+secret scanning, compile/wheel checks, macOS translation integration, and Activity build,
+dependency-audit, desktop, and mobile checks on every push and pull request. Startup also
+performs a real FFmpeg-to-Opus self-test before Discord commands become available.
 
 For a provider regression, test the complete resolver/transcoder path without joining a VC:
 
@@ -241,6 +265,17 @@ uv run simajilord-audio-doctor "https://public.example/media/..."
 ```
 
 This does not require a Discord token and never sends audio or messages to Discord.
+
+The real Codex app-server and typed Discord message capabilities can be checked manually
+without attaching the check to CI or consuming Discord API rate limits:
+
+```bash
+uv run python scripts/manual_agent_discord_qa.py
+```
+
+This one-shot test gives the AI an exact-message task and verifies that it sends a recorded
+intermediate message before returning the final answer. It consumes one model turn and is
+intentionally not run on push.
 
 To inspect Discord embeds, adaptive buttons, local read-aloud, and music ducking without
 connecting a Discord client:

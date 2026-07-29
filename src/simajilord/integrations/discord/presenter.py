@@ -90,11 +90,15 @@ def expanded_message_embeds(
         name=response.author_name,
         icon_url=response.author_avatar_url,
     )
+    edited = " · 編集済み" if response.edited_at_iso is not None else ""
+    embed.set_footer(text=f"#{response.channel_name}{edited}")
     if response.reply_author_name is not None:
         reply_text = response.reply_content_preview or "本文なし"
-        embed.add_field(
+        _add_bounded_field(
+            embed,
             name=f"{response.reply_author_name}さんへの返信",
             value=_bounded_quote_text(reply_text, maximum=600),
+            maximum=600,
             inline=False,
         )
     non_image_attachments = tuple(
@@ -115,9 +119,11 @@ def expanded_message_embeds(
         value = "\n".join(lines)
         if hidden_count:
             value += f"\nほか{hidden_count}件"
-        embed.add_field(
+        _add_bounded_field(
+            embed,
             name="添付ファイル",
             value=_bounded_quote_text(value, maximum=900),
+            maximum=900,
             inline=False,
         )
     if response.poll is not None:
@@ -125,18 +131,22 @@ def expanded_message_embeds(
             f"{index}. {discord.utils.escape_markdown(answer)}"
             for index, answer in enumerate(response.poll.answers[:10], start=1)
         )
-        embed.add_field(
+        _add_bounded_field(
+            embed,
             name=_bounded_quote_text(response.poll.question, maximum=200),
             value=_bounded_quote_text(answers, maximum=800) or "選択肢なし",
+            maximum=800,
             inline=False,
         )
     if response.sticker_names:
-        embed.add_field(
+        _add_bounded_field(
+            embed,
             name="スタンプ",
             value=", ".join(
                 discord.utils.escape_markdown(name)
                 for name in response.sticker_names
             )[:900],
+            maximum=900,
             inline=False,
         )
     if original_embed is not None and source_content:
@@ -146,13 +156,13 @@ def expanded_message_embeds(
             if value
         )
         if rich_text:
-            embed.add_field(
+            _add_bounded_field(
+                embed,
                 name="埋め込み",
                 value=_bounded_quote_text(rich_text, maximum=700),
+                maximum=700,
                 inline=False,
             )
-    edited = " · 編集済み" if response.edited_at_iso is not None else ""
-    embed.set_footer(text=f"#{response.channel_name}{edited}")
 
     image_urls: list[str] = [
         attachment.proxy_url or attachment.url
@@ -214,6 +224,29 @@ def _bounded_quote_text(value: str, *, maximum: int) -> str:
         return normalized
     suffix = "\n\n…続きは元のメッセージで確認できます。"
     return normalized[: maximum - len(suffix)].rstrip() + suffix
+
+
+def _add_bounded_field(
+    embed: discord.Embed,
+    *,
+    name: str,
+    value: str,
+    maximum: int,
+    inline: bool,
+) -> None:
+    """Add a field only within Discord's 6,000-character aggregate embed cap."""
+
+    bounded_name = _bounded_quote_text(name, maximum=256)
+    available = 6_000 - len(embed) - len(bounded_name)
+    if available <= 0:
+        return
+    bounded_value = _bounded_quote_text(
+        value,
+        maximum=min(maximum, 1_024, available),
+    )
+    if not bounded_value:
+        return
+    embed.add_field(name=bounded_name, value=bounded_value, inline=inline)
 
 
 def _expanded_attachment_is_image(content_type: str | None) -> bool:

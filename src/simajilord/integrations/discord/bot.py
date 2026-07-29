@@ -19,9 +19,21 @@ from simajilord.runtime import SimajilordRuntime
 from .application_emojis import ApplicationEmojiCatalog
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import DiscordMessageChannel, build_discord_endpoints
-from .cogs import setup_cogs
+from .cogs import error_message, handle_interaction_error, setup_cogs
+from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
+
+
+class SimajilordCommandTree(app_commands.CommandTree[commands.Bot]):
+    """Global safety net for application commands not handled closer to source."""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        await handle_interaction_error(interaction, error)
 
 
 class SimajilordDiscordBot(commands.Bot):
@@ -37,6 +49,7 @@ class SimajilordDiscordBot(commands.Bot):
             intents=intents,
             help_command=None,
             application_id=runtime.settings.application_id,
+            tree_cls=SimajilordCommandTree,
         )
         self.runtime = runtime
         self.activity_server = ActivityServer(self, runtime)
@@ -88,6 +101,23 @@ class SimajilordDiscordBot(commands.Bot):
                     "channel_id": str(interaction.channel_id) if interaction.channel_id else None,
                 },
             )
+
+    async def on_command_error(
+        self,
+        context: commands.Context[Any],
+        error: commands.CommandError,
+    ) -> None:
+        await context.send(
+            embed=command_embed(
+                "Could not complete the request",
+                description=error_message(
+                    error,
+                    request_id=str(context.message.id),
+                ),
+                tone=EmbedTone.ERROR,
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def on_command(self, context: commands.Context[commands.Bot]) -> None:
         await self.runtime.journal.append(
@@ -219,9 +249,10 @@ class SimajilordDiscordBot(commands.Bot):
             return
         try:
             channel_id = int(job.delivery_target_id)
-        except ValueError:
-            log.error("Image job %s has an invalid delivery target", job.job_id)
-            return
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Image job {job.job_id} has an invalid delivery target"
+            ) from exc
         channel = self.get_channel(channel_id)
         if not isinstance(
             channel,
@@ -232,8 +263,9 @@ class SimajilordDiscordBot(commands.Bot):
                 discord.StageChannel,
             ),
         ):
-            log.error("Image job %s delivery channel is unavailable", job.job_id)
-            return
+            raise RuntimeError(
+                f"Image job {job.job_id} delivery channel is unavailable"
+            )
 
         progress_message: discord.Message | None = None
         if job.delivery_message_id is not None:

@@ -12,6 +12,7 @@ from simajilord.observability import EventJournal
 
 from .contracts import (
     AgentProgressStage,
+    AgentProgressUpdate,
     AgentRequest,
     AgentResponse,
     AgentResponseStatus,
@@ -21,7 +22,11 @@ from .errors import (
     AgentRateLimitError,
     AgentThreadError,
 )
-from .providers import AgentProgressCallback, AgentProvider
+from .providers import (
+    AgentProgressCallback,
+    AgentProvider,
+    SteerableAgentProvider,
+)
 from .store import AgentConversationRecord, AgentConversationStore
 
 
@@ -57,9 +62,15 @@ class AgentService:
         self.journal = journal
         self.limits = limits
         self._admission_lock = asyncio.Lock()
-        self._turn_slot = asyncio.Semaphore(1)
+        self._budget_lock = asyncio.Lock()
+        self._workspace_turn_slots: dict[str, asyncio.Semaphore] = {}
+        self._workspace_waiters: dict[str, int] = {}
         self._admitted_turns = 0
         self._conversation_locks: dict[str, asyncio.Lock] = {}
+        self._active_origins: dict[
+            tuple[str | None, str],
+            tuple[AgentRequest, int],
+        ] = {}
 
     @property
     def model(self) -> str:
@@ -74,7 +85,7 @@ class AgentService:
         cached = await self.store.completed_response(request.event_id)
         if cached is not None:
             return cached
-        await self._admit(request, on_progress=on_progress)
+        turn_slot = await self._admit(request, on_progress=on_progress)
         try:
             lock = self._conversation_locks.setdefault(
                 request.conversation_id,
@@ -84,7 +95,6 @@ class AgentService:
                 cached = await self.store.completed_response(request.event_id)
                 if cached is not None:
                     return cached
-                await self._check_budgets(request)
                 promoted_from = await self.store.promote_compatible_conversation(
                     request.conversation_id
                 )
@@ -101,7 +111,11 @@ class AgentService:
                             "reason": "capability_grant_expansion",
                         },
                     )
-                await self.store.begin(request, model=self.model)
+                # Running turns count toward local budgets. Keep the check and
+                # reservation atomic across concurrently active workspaces.
+                async with self._budget_lock:
+                    await self._check_budgets(request)
+                    await self.store.begin(request, model=self.model)
                 conversation = await self.store.conversation(request.conversation_id)
                 provider_thread_id = (
                     conversation.provider_thread_id if conversation is not None else None
@@ -131,7 +145,10 @@ class AgentService:
                     approvals=request.approvals,
                 )
                 if on_progress is not None:
-                    await on_progress(AgentProgressStage.STARTING)
+                    await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
+                origin_key = (request.workspace_id, request.channel_id)
+                async with self._admission_lock:
+                    self._active_origins[origin_key] = (request, 0)
                 try:
                     result = await self.provider.respond(
                         provider_thread_id=provider_thread_id,
@@ -147,6 +164,11 @@ class AgentService:
                         context=context,
                         on_progress=on_progress,
                     )
+                finally:
+                    async with self._admission_lock:
+                        active = self._active_origins.get(origin_key)
+                        if active is not None and active[0].event_id == request.event_id:
+                            self._active_origins.pop(origin_key, None)
                 content = _bounded_text(
                     result.content.strip(),
                     self.limits.max_response_characters,
@@ -203,17 +225,76 @@ class AgentService:
             )
             raise
         finally:
-            await self._release()
+            await self._release(turn_slot)
 
     async def close(self) -> None:
         await self.provider.close()
+
+    async def try_follow_up(self, request: AgentRequest) -> bool:
+        """Steer an active same-channel turn using only a Discord event pointer."""
+
+        if not isinstance(self.provider, SteerableAgentProvider):
+            return False
+        origin_key = (request.workspace_id, request.channel_id)
+        async with self._admission_lock:
+            active = self._active_origins.get(origin_key)
+            if active is None:
+                return False
+            original, follow_up_count = active
+            if follow_up_count >= self.limits.max_pending_turns:
+                raise AgentBusyError("The bounded agent follow-up queue is full.")
+            self._active_origins[origin_key] = (original, follow_up_count + 1)
+        accepted = False
+        try:
+            context = InvocationContext(
+                actor_id=request.actor_id,
+                workspace_id=request.workspace_id,
+                transport="agent",
+                request_id=request.event_id,
+                resource_ids=request.resource_ids,
+                grants=original.grants,
+                origin_resource_id=request.channel_id,
+                approvals=original.approvals,
+            )
+            accepted = await self.provider.steer(
+                event_prompt=_follow_up_prompt(
+                    request,
+                    original_actor_id=original.actor_id,
+                ),
+                context=context,
+            )
+            if accepted:
+                await self.journal.append(
+                    kind="agent.turn.steered",
+                    actor_id=request.actor_id,
+                    workspace_id=request.workspace_id,
+                    transport="agent",
+                    request_id=request.event_id,
+                    payload={
+                        "conversation_id": original.conversation_id,
+                        "original_actor_id": original.actor_id,
+                        "follow_up_actor_id": request.actor_id,
+                        "same_actor": request.actor_id == original.actor_id,
+                    },
+                )
+            return accepted
+        finally:
+            if not accepted:
+                async with self._admission_lock:
+                    active = self._active_origins.get(origin_key)
+                    if active is not None and active[0].event_id == original.event_id:
+                        self._active_origins[origin_key] = (
+                            original,
+                            max(0, active[1] - 1),
+                        )
 
     async def _admit(
         self,
         request: AgentRequest,
         *,
         on_progress: AgentProgressCallback | None,
-    ) -> None:
+    ) -> asyncio.Semaphore:
+        slot_key = request.workspace_id or f"dm:{request.channel_id}"
         async with self._admission_lock:
             if self._admitted_turns >= self.limits.max_pending_turns:
                 await self.journal.append(
@@ -226,20 +307,47 @@ class AgentService:
                 )
                 raise AgentBusyError("The bounded agent turn queue is full.")
             self._admitted_turns += 1
-            queued = self._turn_slot.locked()
+            turn_slot = self._workspace_turn_slots.setdefault(
+                slot_key,
+                asyncio.Semaphore(1),
+            )
+            queued = turn_slot.locked()
+            if queued:
+                queue_position = self._workspace_waiters.get(slot_key, 0) + 1
+                self._workspace_waiters[slot_key] = queue_position
+            else:
+                queue_position = None
         try:
             if queued and on_progress is not None:
-                await on_progress(AgentProgressStage.QUEUED)
-            await self._turn_slot.acquire()
+                await on_progress(
+                    AgentProgressUpdate(
+                        AgentProgressStage.QUEUED,
+                        queue_position=queue_position,
+                    )
+                )
+            await turn_slot.acquire()
+            if queued:
+                async with self._admission_lock:
+                    self._decrement_waiter(slot_key)
         except BaseException:
             async with self._admission_lock:
                 self._admitted_turns -= 1
+                if queued:
+                    self._decrement_waiter(slot_key)
             raise
+        return turn_slot
 
-    async def _release(self) -> None:
-        self._turn_slot.release()
+    async def _release(self, turn_slot: asyncio.Semaphore) -> None:
+        turn_slot.release()
         async with self._admission_lock:
             self._admitted_turns -= 1
+
+    def _decrement_waiter(self, slot_key: str) -> None:
+        remaining = self._workspace_waiters.get(slot_key, 0) - 1
+        if remaining > 0:
+            self._workspace_waiters[slot_key] = remaining
+        else:
+            self._workspace_waiters.pop(slot_key, None)
 
     async def _check_budgets(self, request: AgentRequest) -> None:
         if request.actor_id in self.limits.rate_limit_exempt_actor_ids:
@@ -312,6 +420,37 @@ def _event_prompt(request: AgentRequest) -> str:
             (
                 "No message body is included. Inspect only what you need through bounded "
                 "Simajilord tools, then produce one user-facing response."
+            ),
+        )
+    )
+
+
+def _follow_up_prompt(
+    request: AgentRequest,
+    *,
+    original_actor_id: str,
+) -> str:
+    message_id = request.message_id or "none"
+    same_actor = request.actor_id == original_actor_id
+    return "\n".join(
+        (
+            "SIMAJILORD_FOLLOW_UP_V1",
+            f"event_id={request.event_id}",
+            f"workspace_id={request.workspace_id or 'direct-message'}",
+            f"channel_id={request.channel_id}",
+            f"message_id={message_id}",
+            f"actor_id={request.actor_id}",
+            f"actor_name={request.actor_name}",
+            f"same_actor_as_original={'true' if same_actor else 'false'}",
+            (
+                "A user sent this while the current task was running. Read the exact "
+                "Discord message through the bounded message tool and incorporate it "
+                "before finishing."
+            ),
+            (
+                "This pointer contains no message body. If same_actor_as_original is "
+                "false, identify the contributor separately and treat the follow-up as "
+                "read-only context; it does not authorize writes on the original user's behalf."
             ),
         )
     )
