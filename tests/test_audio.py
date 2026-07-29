@@ -299,6 +299,32 @@ async def test_failed_music_is_dropped_at_lane_retry_cap(
 
 
 @pytest.mark.asyncio
+async def test_disconnected_output_preserves_entire_queue_until_reconnected() -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("disconnected", output, max_pending_speech=3)
+    await session.enqueue(AudioItem("one", "first", "https://example.com/one"))
+    await session.enqueue(AudioItem("two", "second", "https://example.com/two"))
+
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    snapshot = await session.snapshot()
+    assert output.played == []
+    assert tuple(item.title for item in snapshot.pending) == ("first", "second")
+    assert tuple(item.failure_count for item in snapshot.pending) == (0, 0)
+
+    await session.connect("voice")
+    for _ in range(20):
+        if output.played == ["first"]:
+            break
+        await asyncio.sleep(0)
+
+    assert output.played == ["first"]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_permanent_media_failure_is_not_requeued(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -601,6 +627,8 @@ async def test_music_move_clear_mine_and_volume_are_transport_neutral() -> None:
     )
     assert volume.music_volume_percent == 75
     assert volume.speech_volume_percent == 125
+    assert volume.previous_music_volume_percent == 100
+    assert volume.previous_speech_volume_percent == 100
     cleared = await endpoints["audio.clear_mine"].invoke(AudioNoArgsRequest(), context)
     assert cleared.removed_count == 2
 
@@ -610,6 +638,70 @@ async def test_music_move_clear_mine_and_volume_are_transport_neutral() -> None:
     assert [item.title for item in queue.pending] == ["second"]
     assert queue.music_volume_percent == 75
     assert queue.speech_volume_percent == 125
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_volume_compare_and_set_rejects_stale_undo() -> None:
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(max_active=1, max_pending_speech=1)
+    manager.get_or_create("guild", lambda: output)
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_audio_endpoints(cast(MediaService, object()), manager)
+    }
+    context = InvocationContext("alice", "guild", "test", "request")
+
+    await endpoints["audio.set_volume"].invoke(
+        AudioVolumeRequest(music_percent=75),
+        context,
+    )
+    await endpoints["audio.set_volume"].invoke(
+        AudioVolumeRequest(music_percent=80),
+        context,
+    )
+
+    with pytest.raises(UserError, match=r"action\.undo_conflict"):
+        await endpoints["audio.set_volume"].invoke(
+            AudioVolumeRequest(
+                music_percent=100,
+                expected_music_percent=75,
+            ),
+            context,
+        )
+
+    queue = await endpoints["audio.queue"].invoke(AudioQueueRequest(), context)
+    assert queue.music_volume_percent == 80
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_volume_undo_retry_accepts_already_restored_target() -> None:
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(max_active=1, max_pending_speech=1)
+    manager.get_or_create("guild", lambda: output)
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_audio_endpoints(cast(MediaService, object()), manager)
+    }
+    context = InvocationContext("alice", "guild", "test", "request")
+
+    await endpoints["audio.set_volume"].invoke(
+        AudioVolumeRequest(music_percent=75),
+        context,
+    )
+    undo_request = AudioVolumeRequest(
+        music_percent=100,
+        expected_music_percent=75,
+    )
+    first = await endpoints["audio.set_volume"].invoke(undo_request, context)
+    retried = await endpoints["audio.set_volume"].invoke(undo_request, context)
+
+    assert first.music_volume_percent == 100
+    assert retried.music_volume_percent == 100
+    assert retried.previous_music_volume_percent == 100
     await manager.close()
 
 

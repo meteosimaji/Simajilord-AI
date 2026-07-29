@@ -219,10 +219,14 @@ def quote_message_view(
 
 
 def _bounded_quote_text(value: str, *, maximum: int) -> str:
+    if maximum <= 0:
+        return ""
     normalized = value.strip()
     if len(normalized) <= maximum:
         return normalized
     suffix = "\n\n…続きは元のメッセージで確認できます。"
+    if len(suffix) >= maximum:
+        return "…"[:maximum]
     return normalized[: maximum - len(suffix)].rstrip() + suffix
 
 

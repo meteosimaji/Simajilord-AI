@@ -82,6 +82,7 @@ class ReadableWebPage:
     content_type: str
     text: str
     links: tuple[str, ...]
+    source_truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)

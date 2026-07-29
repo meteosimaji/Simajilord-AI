@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import re
-import unicodedata
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 from time import monotonic
 from typing import Any, Literal, Protocol, TypeVar
 
-from .errors import CapabilityError
+from .errors import CapabilityError, UserError
+from .search import (
+    normalize_search_text,
+    normalized_substring,
+    phrase_match_score,
+    search_overlap_score,
+)
 
 RequestT = TypeVar("RequestT")
 ResponseT = TypeVar("ResponseT")
@@ -19,19 +25,7 @@ CapabilityIdempotency = Literal[
     "idempotent_write",
     "non_idempotent_write",
 ]
-_SEARCH_TOKEN_PATTERN = re.compile(r"[\w.-]+", re.UNICODE)
-
-
-def _normalize_search_text(value: str) -> str:
-    """Normalize user and descriptor text without assuming an ASCII language."""
-
-    return " ".join(
-        unicodedata.normalize("NFKC", value).casefold().split()
-    )
-
-
-def _search_tokens(value: str) -> set[str]:
-    return set(_SEARCH_TOKEN_PATTERN.findall(_normalize_search_text(value)))
+log = logging.getLogger(__name__)
 
 
 class RiskLevel(StrEnum):
@@ -98,7 +92,10 @@ class CapabilityDescriptor:
             raise ValueError("expected_errors must not contain empty values")
         if self.risk is RiskLevel.READ and self.idempotency != "read":
             raise ValueError("read capabilities must use read idempotency")
-        if self.risk is RiskLevel.WRITE and self.idempotency == "read":
+        if (
+            self.risk in {RiskLevel.WRITE, RiskLevel.DESTRUCTIVE}
+            and self.idempotency == "read"
+        ):
             object.__setattr__(self, "idempotency", "non_idempotent_write")
 
 
@@ -188,43 +185,33 @@ class CapabilityRegistry:
     def search(self, query: str, *, limit: int = 5) -> tuple[CapabilityEndpoint, ...]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        normalized_query = _normalize_search_text(query)
+        normalized_query = normalize_search_text(query)
         if not normalized_query:
             return self.all()[:limit]
-        terms = _search_tokens(normalized_query)
 
         scored: list[tuple[int, CapabilityEndpoint]] = []
         for item in self._endpoints.values():
             descriptor = item.descriptor
-            name_terms = _search_tokens(descriptor.name)
-            searchable_text = _normalize_search_text(
-                " ".join(
-                    (
-                        descriptor.summary,
-                        *descriptor.keywords,
-                        *descriptor.side_effects,
-                    )
+            searchable_text = " ".join(
+                (
+                    descriptor.summary,
+                    *descriptor.keywords,
+                    *descriptor.side_effects,
+                    descriptor.user_visible_effect or "",
                 )
             )
-            text_terms = _search_tokens(searchable_text)
-            keyword_phrases = tuple(
-                normalized
-                for keyword in descriptor.keywords
-                if (normalized := _normalize_search_text(keyword))
-            )
-            keyword_substring_score = 2 * sum(
-                phrase in normalized_query
-                for phrase in keyword_phrases
-            )
-            exact_text_score = int(
-                len(normalized_query) >= 3
-                and normalized_query in searchable_text
+            schema_text = " ".join(
+                (
+                    *item.schema.request_fields,
+                    *item.schema.response_fields,
+                )
             )
             score = (
-                len(terms & text_terms)
-                + 3 * len(terms & name_terms)
-                + keyword_substring_score
-                + exact_text_score
+                search_overlap_score(query, searchable_text)
+                + 3 * search_overlap_score(query, descriptor.name)
+                + search_overlap_score(query, schema_text)
+                + 3 * phrase_match_score(query, descriptor.keywords)
+                + 2 * int(normalized_substring(query, searchable_text))
             )
             if score:
                 scored.append((score, item))
@@ -242,28 +229,68 @@ class CapabilityRegistry:
         selected = self.endpoint(name)
         started = monotonic()
         try:
-            response = await selected.invoke(request, context)
+            timeout_seconds = selected.descriptor.timeout_seconds
+            if timeout_seconds is None:
+                response = await selected.invoke(request, context)
+            else:
+                try:
+                    async with asyncio.timeout(timeout_seconds):
+                        response = await selected.invoke(request, context)
+                except TimeoutError as exc:
+                    raise UserError(
+                        "capability.timeout",
+                        capability=name,
+                        timeout_seconds=timeout_seconds,
+                    ) from exc
         except Exception as exc:
-            if self._journal is not None:
-                await self._journal.record_invocation(
-                    capability_name=name,
-                    context=context,
-                    request=request,
-                    response=None,
-                    error=exc,
-                    duration_ms=(monotonic() - started) * 1_000,
-                )
-            raise
-        if self._journal is not None:
-            await self._journal.record_invocation(
+            await self._record_invocation_safely(
                 capability_name=name,
                 context=context,
                 request=request,
-                response=response,
-                error=None,
+                response=None,
+                error=exc,
                 duration_ms=(monotonic() - started) * 1_000,
             )
+            raise
+        await self._record_invocation_safely(
+            capability_name=name,
+            context=context,
+            request=request,
+            response=response,
+            error=None,
+            duration_ms=(monotonic() - started) * 1_000,
+        )
         return response
+
+    async def _record_invocation_safely(
+        self,
+        *,
+        capability_name: str,
+        context: InvocationContext,
+        request: object,
+        response: object | None,
+        error: Exception | None,
+        duration_ms: float,
+    ) -> None:
+        """Keep observability failures from changing the capability outcome."""
+
+        if self._journal is None:
+            return
+        try:
+            await self._journal.record_invocation(
+                capability_name=capability_name,
+                context=context,
+                request=request,
+                response=response,
+                error=error,
+                duration_ms=duration_ms,
+            )
+        except Exception:
+            log.exception(
+                "Capability journal record failed capability=%s request_id=%s",
+                capability_name,
+                context.request_id,
+            )
 
     def manifest(self) -> tuple[Mapping[str, object], ...]:
         """Return a compact manifest suitable for MCP-style discovery."""

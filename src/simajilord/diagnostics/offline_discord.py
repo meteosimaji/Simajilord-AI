@@ -26,7 +26,6 @@ from simajilord.integrations.discord.cogs import (
     HelpView,
     MusicControlsView,
     QuoteComposerView,
-    YouTubeLinkCardView,
     _help_entry_embed,
     _help_overview_embed,
     music_queue_embed,
@@ -710,27 +709,6 @@ def _sample_panels() -> tuple[PreviewPanel, ...]:
             name="Quote · main menu",
             embed=cast(dict[str, Any], quote_view.embed().to_dict()),
             components=serialize_view(quote_view),
-        )
-    )
-    youtube_view = YouTubeLinkCardView(
-        cast(SimajilordRuntime, object()),
-        reference="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    )
-    panels.append(
-        PreviewPanel(
-            name="YouTube · audio actions",
-            embed=cast(
-                dict[str, Any],
-                discord.Embed(
-                    title="YouTube",
-                    description=(
-                        "Play now, add without joining a VC, "
-                        "or use this track to start Radio."
-                    ),
-                    color=discord.Colour.blurple(),
-                ).to_dict(),
-            ),
-            components=serialize_view(youtube_view),
         )
     )
     panels.extend(

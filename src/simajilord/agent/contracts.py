@@ -10,13 +10,57 @@ AGENT_NO_ACTION_CONTENT = "<simajilord:no-action>"
 AGENT_MESSAGE_BREAK = "<simajilord:message-break>"
 AGENT_AUTONOMY_ACTOR_ID = "simajilord:autonomy"
 AGENT_AUDIO_GRANT = "audio"
+AGENT_COMPUTE_GRANT = "safe_compute"
 AGENT_FILE_GRANT = "files"
+AGENT_HIVE_GRANT = "hive_analysis"
 AGENT_IMAGE_GRANT = "image"
+AGENT_MEDIA_GRANT = "media_download"
+AGENT_MEMORY_GRANT = "memory"
 AGENT_MESSAGE_GRANT = "discord_message"
 AGENT_MODERATION_GRANT = "moderation"
 AGENT_QUOTE_GRANT = "discord_quote"
+AGENT_REACTION_GRANT = "discord_reaction"
 AGENT_REPOST_GRANT = "discord_repost"
 AGENT_WEB_GRANT = "web"
+AGENT_TIMER_WRITE_CAPABILITIES = (
+    "timer.create",
+    "timer.cancel",
+)
+AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES = (
+    "discord.delete_message",
+    "discord.bulk_delete_messages",
+    "discord.kick_member",
+    "discord.ban_member",
+)
+AGENT_DISCORD_MODERATION_CAPABILITIES = (
+    "discord.set_timeout",
+    *AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+    "discord.unban_member",
+)
+AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES = (
+    "discord.connect_voice",
+    "discord.create_poll",
+    "discord.reply_message",
+    "discord.edit_own_message",
+    "discord.pin_message",
+    "discord.unpin_message",
+    "discord.create_thread",
+    "discord.update_thread",
+    "discord.add_thread_member",
+    "discord.remove_thread_member",
+    "discord.create_forum_post",
+    "discord.create_role",
+    "discord.assign_role",
+    "discord.remove_role",
+    "discord.update_channel_settings",
+    "discord.create_channel",
+    *AGENT_DISCORD_MODERATION_CAPABILITIES,
+)
+AGENT_MEMORY_WRITE_CAPABILITIES = (
+    "memory.remember",
+    "memory.update",
+    "memory.forget",
+)
 AGENT_AUDIO_CONTROL_CAPABILITIES = (
     "discord.pause_audio",
     "discord.resume_audio",
@@ -48,6 +92,12 @@ AGENT_AUDIO_WRITE_CAPABILITIES = (
     "discord.read_aloud_semantics_set",
     "discord.read_aloud_content_mode_set",
     "discord.speak",
+)
+AGENT_REQUESTED_WRITE_CAPABILITIES = (
+    *AGENT_AUDIO_WRITE_CAPABILITIES,
+    *AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
+    *AGENT_TIMER_WRITE_CAPABILITIES,
+    *AGENT_MEMORY_WRITE_CAPABILITIES,
 )
 
 
@@ -88,6 +138,14 @@ class AgentTrigger(StrEnum):
 
     MENTION = "mention"
     AUTONOMOUS = "autonomous"
+
+
+class AgentAutonomyMode(StrEnum):
+    """Host-enforced autonomy levels, independent of model instructions."""
+
+    OBSERVE = "observe"
+    ASSIST = "assist"
+    ACT = "act"
 
 
 class AgentResponseStatus(StrEnum):
@@ -141,6 +199,7 @@ class AgentRequest:
     resource_ids: tuple[str, ...]
     grants: frozenset[str] = frozenset()
     approvals: frozenset[str] = frozenset()
+    events: tuple[AgentEvent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

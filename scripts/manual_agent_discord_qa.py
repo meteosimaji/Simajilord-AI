@@ -53,6 +53,7 @@ class GetMessageResponse:
     author_name: str
     content: str
     next_offset: int | None = None
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,11 +154,11 @@ async def run() -> dict[str, object]:
             executable="codex",
             model="gpt-5.6-terra",
             workspace_dir=root / "workspace",
-            timeout_seconds=180,
+            timeout_seconds=600,
             reasoning_effort="medium",
             tools=tools,
-            max_tool_calls=6,
-            max_tool_output_characters=6_000,
+            max_tool_calls=32,
+            max_tool_output_characters=24_000,
         )
         service = AgentService(
             provider=provider,
@@ -168,11 +169,13 @@ async def run() -> dict[str, object]:
                 per_user_window_seconds=600,
                 per_workspace_requests=10,
                 per_workspace_window_seconds=3_600,
-                max_tokens_per_24_hours=100_000,
+                max_tokens_per_24_hours=150_000,
                 max_conversation_turns=24,
-                max_context_ratio=0.75,
+                max_context_ratio=0.5,
                 max_response_characters=3_800,
-                max_pending_turns=10,
+                max_active_turns=4,
+                max_pending_turns=20,
+                max_pending_turns_per_user=2,
             ),
         )
         try:

@@ -52,6 +52,8 @@ with Discord's generic “interaction failed” banner.
   music/read-aloud volume, shuffle, move, requester-only clearing, skip, stop, leave, loop,
   bounded per-server/per-user admission, and persistent button controls. A Discord 403 removes
   the denied dashboard binding from both memory and durable state so restart does not revive it
+- The Now Playing panel reports invariant playback/loop duration instead of a projected relative
+  end timestamp, so a durable panel cannot later display an already-expired `Ends` value
 - Zero-click track search when one result is clear, with direct one-click choices only for
   genuinely ambiguous same-name tracks. A selection disables and updates the same visible
   result message while the track is being added
@@ -61,8 +63,9 @@ with Discord's generic “interaction failed” banner.
   connection reservations, debounced durable audio state, and wait/duration metrics
 - Voice-free queueing: add a track before joining, then start automatically when one of its
   requesters enters voice
-- A silent, five-minute YouTube link card with direct `Play`, `Add`, and `Radio` actions;
-  simply posting the link does not resolve media or change the queue
+- There is no YouTube URL listener or generic `Play` / `Add` / `Radio` link card. A bare URL is
+  ignored by the BOT; `!play URL` runs only the normal explicit play flow and does not receive a
+  second fixed card
 - Durable Radio mode fed one related track at a time, while manual requests always take
   priority
 - Durable requester attribution and a bounded recently-played history
@@ -82,8 +85,23 @@ with Discord's generic “interaction failed” banner.
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
 - Server, user, and avatar information
 - Native polls, dice, and bounded random choice
-- Bounded Discord channel listing, reply-chain retrieval, and message-history reads—including
-  voice-channel chat—for the agent without injecting entire messages into its initial context
+- Staged Discord research without injecting whole histories into the initial context:
+  `discord.list_servers` pages through BOT servers and live-checks any uncached requester
+  membership while reporting incomplete lookups instead of silently treating them as absence;
+  `discord.list_channels` pages through the channels currently readable by both principals,
+  `discord.search_messages` searches authorized channels by phrase/author/message-ID or ISO time
+  range in pages of at most 25, and `discord.get_message` retrieves a selected original in
+  chunks. A directly supplied server ID is checked live too. `discord.read_messages` supplies
+  chronological pages for sampling—including voice-channel chat. Results expose stable
+  server/channel/message IDs, explicit completeness, continuation cursors, and
+  reaction/reply/thread signals so the agent can continue a long search without guessing
+- Read-only Discord research may cross to another shared server when both the active requester
+  and BOT still have View Channel and Read Message History access (and private-thread membership
+  where applicable). Each result includes a time-local source-visibility/disclosure advisory.
+  `broader` flags a currently known audience expansion and `uncertain` means the member cache
+  cannot prove the complete audience; neither is a mechanical disclosure block or a source of
+  write authority. Writes remain in the originating server and require live requester and BOT
+  permissions
 - A bare Discord message link expands in place only after actor and BOT permission checks;
   the replacement preserves a Jump link and the original link post is deleted only after the
   replacement succeeds. The complete Embed text budget, including author, footer, title,
@@ -105,14 +123,43 @@ with Discord's generic “interaction failed” banner.
   `Generate` and `Cancel` on the main screen
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
-- Agent research uses Codex first-party live web search through the host's existing ChatGPT OAuth
-  session when `AGENT_WEB_SEARCH_ACCESS` grants access. Local SearXNG remains available to
-  explicit `/web` and prefix commands, but is not exposed to autonomous Codex turns
+- A quota-bound file workspace per Discord server: the agent can import Discord attachments,
+  download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text
+  content in chunks, edit text, and send a selected result back to Discord. PDF reads select
+  1–20 pages at a time and return `total_pages` plus `next_page`; character-level `next_offset`
+  continues within the selected page range, so documents longer than 20 pages remain readable
+- Optional `AGENT_SAFE_COMPUTE_ACCESS` runs only an argv-based Python script that the agent first
+  stores in that server workspace. On macOS, Seatbelt blocks network access, child processes,
+  personal/project host files, and writes outside a temporary staged workspace; wall time, CPU,
+  resident memory, output, open-file, per-file, file-count, and workspace-byte limits are
+  host-enforced.
+  Validated output files are committed through the existing file quota, while failed or
+  over-limit runs discard the staging directory. No general shell capability is exposed
+- Optional `AGENT_CURATED_SKILLS_ENABLED` adds a small package-owned `workflow.search`
+  catalog for community research, long web/PDF reading, file plus safe-compute transforms,
+  generic media saving, selective memory, and Action Receipt/Undo flows. These are typed
+  Simajilord-tool recipes, not Codex user/global skills: no plugin, MCP, shell, or host path
+  is loaded, and workflows requiring unavailable capabilities or grants are omitted
+- A small eager tool surface makes Discord/Web/file/memory/workflow discovery available at the
+  start of a turn. For everything else, the model searches the typed capability registry by a
+  concrete goal and object, reads the returned risk and input schema, then invokes the selected
+  capability. Natural-language command strings and per-platform URL trigger tables are not the
+  capability router
+- `AGENT_WEB_SEARCH_ACCESS` exposes both Codex first-party live search through the host's existing
+  ChatGPT OAuth session and Simajilord's local `web.search`, `web.fetch`, and `web.find` tools.
+  This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
+  and locally fetch a public URL that first-party search could not open. The same grant policy
+  applies to autonomous turns; explicit `/web` and prefix commands remain available independently
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and
   per-turn write approval are separate, and the exact triggering message must be read before
   any approved write
+- Agent actions include intentional reactions, own-message reply/edit/delete, pinning, polls,
+  threads and forum posts, roles, channel settings/creation, audio and read-aloud controls, and
+  permission-checked moderation. Destructive actions require the explicit capability policy,
+  the active contributor's permissions, a reason/evidence where applicable, and a journaled
+  result; retrieving an old administrator message can never authorize a new action
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, context-budget
   rotation, exact-message verification, progressive status updates, and corrective retries
   after failed writes. Separate servers can run turns concurrently without allowing two turns
@@ -120,29 +167,82 @@ with Discord's generic “interaction failed” banner.
   per thread/turn, so concurrent servers cannot consume each other's completion events.
   Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
   as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
-  remain attached so another user's read-only contribution is distinguishable. Queue and
-  host execution progress uses short English status messages. The temporary `Working` embed is
+  remain attached. An accepted contributor may request a write only through that follow-up's
+  opaque host authorization and the contributor's own grants and Discord permissions; it cannot
+  borrow the original requester's authority. Rate limits are checked before admission, while
+  `MAX_ACTIVE_AGENT_TURNS`, `MAX_PENDING_AGENT_TURNS`, and
+  `MAX_PENDING_AGENT_TURNS_PER_USER` independently bound active provider work, waiting work,
+  and one actor's share of waiting work. Active turns do not consume either pending allowance,
+  so the main queue can hold up to the active limit plus the waiting limit. Queue and host
+  execution progress uses short English status
+  messages. The temporary `Working` embed is
   deleted before the final answer is posted as a new reply, preserving the order of visible
   milestone updates. Accepted-follow-up acknowledgements are tied to the parent turn and removed
   on either completion or failure. Multi-step work also posts task-specific progress in the
   conversation language, naming checked evidence and the next step without exposing private
   reasoning
+- Every successful agent write returns an Action Receipt. Reactions, pin state, role membership,
+  timeout state, thread membership/settings, channel topic/slowmode, audio volume, selected
+  read-aloud settings, and Focus Timer create/cancel operations have restart-safe inverse or
+  compensating actions; newly created BOT messages can be deleted. `action.undo` accepts a
+  receipt ID or resolves the same actor's most recent undoable action; repeating the same Undo
+  does not execute the inverse twice. Destructive operations or writes that would require
+  retaining deleted content/file bodies are explicitly receipted as non-undoable.
+  Final replies and autonomous host posts are also receipted immediately after each Discord
+  send using only channel/message IDs, even though they bypass the model tool catalog. A
+  single-source autonomous reply is attributed to that source actor for natural same-actor
+  Undo; a mixed-source batch remains BOT-owned instead of arbitrarily granting one member
+  control over the post. If a final confirmation follows a substantive write in the same turn,
+  ID-less Undo prefers that write; a reply-only turn instead removes its latest host post.
+  The bounded `.data/agent_actions.sqlite3` ledger retains at most 2,000 records, at most 100 per
+  actor, for seven days. It stores IDs and a small scalar inverse (maximum 4 KiB), never a file
+  body, deleted-message body, or large snapshot.
+- Durable agent memory is independent of Codex provider threads in
+  `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success
+  `procedure` scopes enforce same-user/same-channel/same-server visibility. Records contain only
+  a short summary, exact source Discord message IDs, confidence, timestamps, and optional expiry;
+  message bodies, attachments, secret-like values, inferred profiles, and low-confidence guesses
+  are rejected. Eager `memory.search` uses a bounded bilingual lexical matcher tolerant of
+  case/width/punctuation and common English/CJK wording variants, with scope, evidence basis,
+  minimum-confidence, update-time, and `next_offset` filters; an empty query returns the most
+  recently used accessible records. Normalized keys upsert duplicates, search updates
+  `last_used_at`, and expiry plus total/workspace/user/channel/procedure caps keep the database
+  bounded. Memory writes still require the exact authorizing event and return non-undoable
+  Action Receipts; forgetting is intentionally irreversible. Provider conversation continuity
+  and this distilled memory are separate, so rotating a full model context does not turn raw
+  chat history into durable memory.
+- Event-driven autonomy stores content-free message/edit/reaction/thread/voice/timer/audio
+  pointers in `.data/agent_autonomy.sqlite3`. The first event opens one fixed 5–15 second
+  same-channel batch window
+  and each turn receives the oldest candidates up to `AGENT_AUTONOMY_CANDIDATE_LIMIT`; excess
+  events stay queued for a later turn instead of being skipped. `AGENT_AUTONOMY_MAX_RUNS=0`
+  means no artificial run-count cutoff. `observe` suppresses spontaneous turns, `assist` can
+  answer, react, and manage timers, and `act` can use all otherwise granted write capabilities
+  subject to live Discord permissions and the same admission/rate limits. The autonomous
+  principal is the BOT itself, never the user who produced an event; source actors in the batch
+  provide context but not borrowed authority.
+  Global, per-channel, and per-human-source queue caps, per-server autonomous turn budgets,
+  stable deduplication keys, leased fixed-membership batches, and durable exponential retry
+  timestamps prevent gateway bursts from bypassing admission or disappearing on restart.
+  Timer/audio system events do not consume the human-source cap. No built-in GitHub or RSS
+  adapter is connected yet; a future adapter can publish through the same typed
+  `AutonomyEventQueue` without adding a second scheduler
 - Restart-safe local image generation with atomic user/server/pending admission and a resident
   exponential-backoff Discord delivery retry loop. A completed image is not considered
   delivered until Discord accepts it, without waiting for the next service restart
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls
-- Autonomous turns retain bounded audio inspection and a provenance-locked message-repost API,
-  but receive no arbitrary Discord-message write scope, audio-write approval,
-  image-generation scope, or file-write scope
 - Structured, append-only local command/capability/message events in SQLite
 
 One independent audio session is created per Discord server. Different servers may use voice
 concurrently up to the configured process limit; one server never owns multiple Discord voice
 connections.
 
-The optional agent is default-off. Its Codex runtime has browser control, shell execution,
+The optional agent is default-off. Event autonomy is inert until the agent is enabled and
+`AGENT_AUTONOMY_GUILD_IDS` contains an allowed server, even though its mode defaults to `act`
+and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex runtime has
+browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 The default runtime profile is `gpt-5.6-terra` with `medium` reasoning. Context protection is
 rotation, not lossy in-place compression: when the configured turn or context-ratio limit is
@@ -240,11 +340,15 @@ commands call the same capability APIs.
 
 ## Local event journal
 
-`.data/events.sqlite3` records Discord command receipt, capability outcomes, and new Discord
-messages. Each row has a monotonic sequence cursor, actor, workspace, transport, request ID,
-and structured payload. Sensitive field names such as token, password, secret, authorization,
-and cookie are redacted before storage. The agent can read only the rows after its last
-cursor and reconcile user-driven state changes before acting.
+`.data/events.sqlite3` records Discord command receipt, capability outcomes, and Discord/agent
+events. Each row has a monotonic sequence, actor, workspace, transport, request ID, and
+structured payload. Sensitive field names such as token, password, secret, authorization, and
+cookie are redacted before storage. Autonomous delivery state is separate in
+`.data/agent_autonomy.sqlite3`, so advancing an observability cursor cannot discard candidates.
+Undo state is separately bounded in `.data/agent_actions.sqlite3`; inverse behavior remains a
+static code policy, so the database does not retain source file or message content.
+Durable memory state is separately bounded in `.data/agent_memory.sqlite3` and never stores the
+source Discord message body or attachment.
 
 `.data/audio_sessions.json` stores only stable media page references, requester attribution,
 recent history, and queue policy. Signed stream URLs are deliberately excluded. A restart

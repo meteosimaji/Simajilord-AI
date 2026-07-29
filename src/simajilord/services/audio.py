@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import random
 import re
 import uuid
@@ -613,6 +614,22 @@ class AudioSession:
     ) -> tuple[float, float]:
         """Set durable music/read-aloud gain without coupling to Discord."""
 
+        current_music, current_speech, _, _ = await self.set_volume_with_previous(
+            music=music,
+            speech=speech,
+        )
+        return current_music, current_speech
+
+    async def set_volume_with_previous(
+        self,
+        *,
+        music: float | None = None,
+        speech: float | None = None,
+        expected_music: float | None = None,
+        expected_speech: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        """Set durable gains and return current then previous music/speech values."""
+
         if music is None and speech is None:
             raise UserError("audio.volume_value_required")
         if music is not None and not 0.0 <= music <= 2.0:
@@ -620,6 +637,50 @@ class AudioSession:
         if speech is not None and not 0.0 <= speech <= 2.0:
             raise UserError("audio.volume_range_invalid")
         async with self._transport_lock:
+            previous_music = self._music_volume
+            previous_speech = self._speech_volume
+            target_matches = (
+                music is None
+                or math.isclose(
+                    previous_music,
+                    music,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ) and (
+                speech is None
+                or math.isclose(
+                    previous_speech,
+                    speech,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            )
+            if target_matches:
+                return (
+                    previous_music,
+                    previous_speech,
+                    previous_music,
+                    previous_speech,
+                )
+            if (
+                expected_music is not None
+                and not math.isclose(
+                    previous_music,
+                    expected_music,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ) or (
+                expected_speech is not None
+                and not math.isclose(
+                    previous_speech,
+                    expected_speech,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise UserError("action.undo_conflict")
             restart_music = (
                 music is not None
                 and self._current is not None
@@ -638,7 +699,12 @@ class AudioSession:
                 self.output.stop()
                 await self._wait_for_current()
         await self._state_changed()
-        return self._music_volume, self._speech_volume
+        return (
+            self._music_volume,
+            self._speech_volume,
+            previous_music,
+            previous_speech,
+        )
 
     async def remove(self, position: int) -> AudioItem:
         if position < 1:
@@ -1229,6 +1295,14 @@ class AudioSession:
             if self._suspended:
                 self._wake.clear()
                 if self._suspended:
+                    await self._wake.wait()
+                continue
+            if not self.output.connected:
+                # A dropped voice transport is a session-level condition, not
+                # one failure per queued track. Preserve the queue unchanged
+                # until ``connect()`` wakes the worker after voice is ready.
+                self._wake.clear()
+                if not self.output.connected:
                     await self._wake.wait()
                 continue
             item = await self._next_item()
@@ -1937,6 +2011,7 @@ class AudioSessionManager:
                         wait_ms=max(0.0, (started_at - requested_at) * 1_000),
                         duration_ms=max(0.0, (finished_at - started_at) * 1_000),
                         outcome=outcome,
+                        resource_id=destination_id,
                     )
                 )
 

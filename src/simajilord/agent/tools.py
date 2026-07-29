@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import math
 import types
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -18,12 +20,76 @@ from simajilord.core import (
     InvocationContext,
     RiskLevel,
 )
+from simajilord.core.errors import CapabilityError
+from simajilord.core.search import normalize_search_text
 
+from .actions import ActionReceipt, ActionReceiptService
 from .errors import AgentToolError
 
 _TOOL_NAMESPACE = "simajilord"
 _SEARCH_TOOL = "capability_search"
 _INVOKE_TOOL = "capability_invoke"
+_AUTHORIZATION_EVENT_ID = "authorization_event_id"
+_MAX_CAPABILITY_SEARCH_OFFSET = 10_000
+_CAPABILITY_BROWSE_QUERIES = frozenset(
+    {
+        "abilities",
+        "ability",
+        "available capabilities",
+        "available tools",
+        "capabilities",
+        "capability",
+        "features",
+        "できること",
+        "ツール",
+        "ヘルプ",
+        "機能一覧",
+        "能力一覧",
+        "一覧",
+        "何ができる",
+        "何ができますか",
+        "機能",
+        "能力",
+        "tools",
+        "what are your capabilities",
+        "what can you do",
+        "what capabilities do you have",
+        "what tools do you have",
+    }
+)
+_CONTENT_RESULT_KEYS = ("content", "content_chunk", "text")
+_RESULT_IDENTITY_KEYS = (
+    "path",
+    "url",
+    "message_id",
+    "channel_id",
+    "guild_id",
+    "source_guild_id",
+    "source_channel_id",
+    "kind",
+    "query",
+    "backend",
+    "order",
+)
+_CONTINUATION_METADATA_KEYS = (
+    "complete",
+    "next_offset",
+    "next_page",
+    "next_before_message_id",
+    "next_after_message_id",
+    "next_cursor",
+    "has_more",
+    "indexing",
+    "retry_after_seconds",
+    "search_window_exhausted",
+    "total_results",
+    "offset",
+    "page_start",
+    "total_pages",
+    "total_characters",
+    "maybe_more",
+)
+log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -51,10 +117,31 @@ class AgentToolCatalog:
         required_grants: Mapping[str, str] | None = None,
         eager_capabilities: Sequence[str] | None = None,
         write_capabilities: Sequence[str] = (),
+        destructive_capabilities: Sequence[str] = (),
         image_output_capabilities: Sequence[str] = (),
+        action_receipts: ActionReceiptService | None = None,
     ) -> None:
         self._registry = registry
         self._allowed_capabilities = tuple(allowed_capabilities)
+        duplicate_capabilities = _duplicates(self._allowed_capabilities)
+        if duplicate_capabilities:
+            raise AgentToolError(
+                "Agent capability allowlist contains duplicates: "
+                + ", ".join(duplicate_capabilities)
+            )
+        policy_sequences = {
+            "eager capability policy": tuple(eager_capabilities or ()),
+            "write capability policy": tuple(write_capabilities),
+            "destructive capability policy": tuple(destructive_capabilities),
+            "image output capability policy": tuple(image_output_capabilities),
+        }
+        for label, values in policy_sequences.items():
+            duplicates = _duplicates(values)
+            if duplicates:
+                raise AgentToolError(
+                    f"Agent {label} contains duplicates: "
+                    + ", ".join(duplicates)
+                )
         self._required_grants = dict(required_grants or {})
         self._eager_capabilities = (
             frozenset(self._allowed_capabilities)
@@ -62,13 +149,21 @@ class AgentToolCatalog:
             else frozenset(eager_capabilities)
         )
         self._write_capabilities = frozenset(write_capabilities)
+        self._destructive_capabilities = frozenset(destructive_capabilities)
         self._image_output_capabilities = frozenset(image_output_capabilities)
+        self._action_receipts = action_receipts
         allowed = set(self._allowed_capabilities)
         unknown_eager = self._eager_capabilities - allowed
         unknown_writes = self._write_capabilities - allowed
+        unknown_destructive = self._destructive_capabilities - allowed
         unknown_images = self._image_output_capabilities - allowed
-        if unknown_eager or unknown_writes or unknown_images:
-            unknown = sorted(unknown_eager | unknown_writes | unknown_images)
+        if unknown_eager or unknown_writes or unknown_destructive or unknown_images:
+            unknown = sorted(
+                unknown_eager
+                | unknown_writes
+                | unknown_destructive
+                | unknown_images
+            )
             raise AgentToolError(
                 "Agent tool policies reference capabilities outside the allowlist: "
                 + ", ".join(unknown)
@@ -84,6 +179,25 @@ class AgentToolCatalog:
             raise AgentToolError(
                 "Agent write capabilities require explicit grants: "
                 + ", ".join(sorted(ungranted_writes))
+            )
+        if self._action_receipts is not None:
+            unclassified_writes = {
+                capability
+                for capability in self._write_capabilities
+                if not self._action_receipts.has_explicit_policy(capability)
+            }
+            if unclassified_writes:
+                raise AgentToolError(
+                    "Agent write capabilities require an explicit Action policy: "
+                    + ", ".join(sorted(unclassified_writes))
+                )
+        unmanaged_destructive = (
+            self._destructive_capabilities - self._write_capabilities
+        )
+        if unmanaged_destructive:
+            raise AgentToolError(
+                "Destructive capabilities must also be declared as writes: "
+                + ", ".join(sorted(unmanaged_destructive))
             )
         aliases: dict[str, str] = {}
         for capability_name in self._allowed_capabilities:
@@ -121,6 +235,34 @@ class AgentToolCatalog:
             else None
         )
 
+    def authorization_event_id_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> str | None:
+        """Return the exact event whose actor must authorize one resolved write."""
+
+        if self.write_capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        ) is None:
+            return None
+        if not isinstance(arguments, dict):
+            return None
+        value = arguments.get(_AUTHORIZATION_EVENT_ID)
+        return value if isinstance(value, str) and value else None
+
+    def write_is_safe_to_retry(self, capability_name: str) -> bool:
+        """Return whether an already failed write may be repeated automatically."""
+
+        if capability_name not in self._write_capabilities:
+            return False
+        return (
+            self._registry.endpoint(capability_name).descriptor.idempotency
+            == "idempotent_write"
+        )
+
     def capability_for_call(
         self,
         *,
@@ -145,8 +287,11 @@ class AgentToolCatalog:
         """Build app-server dynamic tool specs from currently registered endpoints."""
 
         tools: list[Mapping[str, object]] = []
+        hidden_configured = False
         hidden_available = False
         for alias, capability_name in sorted(self._aliases.items()):
+            if capability_name not in self._eager_capabilities:
+                hidden_configured = True
             if not self._is_available(capability_name, context):
                 continue
             endpoint = self._validated_endpoint(capability_name, context)
@@ -158,11 +303,16 @@ class AgentToolCatalog:
                     "type": "function",
                     "name": alias,
                     "description": _descriptor_description(endpoint.descriptor),
-                    "inputSchema": _dataclass_schema(endpoint.request_type),
+                    "inputSchema": _tool_input_schema(
+                        endpoint.request_type,
+                        write=capability_name in self._write_capabilities,
+                    ),
                 }
             )
+        if hidden_configured:
+            tools.append(_search_spec())
         if hidden_available:
-            tools.extend((_search_spec(), _invoke_spec()))
+            tools.append(_invoke_spec())
         if not tools:
             return ()
         return (
@@ -210,7 +360,7 @@ class AgentToolCatalog:
             raise AgentToolError("Use capability_invoke for discovered capabilities.")
         return await self._invoke_capability(
             capability_name,
-            arguments,
+            _without_authorization_event_id(arguments),
             context=context,
             max_output_characters=max_output_characters,
         )
@@ -224,32 +374,67 @@ class AgentToolCatalog:
     ) -> str:
         if not isinstance(arguments, dict):
             raise AgentToolError("Capability search arguments must be an object.")
-        unknown = set(arguments) - {"query", "limit"}
+        unknown = set(arguments) - {"query", "offset", "limit"}
         if unknown:
             raise AgentToolError(
                 f"Unknown capability search fields: {', '.join(sorted(unknown))}"
             )
-        query = arguments.get("query")
+        query = arguments.get("query", "")
+        offset = arguments.get("offset", 0)
         limit = arguments.get("limit", 3)
-        if not isinstance(query, str) or not query.strip():
-            raise AgentToolError("Capability search query must be non-empty text.")
+        if not isinstance(query, str):
+            raise AgentToolError("Capability search query must be text.")
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or not 0 <= offset <= _MAX_CAPABILITY_SEARCH_OFFSET
+        ):
+            raise AgentToolError(
+                "Capability search offset must be between 0 and "
+                f"{_MAX_CAPABILITY_SEARCH_OFFSET}."
+            )
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 5:
             raise AgentToolError("Capability search limit must be between 1 and 5.")
-        available = {
-            name
-            for name in self._allowed_capabilities
-            if self._is_available(name, context)
-        }
-        matches = tuple(
-            item
-            for item in self._registry.search(
-                query,
-                limit=max(1, len(self._registry.all())),
+        browse = _is_capability_browse_query(query)
+        registered = self._registry.all()
+        candidates = (
+            tuple(
+                item
+                for item in registered
+                if item.descriptor.name in self._allowed_capabilities
             )
-            if item.descriptor.name in available
-        )[:limit]
+            if browse
+            else tuple(
+                item
+                for item in self._registry.search(
+                    query,
+                    limit=max(1, len(registered)),
+                )
+                if item.descriptor.name in self._allowed_capabilities
+            )
+        )
+        available_matches: list[Any] = []
+        unavailable_reason_counts: dict[str, int] = {}
+        candidate_names = {item.descriptor.name for item in candidates}
+        if browse:
+            candidate_names.update(self._allowed_capabilities)
+        for capability_name in sorted(candidate_names):
+            reason = self._unavailable_reason(capability_name, context)
+            if reason is not None:
+                unavailable_reason_counts[reason] = (
+                    unavailable_reason_counts.get(reason, 0) + 1
+                )
+        for item in candidates:
+            if self._unavailable_reason(item.descriptor.name, context) is None:
+                self._validated_endpoint(item.descriptor.name, context)
+                available_matches.append(item)
+        page = available_matches[offset : offset + limit]
+        next_offset = offset + len(page)
+        has_more = next_offset < len(available_matches)
         payload = {
             "query": query,
+            "browse": browse,
+            "offset": offset,
             "matches": [
                 {
                     "name": item.descriptor.name,
@@ -258,10 +443,18 @@ class AgentToolCatalog:
                     "metadata": _descriptor_metadata(item.descriptor),
                     "input_schema": _dataclass_schema(item.request_type),
                 }
-                for item in matches
+                for item in page
             ],
+            "next_offset": next_offset if has_more else None,
+            "has_more": has_more,
+            "total_results": len(available_matches),
+            "unavailable_reason_counts": unavailable_reason_counts,
         }
-        return _bounded_json(payload, max_output_characters=max_output_characters)
+        return _bounded_json(
+            payload,
+            max_output_characters=max_output_characters,
+            request={"offset": offset},
+        )
 
     async def _invoke_discovered(
         self,
@@ -272,7 +465,11 @@ class AgentToolCatalog:
     ) -> AgentToolOutput:
         if not isinstance(arguments, dict):
             raise AgentToolError("Capability invocation arguments must be an object.")
-        unknown = set(arguments) - {"name", "arguments"}
+        unknown = set(arguments) - {
+            "name",
+            "arguments",
+            _AUTHORIZATION_EVENT_ID,
+        }
         if unknown:
             raise AgentToolError(
                 f"Unknown capability invocation fields: {', '.join(sorted(unknown))}"
@@ -305,6 +502,24 @@ class AgentToolCatalog:
         endpoint = self._validated_endpoint(capability_name, context)
         request = _build_dataclass(endpoint.request_type, arguments)
         result = await self._registry.invoke(capability_name, request, context)
+        receipt: ActionReceipt | None = None
+        if (
+            self._action_receipts is not None
+            and capability_name in self._write_capabilities
+        ):
+            try:
+                receipt = await self._action_receipts.record(
+                    capability=capability_name,
+                    request=request,
+                    response=result,
+                    context=context,
+                )
+            except Exception:
+                log.exception(
+                    "Action receipt recording failed capability=%s request_id=%s",
+                    capability_name,
+                    context.request_id,
+                )
         if capability_name in self._image_output_capabilities:
             if not dataclasses.is_dataclass(result):
                 raise AgentToolError("Image capability returned an invalid record.")
@@ -319,12 +534,23 @@ class AgentToolCatalog:
                 )
                 for field in dataclasses.fields(cast(Any, result))
             }
+            if receipt is not None:
+                visible["action_receipt"] = receipt
             return AgentToolOutput(
-                _bounded_json(visible, max_output_characters=max_output_characters),
+                _bounded_json(
+                    visible,
+                    max_output_characters=max_output_characters,
+                    request=request,
+                ),
                 image_url=image_url,
             )
+        visible_result = _with_action_receipt(result, receipt)
         return AgentToolOutput(
-            _bounded_json(result, max_output_characters=max_output_characters)
+            _bounded_json(
+                visible_result,
+                max_output_characters=max_output_characters,
+                request=request,
+            )
         )
 
     def _is_available(
@@ -332,22 +558,39 @@ class AgentToolCatalog:
         capability_name: str,
         context: InvocationContext | None,
     ) -> bool:
+        return self._unavailable_reason(capability_name, context) is None
+
+    def _unavailable_reason(
+        self,
+        capability_name: str,
+        context: InvocationContext | None,
+    ) -> str | None:
+        """Return a coarse availability bucket without exposing endpoint metadata."""
+
         required_grant = self._required_grants.get(capability_name)
         has_grant = required_grant is None or (
             context is not None and required_grant in context.grants
         )
         if not has_grant:
-            return False
-        descriptor = self._registry.endpoint(capability_name).descriptor
+            return "missing_grant"
+        try:
+            descriptor = self._registry.endpoint(capability_name).descriptor
+        except CapabilityError:
+            # Discord transport endpoints are attached after the core runtime is built.
+            return "endpoint_unregistered"
         if descriptor.requires_workspace and (
             context is None or context.workspace_id is None
         ):
-            return False
+            return "workspace_required"
         if descriptor.approval is ApprovalMode.NEVER:
-            return True
+            return None
         if descriptor.approval is ApprovalMode.WHEN_REQUESTED:
-            return context is not None and capability_name in context.approvals
-        return False
+            return (
+                None
+                if context is not None and capability_name in context.approvals
+                else "approval_required"
+            )
+        return "approval_required"
 
     def _validated_endpoint(
         self,
@@ -368,15 +611,27 @@ class AgentToolCatalog:
             raise AgentToolError(
                 f"Agent catalog lacks turn approval for {capability_name}."
             )
-        if descriptor.risk is RiskLevel.DESTRUCTIVE:
+        if (
+            capability_name in self._destructive_capabilities
+            and descriptor.risk is not RiskLevel.DESTRUCTIVE
+        ):
             raise AgentToolError(
-                f"Agent catalog cannot expose destructive {capability_name}."
+                "Agent destructive policy does not match capability risk metadata: "
+                f"{capability_name}."
+            )
+        if descriptor.risk is RiskLevel.DESTRUCTIVE and (
+            capability_name not in self._destructive_capabilities
+            or capability_name not in self._write_capabilities
+            or required_grant is None
+        ):
+            raise AgentToolError(
+                f"Agent catalog cannot expose unmanaged destructive {capability_name}."
             )
         if descriptor.risk is RiskLevel.EXTERNAL and required_grant is None:
             raise AgentToolError(
                 f"Agent external catalog requires a grant for {capability_name}."
             )
-        if descriptor.risk is RiskLevel.WRITE and (
+        if descriptor.risk in {RiskLevel.WRITE, RiskLevel.DESTRUCTIVE} and (
             capability_name not in self._write_capabilities or required_grant is None
         ):
             raise AgentToolError(
@@ -431,17 +686,40 @@ def _search_spec() -> Mapping[str, object]:
     return {
         "type": "function",
         "name": _SEARCH_TOOL,
-        "description": "Find a small relevant set of available Simajilord capabilities.",
+        "description": (
+            "Search available Simajilord capabilities, or browse them with an empty/general "
+            "ability query. Follow next_offset until has_more is false. Unavailable tools "
+            "are reported only as coarse reason counts; their names and schemas stay hidden."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Concrete verb plus object, such as '過去メッセージを検索' or "
+                        "'assign a role'. Use empty text or a general ability question "
+                        "to browse the available catalog."
+                    ),
+                    "default": "",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": _MAX_CAPABILITY_SEARCH_OFFSET,
+                    "default": 0,
+                    "description": "Copy next_offset from the previous result page.",
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 5},
             },
-            "required": ["query"],
             "additionalProperties": False,
         },
     }
+
+
+def _is_capability_browse_query(query: str) -> bool:
+    normalized = normalize_search_text(query)
+    return not normalized or normalized in _CAPABILITY_BROWSE_QUERIES
 
 
 def _invoke_spec() -> Mapping[str, object]:
@@ -454,6 +732,13 @@ def _invoke_spec() -> Mapping[str, object]:
             "properties": {
                 "name": {"type": "string"},
                 "arguments": {"type": "object"},
+                _AUTHORIZATION_EVENT_ID: {
+                    "type": "string",
+                    "description": (
+                        "Required for a write: the exact Simajilord event ID whose "
+                        "actor is authorizing this action."
+                    ),
+                },
             },
             "required": ["name", "arguments"],
             "additionalProperties": False,
@@ -466,6 +751,19 @@ def _tool_alias(capability_name: str) -> str:
     if not alias or len(alias) > 128 or not alias.replace("_", "").isalnum():
         raise AgentToolError(f"Capability name cannot become a dynamic tool: {capability_name}")
     return alias
+
+
+def _duplicates(values: Sequence[str]) -> tuple[str, ...]:
+    """Return stable duplicate names before aliases silently shadow a policy entry."""
+
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        else:
+            seen.add(value)
+    return tuple(sorted(duplicates))
 
 
 def _dataclass_schema(model: type[Any]) -> Mapping[str, object]:
@@ -491,6 +789,44 @@ def _dataclass_schema(model: type[Any]) -> Mapping[str, object]:
     if required:
         schema["required"] = required
     return schema
+
+
+def _tool_input_schema(
+    model: type[Any],
+    *,
+    write: bool,
+) -> Mapping[str, object]:
+    schema = dict(_dataclass_schema(model))
+    if not write:
+        return schema
+    properties = dict(cast(Mapping[str, object], schema["properties"]))
+    if _AUTHORIZATION_EVENT_ID in properties:
+        raise AgentToolError(
+            f"{model.__name__} shadows the reserved "
+            f"{_AUTHORIZATION_EVENT_ID} field."
+        )
+    properties[_AUTHORIZATION_EVENT_ID] = {
+        "type": "string",
+        "description": (
+            "The exact Simajilord event ID whose actor is authorizing this write. "
+            "Read its Discord message completely before acting when it has one."
+        ),
+    }
+    schema["properties"] = properties
+    required = list(cast(Sequence[str], schema.get("required", ())))
+    required.append(_AUTHORIZATION_EVENT_ID)
+    schema["required"] = required
+    return schema
+
+
+def _without_authorization_event_id(arguments: object) -> object:
+    if not isinstance(arguments, dict) or _AUTHORIZATION_EVENT_ID not in arguments:
+        return arguments
+    return {
+        key: value
+        for key, value in arguments.items()
+        if key != _AUTHORIZATION_EVENT_ID
+    }
 
 
 def _annotation_schema(annotation: object) -> Mapping[str, object]:
@@ -603,27 +939,535 @@ def _convert_value(value: object, annotation: object) -> object:
     raise TypeError(f"Unsupported value type: {annotation!r}")
 
 
-def _bounded_json(value: object, *, max_output_characters: int) -> str:
+def _bounded_json(
+    value: object,
+    *,
+    max_output_characters: int,
+    request: object | None = None,
+) -> str:
     if max_output_characters < 200:
         raise AgentToolError("Dynamic tool output budget is too small.")
-    encoded = json.dumps(
-        _json_value(value),
+    normalized = _json_value(value)
+    encoded = _encode_json(normalized)
+    if len(encoded) <= max_output_characters:
+        return encoded
+    if isinstance(normalized, Mapping):
+        mapping = {str(key): item for key, item in normalized.items()}
+        for key in _CONTENT_RESULT_KEYS:
+            if isinstance(mapping.get(key), str):
+                return _bounded_content_mapping(
+                    mapping,
+                    content_key=key,
+                    request=request,
+                    max_output_characters=max_output_characters,
+                )
+        list_key = _primary_result_list_key(mapping)
+        if list_key is not None:
+            return _bounded_list_mapping(
+                mapping,
+                list_key=list_key,
+                request=request,
+                max_output_characters=max_output_characters,
+            )
+    return _bounded_structured_value(
+        normalized,
+        max_output_characters=max_output_characters,
+    )
+
+
+def _bounded_content_mapping(
+    value: Mapping[str, object],
+    *,
+    content_key: str,
+    request: object | None,
+    max_output_characters: int,
+) -> str:
+    original_content = value[content_key]
+    assert isinstance(original_content, str)
+    payload = _shallow_result_payload(value, excluded={content_key})
+    payload[content_key] = ""
+    offset_value = value.get("offset")
+    if not isinstance(offset_value, int) or isinstance(offset_value, bool):
+        offset_value = _request_integer(request, "offset")
+    has_offset_continuation = (
+        offset_value is not None
+        and ("next_offset" in value or _request_has_field(request, "offset"))
+    )
+    protected = {
+        "truncated",
+        "reason",
+        content_key,
+        *(
+            ("offset", "next_offset", "complete")
+            if has_offset_continuation
+            else ()
+        ),
+    }
+    payload = _drop_optional_fields_to_fit(
+        payload,
+        protected=protected,
+        max_output_characters=max_output_characters,
+    )
+
+    def candidate(visible_characters: int) -> dict[str, object]:
+        result = dict(payload)
+        result[content_key] = original_content[:visible_characters]
+        if visible_characters < len(original_content):
+            if has_offset_continuation:
+                assert offset_value is not None
+                result["offset"] = offset_value
+                result["next_offset"] = offset_value + visible_characters
+                result["complete"] = False
+                if "next_page" in result:
+                    # Finish the selected page chunk before advancing to a later page.
+                    result["next_page"] = None
+            result["content_truncated"] = True
+        return result
+
+    best = candidate(0)
+    if len(_encode_json(best)) > max_output_characters:
+        minimal: dict[str, object] = {
+            "truncated": True,
+            "reason": "agent_tool_output_budget",
+            content_key: "",
+        }
+        if has_offset_continuation:
+            assert offset_value is not None
+            minimal.update(
+                {
+                    "offset": offset_value,
+                    "next_offset": offset_value,
+                    "complete": False,
+                }
+            )
+        payload = minimal
+        best = candidate(0)
+    lower = 0
+    upper = len(original_content)
+    while lower <= upper:
+        midpoint = (lower + upper) // 2
+        proposed = candidate(midpoint)
+        if len(_encode_json(proposed)) <= max_output_characters:
+            best = proposed
+            lower = midpoint + 1
+        else:
+            upper = midpoint - 1
+    if (
+        original_content
+        and not best[content_key]
+        and has_offset_continuation
+    ):
+        # A supported budget always has room for progress once optional metadata is gone.
+        one_character = candidate(1)
+        if len(_encode_json(one_character)) <= max_output_characters:
+            best = one_character
+    return _encode_json(best)
+
+
+def _bounded_list_mapping(
+    value: Mapping[str, object],
+    *,
+    list_key: str,
+    request: object | None,
+    max_output_characters: int,
+) -> str:
+    original_items = value[list_key]
+    assert isinstance(original_items, list)
+    payload = _shallow_result_payload(value, excluded={list_key})
+    payload[list_key] = []
+    mode = _list_continuation_mode(value, request)
+    base_offset = _request_integer(request, "offset")
+    if base_offset is None:
+        response_offset = value.get("offset")
+        if isinstance(response_offset, int) and not isinstance(response_offset, bool):
+            base_offset = response_offset
+    protected = {"truncated", "reason", list_key}
+    if mode == "offset":
+        protected.update(("offset", "next_offset", "complete"))
+    elif mode == "before":
+        protected.update(("next_before_message_id", "has_more", "complete"))
+    elif mode == "after":
+        protected.update(("next_after_message_id", "has_more", "complete"))
+    elif mode == "cursor":
+        protected.update(("next_cursor", "has_more", "complete"))
+    payload = _drop_optional_fields_to_fit(
+        payload,
+        protected=protected,
+        max_output_characters=max_output_characters,
+    )
+
+    def selected(count: int, *, compact: bool = False) -> list[object]:
+        if count <= 0:
+            return []
+        timestamp_desc = (
+            mode == "before"
+            and _request_text(request, "sort_by") == "timestamp"
+            and _request_text(request, "sort_order") == "desc"
+        )
+        items = (
+            original_items[-count:]
+            if mode == "before" and not timestamp_desc
+            else original_items[:count]
+        )
+        if not compact:
+            return list(items)
+        return [
+            _compact_json_value(item, string_limit=96, list_limit=4, depth=0)[0]
+            for item in items
+        ]
+
+    def candidate(items: list[object]) -> dict[str, object]:
+        result = dict(payload)
+        result[list_key] = items
+        hidden_items = len(items) < len(original_items)
+        if hidden_items:
+            result["complete"] = False
+            result["has_more"] = True
+            if mode == "offset":
+                start = base_offset or 0
+                result["offset"] = start
+                result["next_offset"] = start + len(items)
+                if "next_before_message_id" in result:
+                    result["next_before_message_id"] = None
+                if "next_after_message_id" in result:
+                    result["next_after_message_id"] = None
+            elif mode == "before":
+                if "next_offset" in result:
+                    result["next_offset"] = None
+                if "next_after_message_id" in result:
+                    result["next_after_message_id"] = None
+                timestamp_desc = (
+                    _request_text(request, "sort_by") == "timestamp"
+                    and _request_text(request, "sort_order") == "desc"
+                )
+                boundary = _message_boundary(items, first=not timestamp_desc)
+                if boundary is not None:
+                    result["next_before_message_id"] = boundary
+            elif mode == "after":
+                if "next_offset" in result:
+                    result["next_offset"] = None
+                if "next_before_message_id" in result:
+                    result["next_before_message_id"] = None
+                boundary = _message_boundary(items, first=False)
+                if boundary is not None:
+                    result["next_after_message_id"] = boundary
+            elif mode == "cursor":
+                result["next_offset"] = None
+                result["next_cursor"] = None
+                retry_arguments: dict[str, object] = {
+                    "limit": max(1, len(items)),
+                }
+                request_cursor = _request_text(request, "cursor")
+                if request_cursor is not None:
+                    retry_arguments["cursor"] = request_cursor
+                result["continuation_retry_required"] = True
+                result["continuation_retry"] = {
+                    "use_same_arguments": True,
+                    "replace": retry_arguments,
+                }
+            result["items_truncated"] = True
+        return result
+
+    best = candidate([])
+    for count in range(1, len(original_items) + 1):
+        proposed = candidate(selected(count))
+        if len(_encode_json(proposed)) > max_output_characters:
+            break
+        best = proposed
+    if not best[list_key] and original_items:
+        compact_item = selected(1, compact=True)
+        proposed = candidate(compact_item)
+        if len(_encode_json(proposed)) <= max_output_characters:
+            best = proposed
+        else:
+            projected_item = (
+                _capability_match_projection(
+                    selected(1)[0]
+                )
+                if list_key == "matches"
+                else _identity_projection(compact_item[0])
+            )
+            proposed = candidate([projected_item])
+            if len(_encode_json(proposed)) <= max_output_characters:
+                best = proposed
+    if len(_encode_json(best)) <= max_output_characters:
+        return _encode_json(best)
+    return _bounded_structured_value(
+        {
+            "truncated": True,
+            "reason": "agent_tool_output_budget",
+            list_key: [],
+        },
+        max_output_characters=max_output_characters,
+    )
+
+
+def _bounded_structured_value(
+    value: object,
+    *,
+    max_output_characters: int,
+) -> str:
+    for string_limit, list_limit in (
+        (512, 20),
+        (256, 10),
+        (128, 5),
+        (64, 2),
+        (32, 1),
+    ):
+        compact, _changed = _compact_json_value(
+            value,
+            string_limit=string_limit,
+            list_limit=list_limit,
+            depth=0,
+        )
+        payload = (
+            dict(compact)
+            if isinstance(compact, Mapping)
+            else {"value": compact}
+        )
+        payload["truncated"] = True
+        payload["reason"] = "agent_tool_output_budget"
+        encoded = _encode_json(payload)
+        if len(encoded) <= max_output_characters:
+            return encoded
+    return _encode_json(
+        {
+            "truncated": True,
+            "reason": "agent_tool_output_budget",
+            "result_omitted": True,
+        }
+    )
+
+
+def _shallow_result_payload(
+    value: Mapping[str, object],
+    *,
+    excluded: set[str],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "truncated": True,
+        "reason": "agent_tool_output_budget",
+    }
+    for key, item in value.items():
+        if key in excluded:
+            continue
+        if item is None or isinstance(item, (bool, int, float)):
+            payload[key] = item
+            continue
+        if isinstance(item, str):
+            payload[key] = item if len(item) <= 512 else item[:511] + "…"
+            continue
+        if len(_encode_json(item)) <= 512:
+            payload[key] = item
+    return payload
+
+
+def _drop_optional_fields_to_fit(
+    payload: dict[str, object],
+    *,
+    protected: set[str],
+    max_output_characters: int,
+) -> dict[str, object]:
+    bounded = dict(payload)
+    while len(_encode_json(bounded)) > max_output_characters:
+        optional = [key for key in bounded if key not in protected]
+        if not optional:
+            break
+        selected = max(optional, key=lambda key: len(_encode_json(bounded[key])))
+        bounded.pop(selected)
+    return bounded
+
+
+def _compact_json_value(
+    value: object,
+    *,
+    string_limit: int,
+    list_limit: int,
+    depth: int,
+) -> tuple[object, bool]:
+    if isinstance(value, str):
+        if len(value) <= string_limit:
+            return value, False
+        return value[: max(1, string_limit - 1)] + "…", True
+    if isinstance(value, Mapping):
+        compact: dict[str, object] = {}
+        changed = False
+        for key, item in value.items():
+            compact_item, item_changed = _compact_json_value(
+                item,
+                string_limit=string_limit,
+                list_limit=list_limit,
+                depth=depth + 1,
+            )
+            compact[str(key)] = compact_item
+            changed = changed or item_changed
+        if changed and depth > 0:
+            compact["_output_truncated"] = True
+        return compact, changed
+    if isinstance(value, list):
+        shown = value[:list_limit]
+        compact_items: list[object] = []
+        changed = len(shown) < len(value)
+        for item in shown:
+            compact_item, item_changed = _compact_json_value(
+                item,
+                string_limit=string_limit,
+                list_limit=list_limit,
+                depth=depth + 1,
+            )
+            compact_items.append(compact_item)
+            changed = changed or item_changed
+        return compact_items, changed
+    return value, False
+
+
+def _identity_projection(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    projected = {
+        str(key): item
+        for key, item in value.items()
+        if (
+            str(key) in _RESULT_IDENTITY_KEYS
+            or str(key) in {"name", "title", "risk"}
+            or str(key).endswith("_id")
+        )
+        and (item is None or isinstance(item, (str, bool, int, float)))
+    }
+    projected["_output_truncated"] = True
+    return projected
+
+
+def _capability_match_projection(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    return {
+        key: _without_schema_descriptions(item)
+        for key, item in value.items()
+        if key in {"name", "risk", "input_schema"}
+    }
+
+
+def _without_schema_descriptions(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _without_schema_descriptions(item)
+            for key, item in value.items()
+            if str(key) != "description"
+        }
+    if isinstance(value, list):
+        return [_without_schema_descriptions(item) for item in value]
+    return value
+
+
+def _primary_result_list_key(value: Mapping[str, object]) -> str | None:
+    for key in (
+        "matches",
+        "messages",
+        "files",
+        "servers",
+        "channels",
+        "sources",
+        "items",
+        "timers",
+        "events",
+        "jobs",
+        "results",
+        "links",
+    ):
+        if isinstance(value.get(key), list):
+            return key
+    return next(
+        (str(key) for key, item in value.items() if isinstance(item, list)),
+        None,
+    )
+
+
+def _list_continuation_mode(
+    value: Mapping[str, object],
+    request: object | None,
+) -> Literal["offset", "before", "after", "cursor", "none"]:
+    sort_by = _request_text(request, "sort_by")
+    sort_order = _request_text(request, "sort_order")
+    if sort_by == "relevance":
+        if (
+            value.get("cursor_pagination") is True
+            or _request_text(request, "cursor") is not None
+            or isinstance(value.get("next_cursor"), str)
+        ):
+            return "cursor"
+        if "next_offset" in value:
+            return "offset"
+    if sort_by == "timestamp":
+        if "next_after_message_id" in value and sort_order == "asc":
+            return "after"
+        if "next_before_message_id" in value:
+            return "before"
+    if sort_by is None:
+        if "next_offset" in value and _request_has_field(request, "offset"):
+            return "offset"
+        if "next_before_message_id" in value:
+            return "before"
+        if "next_after_message_id" in value:
+            return "after"
+    return "none"
+
+
+def _message_boundary(items: list[object], *, first: bool) -> str | None:
+    if not items:
+        return None
+    selected = items[0] if first else items[-1]
+    if not isinstance(selected, Mapping):
+        return None
+    message_id = selected.get("message_id")
+    return message_id if isinstance(message_id, str) and message_id else None
+
+
+def _request_has_field(request: object | None, field_name: str) -> bool:
+    if isinstance(request, Mapping):
+        return field_name in request
+    return request is not None and hasattr(request, field_name)
+
+
+def _request_integer(request: object | None, field_name: str) -> int | None:
+    value = (
+        request.get(field_name)
+        if isinstance(request, Mapping)
+        else getattr(request, field_name, None)
+    )
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _request_text(request: object | None, field_name: str) -> str | None:
+    value = (
+        request.get(field_name)
+        if isinstance(request, Mapping)
+        else getattr(request, field_name, None)
+    )
+    return value if isinstance(value, str) else None
+
+
+def _encode_json(value: object) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     )
-    if len(encoded) <= max_output_characters:
-        return encoded
-    wrapper = json.dumps(
-        {
-            "truncated": True,
-            "reason": "agent_tool_output_budget",
-            "preview": encoded[: max_output_characters - 120],
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return wrapper[:max_output_characters]
+
+
+def _continuation_metadata(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    metadata: dict[str, object] = {}
+    for key in _CONTINUATION_METADATA_KEYS:
+        if key not in value:
+            continue
+        item = value[key]
+        if item is None or isinstance(item, (str, bool, int)):
+            metadata[key] = item
+    return metadata
 
 
 def _json_value(value: object) -> object:
@@ -642,6 +1486,34 @@ def _json_value(value: object) -> object:
         return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
-    if value is None or isinstance(value, (str, bool, int, float)):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if value is None or isinstance(value, (str, bool, int)):
         return value
     return repr(value)
+
+
+def _with_action_receipt(
+    result: object,
+    receipt: ActionReceipt | None,
+) -> object:
+    """Add receipt metadata while preserving every existing top-level result field."""
+
+    if receipt is None:
+        return result
+    if dataclasses.is_dataclass(result) and not isinstance(result, type):
+        visible = {
+            field.name: getattr(result, field.name)
+            for field in dataclasses.fields(result)
+        }
+        if "action_receipt" in visible:
+            raise AgentToolError("Capability response shadows action_receipt.")
+        visible["action_receipt"] = receipt
+        return visible
+    if isinstance(result, Mapping):
+        visible = dict(result)
+        if "action_receipt" in visible:
+            raise AgentToolError("Capability response shadows action_receipt.")
+        visible["action_receipt"] = receipt
+        return visible
+    return {"result": result, "action_receipt": receipt}

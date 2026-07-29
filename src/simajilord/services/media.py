@@ -13,7 +13,12 @@ from time import monotonic
 from typing import Protocol, TypeVar, cast
 
 from simajilord.domain.audio import AudioItem
-from simajilord.domain.media import DownloadArtifact, DownloadFormat, MediaCandidate
+from simajilord.domain.media import (
+    DownloadArtifact,
+    DownloadBatch,
+    DownloadFormat,
+    MediaCandidate,
+)
 
 from .metrics import ServiceMetricHook, ServiceOperationMetric
 
@@ -55,6 +60,16 @@ class MediaProvider(Protocol):
         *,
         max_bytes: int,
     ) -> DownloadArtifact: ...
+
+    async def download_many(
+        self,
+        url: str,
+        media_type: DownloadFormat,
+        destination: Path,
+        *,
+        max_bytes: int,
+        max_items: int,
+    ) -> DownloadBatch: ...
 
 
 @dataclass(slots=True)
@@ -347,6 +362,32 @@ class MediaService:
                 media_type,
                 destination,
                 max_bytes=max_bytes,
+            ),
+        )
+
+    async def download_many(
+        self,
+        url: str,
+        media_type: DownloadFormat,
+        destination: Path,
+        *,
+        max_bytes: int,
+        max_items: int,
+        workspace_id: str = "system",
+        priority: MediaPriority = MediaPriority.NORMAL,
+    ) -> DownloadBatch:
+        if not 1 <= max_items <= 10:
+            raise ValueError("max_items must be between 1 and 10")
+        return await self._run(
+            workspace_id=workspace_id,
+            priority=priority,
+            operation_name="download",
+            operation=lambda: self.provider.download_many(
+                url,
+                media_type,
+                destination,
+                max_bytes=max_bytes,
+                max_items=max_items,
             ),
         )
 

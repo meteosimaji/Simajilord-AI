@@ -23,6 +23,11 @@ from .audio import (
     AudioVolumeRequest,
     build_audio_endpoints,
 )
+from .compute import (
+    ComputeRunRequest,
+    FileDownloadUrlRequest,
+    build_compute_endpoints,
+)
 from .files import build_file_endpoints
 from .focus_timer import (
     FocusTimerCancelRequest,
@@ -40,7 +45,14 @@ from .image import (
     ImageStatusResponse,
     build_image_endpoints,
 )
-from .media import DownloadRequest, DownloadResponse, build_download_endpoint
+from .media import (
+    DownloadRequest,
+    DownloadResponse,
+    MediaSaveRequest,
+    MediaSaveResponse,
+    build_download_endpoint,
+    build_media_save_endpoint,
+)
 from .moderation import (
     ModerationStatusRequest,
     ModerationStatusResponse,
@@ -123,8 +135,10 @@ __all__ = [
     "CapabilitySearchResponse",
     "ChooseRequest",
     "ChooseResponse",
+    "ComputeRunRequest",
     "DownloadRequest",
     "DownloadResponse",
+    "FileDownloadUrlRequest",
     "FocusTimerCancelRequest",
     "FocusTimerCreateRequest",
     "FocusTimerItem",
@@ -135,6 +149,8 @@ __all__ = [
     "ImageGenerateResponse",
     "ImageStatusRequest",
     "ImageStatusResponse",
+    "MediaSaveRequest",
+    "MediaSaveResponse",
     "ModerationStatusRequest",
     "ModerationStatusResponse",
     "PingRequest",
@@ -165,10 +181,12 @@ __all__ = [
     "WebStatusRequest",
     "WebStatusResponse",
     "build_audio_endpoints",
+    "build_compute_endpoints",
     "build_download_endpoint",
     "build_file_endpoints",
     "build_focus_timer_endpoints",
     "build_image_endpoints",
+    "build_media_save_endpoint",
     "build_moderation_endpoints",
     "build_read_aloud_endpoint",
     "build_read_aloud_policy_endpoints",

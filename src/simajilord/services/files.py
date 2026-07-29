@@ -7,7 +7,10 @@ import io
 import os
 import re
 import tempfile
+import threading
 import zipfile
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -32,6 +35,20 @@ _TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
+_MEDIA_KINDS = {
+    ".aac": "audio/aac",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".oga": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".wav": "audio/wav",
+    ".webm": "video/webm",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +69,9 @@ class WorkspaceReadResult:
     offset: int
     next_offset: int | None
     complete: bool
+    page_start: int | None = None
+    next_page: int | None = None
+    total_pages: int | None = None
 
 
 class AgentFileSandbox:
@@ -69,10 +89,19 @@ class AgentFileSandbox:
         self.max_file_bytes = max_file_bytes
         self.max_workspace_bytes = max_workspace_bytes
         self.max_files = max_files
+        self._lock_guard = threading.Lock()
+        self._workspace_locks: dict[str, threading.RLock] = {}
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
 
     def list(self, workspace_id: str) -> tuple[WorkspaceFileRecord, ...]:
+        with self.locked_workspace(workspace_id):
+            return self._list_unlocked(workspace_id)
+
+    def _list_unlocked(
+        self,
+        workspace_id: str,
+    ) -> tuple[WorkspaceFileRecord, ...]:
         scope = self._scope(workspace_id)
         records: list[WorkspaceFileRecord] = []
         for path in sorted(scope.rglob("*")):
@@ -89,17 +118,109 @@ class AgentFileSandbox:
         relative_path: str,
         content: bytes,
     ) -> WorkspaceFileRecord:
+        with self.locked_workspace(workspace_id):
+            return self._import_bytes_unlocked(
+                workspace_id,
+                relative_path,
+                content,
+            )
+
+    def import_batch(
+        self,
+        workspace_id: str,
+        files: Sequence[tuple[str, bytes]],
+    ) -> tuple[WorkspaceFileRecord, ...]:
+        """Atomically validate and import a bounded group of generated files."""
+
+        if not files:
+            return ()
+        paths = [path for path, _content in files]
+        if len(set(paths)) != len(paths):
+            raise UserError("files.path_conflict")
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            current = {
+                record.path: record
+                for record in self._list_unlocked(workspace_id)
+            }
+            prospective = dict(current)
+            for relative_path, content in files:
+                if len(content) > self.max_file_bytes:
+                    raise UserError("files.file_too_large")
+                destination = self._path(scope, relative_path)
+                prospective[relative_path] = WorkspaceFileRecord(
+                    path=relative_path,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    kind=workspace_file_kind(destination, content),
+                )
+            if len(prospective) > self.max_files:
+                raise UserError("files.file_count_limit")
+            if (
+                sum(record.size_bytes for record in prospective.values())
+                > self.max_workspace_bytes
+            ):
+                raise UserError("files.workspace_quota")
+
+            previous = {
+                relative_path: (
+                    self._path(scope, relative_path).read_bytes()
+                    if relative_path in current
+                    else None
+                )
+                for relative_path in paths
+            }
+            committed: list[WorkspaceFileRecord] = []
+            try:
+                for relative_path, content in files:
+                    committed.append(
+                        self._replace_bytes_unlocked(
+                            scope,
+                            relative_path,
+                            content,
+                        )
+                    )
+            except Exception:
+                for relative_path in reversed(paths):
+                    prior_content = previous[relative_path]
+                    destination = self._path(scope, relative_path)
+                    if prior_content is None:
+                        destination.unlink(missing_ok=True)
+                    else:
+                        self._replace_bytes_unlocked(
+                            scope,
+                            relative_path,
+                            prior_content,
+                        )
+                raise
+            return tuple(committed)
+
+    def _import_bytes_unlocked(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        content: bytes,
+    ) -> WorkspaceFileRecord:
         if len(content) > self.max_file_bytes:
             raise UserError("files.file_too_large")
         scope = self._scope(workspace_id)
         destination = self._path(scope, relative_path)
         existing_size = destination.stat().st_size if destination.exists() else 0
-        files = self.list(workspace_id)
+        files = self._list_unlocked(workspace_id)
         if not destination.exists() and len(files) >= self.max_files:
             raise UserError("files.file_count_limit")
         used = sum(item.size_bytes for item in files)
         if used - existing_size + len(content) > self.max_workspace_bytes:
             raise UserError("files.workspace_quota")
+        return self._replace_bytes_unlocked(scope, relative_path, content)
+
+    def _replace_bytes_unlocked(
+        self,
+        scope: Path,
+        relative_path: str,
+        content: bytes,
+    ) -> WorkspaceFileRecord:
+        destination = self._path(scope, relative_path)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._assert_no_symlinks(scope, destination)
         with tempfile.NamedTemporaryFile(
@@ -127,10 +248,15 @@ class AgentFileSandbox:
     ) -> WorkspaceFileRecord:
         if "\x00" in content:
             raise UserError("files.text_invalid")
-        scope = self._scope(workspace_id)
-        destination = self._path(scope, relative_path)
-        self._check_expected_hash(destination, expected_sha256)
-        return self.import_bytes(workspace_id, relative_path, content.encode("utf-8"))
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            destination = self._path(scope, relative_path)
+            self._check_expected_hash(destination, expected_sha256)
+            return self._import_bytes_unlocked(
+                workspace_id,
+                relative_path,
+                content.encode("utf-8"),
+            )
 
     def replace_text(
         self,
@@ -143,31 +269,49 @@ class AgentFileSandbox:
     ) -> WorkspaceFileRecord:
         if not old:
             raise UserError("files.replace_old_empty")
-        scope = self._scope(workspace_id)
-        path = self._path(scope, relative_path)
-        self._assert_regular_file(path)
-        data = path.read_bytes()
-        if len(data) > 200_000:
-            raise UserError("files.text_too_large_to_edit")
-        try:
-            content = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise UserError("files.text_encoding_unsupported") from exc
-        current_sha256 = hashlib.sha256(data).hexdigest()
-        if current_sha256 != expected_sha256:
-            raise UserError("files.hash_conflict")
-        occurrences = content.count(old)
-        if occurrences != 1:
-            raise UserError(
-                "files.replace_not_unique",
-                occurrences=occurrences,
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            path = self._path(scope, relative_path)
+            self._assert_regular_file(path)
+            data = path.read_bytes()
+            if len(data) > 200_000:
+                raise UserError("files.text_too_large_to_edit")
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise UserError("files.text_encoding_unsupported") from exc
+            current_sha256 = hashlib.sha256(data).hexdigest()
+            if current_sha256 != expected_sha256:
+                raise UserError("files.hash_conflict")
+            occurrences = content.count(old)
+            if occurrences != 1:
+                raise UserError(
+                    "files.replace_not_unique",
+                    occurrences=occurrences,
+                )
+            return self.write_text(
+                workspace_id,
+                relative_path,
+                content.replace(old, new, 1),
+                expected_sha256=expected_sha256,
             )
-        return self.write_text(
-            workspace_id,
-            relative_path,
-            content.replace(old, new, 1),
-            expected_sha256=expected_sha256,
-        )
+
+    @contextmanager
+    def locked_workspace(self, workspace_id: str) -> Iterator[None]:
+        """Serialize quota, CAS, and commit decisions for one workspace."""
+
+        lock = self._workspace_lock(workspace_id)
+        with lock:
+            yield
+
+    def _workspace_lock(self, workspace_id: str) -> threading.RLock:
+        if not workspace_id or len(workspace_id) > 200:
+            raise UserError("files.workspace_invalid")
+        with self._lock_guard:
+            return self._workspace_locks.setdefault(
+                workspace_id,
+                threading.RLock(),
+            )
 
     def read(
         self,
@@ -176,18 +320,50 @@ class AgentFileSandbox:
         *,
         offset: int,
         max_characters: int,
+        page_start: int = 1,
+        page_count: int = 5,
     ) -> WorkspaceReadResult:
         if offset < 0 or not 1 <= max_characters <= 20_000:
             raise UserError("files.read_range_invalid")
+        if page_start < 1 or not 1 <= page_count <= 20:
+            raise UserError("files.page_range_invalid")
         scope = self._scope(workspace_id)
         path = self._path(scope, relative_path)
         self._assert_regular_file(path)
         data = path.read_bytes()
-        kind = _kind(path, data)
-        content = _inspect_content(path, data, kind)
+        kind = workspace_file_kind(path, data)
+        total_pages: int | None = None
+        selected_page_start: int | None = None
+        selected_page_end: int | None = None
+        if kind == "pdf":
+            (
+                content,
+                total_pages,
+                selected_page_start,
+                selected_page_end,
+            ) = _pdf_text(
+                data,
+                page_start=page_start,
+                page_count=page_count,
+            )
+        else:
+            if page_start != 1 or page_count != 5:
+                raise UserError("files.page_range_unsupported")
+            content = _inspect_content(path, data, kind)
         if offset > len(content):
             raise UserError("files.read_range_invalid")
         end = min(len(content), offset + max_characters)
+        next_offset = end if end < len(content) else None
+        next_page = (
+            selected_page_end + 1
+            if (
+                next_offset is None
+                and selected_page_end is not None
+                and total_pages is not None
+                and selected_page_end < total_pages
+            )
+            else None
+        )
         return WorkspaceReadResult(
             path=relative_path,
             kind=kind,
@@ -195,8 +371,11 @@ class AgentFileSandbox:
             size_bytes=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
             offset=offset,
-            next_offset=end if end < len(content) else None,
-            complete=end == len(content),
+            next_offset=next_offset,
+            complete=next_offset is None and next_page is None,
+            page_start=selected_page_start,
+            next_page=next_page,
+            total_pages=total_pages,
         )
 
     def path_for_delivery(self, workspace_id: str, relative_path: str) -> Path:
@@ -204,6 +383,23 @@ class AgentFileSandbox:
         path = self._path(scope, relative_path)
         self._assert_regular_file(path)
         return path
+
+    def snapshot_for_delivery(
+        self,
+        workspace_id: str,
+        relative_path: str,
+    ) -> tuple[str, bytes]:
+        """Read one immutable send snapshot while workspace writers are excluded."""
+
+        with self.locked_workspace(workspace_id):
+            path = self.path_for_delivery(workspace_id, relative_path)
+            return path.name, path.read_bytes()
+
+    def validate_path(self, workspace_id: str, relative_path: str) -> None:
+        """Validate a future workspace path without creating the target file."""
+
+        scope = self._scope(workspace_id)
+        self._path(scope, relative_path)
 
     def _scope(self, workspace_id: str) -> Path:
         if not workspace_id or len(workspace_id) > 200:
@@ -266,11 +462,13 @@ class AgentFileSandbox:
             path=path.relative_to(scope).as_posix(),
             size_bytes=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
-            kind=_kind(path, data),
+            kind=workspace_file_kind(path, data),
         )
 
 
-def _kind(path: Path, data: bytes) -> str:
+def workspace_file_kind(path: Path, data: bytes) -> str:
+    """Classify workspace bytes without opening or executing their contents."""
+
     suffix = path.suffix.lower()
     if data.startswith(b"%PDF-") or suffix == ".pdf":
         return "pdf"
@@ -282,6 +480,8 @@ def _kind(path: Path, data: bytes) -> str:
         return "image/jpeg"
     if data[:6] in {b"GIF87a", b"GIF89a"}:
         return "image/gif"
+    if suffix in _MEDIA_KINDS:
+        return _MEDIA_KINDS[suffix]
     if suffix in _TEXT_SUFFIXES:
         return "text"
     try:
@@ -297,8 +497,6 @@ def _inspect_content(path: Path, data: bytes, kind: str) -> str:
             return data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise UserError("files.text_encoding_unsupported") from exc
-    if kind == "pdf":
-        return _pdf_text(data)
     if kind == "zip":
         return _zip_listing(data)
     if kind.startswith("image/"):
@@ -306,19 +504,37 @@ def _inspect_content(path: Path, data: bytes, kind: str) -> str:
     return f"Binary file: {path.name} ({len(data)} bytes)."
 
 
-def _pdf_text(data: bytes) -> str:
+def _pdf_text(
+    data: bytes,
+    *,
+    page_start: int,
+    page_count: int,
+) -> tuple[str, int, int, int]:
     try:
         reader = PdfReader(io.BytesIO(data), strict=False)
         if reader.is_encrypted:
             raise UserError("files.pdf_encrypted")
         pages = reader.pages
-        lines = [f"PDF pages: {len(pages)}"]
-        for index, page in enumerate(pages[:20], start=1):
+        total_pages = len(pages)
+        if total_pages < 1 or page_start > total_pages:
+            raise UserError(
+                "files.page_range_invalid",
+                total_pages=total_pages,
+            )
+        page_end = min(total_pages, page_start + page_count - 1)
+        lines = [
+            (
+                f"PDF pages: {total_pages}; selected pages: "
+                f"{page_start}-{page_end}"
+            )
+        ]
+        for index in range(page_start, page_end + 1):
+            page = pages[index - 1]
             text = (page.extract_text() or "").strip()
             lines.append(f"\n--- Page {index} ---\n{text}")
-        if len(pages) > 20:
-            lines.append(f"\n[Only the first 20 of {len(pages)} pages were inspected.]")
-        return "\n".join(lines)
+        if page_end < total_pages:
+            lines.append(f"\n[Continue with page_start={page_end + 1}.]")
+        return "\n".join(lines), total_pages, page_start, page_end
     except UserError:
         raise
     except Exception as exc:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -33,6 +35,13 @@ class FocusTimer:
     restore_content_mode: str | None
     status: FocusTimerStatus
     attempts: int = 0
+    delivery_message_id: str | None = None
+
+
+@dataclass(slots=True)
+class _TimerDeliveryLockState:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 class FocusTimerService:
@@ -42,6 +51,8 @@ class FocusTimerService:
         self.path = path
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
+        self._delivery_locks: dict[str, _TimerDeliveryLockState] = {}
+        self._focus_session_locks: dict[str, _TimerDeliveryLockState] = {}
         self._initialize()
         self._requeue_interrupted()
 
@@ -97,10 +108,85 @@ class FocusTimerService:
 
     async def complete(self, timer_id: str) -> FocusTimer:
         async with self._lock:
+            return await asyncio.to_thread(self._complete, timer_id)
+
+    async def current(self, timer_id: str) -> FocusTimer:
+        """Reload one timer before performing an externally visible delivery."""
+
+        async with self._lock:
+            return await asyncio.to_thread(self._require, timer_id)
+
+    async def set_delivery_message(self, timer_id: str, message_id: str) -> FocusTimer:
+        """Persist the one Discord message used to reconcile delivery retries."""
+
+        async with self._lock:
             return await asyncio.to_thread(
-                self._set_status,
+                self._set_delivery_message,
                 timer_id,
-                FocusTimerStatus.COMPLETED,
+                message_id,
+            )
+
+    @asynccontextmanager
+    async def delivery_lock(self, timer_id: str) -> AsyncIterator[None]:
+        """Serialize normal and retry delivery for one timer within this process."""
+
+        state = self._delivery_locks.get(timer_id)
+        if state is None:
+            state = _TimerDeliveryLockState(lock=asyncio.Lock())
+            self._delivery_locks[timer_id] = state
+        state.users += 1
+        acquired = False
+        try:
+            await state.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                state.lock.release()
+            state.users -= 1
+            if (
+                state.users == 0
+                and self._delivery_locks.get(timer_id) is state
+            ):
+                self._delivery_locks.pop(timer_id, None)
+
+    @asynccontextmanager
+    async def focus_session_lock(
+        self,
+        workspace_id: str,
+    ) -> AsyncIterator[None]:
+        """Serialize focus-mode leases with read-aloud policy transitions."""
+
+        state = self._focus_session_locks.get(workspace_id)
+        if state is None:
+            state = _TimerDeliveryLockState(lock=asyncio.Lock())
+            self._focus_session_locks[workspace_id] = state
+        state.users += 1
+        acquired = False
+        try:
+            await state.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                state.lock.release()
+            state.users -= 1
+            if (
+                state.users == 0
+                and self._focus_session_locks.get(workspace_id) is state
+            ):
+                self._focus_session_locks.pop(workspace_id, None)
+
+    async def set_restore_content_mode(
+        self,
+        timer_id: str,
+        mode: str,
+    ) -> FocusTimer:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._set_restore_content_mode,
+                timer_id,
+                mode,
             )
 
     async def retry(self, timer_id: str, *, delay_seconds: int = 30) -> FocusTimer:
@@ -125,22 +211,75 @@ class FocusTimerService:
         workspace_id: str,
         actor_id: str | None = None,
     ) -> FocusTimer:
+        timer, _changed = await self.cancel_with_change(
+            timer_id=timer_id,
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+        )
+        return timer
+
+    async def cancel_with_change(
+        self,
+        *,
+        timer_id: str,
+        workspace_id: str,
+        actor_id: str | None = None,
+    ) -> tuple[FocusTimer, bool]:
         async with self._lock:
             timer = await asyncio.to_thread(self._require, timer_id)
             if timer.workspace_id != workspace_id:
                 raise UserError("timer.not_found")
             if actor_id is not None and timer.actor_id != actor_id:
                 raise UserError("timer.not_owner")
+            if timer.status is FocusTimerStatus.CANCELLED:
+                return timer, False
             if timer.status not in {
                 FocusTimerStatus.SCHEDULED,
                 FocusTimerStatus.DELIVERING,
             }:
                 raise UserError("timer.not_active")
-            return await asyncio.to_thread(
+            cancelled = await asyncio.to_thread(
                 self._set_status,
                 timer_id,
                 FocusTimerStatus.CANCELLED,
             )
+            return cancelled, True
+
+    async def restore(
+        self,
+        *,
+        timer_id: str,
+        workspace_id: str,
+        actor_id: str | None = None,
+    ) -> FocusTimer:
+        timer, _changed = await self.restore_with_change(
+            timer_id=timer_id,
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+        )
+        return timer
+
+    async def restore_with_change(
+        self,
+        *,
+        timer_id: str,
+        workspace_id: str,
+        actor_id: str | None = None,
+    ) -> tuple[FocusTimer, bool]:
+        """Restore a cancelled timer without retaining a duplicate timer snapshot."""
+
+        async with self._lock:
+            timer = await asyncio.to_thread(self._require, timer_id)
+            if timer.workspace_id != workspace_id:
+                raise UserError("timer.not_found")
+            if actor_id is not None and timer.actor_id != actor_id:
+                raise UserError("timer.not_owner")
+            if timer.status is FocusTimerStatus.SCHEDULED:
+                return timer, False
+            if timer.status is not FocusTimerStatus.CANCELLED:
+                raise UserError("timer.not_cancelled")
+            restored = await asyncio.to_thread(self._restore, timer)
+            return restored, True
 
     def _initialize(self) -> None:
         with self._connect() as connection:
@@ -158,6 +297,7 @@ class FocusTimerService:
                     restore_content_mode TEXT,
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    delivery_message_id TEXT,
                     finished_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS focus_timers_due
@@ -173,6 +313,10 @@ class FocusTimerService:
             if "finished_at" not in columns:
                 connection.execute(
                     "ALTER TABLE focus_timers ADD COLUMN finished_at TEXT"
+                )
+            if "delivery_message_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE focus_timers ADD COLUMN delivery_message_id TEXT"
                 )
         self.path.chmod(0o600)
 
@@ -198,8 +342,8 @@ class FocusTimerService:
                 INSERT INTO focus_timers (
                     timer_id, workspace_id, actor_id, delivery_target_id,
                     due_at, message, voice_notify, focus_session,
-                    restore_content_mode, status, attempts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    restore_content_mode, status, attempts, delivery_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _timer_values(timer),
             )
@@ -307,6 +451,91 @@ class FocusTimerService:
                 raise UserError("timer.not_active")
         return self._require(timer_id)
 
+    def _set_delivery_message(
+        self,
+        timer_id: str,
+        message_id: str,
+    ) -> FocusTimer:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE focus_timers
+                SET delivery_message_id = ?
+                WHERE timer_id = ?
+                """,
+                (message_id, timer_id),
+            )
+            if cursor.rowcount != 1:
+                raise UserError("timer.not_found")
+        return self._require(timer_id)
+
+    def _set_restore_content_mode(
+        self,
+        timer_id: str,
+        mode: str,
+    ) -> FocusTimer:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE focus_timers
+                SET restore_content_mode = ?
+                WHERE timer_id = ?
+                """,
+                (mode, timer_id),
+            )
+            if cursor.rowcount != 1:
+                raise UserError("timer.not_found")
+        return self._require(timer_id)
+
+    def _complete(self, timer_id: str) -> FocusTimer:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE focus_timers
+                SET status = ?, finished_at = ?
+                WHERE timer_id = ? AND status = ?
+                """,
+                (
+                    FocusTimerStatus.COMPLETED.value,
+                    datetime.now(UTC).isoformat(),
+                    timer_id,
+                    FocusTimerStatus.DELIVERING.value,
+                ),
+            )
+        if cursor.rowcount == 1:
+            return self._require(timer_id)
+        current = self._require(timer_id)
+        if current.status in {
+            FocusTimerStatus.COMPLETED,
+            FocusTimerStatus.CANCELLED,
+        }:
+            return current
+        raise UserError("timer.not_active")
+
+    def _restore(self, timer: FocusTimer) -> FocusTimer:
+        due_at = max(
+            timer.due_at,
+            datetime.now(UTC) + timedelta(seconds=5),
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE focus_timers
+                SET status = ?, due_at = ?, finished_at = NULL,
+                    delivery_message_id = NULL
+                WHERE timer_id = ? AND status = ?
+                """,
+                (
+                    FocusTimerStatus.SCHEDULED.value,
+                    due_at.isoformat(),
+                    timer.timer_id,
+                    FocusTimerStatus.CANCELLED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise UserError("timer.not_cancelled")
+        return self._require(timer.timer_id)
+
     def _prune_terminal(self, cutoff: str) -> int:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -354,6 +583,7 @@ def _timer_values(timer: FocusTimer) -> tuple[object, ...]:
         timer.restore_content_mode,
         timer.status.value,
         timer.attempts,
+        timer.delivery_message_id,
     )
 
 
@@ -374,4 +604,9 @@ def _row_to_timer(row: sqlite3.Row) -> FocusTimer:
         ),
         status=FocusTimerStatus(str(row["status"])),
         attempts=int(row["attempts"]),
+        delivery_message_id=(
+            str(row["delivery_message_id"])
+            if row["delivery_message_id"] is not None
+            else None
+        ),
     )

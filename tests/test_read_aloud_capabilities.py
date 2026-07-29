@@ -10,6 +10,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudExclusionTarget,
     ReadAloudPolicyResponse,
     ReadAloudResponse,
+    ReadAloudSemanticsSetRequest,
     ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
     ReadAloudUserVoiceSetRequest,
@@ -103,6 +104,17 @@ async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> N
     assert response.announce_join is True
     assert response.announce_leave is True
     assert response.announce_move is False
+    assert response.previous_announce_join is False
+    assert response.previous_announce_leave is False
+    assert response.previous_announce_move is False
+    semantics = await endpoints["speech.read_aloud_semantics_set"].invoke(
+        ReadAloudSemanticsSetRequest(author_names=True, vc_members_only=True),
+        context,
+    )
+    assert semantics.previous_read_author_names is True
+    assert semantics.previous_read_replies is True
+    assert semantics.previous_read_attachments is True
+    assert semantics.previous_vc_members_only is False
     await endpoints["speech.read_aloud_server_voice_set"].invoke(
         ReadAloudServerVoiceSetRequest(ReadAloudVoicePreset.NARRATOR),
         context,
@@ -116,6 +128,36 @@ async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> N
     assert ReadAloudService(service.state_file).policy("guild") == service.policy(
         "guild"
     )
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_compare_and_set_accepts_satisfied_undo_target(tmp_path) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_read_aloud_policy_endpoints(service)
+    }
+    context = _context()
+    await endpoints["speech.read_aloud_announcements_set"].invoke(
+        ReadAloudAnnouncementsSetRequest(join=True),
+        context,
+    )
+    await endpoints["speech.read_aloud_announcements_set"].invoke(
+        ReadAloudAnnouncementsSetRequest(join=False),
+        context,
+    )
+
+    response = await endpoints["speech.read_aloud_announcements_set"].invoke(
+        ReadAloudAnnouncementsSetRequest(
+            join=False,
+            expected_join=True,
+        ),
+        context,
+    )
+
+    assert response.announce_join is False
+    assert response.previous_announce_join is False
+    assert service.policy("guild").announce_join is False
 
 
 def test_split_capability_names_are_unique_and_non_shadowing(tmp_path) -> None:

@@ -33,3 +33,12 @@ class DownloadArtifact:
     media_type: DownloadFormat
     source_url: str
     size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadBatch:
+    """One public post may contain several independently usable media files."""
+
+    artifacts: tuple[DownloadArtifact, ...]
+    skipped_items: int = 0
+    partial: bool = False

@@ -6,10 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from simajilord.agent.tools import AgentToolCatalog
+from simajilord.capabilities.media import (
+    MediaSaveRequest,
+    MediaSaveResponse,
+    build_media_save_endpoint,
+)
+from simajilord.core import InvocationContext
+from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioItem
 from simajilord.domain.media import (
     DownloadArtifact,
+    DownloadBatch,
     DownloadFormat,
     MediaCandidate,
 )
@@ -20,6 +29,7 @@ from simajilord.media.security import (
     validate_media_url,
     validate_public_media_url,
 )
+from simajilord.services.files import AgentFileSandbox
 from simajilord.services.media import MediaPriority, MediaService
 
 
@@ -280,6 +290,287 @@ async def test_provider_combines_multiple_youtube_mix_seeds_without_stream_resol
 def test_provider_errors_have_stable_categories(detail: str, category: str) -> None:
     error: MediaError = classify_yt_dlp_error(detail)
     assert error.category == category
+
+
+@pytest.mark.asyncio
+async def test_provider_downloads_multiple_post_media_with_one_generic_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = YtDlpProvider(cookie_file=None, download_timeout_seconds=30)
+    captured_commands: list[list[str]] = []
+
+    async def public_url(value: str) -> str:
+        return value
+
+    async def run(
+        command: list[str],
+        *,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        del environment
+        captured_commands.append(command)
+        destination = Path(command[command.index("--paths") + 1])
+        (destination / "post_01_[one].mp4").write_bytes(b"first")
+        (destination / "post_02_[two].mp4").write_bytes(b"second")
+        return 0, ""
+
+    monkeypatch.setattr(
+        "simajilord.media.providers.yt_dlp.validate_public_media_url",
+        public_url,
+    )
+    monkeypatch.setattr(provider, "_run_download_process", run)
+
+    batch = await provider.download_many(
+        "https://x.com/example/status/1",
+        DownloadFormat.VIDEO,
+        tmp_path / "download",
+        max_bytes=1_000,
+        max_items=4,
+    )
+
+    assert [item.path.name for item in batch.artifacts] == [
+        "post_01_[one].mp4",
+        "post_02_[two].mp4",
+    ]
+    assert batch.partial is False
+    command = captured_commands[0]
+    assert command[command.index("--playlist-end") + 1] == "4"
+    assert "--no-playlist" not in command
+    assert "--ignore-config" in command
+    assert "--no-cache-dir" in command
+    selector = command[command.index("--format") + 1]
+    assert "filesize_approx<=1000" in selector
+    assert "height<=720" in selector
+    assert command[-1] == "https://x.com/example/status/1"
+
+
+@pytest.mark.asyncio
+async def test_provider_bounds_unexpected_extra_artifacts_and_scrubs_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = YtDlpProvider(cookie_file=None, download_timeout_seconds=30)
+    captured_environment: dict[str, str] = {}
+
+    async def public_url(value: str) -> str:
+        return value
+
+    async def run(
+        command: list[str],
+        *,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        captured_environment.update(environment)
+        destination = Path(command[command.index("--paths") + 1])
+        for index in range(3):
+            (destination / f"post_{index:02d}.mp4").write_bytes(
+                str(index).encode()
+            )
+        return 0, ""
+
+    monkeypatch.setenv("DISCORD_TOKEN", "must-not-reach-downloader")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-downloader")
+    monkeypatch.setattr(
+        "simajilord.media.providers.yt_dlp.validate_public_media_url",
+        public_url,
+    )
+    monkeypatch.setattr(provider, "_run_download_process", run)
+
+    batch = await provider.download_many(
+        "https://example.test/post/1",
+        DownloadFormat.VIDEO,
+        tmp_path / "download",
+        max_bytes=1_000,
+        max_items=2,
+    )
+
+    assert len(batch.artifacts) == 2
+    assert batch.skipped_items == 1
+    assert batch.partial is True
+    assert "DISCORD_TOKEN" not in captured_environment
+    assert "OPENAI_API_KEY" not in captured_environment
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_one_transient_extractor_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = YtDlpProvider(cookie_file=None, download_timeout_seconds=30)
+    attempts = 0
+
+    async def public_url(value: str) -> str:
+        return value
+
+    async def run(
+        command: list[str],
+        *,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        nonlocal attempts
+        del environment
+        attempts += 1
+        if attempts == 1:
+            return 1, "Unable to extract universal data for rehydration"
+        destination = Path(command[command.index("--paths") + 1])
+        (destination / "clip_00_[id].mp4").write_bytes(b"usable")
+        return 0, ""
+
+    monkeypatch.setattr(
+        "simajilord.media.providers.yt_dlp.validate_public_media_url",
+        public_url,
+    )
+    monkeypatch.setattr(provider, "_run_download_process", run)
+
+    batch = await provider.download_many(
+        "https://www.tiktok.com/@example/video/1",
+        DownloadFormat.VIDEO,
+        tmp_path / "download",
+        max_bytes=1_000,
+        max_items=1,
+    )
+
+    assert attempts == 2
+    assert batch.artifacts[0].path.read_bytes() == b"usable"
+
+
+@pytest.mark.asyncio
+async def test_provider_bounds_repeated_transient_extractor_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = YtDlpProvider(cookie_file=None, download_timeout_seconds=30)
+    attempts = 0
+
+    async def public_url(value: str) -> str:
+        return value
+
+    async def run(
+        command: list[str],
+        *,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
+        nonlocal attempts
+        del command, environment
+        attempts += 1
+        return 1, "Unable to extract universal data for rehydration"
+
+    monkeypatch.setattr(
+        "simajilord.media.providers.yt_dlp.validate_public_media_url",
+        public_url,
+    )
+    monkeypatch.setattr(provider, "_run_download_process", run)
+
+    with pytest.raises(MediaError) as error:
+        await provider.download_many(
+            "https://www.tiktok.com/@example/video/1",
+            DownloadFormat.VIDEO,
+            tmp_path / "download",
+            max_bytes=1_000,
+            max_items=1,
+        )
+
+    assert attempts == 3
+    assert error.value.category == "extractor_challenge"
+
+
+@pytest.mark.asyncio
+async def test_media_save_creates_content_addressed_workspace_files(
+    tmp_path: Path,
+) -> None:
+    class FakeMedia:
+        async def download_many(
+            self,
+            url: str,
+            media_type: DownloadFormat,
+            destination: Path,
+            *,
+            max_bytes: int,
+            max_items: int,
+            workspace_id: str,
+            priority: MediaPriority,
+        ) -> DownloadBatch:
+            assert max_bytes == 100
+            assert max_items == 4
+            assert workspace_id == "guild"
+            assert priority is MediaPriority.NORMAL
+            first = destination / "first.mp4"
+            second = destination / "second.mp4"
+            first.write_bytes(b"first media")
+            second.write_bytes(b"second media")
+            return DownloadBatch(
+                artifacts=(
+                    DownloadArtifact(
+                        path=first,
+                        title="first",
+                        media_type=media_type,
+                        source_url=url,
+                        size_bytes=first.stat().st_size,
+                    ),
+                    DownloadArtifact(
+                        path=second,
+                        title="second",
+                        media_type=media_type,
+                        source_url=url,
+                        size_bytes=second.stat().st_size,
+                    ),
+                )
+            )
+
+    files = AgentFileSandbox(tmp_path / "files", max_file_bytes=100)
+    capability = build_media_save_endpoint(FakeMedia(), files)  # type: ignore[arg-type]
+    result = await capability.invoke(
+        MediaSaveRequest("https://video.example/post"),
+        InvocationContext("actor", "guild", "agent", "event"),
+    )
+
+    assert isinstance(result, MediaSaveResponse)
+    assert len(result.files) == 2
+    assert all(item.path.startswith("media/") for item in result.files)
+    assert [item.size_bytes for item in result.files] == [11, 12]
+    assert files.path_for_delivery("guild", result.files[0].path).read_bytes() == (
+        b"first media"
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_save_is_discoverable_without_platform_specific_tools(
+    tmp_path: Path,
+) -> None:
+    files = AgentFileSandbox(tmp_path / "files")
+    registry = CapabilityRegistry()
+    registry.register(
+        build_media_save_endpoint(
+            object(),  # type: ignore[arg-type]
+            files,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("media.save",),
+        required_grants={"media.save": "media"},
+        eager_capabilities=(),
+        write_capabilities=("media.save",),
+    )
+
+    output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "SNSの動画を保存したい", "limit": 3},
+        context=InvocationContext(
+            "actor",
+            "guild",
+            "agent",
+            "event",
+            grants=frozenset({"media"}),
+        ),
+        max_output_characters=4_000,
+    )
+
+    assert '"name":"media.save"' in output.text
+    assert "media.save_x" not in output.text
+    assert "media.save_tiktok" not in output.text
 
 
 @pytest.mark.asyncio

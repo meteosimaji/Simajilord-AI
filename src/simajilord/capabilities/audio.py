@@ -188,6 +188,8 @@ class AudioControlRequest:
     pitch: float | None = None
     music_percent: int | None = None
     speech_percent: int | None = None
+    expected_music_percent: int | None = None
+    expected_speech_percent: int | None = None
     to_position: int | None = None
     replace_mix: bool = False
 
@@ -203,6 +205,8 @@ class AudioControlResponse:
     pitch: float | None = None
     music_volume_percent: int | None = None
     speech_volume_percent: int | None = None
+    previous_music_volume_percent: int | None = None
+    previous_speech_volume_percent: int | None = None
     removed_count: int | None = None
 
 
@@ -248,6 +252,8 @@ class AudioTuneRequest:
 class AudioVolumeRequest:
     music_percent: int | None = None
     speech_percent: int | None = None
+    expected_music_percent: int | None = None
+    expected_speech_percent: int | None = None
 
 
 def build_audio_endpoints(
@@ -403,6 +409,8 @@ def build_audio_endpoints(
         pitch: float | None = None
         music_volume_percent: int | None = None
         speech_volume_percent: int | None = None
+        previous_music_volume_percent: int | None = None
+        previous_speech_volume_percent: int | None = None
         removed_count: int | None = None
         if request.action is AudioAction.PAUSE:
             await session.pause()
@@ -438,12 +446,29 @@ def build_audio_endpoints(
         elif request.action is AudioAction.VOLUME:
             if request.music_percent is None and request.speech_percent is None:
                 raise UserError("audio.volume_value_required")
-            music_volume, speech_volume = await session.set_volume(
+            (
+                music_volume,
+                speech_volume,
+                previous_music_volume,
+                previous_speech_volume,
+            ) = await session.set_volume_with_previous(
                 music=(None if request.music_percent is None else request.music_percent / 100),
                 speech=(None if request.speech_percent is None else request.speech_percent / 100),
+                expected_music=(
+                    None
+                    if request.expected_music_percent is None
+                    else request.expected_music_percent / 100
+                ),
+                expected_speech=(
+                    None
+                    if request.expected_speech_percent is None
+                    else request.expected_speech_percent / 100
+                ),
             )
             music_volume_percent = round(music_volume * 100)
             speech_volume_percent = round(speech_volume * 100)
+            previous_music_volume_percent = round(previous_music_volume * 100)
+            previous_speech_volume_percent = round(previous_speech_volume * 100)
         elif request.action is AudioAction.MOVE:
             if request.position is None or request.to_position is None:
                 raise UserError("audio.queue_position_invalid")
@@ -467,6 +492,8 @@ def build_audio_endpoints(
             pitch=pitch,
             music_volume_percent=music_volume_percent,
             speech_volume_percent=speech_volume_percent,
+            previous_music_volume_percent=previous_music_volume_percent,
+            previous_speech_volume_percent=previous_speech_volume_percent,
             removed_count=removed_count,
         )
 
@@ -571,6 +598,8 @@ def build_audio_endpoints(
                 action=AudioAction.VOLUME,
                 music_percent=request.music_percent,
                 speech_percent=request.speech_percent,
+                expected_music_percent=request.expected_music_percent,
+                expected_speech_percent=request.expected_speech_percent,
             ),
             context,
         )

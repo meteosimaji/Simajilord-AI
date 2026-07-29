@@ -31,8 +31,9 @@ _SEARCH_PRESETS = {
     SearchDepth.STANDARD: (80, 10, 4),
     SearchDepth.DEEP: (160, 20, 8),
 }
-_MAX_PAGE_TEXT_CHARACTERS = 40_000
+_MAX_PAGE_TEXT_CHARACTERS = 200_000
 _MAX_PAGE_LINKS = 40
+_MAX_WEB_PDF_PAGES = 200
 _MAX_CACHE_ENTRIES = 32
 _CACHE_TTL_SECONDS = 300.0
 _BLOCK_ELEMENTS = frozenset(
@@ -328,13 +329,18 @@ async def _readable_page(resource: FetchedWebResource) -> ReadableWebPage:
     final_url = resource.final_url
     extension = urlsplit(final_url).path.rsplit(".", maxsplit=1)[-1].lower()
     if content_type == "application/pdf" or body.startswith(b"%PDF-") or extension == "pdf":
-        text, title = await asyncio.to_thread(_pdf_text, body, final_url)
+        text, title, source_truncated = await asyncio.to_thread(
+            _pdf_text,
+            body,
+            final_url,
+        )
         return ReadableWebPage(
             final_url=final_url,
             title=title,
             content_type="application/pdf",
             text=text[:_MAX_PAGE_TEXT_CHARACTERS],
             links=(),
+            source_truncated=source_truncated,
         )
     if not _textual_content(content_type, extension):
         raise WebError(
@@ -357,17 +363,20 @@ async def _readable_page(resource: FetchedWebResource) -> ReadableWebPage:
             content_type=content_type,
             text=text[:_MAX_PAGE_TEXT_CHARACTERS],
             links=tuple(parser.links),
+            source_truncated=len(text) > _MAX_PAGE_TEXT_CHARACTERS,
         )
+    text = _normalize_readable_text(decoded)
     return ReadableWebPage(
         final_url=final_url,
         title=_fallback_title(final_url),
         content_type=content_type,
-        text=_normalize_readable_text(decoded)[:_MAX_PAGE_TEXT_CHARACTERS],
+        text=text[:_MAX_PAGE_TEXT_CHARACTERS],
         links=(),
+        source_truncated=len(text) > _MAX_PAGE_TEXT_CHARACTERS,
     )
 
 
-def _pdf_text(body: bytes, final_url: str) -> tuple[str, str]:
+def _pdf_text(body: bytes, final_url: str) -> tuple[str, str, bool]:
     try:
         reader = PdfReader(io.BytesIO(body), strict=False)
         if reader.is_encrypted:
@@ -375,12 +384,19 @@ def _pdf_text(body: bytes, final_url: str) -> tuple[str, str]:
                 reader.decrypt("")
         parts: list[str] = []
         extracted_characters = 0
-        for page in reader.pages:
+        source_truncated = False
+        total_pages = len(reader.pages)
+        page_limit = min(total_pages, _MAX_WEB_PDF_PAGES)
+        for index in range(page_limit):
+            page = reader.pages[index]
             page_text = page.extract_text() or ""
             parts.append(page_text)
             extracted_characters += len(page_text)
             if extracted_characters >= _MAX_PAGE_TEXT_CHARACTERS:
+                source_truncated = index + 1 < total_pages
                 break
+        else:
+            source_truncated = page_limit < total_pages
         metadata_title = (
             str(reader.metadata.title).strip()
             if reader.metadata is not None and reader.metadata.title
@@ -391,7 +407,12 @@ def _pdf_text(body: bytes, final_url: str) -> tuple[str, str]:
     text = _normalize_readable_text("\n".join(parts))
     if not text:
         raise WebError("content_empty", "The PDF has no extractable text.")
-    return text, metadata_title[:180] or _fallback_title(final_url)
+    source_truncated = source_truncated or len(text) > _MAX_PAGE_TEXT_CHARACTERS
+    return (
+        text,
+        metadata_title[:180] or _fallback_title(final_url),
+        source_truncated,
+    )
 
 
 def _decode_body(body: bytes, declared_charset: str | None) -> str:

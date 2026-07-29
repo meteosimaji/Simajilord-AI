@@ -2,6 +2,13 @@
 
 from .audio import AudioOutput, AudioSession, AudioSessionManager, SpeechQueueReservation
 from .audio_state import AudioStateStore, StoredAudioItem, StoredAudioSession
+from .compute import (
+    ComputeLimits,
+    ComputeRunResult,
+    MacOSSandboxedPythonLauncher,
+    WorkspaceComputeService,
+    WorkspaceDownloadResult,
+)
 from .files import AgentFileSandbox
 from .focus_timer import FocusTimer, FocusTimerService, FocusTimerStatus
 from .image import ImageGenerationService, ImageGenerationStore
@@ -47,6 +54,8 @@ __all__ = [
     "AudioSession",
     "AudioSessionManager",
     "AudioStateStore",
+    "ComputeLimits",
+    "ComputeRunResult",
     "DataMaintenanceService",
     "FocusTimer",
     "FocusTimerService",
@@ -55,6 +64,7 @@ __all__ = [
     "ImageGenerationStore",
     "LocalMediaRecord",
     "LocalMediaStore",
+    "MacOSSandboxedPythonLauncher",
     "MaintenanceReport",
     "MediaPriority",
     "MediaService",
@@ -90,4 +100,6 @@ __all__ = [
     "TranslationService",
     "TranslationStore",
     "WebService",
+    "WorkspaceComputeService",
+    "WorkspaceDownloadResult",
 ]

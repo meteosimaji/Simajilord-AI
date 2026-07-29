@@ -15,17 +15,24 @@ from discord.ext import commands
 from PIL import Image
 
 from simajilord.agent import (
+    ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
+    AGENT_COMPUTE_GRANT,
+    AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
     AGENT_FILE_GRANT,
+    AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
+    AGENT_REACTION_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
+    AgentAutonomyMode,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentProviderLimitError,
     AgentRateLimitError,
+    AgentTimeoutError,
 )
 from simajilord.capabilities.audio import (
     AudioAction,
@@ -55,11 +62,13 @@ from simajilord.capabilities.translation import (
 )
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
-from simajilord.core import CapabilityRegistry, InvocationContext
+from simajilord.core import ApprovalMode, CapabilityRegistry, InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
+    DiscordImportAttachmentRequest,
+    DiscordSendFileRequest,
     DiscordServerResponse,
     DiscordTranslatedSegmentRecord,
     DiscordTranslateMessageRequest,
@@ -72,12 +81,15 @@ from simajilord.integrations.discord.capabilities import (
     _actor_member,
     _assert_agent_channel_scope,
     _assert_agent_update_scope,
+    _attachment,
     _bounded_event_message,
     _can_post_expanded_message,
     _custom_emoji_records,
     _discord_event_message_id,
+    _message_context_text,
     _message_preview,
     _prepare_discord_animated_media,
+    _workspace_attachment_name,
     agent_readable_channel_ids,
     build_discord_endpoints,
     discord_translation_segments,
@@ -111,13 +123,13 @@ from simajilord.integrations.discord.cogs import (
     VoiceLifecycleCog,
     WebCog,
     WebFetchContinueView,
-    YouTubeLinkCardCog,
-    YouTubeLinkCardView,
+    _agent_delivery_nonce,
     _agent_error_text,
     _agent_grants,
     _agent_message_groups,
     _agent_progress_text,
     _AgentProgressMessage,
+    _autonomy_approvals,
     _discord_message_chunks,
     _help_category_embed,
     _locale_target,
@@ -127,9 +139,9 @@ from simajilord.integrations.discord.cogs import (
     _translation_detection_margin,
     _translation_result_embeds,
     _translation_target_autocomplete_choices,
-    _youtube_card_reference,
     audio_control_capability_call,
     discord_conversation_id,
+    edit_deferred_error,
     error_message,
     server_info_embed,
     user_info_embed,
@@ -141,7 +153,258 @@ from simajilord.integrations.discord.help_catalog import (
     PublicCommandSpec,
 )
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.files import AgentFileSandbox
 from simajilord.services.translation import TranslationPreference
+
+
+def test_workspace_attachment_names_are_bounded_and_collision_free() -> None:
+    first = Mock(spec=discord.Attachment)
+    first.id = 101
+    first.filename = f"{'a' * 250}.pdf"
+    second = Mock(spec=discord.Attachment)
+    second.id = 202
+    second.filename = first.filename
+
+    first_name = _workspace_attachment_name(first)
+    second_name = _workspace_attachment_name(second)
+
+    assert first_name != second_name
+    assert len(first_name) <= 180
+    assert first_name.endswith(".pdf")
+
+
+@pytest.mark.asyncio
+async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b"%PDF-1.7\ncanonical attachment"
+    attachment = Mock(spec=discord.Attachment)
+    attachment.id = 1531959430940201000
+    attachment.filename = "document.pdf"
+    attachment.size = len(payload)
+
+    async def read(*, use_cached: bool = False) -> bytes:
+        if use_cached:
+            raise AssertionError("the unsupported media proxy must not be primary")
+        return payload
+
+    attachment.read = AsyncMock(side_effect=read)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._attachment",
+        AsyncMock(return_value=(Mock(spec=discord.Message), attachment)),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "agent-files")
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:1531959431212961902",
+    )
+
+    response = await endpoints["discord.import_attachment"].invoke(
+        DiscordImportAttachmentRequest(
+            channel_id="1373866905357778984",
+            message_id="1531959431212961902",
+        ),
+        context,
+    )
+
+    assert response.path == (
+        "attachments/1531959431212961902/"
+        "1531959430940201000-document.pdf"
+    )
+    assert runtime.files.path_for_delivery("guild", response.path).read_bytes() == payload
+    attachment.read.assert_awaited_once_with(use_cached=False)
+
+
+@pytest.mark.asyncio
+async def test_agent_attachment_import_rechecks_downloaded_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    attachment = Mock(spec=discord.Attachment)
+    attachment.id = 123
+    attachment.filename = "payload.bin"
+    attachment.size = 1
+    attachment.read = AsyncMock(return_value=b"12345")
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._attachment",
+        AsyncMock(return_value=(Mock(spec=discord.Message), attachment)),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "agent-files", max_file_bytes=4)
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    with pytest.raises(UserError, match=r"files\.file_too_large"):
+        await endpoints["discord.import_attachment"].invoke(
+            DiscordImportAttachmentRequest(
+                channel_id="1",
+                message_id="2",
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="guild",
+                transport="agent",
+                request_id="event",
+            ),
+        )
+    assert runtime.files.list("guild") == ()
+
+
+@pytest.mark.asyncio
+async def test_agent_file_delivery_uses_the_guild_upload_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "agent-files")
+    runtime.files.import_bytes("guild", "result.bin", b"12345")
+    guild = Mock(spec=discord.Guild)
+    guild.filesize_limit = 4
+    channel = Mock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._message_channel",
+        lambda selected_guild, channel_id: channel,
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    with pytest.raises(UserError, match=r"discord\.file_too_large"):
+        await endpoints["discord.send_file"].invoke(
+            DiscordSendFileRequest(channel_id="1", path="result.bin"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="guild",
+                transport="agent",
+                request_id="event",
+                resource_ids=("1",),
+                origin_resource_id="1",
+            ),
+        )
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_file_delivery_sends_the_authorized_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "agent-files")
+    runtime.files.import_bytes("guild", "result.bin", b"authorized")
+    guild = Mock(spec=discord.Guild)
+    guild.filesize_limit = 100
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 1
+    actor = Mock(spec=discord.Member)
+    bot = Mock(spec=discord.Member)
+    sent = Mock(spec=discord.Message)
+    sent.id = 99
+
+    async def send(
+        content: str | None,
+        *,
+        file: discord.File,
+        allowed_mentions: discord.AllowedMentions,
+    ) -> discord.Message:
+        del content, allowed_mentions
+        runtime.files.import_bytes("guild", "result.bin", b"newer")
+        assert file.fp.read() == b"authorized"
+        return sent
+
+    channel.send = AsyncMock(side_effect=send)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._write_message_channel",
+        AsyncMock(return_value=(guild, channel, actor, bot)),
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    response = await endpoints["discord.send_file"].invoke(
+        DiscordSendFileRequest(channel_id="1", path="result.bin"),
+        InvocationContext(
+            actor_id="7",
+            workspace_id="guild",
+            transport="agent",
+            request_id="event",
+            resource_ids=("1",),
+            origin_resource_id="1",
+        ),
+    )
+
+    assert response.message_id == "99"
+    assert response.size_bytes == len(b"authorized")
+
+
+@pytest.mark.asyncio
+async def test_attachment_read_rechecks_live_actor_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guild = Mock(spec=discord.Guild)
+    channel = Mock(spec=discord.TextChannel)
+    actor = Mock(spec=discord.Member)
+    bot = Mock(spec=discord.Member)
+    guild.me = bot
+    guild.get_channel_or_thread.return_value = channel
+    channel.permissions_for.return_value = discord.Permissions.none()
+    channel.fetch_message = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=actor),
+    )
+
+    with pytest.raises(
+        UserError,
+        match=r"discord\.agent_read_channel_forbidden",
+    ):
+        await _attachment(
+            cast(discord.Client, object()),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="guild",
+                transport="agent",
+                request_id="event",
+                resource_ids=("1",),
+            ),
+            "1",
+            "2",
+            0,
+        )
+    channel.fetch_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -187,11 +450,13 @@ async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> No
     source.id = 42
     source.channel = Mock()
     source.channel.send = AsyncMock()
+    final_message = Mock(spec=discord.Message)
+    final_message.id = 45
 
     async def reply(*args: object, **kwargs: object) -> Mock:
         del args, kwargs
         order.append("final")
-        return Mock(spec=discord.Message)
+        return final_message
 
     source.reply = AsyncMock(side_effect=reply)
     published = Mock(spec=discord.Message)
@@ -202,7 +467,8 @@ async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> No
 
     published.delete = AsyncMock(side_effect=delete)
     published.edit = AsyncMock()
-    progress = _AgentProgressMessage(source)
+    on_posted = AsyncMock()
+    progress = _AgentProgressMessage(source, on_posted=on_posted)
     progress.message = published
 
     await progress.finish("Final answer")
@@ -210,8 +476,32 @@ async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> No
     assert order == ["delete-progress", "final"]
     published.edit.assert_not_awaited()
     source.reply.assert_awaited_once()
+    assert source.reply.await_args.kwargs["nonce"] == _agent_delivery_nonce(
+        "discord:message:42",
+        0,
+    )
     source.channel.send.assert_not_awaited()
+    on_posted.assert_awaited_once_with(final_message)
     assert progress.message is None
+
+
+@pytest.mark.asyncio
+async def test_agent_receipt_failure_does_not_repost_a_delivered_final() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.channel = Mock()
+    source.channel.send = AsyncMock()
+    final_message = Mock(spec=discord.Message)
+    final_message.id = 45
+    source.reply = AsyncMock(return_value=final_message)
+    on_posted = AsyncMock(side_effect=RuntimeError("receipt unavailable"))
+    progress = _AgentProgressMessage(source, on_posted=on_posted)
+
+    await progress.finish("Final answer")
+
+    source.reply.assert_awaited_once()
+    source.channel.send.assert_not_awaited()
+    on_posted.assert_awaited_once_with(final_message)
 
 
 @pytest.mark.asyncio
@@ -234,7 +524,8 @@ async def test_agent_failure_replaces_working_with_a_new_reply() -> None:
 
     published.delete = AsyncMock(side_effect=delete)
     published.edit = AsyncMock()
-    progress = _AgentProgressMessage(source)
+    on_posted = AsyncMock()
+    progress = _AgentProgressMessage(source, on_posted=on_posted)
     progress.message = published
 
     await progress.fail("Could not finish")
@@ -242,6 +533,12 @@ async def test_agent_failure_replaces_working_with_a_new_reply() -> None:
     assert order == ["delete-progress", "failure"]
     published.edit.assert_not_awaited()
     source.reply.assert_awaited_once()
+    assert source.reply.await_args.kwargs["nonce"] == _agent_delivery_nonce(
+        "discord:message:42",
+        0,
+        purpose="error",
+    )
+    on_posted.assert_not_awaited()
     assert progress.message is None
 
 
@@ -345,38 +642,112 @@ async def test_view_error_boundary_returns_reference_id_to_user() -> None:
     assert "Reference ID: `987`" in (call.kwargs["embed"].description or "")
 
 
-def test_autonomous_agent_grants_keep_reads_but_remove_write_scopes() -> None:
+@pytest.mark.asyncio
+async def test_expired_deferred_error_response_does_not_escape() -> None:
+    response = SimpleNamespace(status=404, reason="Not Found")
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 988
+    interaction.response = Mock()
+    interaction.response.is_done.return_value = True
+    interaction.edit_original_response = AsyncMock(
+        side_effect=discord.NotFound(
+            response,
+            {"code": 10015, "message": "Unknown Webhook"},
+        )
+    )
+
+    await edit_deferred_error(
+        interaction,
+        UserError("translation.message_text_required"),
+    )
+
+    interaction.edit_original_response.assert_awaited_once()
+
+
+def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.settings.agent_file_sandbox_enabled = True
     runtime.settings.agent_web_search_access = AgentFeatureAccess.EVERYONE
-    runtime.settings.agent_admin_user_ids = frozenset()
+    runtime.settings.agent_safe_compute_access = AgentFeatureAccess.EVERYONE
+    runtime.settings.agent_admin_user_ids = frozenset({"7"})
     runtime.settings.image_generation_access = AgentFeatureAccess.EVERYONE
     runtime.files = object()
+    runtime.compute = object()
     runtime.moderation.provider = object()
     runtime.image.provider = object()
 
     requested = _agent_grants(runtime, actor_id="7")
-    autonomous = _agent_grants(runtime, actor_id="simajilord:autonomy", autonomous=True)
+    runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ASSIST
+    assist = _agent_grants(runtime, actor_id="99", autonomous=True)
+    runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ACT
+    act = _agent_grants(runtime, actor_id="99", autonomous=True)
 
     assert {
         AGENT_AUDIO_GRANT,
         AGENT_WEB_GRANT,
-        AGENT_MODERATION_GRANT,
-        AGENT_REPOST_GRANT,
-    } <= autonomous
+        AGENT_HIVE_GRANT,
+        AGENT_MESSAGE_GRANT,
+        AGENT_REACTION_GRANT,
+    } <= assist
+    assert AGENT_MODERATION_GRANT not in assist
     assert {
         AGENT_MESSAGE_GRANT,
+        AGENT_REACTION_GRANT,
         AGENT_FILE_GRANT,
         AGENT_IMAGE_GRANT,
     } <= requested
-    assert (
-        not {
-            AGENT_MESSAGE_GRANT,
-            AGENT_FILE_GRANT,
-            AGENT_IMAGE_GRANT,
-        }
-        & autonomous
+    assert not {AGENT_FILE_GRANT, AGENT_IMAGE_GRANT} & assist
+    assert {
+        AGENT_FILE_GRANT,
+        AGENT_IMAGE_GRANT,
+        AGENT_COMPUTE_GRANT,
+        AGENT_MODERATION_GRANT,
+        AGENT_REPOST_GRANT,
+    } <= act
+    assert AGENT_COMPUTE_GRANT in requested
+    assert AGENT_COMPUTE_GRANT not in assist
+    assert ACTION_UNDO_ANY_GRANT in requested
+    assert ACTION_UNDO_ANY_GRANT not in assist
+
+
+def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings.agent_file_sandbox_enabled = False
+    runtime.settings.agent_web_search_access = AgentFeatureAccess.DISABLED
+    runtime.settings.agent_safe_compute_access = AgentFeatureAccess.DISABLED
+    runtime.settings.agent_admin_user_ids = frozenset()
+    runtime.settings.image_generation_access = AgentFeatureAccess.DISABLED
+    runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ACT
+    runtime.files = None
+    runtime.compute = None
+    runtime.moderation.provider = None
+    runtime.image.provider = None
+
+    assert AGENT_MODERATION_GRANT in _agent_grants(runtime, actor_id="7")
+    assert AGENT_MODERATION_GRANT in _agent_grants(
+        runtime,
+        actor_id="99",
+        autonomous=True,
     )
+
+
+def test_destructive_approvals_are_exposed_only_to_act_autonomy() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.all.return_value = tuple(
+        SimpleNamespace(
+            descriptor=SimpleNamespace(
+                name=name,
+                approval=ApprovalMode.WHEN_REQUESTED,
+            )
+        )
+        for name in AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES
+    )
+
+    assist = _autonomy_approvals(runtime, AgentAutonomyMode.ASSIST)
+    act = _autonomy_approvals(runtime, AgentAutonomyMode.ACT)
+
+    assert not set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) & assist
+    assert set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) <= act
 
 
 def test_common_music_actions_have_short_top_level_commands() -> None:
@@ -2630,6 +3001,37 @@ async def test_quote_composer_preserves_combinable_styles_and_jump_choice() -> N
     assert request.include_jump is False
 
 
+@pytest.mark.asyncio
+async def test_quote_composer_rolls_back_state_when_discord_rejects_edit() -> None:
+    view = QuoteComposerView(
+        cast(SimajilordRuntime, object()),
+        requester_id=7,
+        source_channel_id=50,
+        source_message_id=60,
+        destination_channel_id=50,
+    )
+    interaction = Mock(spec=discord.Interaction)
+    interaction.response.edit_message = AsyncMock(side_effect=RuntimeError("expired"))
+
+    with pytest.raises(RuntimeError, match="expired"):
+        await view._toggle_setting(interaction, "flip")
+
+    assert view.flip is False
+    assert view.more_menu_button.label == "More · 1 On"
+
+    with pytest.raises(RuntimeError, match="expired"):
+        await view._open_page(interaction, "more")
+
+    assert view._page == "main"
+    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
+        "Layout · Landscape",
+        "Style · B/W",
+        "More · 1 On",
+        "Generate",
+        "Cancel",
+    ]
+
+
 def test_quote_composer_uses_hierarchical_native_menu() -> None:
     view = QuoteComposerView(
         cast(SimajilordRuntime, object()),
@@ -2663,48 +3065,6 @@ def test_quote_composer_uses_hierarchical_native_menu() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    ("content", "expected"),
-    (
-        (
-            "https://youtu.be/dQw4w9WgXcQ",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        ),
-        (
-            "Listen https://music.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        ),
-        (
-            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        ),
-        ("https://youtube.com.example/watch?v=dQw4w9WgXcQ", None),
-        (
-            "https://youtu.be/dQw4w9WgXcQ https://youtu.be/9bZkp7q19f0",
-            None,
-        ),
-    ),
-)
-def test_youtube_card_reference_is_conservative(
-    content: str,
-    expected: str | None,
-) -> None:
-    assert _youtube_card_reference(content) == expected
-
-
-def test_youtube_card_has_three_direct_actions() -> None:
-    view = YouTubeLinkCardView(
-        cast(SimajilordRuntime, object()),
-        reference="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    )
-
-    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
-        "Play",
-        "Add",
-        "Radio",
-    ]
-
-
 def test_fresh_mix_and_duplicate_music_aliases_are_hidden() -> None:
     top_level = {
         command.name
@@ -2722,29 +3082,12 @@ def test_fresh_mix_and_duplicate_music_aliases_are_hidden() -> None:
     assert groups == []
 
 
-@pytest.mark.asyncio
-async def test_youtube_message_listener_posts_silent_temporary_card() -> None:
-    runtime = Mock(spec=SimajilordRuntime)
-    message = Mock(spec=discord.Message)
-    message.guild = Mock(spec=discord.Guild)
-    message.guild.id = 1
-    message.channel = Mock(spec=discord.TextChannel)
-    message.channel.id = 2
-    message.id = 3
-    message.author = Mock(spec=discord.Member)
-    message.author.bot = False
-    message.content = "https://youtu.be/dQw4w9WgXcQ"
-    reply = Mock(spec=discord.Message)
-    message.reply = AsyncMock(return_value=reply)
+def test_youtube_url_card_feature_is_not_exposed() -> None:
+    from simajilord.integrations.discord import cogs
 
-    await YouTubeLinkCardCog(runtime).on_message(message)
-
-    message.reply.assert_awaited_once()
-    kwargs = message.reply.await_args.kwargs
-    assert kwargs["silent"] is True
-    assert kwargs["mention_author"] is False
-    assert isinstance(kwargs["view"], YouTubeLinkCardView)
-    assert kwargs["view"].message is reply
+    assert not hasattr(cogs, "YouTubeLinkCardCog")
+    assert not hasattr(cogs, "YouTubeLinkCardView")
+    assert not hasattr(cogs, "_youtube_card_reference")
 
 
 @pytest.mark.asyncio
@@ -2928,6 +3271,8 @@ def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
             total_characters=8_000,
             next_offset=3_500,
             links=(),
+            complete=False,
+            source_truncated=False,
         ),
     )
     buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
@@ -2936,11 +3281,37 @@ def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
     assert view.next_offset == 3_500
 
 
-def test_message_index_preview_uses_full_short_or_25_plus_5() -> None:
-    assert _message_preview("x" * 30) == ("x" * 30, False)
-    preview, truncated = _message_preview("abcdefghijklmnopqrstuvwxyz123456789")
-    assert preview == "abcdefghijklmnopqrstuvwxy…56789"
+def test_message_index_preview_keeps_bounded_context_from_both_ends() -> None:
+    assert _message_preview("x" * 240) == ("x" * 240, False)
+    preview, truncated = _message_preview("a" * 200 + "middle" + "z" * 39)
+    assert preview == "a" * 200 + "…" + "z" * 39
+    assert len(preview) == 240
     assert truncated is True
+
+
+def test_agent_message_context_includes_embed_and_component_text() -> None:
+    message = Mock(spec=discord.Message)
+    message.content = "visible content"
+    message.is_system.return_value = False
+    message.embeds = [
+        discord.Embed(
+            title="Release title",
+            description="Release description",
+        ).add_field(name="Status", value="Ready")
+    ]
+    message.poll = None
+    message.components = []
+    message.attachments = []
+
+    context = _message_context_text(message)
+
+    assert context.splitlines() == [
+        "visible content",
+        "[embed.0.title] Release title",
+        "[embed.0.description] Release description",
+        "[embed.0.field.0.name] Status",
+        "[embed.0.field.0.value] Ready",
+    ]
 
 
 def test_discord_message_link_parser_accepts_only_one_bare_safe_link() -> None:
@@ -3227,6 +3598,25 @@ def test_agent_message_breaks_have_no_artificial_post_count_limit() -> None:
     assert messages == tuple(str(index) for index in range(8))
 
 
+def test_agent_delivery_nonce_is_stable_bounded_and_chunk_specific() -> None:
+    first = _agent_delivery_nonce("discord:message-edit:42:2026-07-29", 0)
+
+    assert first == _agent_delivery_nonce(
+        "discord:message-edit:42:2026-07-29",
+        0,
+    )
+    assert len(first) == 25
+    assert first != _agent_delivery_nonce(
+        "discord:message-edit:42:2026-07-29",
+        1,
+    )
+    assert first != _agent_delivery_nonce(
+        "discord:message-edit:42:2026-07-29",
+        0,
+        purpose="error",
+    )
+
+
 def test_agent_rate_limit_message_includes_exact_retry_time() -> None:
     error = AgentRateLimitError(
         "limited",
@@ -3240,6 +3630,17 @@ def test_agent_provider_limit_message_explains_the_actual_failure() -> None:
     message = _agent_error_text(AgentProviderLimitError("usage limit"))
     assert "AIプロバイダーの利用上限" in message
     assert "もう一度お試しください" in message
+
+
+def test_agent_timeout_message_explains_interruption_and_uncertain_results() -> None:
+    message = _agent_error_text(
+        AgentTimeoutError("deadline reached", timeout_seconds=125)
+    )
+    assert "設定上限(2分5秒)" in message
+    assert "中断" in message
+    assert "途中の回答は確定していません" in message
+    assert "成功した操作は自動では元に戻りません" in message
+    assert "もう一度メンション" in message
 
 
 def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
@@ -3270,7 +3671,7 @@ def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
     ) == ("10",)
 
 
-def test_trusted_guild_scope_uses_bot_visibility_without_model_self_report() -> None:
+def test_trusted_guild_scope_never_borrows_the_bots_wider_visibility() -> None:
     guild = Mock(spec=discord.Guild)
     bot_member = Mock(spec=discord.Member)
     actor = Mock(spec=discord.Member)
@@ -3292,6 +3693,29 @@ def test_trusted_guild_scope_uses_bot_visibility_without_model_self_report() -> 
         actor,
         trusted_guild=True,
         trigger_channel_id=10,
+    ) == ()
+
+
+def test_trusted_autonomy_bot_principal_uses_only_bot_visibility() -> None:
+    guild = Mock(spec=discord.Guild)
+    bot_member = Mock(spec=discord.Member)
+    guild.me = bot_member
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    guild.text_channels = [channel]
+    guild.threads = []
+    guild.voice_channels = []
+    guild.stage_channels = []
+    channel.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+
+    assert agent_readable_channel_ids(
+        guild,
+        None,
+        trusted_guild=True,
+        trigger_channel_id=20,
     ) == ("20",)
 
 
@@ -3368,7 +3792,7 @@ def test_agent_tool_cannot_expand_the_runtime_resource_scope() -> None:
         _assert_agent_channel_scope(context, "60")
 
 
-def test_agent_progress_update_stays_in_trigger_channel() -> None:
+def test_agent_write_scope_allows_authorized_channel_in_origin_guild() -> None:
     context = InvocationContext(
         actor_id="30",
         workspace_id="10",
@@ -3378,5 +3802,6 @@ def test_agent_progress_update_stays_in_trigger_channel() -> None:
         origin_resource_id="50",
     )
     _assert_agent_update_scope(context, "50")
-    with pytest.raises(UserError, match=r"discord\.agent_update_channel_forbidden"):
-        _assert_agent_update_scope(context, "60")
+    _assert_agent_update_scope(context, "60")
+    with pytest.raises(UserError, match=r"discord\.agent_read_channel_forbidden"):
+        _assert_agent_update_scope(context, "70")

@@ -15,7 +15,6 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         "Queued · waiting for voice",
         "Playing · radio and read aloud",
         "Quote · main menu",
-        "YouTube · audio actions",
         "Help · overview",
         "Help · /play",
         "Server info · populated",
@@ -57,17 +56,12 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         "Generate",
         "Cancel",
     )
-    assert tuple(
-        str(component.get("label"))
-        for component in panels[4].components
-        if component.get("type") == 2
-    ) == ("Play", "Add", "Radio")
-    assert panels[5].embed["title"] == "Help"
-    overview_fields = panels[5].embed["fields"]
+    assert panels[4].embed["title"] == "Help"
+    overview_fields = panels[4].embed["fields"]
     assert all("commands" in str(field["name"]) for field in overview_fields)
     assert all("`/" not in str(field["value"]) for field in overview_fields)
-    assert panels[6].embed["title"] == "/play"
-    assert [field["name"] for field in panels[6].embed["fields"]] == [
+    assert panels[5].embed["title"] == "/play"
+    assert [field["name"] for field in panels[5].embed["fields"]] == [
         "Usage",
         "Examples",
         "Required permissions",
@@ -75,8 +69,8 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         "Behaviour notes",
         "Common errors",
     ]
-    assert panels[7].embed["title"] == "Simajilord Audio Lab"
-    assert panels[8].embed["title"] == "Meteo in Simajilord"
+    assert panels[6].embed["title"] == "Simajilord Audio Lab"
+    assert panels[7].embed["title"] == "Meteo in Simajilord"
 
 
 def test_offline_html_is_local_and_contains_audio_controls() -> None:

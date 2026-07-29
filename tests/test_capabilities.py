@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
@@ -11,7 +12,7 @@ from simajilord.core import (
     RiskLevel,
     endpoint,
 )
-from simajilord.core.errors import CapabilityError
+from simajilord.core.errors import CapabilityError, UserError
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,26 @@ class Request:
 @dataclass(frozen=True)
 class Response:
     doubled: int
+
+
+@dataclass(frozen=True)
+class SearchRequest:
+    duration_minutes: int
+    thread_name: str
+
+
+class RecordingJournal:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    async def record_invocation(self, **values: object) -> None:
+        self.records.append(values)
+
+
+class FailingJournal:
+    async def record_invocation(self, **values: object) -> None:
+        del values
+        raise RuntimeError("journal unavailable")
 
 
 def build_endpoint():
@@ -56,6 +77,55 @@ def test_registry_rejects_duplicate_names() -> None:
         registry.register(build_endpoint())
 
 
+def test_registry_search_handles_nfkc_punctuation_cjk_and_schema_fields() -> None:
+    registry = CapabilityRegistry()
+
+    async def searchable_handler(
+        request: SearchRequest,
+        _: InvocationContext,
+    ) -> Response:
+        return Response(request.duration_minutes)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "timer.create",
+                "Create a delayed focus notification.",
+                RiskLevel.WRITE,
+                keywords=("timer", "タイマー", "集中", "通知"),
+            ),
+            SearchRequest,
+            Response,
+            searchable_handler,
+        )
+    )
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.create_thread",
+                "Create a discussion container.",
+                RiskLevel.WRITE,
+                keywords=("thread", "スレッド", "議論", "分ける"),
+            ),
+            SearchRequest,
+            Response,
+            searchable_handler,
+        )
+    )
+
+    assert registry.search("２５分後、集中タイマーをかけて")[0].descriptor.name == (
+        "timer.create"
+    )
+    assert registry.search("この議論をスレッドに分けて")[0].descriptor.name == (
+        "discord.create_thread"
+    )
+    assert registry.search("TIMER\uFF0FCREATE")[0].descriptor.name == "timer.create"
+    assert {
+        item.descriptor.name
+        for item in registry.search("duration minutes", limit=5)
+    } == {"timer.create", "discord.create_thread"}
+
+
 @pytest.mark.asyncio
 async def test_registry_rejects_wrong_request_type() -> None:
     registry = CapabilityRegistry()
@@ -66,6 +136,85 @@ async def test_registry_rejects_wrong_request_type() -> None:
             object(),
             InvocationContext("actor", None, "test", "request"),
         )
+
+
+@pytest.mark.asyncio
+async def test_registry_enforces_descriptor_timeout_and_records_stable_error() -> None:
+    cancelled = asyncio.Event()
+    journal = RecordingJournal()
+
+    async def wait_forever(_: Request, __: InvocationContext) -> Response:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    registry = CapabilityRegistry(journal=journal)
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "test.timeout",
+                "Wait beyond the declared deadline.",
+                RiskLevel.READ,
+                timeout_seconds=0.01,
+            ),
+            Request,
+            Response,
+            wait_forever,
+        )
+    )
+
+    with pytest.raises(UserError) as captured:
+        await registry.invoke(
+            "test.timeout",
+            Request(1),
+            InvocationContext("actor", "workspace", "test", "request-timeout"),
+        )
+
+    assert captured.value.code == "capability.timeout"
+    assert captured.value.details == {
+        "capability": "test.timeout",
+        "timeout_seconds": 0.01,
+    }
+    assert cancelled.is_set()
+    assert len(journal.records) == 1
+    assert journal.records[0]["error"] is captured.value
+    assert journal.records[0]["response"] is None
+
+
+@pytest.mark.asyncio
+async def test_journal_failure_does_not_replace_capability_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    successful = CapabilityRegistry(journal=FailingJournal())
+    successful.register(build_endpoint())
+    result = await successful.invoke(
+        "test.double",
+        Request(4),
+        InvocationContext("actor", "workspace", "test", "request-success"),
+    )
+    assert result == Response(8)
+
+    async def fail(_: Request, __: InvocationContext) -> Response:
+        raise CapabilityError("primary capability failure")
+
+    failed = CapabilityRegistry(journal=FailingJournal())
+    failed.register(
+        endpoint(
+            CapabilityDescriptor("test.fail", "Fail predictably.", RiskLevel.READ),
+            Request,
+            Response,
+            fail,
+        )
+    )
+    with pytest.raises(CapabilityError, match="primary capability failure"):
+        await failed.invoke(
+            "test.fail",
+            Request(1),
+            InvocationContext("actor", "workspace", "test", "request-failure"),
+        )
+
+    assert caplog.text.count("Capability journal record failed") == 2
 
 
 def test_manifest_exposes_agent_planning_metadata() -> None:
@@ -127,10 +276,16 @@ def test_descriptor_rejects_contradictory_planning_metadata() -> None:
         )
 
 
-def test_write_descriptor_defaults_to_non_idempotent_write() -> None:
+@pytest.mark.parametrize(
+    "risk",
+    (RiskLevel.WRITE, RiskLevel.DESTRUCTIVE),
+)
+def test_mutating_descriptor_defaults_to_non_idempotent_write(
+    risk: RiskLevel,
+) -> None:
     descriptor = CapabilityDescriptor(
         "test.write",
         "Write.",
-        RiskLevel.WRITE,
+        risk,
     )
     assert descriptor.idempotency == "non_idempotent_write"

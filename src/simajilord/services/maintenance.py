@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from simajilord.agent.memory import AgentMemoryStore
 from simajilord.agent.store import AgentConversationStore
 from simajilord.observability import EventJournal
 
@@ -30,6 +31,7 @@ class MaintenanceReport:
     event_records_removed: int = 0
     agent_requests_removed: int = 0
     agent_conversations_removed: int = 0
+    agent_memories_removed: int = 0
     focus_timers_removed: int = 0
     image_jobs_removed: int = 0
     image_files_removed: int = 0
@@ -60,6 +62,7 @@ class DataMaintenanceService:
         max_data_bytes: int,
         journal: EventJournal,
         agent_store: AgentConversationStore,
+        memory_store: AgentMemoryStore,
         focus_timers: FocusTimerService,
         image_store: ImageGenerationStore,
         image_output_dir: Path,
@@ -76,6 +79,7 @@ class DataMaintenanceService:
         self.max_data_bytes = max_data_bytes
         self.journal = journal
         self.agent_store = agent_store
+        self.memory_store = memory_store
         self.focus_timers = focus_timers
         self.image_store = image_store
         self.image_output_dir = image_output_dir.resolve()
@@ -102,6 +106,7 @@ class DataMaintenanceService:
             agent_requests, agent_conversations = await self.agent_store.prune(
                 before=cutoff
             )
+            agent_memories = await self.memory_store.cleanup(now=current)
             focus_timers = await self.focus_timers.prune_terminal(before=cutoff)
             image_jobs, image_paths = await asyncio.to_thread(
                 self.image_store.prune_delivered_terminal,
@@ -153,6 +158,7 @@ class DataMaintenanceService:
                 event_records_removed=events,
                 agent_requests_removed=agent_requests,
                 agent_conversations_removed=agent_conversations,
+                agent_memories_removed=agent_memories,
                 focus_timers_removed=focus_timers,
                 image_jobs_removed=image_jobs,
                 image_files_removed=image_files,

@@ -10,7 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from simajilord.core.errors import ConfigurationError
+from simajilord.core.errors import ConfigurationError, UserError
 
 
 class ReadAloudMode(StrEnum):
@@ -85,6 +85,19 @@ class ReadAloudPolicy:
     user_voice_presets: tuple[tuple[str, ReadAloudVoicePreset], ...] = ()
     ignore_bots: bool = True
     ignore_webhooks: bool = True
+
+
+def read_aloud_content_mode(policy: ReadAloudPolicy) -> ReadAloudContentMode:
+    """Project the four content switches into their public preset."""
+
+    read_events = policy.announce_join or policy.announce_leave or policy.announce_move
+    if policy.read_messages and read_events:
+        return ReadAloudContentMode.ALL
+    if policy.read_messages:
+        return ReadAloudContentMode.MESSAGES
+    if read_events:
+        return ReadAloudContentMode.EVENTS
+    return ReadAloudContentMode.OFF
 
 
 class ReadAloudService:
@@ -329,6 +342,27 @@ class ReadAloudService:
     ) -> ReadAloudPolicy:
         """Update selected voice-state announcement switches."""
 
+        updated, _ = await self.set_announcements_with_previous(
+            workspace_id=workspace_id,
+            join=join,
+            leave=leave,
+            move=move,
+        )
+        return updated
+
+    async def set_announcements_with_previous(
+        self,
+        *,
+        workspace_id: str,
+        join: bool | None = None,
+        leave: bool | None = None,
+        move: bool | None = None,
+        expected_join: bool | None = None,
+        expected_leave: bool | None = None,
+        expected_move: bool | None = None,
+    ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
+        """Update announcement switches and atomically return the prior policy."""
+
         if join is None and leave is None and move is None:
             raise ValueError("read_aloud.announcement_value_required")
         async with self._lock:
@@ -339,9 +373,22 @@ class ReadAloudService:
                 announce_leave=current.announce_leave if leave is None else leave,
                 announce_move=current.announce_move if move is None else move,
             )
+            if updated == current:
+                return current, current
+            if (
+                expected_join is not None
+                and current.announce_join != expected_join
+            ) or (
+                expected_leave is not None
+                and current.announce_leave != expected_leave
+            ) or (
+                expected_move is not None
+                and current.announce_move != expected_move
+            ):
+                raise UserError("action.undo_conflict")
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
-            return updated
+            return updated, current
 
     async def set_content_mode(
         self,
@@ -351,11 +398,26 @@ class ReadAloudService:
     ) -> ReadAloudPolicy:
         """Apply one explicit messages/events preset without deleting the route."""
 
-        read_messages = mode in {
+        updated, _ = await self.set_content_mode_with_previous(
+            workspace_id=workspace_id,
+            mode=mode,
+        )
+        return updated
+
+    async def set_content_mode_with_previous(
+        self,
+        *,
+        workspace_id: str,
+        mode: ReadAloudContentMode,
+    ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
+        """Apply a content preset and atomically return the prior scalar policy."""
+
+        normalized_mode = ReadAloudContentMode(mode)
+        read_messages = normalized_mode in {
             ReadAloudContentMode.ALL,
             ReadAloudContentMode.MESSAGES,
         }
-        read_events = mode in {
+        read_events = normalized_mode in {
             ReadAloudContentMode.ALL,
             ReadAloudContentMode.EVENTS,
         }
@@ -368,6 +430,84 @@ class ReadAloudService:
                 announce_leave=read_events,
                 announce_move=read_events,
             )
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated, current
+
+    async def compare_and_set_content_mode(
+        self,
+        *,
+        workspace_id: str,
+        expected: ReadAloudContentMode,
+        mode: ReadAloudContentMode,
+    ) -> tuple[ReadAloudPolicy, bool]:
+        """Apply a preset only while the current preset still matches."""
+
+        normalized_expected = ReadAloudContentMode(expected)
+        normalized_mode = ReadAloudContentMode(mode)
+        read_messages = normalized_mode in {
+            ReadAloudContentMode.ALL,
+            ReadAloudContentMode.MESSAGES,
+        }
+        read_events = normalized_mode in {
+            ReadAloudContentMode.ALL,
+            ReadAloudContentMode.EVENTS,
+        }
+        async with self._lock:
+            current = self.policy(workspace_id)
+            if read_aloud_content_mode(current) != normalized_expected:
+                return current, False
+            updated = replace(
+                current,
+                read_messages=read_messages,
+                announce_join=read_events,
+                announce_leave=read_events,
+                announce_move=read_events,
+            )
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated, True
+
+    async def restore_content_state(
+        self,
+        *,
+        workspace_id: str,
+        read_messages: bool,
+        announce_join: bool,
+        announce_leave: bool,
+        announce_move: bool,
+        expected_read_messages: bool | None = None,
+        expected_announce_join: bool | None = None,
+        expected_announce_leave: bool | None = None,
+        expected_announce_move: bool | None = None,
+    ) -> ReadAloudPolicy:
+        """Restore the four exact booleans collapsed by a content-mode preset."""
+
+        async with self._lock:
+            current = self.policy(workspace_id)
+            updated = replace(
+                current,
+                read_messages=read_messages,
+                announce_join=announce_join,
+                announce_leave=announce_leave,
+                announce_move=announce_move,
+            )
+            if updated == current:
+                return current
+            if (
+                expected_read_messages is not None
+                and current.read_messages != expected_read_messages
+            ) or (
+                expected_announce_join is not None
+                and current.announce_join != expected_announce_join
+            ) or (
+                expected_announce_leave is not None
+                and current.announce_leave != expected_announce_leave
+            ) or (
+                expected_announce_move is not None
+                and current.announce_move != expected_announce_move
+            ):
+                raise UserError("action.undo_conflict")
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -437,6 +577,30 @@ class ReadAloudService:
     ) -> ReadAloudPolicy:
         """Update selected semantic speech formatting switches."""
 
+        updated, _ = await self.set_semantic_options_with_previous(
+            workspace_id=workspace_id,
+            author_names=author_names,
+            replies=replies,
+            attachments=attachments,
+            vc_members_only=vc_members_only,
+        )
+        return updated
+
+    async def set_semantic_options_with_previous(
+        self,
+        *,
+        workspace_id: str,
+        author_names: bool | None = None,
+        replies: bool | None = None,
+        attachments: bool | None = None,
+        vc_members_only: bool | None = None,
+        expected_author_names: bool | None = None,
+        expected_replies: bool | None = None,
+        expected_attachments: bool | None = None,
+        expected_vc_members_only: bool | None = None,
+    ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
+        """Update semantic options and atomically return the prior policy."""
+
         if (
             author_names is None
             and replies is None
@@ -465,9 +629,25 @@ class ReadAloudService:
                     else vc_members_only
                 ),
             )
+            if updated == current:
+                return current, current
+            if (
+                expected_author_names is not None
+                and current.read_author_names != expected_author_names
+            ) or (
+                expected_replies is not None
+                and current.read_replies != expected_replies
+            ) or (
+                expected_attachments is not None
+                and current.read_attachments != expected_attachments
+            ) or (
+                expected_vc_members_only is not None
+                and current.vc_members_only != expected_vc_members_only
+            ):
+                raise UserError("action.undo_conflict")
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
-            return updated
+            return updated, current
 
     def allows_message(
         self,

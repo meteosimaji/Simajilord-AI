@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import discord
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.local_media import LocalMediaRecord
+
+from .attachment_io import read_attachment_bytes
 
 PLAYABLE_ATTACHMENT_SUFFIXES = {
     ".aac",
@@ -55,7 +58,15 @@ async def import_discord_attachment(
     import_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = import_root / f"{secrets.token_hex(16)}.part"
     try:
-        await attachment.save(temporary, use_cached=True)
+        content = await read_attachment_bytes(attachment)
+        if not content:
+            raise UserError("local_media.empty")
+        if len(content) > runtime.settings.local_media_max_file_bytes:
+            raise UserError(
+                "local_media.too_large",
+                maximum=runtime.settings.local_media_max_file_bytes,
+            )
+        await asyncio.to_thread(temporary.write_bytes, content)
         return await runtime.local_media.import_file(
             temporary,
             original_filename=attachment.filename,

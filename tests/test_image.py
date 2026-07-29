@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock, Mock
 
+import discord
 import pytest
 
 from simajilord.capabilities.image import (
@@ -21,6 +25,10 @@ from simajilord.domain.image import (
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
+)
+from simajilord.integrations.discord.bot import (
+    SimajilordDiscordBot,
+    _image_progress_embed,
 )
 from simajilord.observability import EventJournal
 from simajilord.providers.image import ImageProviderResult
@@ -77,6 +85,40 @@ def _prompt(subject: str = "a cat") -> ImageGenerationPrompt:
         style="clean editorial illustration",
         lighting="soft window light",
         rendering=ImageRendering.ILLUSTRATION,
+    )
+
+
+def _job(
+    tmp_path: Path,
+    *,
+    job_id: str,
+    status: ImageJobStatus,
+    delivery_message_id: str | None = None,
+) -> ImageGenerationJob:
+    output = tmp_path / "output" / f"{job_id}.png"
+    if status is ImageJobStatus.COMPLETED:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    return ImageGenerationJob(
+        job_id=job_id,
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="123",
+        reply_to_message_id="456",
+        prompt=_prompt(),
+        caption_json=build_ideogram_caption(_prompt()),
+        status=status,
+        output_path=output if status is ImageJobStatus.COMPLETED else None,
+        width=512,
+        height=512,
+        seed=1,
+        created_at_iso=datetime.now(UTC).isoformat(),
+        completed_at_iso=(
+            datetime.now(UTC).isoformat()
+            if status in {ImageJobStatus.COMPLETED, ImageJobStatus.FAILED}
+            else None
+        ),
+        delivery_message_id=delivery_message_id,
     )
 
 
@@ -181,6 +223,56 @@ def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
     assert store.get(delivered.job_id) is None
     assert store.get(undelivered.job_id) is not None
     assert store.prune_oldest_delivered_terminal() == (False, ())
+
+
+def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> None:
+    database = tmp_path / "image.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE image_generation_jobs (
+                job_id TEXT PRIMARY KEY,
+                actor_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                delivery_target_id TEXT NOT NULL,
+                reply_to_message_id TEXT,
+                prompt_json TEXT NOT NULL,
+                caption_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                output_path TEXT,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                seed INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                generation_seconds REAL,
+                error_code TEXT,
+                progress_step INTEGER NOT NULL DEFAULT 0,
+                progress_total INTEGER NOT NULL DEFAULT 12,
+                delivered INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+    store = ImageGenerationStore(database)
+    with sqlite3.connect(database) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(image_generation_jobs)"
+            )
+        }
+    assert "delivery_message_id" in columns
+    job = _job(
+        tmp_path,
+        job_id="post-migration",
+        status=ImageJobStatus.FAILED,
+    )
+    store.insert(job)
+    store.mark_delivered(job.job_id, message_id="123")
+    migrated = store.require(job.job_id)
+    assert migrated.delivery_message_id == "123"
+    assert migrated.delivered is True
 
 
 @pytest.mark.asyncio
@@ -306,6 +398,258 @@ async def test_terminal_retry_is_not_lost_while_an_older_retry_is_in_flight(
     assert seen == [ImageJobStatus.RUNNING, ImageJobStatus.COMPLETED]
     assert service.store.require(job.job_id).delivered is True
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_delivery_lock_serializes_and_reloads_terminal_state(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    running = _job(
+        tmp_path,
+        job_id="serialized-delivery",
+        status=ImageJobStatus.RUNNING,
+    )
+    service.store.insert(running)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    seen: list[ImageJobStatus] = []
+
+    async def delivery(job: ImageGenerationJob) -> None:
+        seen.append(job.status)
+        if job.status is ImageJobStatus.RUNNING:
+            first_started.set()
+            await release_first.wait()
+        else:
+            await service.mark_delivered(job.job_id)
+
+    service._delivery_handler = delivery
+    first = asyncio.create_task(service._notify(running))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    output = tmp_path / "output" / "serialized-delivery.png"
+    output.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    terminal = service.store.complete(
+        running.job_id,
+        output_path=output,
+        generation_seconds=0.01,
+    )
+    second = asyncio.create_task(service._notify(terminal))
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    assert seen == [ImageJobStatus.RUNNING, ImageJobStatus.COMPLETED]
+    assert service.store.require(running.job_id).delivered is True
+    assert service._delivery_locks == {}
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_two_terminal_notifications_publish_only_once(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    terminal = _job(
+        tmp_path,
+        job_id="single-terminal-delivery",
+        status=ImageJobStatus.COMPLETED,
+    )
+    service.store.insert(terminal)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    attempts = 0
+
+    async def delivery(job: ImageGenerationJob) -> None:
+        nonlocal attempts
+        attempts += 1
+        first_started.set()
+        await release_first.wait()
+        await service.mark_delivered(job.job_id)
+
+    service._delivery_handler = delivery
+    first = asyncio.create_task(service._notify(terminal))
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    second = asyncio.create_task(service._notify(terminal))
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    assert attempts == 1
+    assert service.store.require(terminal.job_id).delivered is True
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_journal_failure_does_not_change_completed_result(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    service.journal.append = AsyncMock(side_effect=OSError("journal unavailable"))
+
+    async def delivery(job: ImageGenerationJob) -> None:
+        if job.status is ImageJobStatus.COMPLETED:
+            await service.mark_delivered(job.job_id)
+
+    await service.start(delivery)
+    job = await service.submit(
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt(),
+    )
+    for _ in range(100):
+        current = service.store.require(job.job_id)
+        if current.delivered:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("image worker did not preserve completion after journal failure")
+
+    current = service.store.require(job.job_id)
+    assert current.status is ImageJobStatus.COMPLETED
+    assert current.error_code is None
+    assert current.output_path is not None and current.output_path.is_file()
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_image_edits_persistent_message_across_mark_failure(
+    tmp_path: Path,
+) -> None:
+    job = _job(
+        tmp_path,
+        job_id="edit-after-crash-window",
+        status=ImageJobStatus.COMPLETED,
+        delivery_message_id="789",
+    )
+    progress_message = Mock(spec=discord.Message)
+    progress_message.id = 789
+    progress_message.attachments = []
+    progress_message.embeds = [_image_progress_embed(job)]
+
+    async def edit_progress(**kwargs: object) -> None:
+        progress_message.attachments = [
+            SimpleNamespace(filename="simajilord-edit-aft.png")
+        ]
+        progress_message.embeds = [kwargs["embed"]]
+
+    progress_message.edit = AsyncMock(side_effect=edit_progress)
+    channel = Mock(spec=discord.TextChannel)
+    channel.fetch_message = AsyncMock(return_value=progress_message)
+    channel.send = AsyncMock()
+    image_service = SimpleNamespace(
+        set_delivery_message=AsyncMock(),
+        mark_delivered=AsyncMock(
+            side_effect=[OSError("database unavailable"), None]
+        ),
+    )
+    bot = Mock(spec=SimajilordDiscordBot)
+    bot.get_channel.return_value = channel
+    bot.runtime = SimpleNamespace(image=image_service)
+    bot.user = SimpleNamespace(id=999)
+    bot._image_delivery_message = (
+        SimajilordDiscordBot._image_delivery_message.__get__(bot)
+    )
+
+    with pytest.raises(OSError, match="database unavailable"):
+        await SimajilordDiscordBot._deliver_image_job(bot, job)
+    await SimajilordDiscordBot._deliver_image_job(bot, job)
+
+    assert channel.send.await_count == 0
+    assert progress_message.edit.await_count == 1
+    assert image_service.mark_delivered.await_count == 2
+    image_service.mark_delivered.assert_awaited_with(
+        job.job_id,
+        message_id="789",
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_image_recovers_unpersisted_progress_message(
+    tmp_path: Path,
+) -> None:
+    job = _job(
+        tmp_path,
+        job_id="recover-message-id",
+        status=ImageJobStatus.COMPLETED,
+    )
+    progress_message = Mock(spec=discord.Message)
+    progress_message.id = 987
+    progress_message.author = SimpleNamespace(id=999)
+    progress_message.attachments = []
+    progress_message.embeds = [_image_progress_embed(job)]
+    progress_message.edit = AsyncMock()
+    channel = Mock(spec=discord.TextChannel)
+    channel.send = AsyncMock()
+
+    async def history(
+        *,
+        limit: int,
+        after: datetime,
+        oldest_first: bool,
+    ) -> AsyncIterator[discord.Message]:
+        assert limit == 1_000
+        assert after.tzinfo is not None
+        assert oldest_first is True
+        yield progress_message
+
+    channel.history = history
+    image_service = SimpleNamespace(
+        set_delivery_message=AsyncMock(),
+        mark_delivered=AsyncMock(),
+    )
+    bot = Mock(spec=SimajilordDiscordBot)
+    bot.get_channel.return_value = channel
+    bot.runtime = SimpleNamespace(image=image_service)
+    bot.user = SimpleNamespace(id=999)
+    bot._image_delivery_message = (
+        SimajilordDiscordBot._image_delivery_message.__get__(bot)
+    )
+
+    await SimajilordDiscordBot._deliver_image_job(bot, job)
+
+    image_service.set_delivery_message.assert_awaited_once_with(
+        job.job_id,
+        "987",
+    )
+    image_service.mark_delivered.assert_awaited_once_with(
+        job.job_id,
+        message_id="987",
+    )
+    progress_message.edit.assert_awaited_once()
+    assert channel.send.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_progress_fetch_failure_does_not_send_duplicate(
+    tmp_path: Path,
+) -> None:
+    job = _job(
+        tmp_path,
+        job_id="transient-fetch",
+        status=ImageJobStatus.COMPLETED,
+        delivery_message_id="789",
+    )
+    response = SimpleNamespace(status=503, reason="Service Unavailable")
+    channel = Mock(spec=discord.TextChannel)
+    channel.fetch_message = AsyncMock(
+        side_effect=discord.HTTPException(response, "temporary outage")
+    )
+    channel.send = AsyncMock()
+    image_service = SimpleNamespace(
+        set_delivery_message=AsyncMock(),
+        mark_delivered=AsyncMock(),
+    )
+    bot = Mock(spec=SimajilordDiscordBot)
+    bot.get_channel.return_value = channel
+    bot.runtime = SimpleNamespace(image=image_service)
+    bot.user = SimpleNamespace(id=999)
+    bot._image_delivery_message = (
+        SimajilordDiscordBot._image_delivery_message.__get__(bot)
+    )
+
+    with pytest.raises(discord.HTTPException, match="temporary outage"):
+        await SimajilordDiscordBot._deliver_image_job(bot, job)
+
+    assert channel.send.await_count == 0
+    assert image_service.mark_delivered.await_count == 0
 
 
 @pytest.mark.asyncio

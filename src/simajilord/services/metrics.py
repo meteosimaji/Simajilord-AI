@@ -15,6 +15,7 @@ class ServiceOperationMetric:
     wait_ms: float
     duration_ms: float
     outcome: str
+    resource_id: str | None = None
 
 
 ServiceMetricHook = Callable[[ServiceOperationMetric], Awaitable[None]]

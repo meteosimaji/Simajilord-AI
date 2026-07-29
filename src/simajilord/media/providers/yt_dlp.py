@@ -7,13 +7,19 @@ import logging
 import os
 import sys
 from collections.abc import Iterator, Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioItem
-from simajilord.domain.media import DownloadArtifact, DownloadFormat, MediaCandidate
+from simajilord.domain.media import (
+    DownloadArtifact,
+    DownloadBatch,
+    DownloadFormat,
+    MediaCandidate,
+)
 from simajilord.media.security import (
     normalize_media_query,
     normalize_media_reference,
@@ -223,16 +229,44 @@ class YtDlpProvider:
         *,
         max_bytes: int,
     ) -> DownloadArtifact:
+        batch = await self.download_many(
+            url,
+            media_type,
+            destination,
+            max_bytes=max_bytes,
+            max_items=1,
+        )
+        return batch.artifacts[0]
+
+    async def download_many(
+        self,
+        url: str,
+        media_type: DownloadFormat,
+        destination: Path,
+        *,
+        max_bytes: int,
+        max_items: int,
+    ) -> DownloadBatch:
+        if not 1 <= max_items <= 10:
+            raise ValueError("max_items must be between 1 and 10")
         source_url = await validate_public_media_url(url)
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if any(destination.iterdir()):
+            raise MediaError(
+                "unsafe_path",
+                "The media download destination must be empty.",
+            )
         command = [
             sys.executable,
             "-m",
             "yt_dlp",
+            "--ignore-config",
+            "--no-cache-dir",
             "--no-plugin-dirs",
             "--use-extractors",
             "default,-generic",
-            "--no-playlist",
+            "--playlist-end",
+            str(max_items),
             "--no-progress",
             "--no-warnings",
             "--restrict-filenames",
@@ -241,18 +275,115 @@ class YtDlpProvider:
             "--paths",
             str(destination),
             "--output",
-            "%(title).120B_[%(id)s].%(ext)s",
+            "%(title).100B_%(playlist_index|0)02d_[%(id)s].%(ext)s",
         ]
         if self.cookie_file is not None:
             command.extend(("--cookies", str(self.cookie_file)))
         if media_type is DownloadFormat.AUDIO:
-            command.extend(("--extract-audio", "--audio-format", "mp3"))
+            command.extend(
+                (
+                    "--format",
+                    (
+                        f"ba[filesize_approx<={max_bytes}]/"
+                        f"ba[filesize<={max_bytes}]/ba"
+                    ),
+                    "--extract-audio",
+                    "--audio-format",
+                    "mp3",
+                )
+            )
         else:
-            command.extend(("--format", "bv*+ba/b", "--merge-output-format", "mp4"))
+            command.extend(
+                (
+                    "--format",
+                    (
+                        f"b[filesize_approx<={max_bytes}]/"
+                        f"b[filesize<={max_bytes}]/b[height<=720]/b"
+                    ),
+                    "--merge-output-format",
+                    "mp4",
+                )
+            )
         command.append(source_url)
 
-        environment = os.environ.copy()
-        environment["YTDLP_NO_PLUGINS"] = "1"
+        environment = _download_environment()
+        return_code = 1
+        output = ""
+        for attempt in range(3):
+            return_code, output = await self._run_download_process(
+                command,
+                environment=environment,
+            )
+            if (
+                return_code == 0
+                or _downloaded_paths(destination)
+                or not _retryable_extraction_failure(output)
+                or attempt == 2
+            ):
+                break
+
+        destination_root = destination.resolve()
+        artifacts: list[DownloadArtifact] = []
+        skipped_oversize = 0
+        for path in _downloaded_paths(destination):
+            artifact_path = path.resolve()
+            if (
+                path.is_symlink()
+                or destination_root not in artifact_path.parents
+            ):
+                raise MediaError(
+                    "unsafe_path",
+                    "The media provider returned an unsafe path.",
+                )
+            size = artifact_path.stat().st_size
+            if size > max_bytes:
+                artifact_path.unlink(missing_ok=True)
+                skipped_oversize += 1
+                continue
+            artifacts.append(
+                DownloadArtifact(
+                    path=artifact_path,
+                    title=artifact_path.stem,
+                    media_type=media_type,
+                    source_url=source_url,
+                    size_bytes=size,
+                )
+            )
+
+        skipped_from_provider = sum(
+            "larger than max-filesize" in line.casefold()
+            for line in output.splitlines()
+        )
+        overflow_items = max(0, len(artifacts) - max_items)
+        skipped_items = max(
+            skipped_oversize,
+            skipped_from_provider,
+            overflow_items,
+        )
+        if not artifacts:
+            if skipped_items:
+                raise MediaError(
+                    "too_large",
+                    "The media exceeds this server's upload limit.",
+                )
+            if return_code != 0:
+                raise classify_yt_dlp_error(output[-2_000:])
+            raise MediaError(
+                "unknown",
+                "The media provider produced no usable files.",
+            )
+        return DownloadBatch(
+            artifacts=tuple(artifacts[:max_items]),
+            skipped_items=skipped_items,
+            partial=return_code != 0 or skipped_items > 0,
+        )
+
+    async def _run_download_process(
+        self,
+        command: list[str],
+        *,
+        environment: dict[str, str],
+    ) -> tuple[int, str]:
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -264,36 +395,14 @@ class YtDlpProvider:
                 process.communicate(),
                 timeout=self.download_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            await _terminate_process(process)
+            raise
         except TimeoutError as exc:
-            process.kill()
-            await process.wait()
+            await _terminate_process(process)
             raise MediaError("timeout", "The media download timed out.") from exc
-
-        if process.returncode != 0:
-            detail = (stderr or stdout).decode(errors="replace")[-2_000:]
-            raise classify_yt_dlp_error(detail)
-
-        files = tuple(
-            path
-            for path in destination.iterdir()
-            if path.is_file() and path.suffix not in {".part", ".ytdl"}
-        )
-        if len(files) != 1:
-            raise MediaError("unknown", "The media provider produced an unexpected result.")
-        artifact_path = files[0].resolve()
-        if destination.resolve() not in artifact_path.parents:
-            raise MediaError("unsafe_path", "The media provider returned an unsafe path.")
-        size = artifact_path.stat().st_size
-        if size > max_bytes:
-            artifact_path.unlink(missing_ok=True)
-            raise MediaError("too_large", "The downloaded file exceeds this server's upload limit.")
-        return DownloadArtifact(
-            path=artifact_path,
-            title=artifact_path.stem,
-            media_type=media_type,
-            source_url=source_url,
-            size_bytes=size,
-        )
+        output = b"\n".join((stdout, stderr)).decode(errors="replace")
+        return process.returncode or 0, output
 
 
 def _first_entry(info: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -453,6 +562,14 @@ def classify_yt_dlp_error(detail: str) -> MediaError:
             "cookie_required",
             "This media requires authentication. Configure a private cookie file on the host.",
         )
+    if _retryable_extraction_failure(detail):
+        return MediaError(
+            "extractor_challenge",
+            (
+                "The platform's temporary extraction challenge persisted after bounded "
+                "retries. Retry later or configure a private host cookie file."
+            ),
+        )
     if "geo" in lowered and any(term in lowered for term in ("restrict", "block", "country")):
         return MediaError("geo_restricted", "This media is unavailable in the host region.")
     if any(term in lowered for term in ("unsupported url", "no suitable extractor")):
@@ -468,3 +585,67 @@ def classify_yt_dlp_error(detail: str) -> MediaError:
         return MediaError("unavailable", "This media is unavailable or private.")
     log.warning("Unclassified media provider failure: %s", detail[-500:])
     return MediaError("unknown", "The media provider could not complete the request.")
+
+
+def _downloaded_paths(destination: Path) -> tuple[Path, ...]:
+    ignored_suffixes = {".json", ".part", ".temp", ".tmp", ".ytdl"}
+    return tuple(
+        sorted(
+            (
+                path
+                for path in destination.iterdir()
+                if path.is_file() and path.suffix.casefold() not in ignored_suffixes
+            ),
+            key=lambda item: item.name,
+        )
+    )
+
+
+def _download_environment() -> dict[str, str]:
+    """Give the downloader only runtime settings, never bot credentials."""
+
+    environment = {
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "YTDLP_NO_PLUGINS": "1",
+    }
+    for name in (
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TMPDIR",
+    ):
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
+    return environment
+
+
+def _retryable_extraction_failure(detail: str) -> bool:
+    normalized = detail.casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "challenge cookie",
+            "remote end closed connection",
+            "timed out",
+            "unable to extract universal data for rehydration",
+        )
+    )
+
+
+async def _terminate_process(process: asyncio.subprocess.Process) -> None:
+    """Leave no downloader behind when a capability timeout cancels this task."""
+
+    if process.returncode is not None:
+        return
+    with suppress(ProcessLookupError):
+        process.kill()
+    try:
+        await asyncio.shield(process.communicate())
+    except (BrokenPipeError, ConnectionResetError, ProcessLookupError):
+        await asyncio.shield(process.wait())

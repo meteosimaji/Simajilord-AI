@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 
 import discord
 
@@ -16,6 +18,7 @@ from simajilord.agent import (
     AgentProgressUpdate,
     AgentProviderLimitError,
     AgentRateLimitError,
+    AgentTimeoutError,
     AgentUnavailableError,
 )
 
@@ -59,6 +62,28 @@ def agent_message_groups(content: str) -> tuple[str, ...]:
     return tuple(messages)
 
 
+def agent_delivery_nonce(
+    delivery_key: str,
+    index: int,
+    *,
+    purpose: str = "response",
+) -> str:
+    """Derive a stable Discord nonce for one event-owned host delivery.
+
+    discord.py sends ``enforce_nonce=true`` whenever a nonce is provided. Discord
+    can therefore return the already-created message when a retry crosses the
+    narrow send/receipt/ACK crash window. Only a digest is exposed and Discord's
+    25-character nonce limit is preserved.
+    """
+
+    if index < 0:
+        raise ValueError("delivery nonce index must be non-negative")
+    digest = hashlib.sha256(
+        f"{purpose}\0{delivery_key}\0{index}".encode()
+    ).hexdigest()
+    return f"sla{digest[:22]}"
+
+
 def agent_error_text(error: Exception) -> str:
     if isinstance(error, AgentBusyError):
         return "AIへの依頼が混み合っています。少し待ってからもう一度お試しください。"
@@ -75,6 +100,13 @@ def agent_error_text(error: Exception) -> str:
         return (
             "AIプロバイダーの利用上限に達しています。"
             "上限がリセットされてから、もう一度お試しください。"
+        )
+    if isinstance(error, AgentTimeoutError):
+        limit = retry_after_text(max(1, round(error.timeout_seconds)))
+        return (
+            f"AIの処理が設定上限({limit})に達したため、中断しました。"
+            "途中の回答は確定していません。すでに成功した操作は自動では元に戻りません。"
+            "続きから進める場合は、もう一度メンションしてください。"
         )
     return "AIの処理を完了できませんでした。"
 
@@ -127,10 +159,14 @@ class AgentProgressMessage:
         *,
         initial_delay_seconds: float = 1.0,
         minimum_update_seconds: float = 2.5,
+        on_posted: Callable[[discord.Message], Awaitable[None]] | None = None,
+        delivery_key: str | None = None,
     ) -> None:
         self.source = source
         self.initial_delay_seconds = initial_delay_seconds
         self.minimum_update_seconds = minimum_update_seconds
+        self.on_posted = on_posted
+        self.delivery_key = delivery_key or f"discord:message:{source.id}"
         self.message: discord.Message | None = None
         self._latest: AgentProgressUpdate | None = None
         self._published: AgentProgressUpdate | None = None
@@ -151,24 +187,33 @@ class AgentProgressMessage:
             )
 
     async def finish(self, content: str) -> None:
+        messages = await self.prepare(content)
+        if not messages:
+            return
+        first = await self.source.reply(
+            messages[0],
+            nonce=agent_delivery_nonce(self.delivery_key, 0),
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self._notify_posted(first)
+        for index, message_content in enumerate(messages[1:], start=1):
+            posted = await self.source.channel.send(
+                message_content,
+                nonce=agent_delivery_nonce(self.delivery_key, index),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self._notify_posted(posted)
+
+    async def prepare(self, content: str) -> tuple[str, ...]:
+        """Close temporary UI and return final chunks without posting them."""
+
         self._closed = True
         await self._cancel_pending()
         await self._delete_temporary_messages()
         if content.strip() == AGENT_NO_ACTION_CONTENT:
-            return
-        messages = agent_message_groups(content)
-        if not messages:
-            return
-        await self.source.reply(
-            messages[0],
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        for message in messages[1:]:
-            await self.source.channel.send(
-                message,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            return ()
+        return agent_message_groups(content)
 
     async def fail(self, content: str) -> None:
         self._closed = True
@@ -176,6 +221,11 @@ class AgentProgressMessage:
         await self._delete_temporary_messages()
         await self.source.reply(
             content,
+            nonce=agent_delivery_nonce(
+                self.delivery_key,
+                0,
+                purpose="error",
+            ),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -212,6 +262,11 @@ class AgentProgressMessage:
                 if self.message is None:
                     self.message = await self.source.reply(
                         embed=embed,
+                        nonce=agent_delivery_nonce(
+                            self.delivery_key,
+                            0,
+                            purpose="progress",
+                        ),
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
@@ -274,6 +329,22 @@ class AgentProgressMessage:
                 "Failed to delete AI %s message source_message_id=%s "
                 "temporary_message_id=%s",
                 kind,
+                self.source.id,
+                message.id,
+            )
+
+    async def _notify_posted(self, message: discord.Message) -> None:
+        callback = self.on_posted
+        if callback is None:
+            return
+        try:
+            await callback(message)
+        except Exception:
+            # Receipt persistence must never turn a successful Discord send into
+            # an apparent delivery failure or cause the model response to repost.
+            log.exception(
+                "Failed to receipt AI host post source_message_id=%s "
+                "posted_message_id=%s",
                 self.source.id,
                 message.id,
             )

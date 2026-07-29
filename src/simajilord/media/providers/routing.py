@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from simajilord.domain.audio import AudioItem
-from simajilord.domain.media import DownloadArtifact, DownloadFormat, MediaCandidate
+from simajilord.domain.media import (
+    DownloadArtifact,
+    DownloadBatch,
+    DownloadFormat,
+    MediaCandidate,
+)
 from simajilord.services.local_media import LOCAL_MEDIA_SCHEME, LocalMediaStore
 from simajilord.services.media import MediaProvider
 
@@ -55,4 +60,21 @@ class RoutingMediaProvider:
             media_type,
             destination,
             max_bytes=max_bytes,
+        )
+
+    async def download_many(
+        self,
+        url: str,
+        media_type: DownloadFormat,
+        destination: Path,
+        *,
+        max_bytes: int,
+        max_items: int,
+    ) -> DownloadBatch:
+        return await self.remote.download_many(
+            url,
+            media_type,
+            destination,
+            max_bytes=max_bytes,
+            max_items=max_items,
         )

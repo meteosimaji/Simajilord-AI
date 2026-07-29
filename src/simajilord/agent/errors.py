@@ -36,6 +36,14 @@ class AgentProviderLimitError(AgentProviderError):
     """The upstream provider rejected a turn because its usage limit was reached."""
 
 
+class AgentTimeoutError(AgentProviderError):
+    """The host interrupted a turn after its configured execution deadline."""
+
+    def __init__(self, message: str, *, timeout_seconds: float) -> None:
+        super().__init__(message)
+        self.timeout_seconds = timeout_seconds
+
+
 class AgentThreadError(AgentProviderError):
     """A saved provider thread could not be resumed."""
 

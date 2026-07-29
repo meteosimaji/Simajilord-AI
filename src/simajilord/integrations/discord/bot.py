@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
@@ -23,6 +23,8 @@ from .cogs import error_message, handle_interaction_error, setup_cogs
 from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
+_IMAGE_JOB_FOOTER_PREFIX = "Simajilord image job · "
+_IMAGE_DELIVERY_RECOVERY_LIMIT = 1_000
 
 
 class SimajilordCommandTree(app_commands.CommandTree[commands.Bot]):
@@ -42,6 +44,7 @@ class SimajilordDiscordBot(commands.Bot):
         intents.guilds = True
         intents.voice_states = True
         intents.messages = True
+        intents.reactions = True
         intents.message_content = True
         super().__init__(
             # Mentions are agent events. Prefix commands remain an explicit direct API path.
@@ -267,14 +270,7 @@ class SimajilordDiscordBot(commands.Bot):
                 f"Image job {job.job_id} delivery channel is unavailable"
             )
 
-        progress_message: discord.Message | None = None
-        if job.delivery_message_id is not None:
-            try:
-                progress_message = await channel.fetch_message(
-                    int(job.delivery_message_id)
-                )
-            except (ValueError, discord.DiscordException):
-                progress_message = None
+        progress_message = await self._image_delivery_message(channel, job)
 
         if job.status in {ImageJobStatus.RUNNING, ImageJobStatus.QUEUED}:
             embed = _image_progress_embed(job)
@@ -289,27 +285,104 @@ class SimajilordDiscordBot(commands.Bot):
             return
 
         if job.status is ImageJobStatus.COMPLETED:
-            if progress_message is not None:
-                await progress_message.edit(embed=_image_progress_embed(job))
             if job.output_path is None or not job.output_path.is_file():
                 raise RuntimeError(f"Completed image job has no output: {job.job_id}")
             filename = f"simajilord-{job.job_id[:8]}.png"
             embed = _image_result_embed(job, filename=filename)
-            await channel.send(
-                embed=embed,
-                file=discord.File(job.output_path, filename=filename),
-                allowed_mentions=discord.AllowedMentions.none(),
+            if progress_message is None or not _image_result_already_present(
+                progress_message,
+                job=job,
+                filename=filename,
+            ):
+                image_file = discord.File(job.output_path, filename=filename)
+                try:
+                    if progress_message is None:
+                        progress_message = await channel.send(
+                            embed=embed,
+                            file=image_file,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        await self.runtime.image.set_delivery_message(
+                            job.job_id,
+                            str(progress_message.id),
+                        )
+                    else:
+                        await progress_message.edit(
+                            embed=embed,
+                            attachments=[image_file],
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                finally:
+                    image_file.close()
+            if progress_message is None:
+                raise RuntimeError(
+                    f"Completed image job has no Discord message: {job.job_id}"
+                )
+            await self.runtime.image.mark_delivered(
+                job.job_id,
+                message_id=str(progress_message.id),
             )
-            await self.runtime.image.mark_delivered(job.job_id)
             return
 
         if job.status is ImageJobStatus.FAILED:
             embed = _image_progress_embed(job)
             if progress_message is None:
-                await _send_image_progress(channel, job, embed)
+                progress_message = await _send_image_progress(channel, job, embed)
+                await self.runtime.image.set_delivery_message(
+                    job.job_id,
+                    str(progress_message.id),
+                )
             else:
-                await progress_message.edit(embed=embed)
-            await self.runtime.image.mark_delivered(job.job_id)
+                await progress_message.edit(
+                    embed=embed,
+                    attachments=[],
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            await self.runtime.image.mark_delivered(
+                job.job_id,
+                message_id=str(progress_message.id),
+            )
+
+    async def _image_delivery_message(
+        self,
+        channel: DiscordMessageChannel,
+        job: ImageGenerationJob,
+    ) -> discord.Message | None:
+        """Resolve the one durable Discord message used for every job state.
+
+        Discord cannot commit a message send and our SQLite update atomically.
+        The bot-authored job marker reconciles the narrow send-before-persist
+        crash window without posting a second result.
+        """
+
+        if job.delivery_message_id is not None:
+            try:
+                return await channel.fetch_message(int(job.delivery_message_id))
+            except (ValueError, discord.NotFound):
+                pass
+
+        user = self.user
+        if user is None:
+            return None
+        marker = _image_job_marker(job.job_id)
+        boundary_text = job.completed_at_iso or job.created_at_iso
+        boundary = datetime.fromisoformat(boundary_text)
+        if boundary.tzinfo is None:
+            boundary = boundary.replace(tzinfo=UTC)
+        async for candidate in channel.history(
+            limit=_IMAGE_DELIVERY_RECOVERY_LIMIT,
+            after=boundary - timedelta(minutes=5),
+            oldest_first=True,
+        ):
+            if candidate.author.id != user.id:
+                continue
+            if any(embed.footer.text == marker for embed in candidate.embeds):
+                await self.runtime.image.set_delivery_message(
+                    job.job_id,
+                    str(candidate.id),
+                )
+                return candidate
+        return None
 
     async def close(self) -> None:
         await self.activity_server.close()
@@ -352,11 +425,12 @@ def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
         )
         if job.error_code:
             embed.add_field(name="エラーコード", value=f"`{job.error_code}`")
+        embed.set_footer(text=_image_job_marker(job.job_id))
         return embed
     complete = job.status is ImageJobStatus.COMPLETED
     step = job.progress_total if complete else job.progress_step
     percentage = round(step / max(1, job.progress_total) * 100)
-    return discord.Embed(
+    embed = discord.Embed(
         title="画像が完成しました" if complete else "画像を生成しています",
         description=(
             "生成が終わりました。投稿の準備をしています…"
@@ -374,6 +448,8 @@ def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
         value=f"幅 {job.width}・高さ {job.height}",
         inline=True,
     )
+    embed.set_footer(text=_image_job_marker(job.job_id))
+    return embed
 
 
 def _image_result_embed(
@@ -396,6 +472,7 @@ def _image_result_embed(
     embed.add_field(name="生成時間", value=duration, inline=True)
     embed.add_field(name="シード", value=str(job.seed), inline=True)
     embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(text=_image_job_marker(job.job_id))
     return embed
 
 
@@ -408,3 +485,26 @@ def _image_prompt_preview(job: ImageGenerationJob) -> str:
         f"{job.prompt.style.strip()} · {job.prompt.lighting.strip()}",
     )
     return "\n".join(part for part in parts if part)[:1_000]
+
+
+def _image_job_marker(job_id: str) -> str:
+    return f"{_IMAGE_JOB_FOOTER_PREFIX}{job_id}"
+
+
+def _image_result_already_present(
+    message: discord.Message,
+    *,
+    job: ImageGenerationJob,
+    filename: str,
+) -> bool:
+    marker = _image_job_marker(job.job_id)
+    has_attachment = any(
+        attachment.filename == filename
+        for attachment in message.attachments
+    )
+    has_result_embed = any(
+        embed.footer.text == marker
+        and embed.image.url == f"attachment://{filename}"
+        for embed in message.embeds
+    )
+    return has_attachment and has_result_embed

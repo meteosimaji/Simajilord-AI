@@ -60,6 +60,8 @@ class WebFetchResponse:
     total_characters: int
     next_offset: int | None
     links: tuple[str, ...]
+    complete: bool
+    source_truncated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +79,7 @@ class WebFindResponse:
     pattern: str
     matches: tuple[WebTextMatch, ...]
     total_matches: int
+    source_truncated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +134,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
         if request.offset > len(page.text):
             raise UserError("web.offset_invalid")
         end = min(len(page.text), request.offset + request.max_characters)
+        next_offset = end if end < len(page.text) else None
         return WebFetchResponse(
             title=page.title,
             url=page.final_url,
@@ -138,8 +142,10 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             text=page.text[request.offset:end],
             offset=request.offset,
             total_characters=len(page.text),
-            next_offset=end if end < len(page.text) else None,
+            next_offset=next_offset,
             links=page.links[:20] if request.include_links else (),
+            complete=next_offset is None and not page.source_truncated,
+            source_truncated=page.source_truncated,
         )
 
     async def find(
@@ -158,6 +164,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             pattern=" ".join(request.pattern.split()).strip(),
             matches=matches,
             total_matches=total_matches,
+            source_truncated=page.source_truncated,
         )
 
     async def status(
@@ -195,7 +202,8 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                 name="web.fetch",
                 summary=(
                     "Fetch readable text from one public URL in bounded chunks. "
-                    "Use an offset to continue."
+                    "Use next_offset to continue. If source_truncated is true, import "
+                    "the URL with files.download_url and use paginated files.read."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=("web", "fetch", "open", "read", "page", "pdf", "url"),
@@ -208,7 +216,10 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
         endpoint(
             CapabilityDescriptor(
                 name="web.find",
-                summary="Find a phrase in a public page and return bounded context.",
+                summary=(
+                    "Find a phrase in the extracted portion of a public page and return "
+                    "bounded context. source_truncated reports an incomplete source."
+                ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=("web", "find", "page", "phrase", "match", "context"),
                 side_effects=(

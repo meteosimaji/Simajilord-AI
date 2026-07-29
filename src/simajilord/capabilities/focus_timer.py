@@ -18,6 +18,7 @@ from simajilord.services.read_aloud import (
     ReadAloudContentMode,
     ReadAloudPolicy,
     ReadAloudService,
+    read_aloud_content_mode,
 )
 
 
@@ -56,6 +57,7 @@ class FocusTimerItem:
 @dataclass(frozen=True, slots=True)
 class FocusTimerResponse:
     timer: FocusTimerItem
+    changed: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,14 +79,48 @@ def build_focus_timer_endpoints(
             raise UserError("timer.delivery_target_required")
         restore_content_mode: str | None = None
         if request.focus_session and read_aloud is not None:
-            restore_content_mode = _content_mode(
-                read_aloud.policy(workspace_id)
-            ).value
-            await read_aloud.set_content_mode(
-                workspace_id=workspace_id,
-                mode=ReadAloudContentMode.EVENTS,
-            )
-        try:
+            async with service.focus_session_lock(workspace_id):
+                active_focus = tuple(
+                    timer
+                    for timer in await service.active(workspace_id=workspace_id)
+                    if timer.focus_session
+                )
+                current_mode = read_aloud_content_mode(
+                    read_aloud.policy(workspace_id)
+                )
+                restore_content_mode = (
+                    (
+                        active_focus[0].restore_content_mode
+                        or current_mode.value
+                    )
+                    if active_focus
+                    else current_mode.value
+                )
+                if not active_focus:
+                    await read_aloud.set_content_mode(
+                        workspace_id=workspace_id,
+                        mode=ReadAloudContentMode.EVENTS,
+                    )
+                try:
+                    timer = await service.create(
+                        workspace_id=workspace_id,
+                        actor_id=context.actor_id,
+                        delivery_target_id=delivery_target_id,
+                        duration_seconds=request.duration_seconds,
+                        message=request.message,
+                        voice_notify=request.voice_notify,
+                        focus_session=True,
+                        restore_content_mode=restore_content_mode,
+                    )
+                except Exception:
+                    if not active_focus:
+                        await read_aloud.compare_and_set_content_mode(
+                            workspace_id=workspace_id,
+                            expected=ReadAloudContentMode.EVENTS,
+                            mode=current_mode,
+                        )
+                    raise
+        else:
             timer = await service.create(
                 workspace_id=workspace_id,
                 actor_id=context.actor_id,
@@ -95,13 +131,6 @@ def build_focus_timer_endpoints(
                 focus_session=request.focus_session,
                 restore_content_mode=restore_content_mode,
             )
-        except Exception:
-            if restore_content_mode is not None and read_aloud is not None:
-                await read_aloud.set_content_mode(
-                    workspace_id=workspace_id,
-                    mode=ReadAloudContentMode(restore_content_mode),
-                )
-            raise
         return FocusTimerResponse(timer=_item(timer))
 
     async def list_active(
@@ -118,21 +147,85 @@ def build_focus_timer_endpoints(
         request: FocusTimerCancelRequest,
         context: InvocationContext,
     ) -> FocusTimerResponse:
-        timer = await service.cancel(
-            timer_id=request.timer_id,
-            workspace_id=_workspace(context),
-            actor_id=context.actor_id,
-        )
-        if (
-            timer.focus_session
-            and timer.restore_content_mode is not None
-            and read_aloud is not None
-        ):
-            await read_aloud.set_content_mode(
-                workspace_id=timer.workspace_id,
-                mode=ReadAloudContentMode(timer.restore_content_mode),
+        workspace_id = _workspace(context)
+        async with service.focus_session_lock(workspace_id):
+            timer, changed = await service.cancel_with_change(
+                timer_id=request.timer_id,
+                workspace_id=workspace_id,
+                actor_id=context.actor_id,
             )
-        return FocusTimerResponse(timer=_item(timer))
+            if (
+                changed
+                and timer.focus_session
+                and timer.restore_content_mode is not None
+                and read_aloud is not None
+                and not any(
+                    active.focus_session
+                    for active in await service.active(workspace_id=workspace_id)
+                )
+            ):
+                await read_aloud.compare_and_set_content_mode(
+                    workspace_id=workspace_id,
+                    expected=ReadAloudContentMode.EVENTS,
+                    mode=ReadAloudContentMode(timer.restore_content_mode),
+                )
+        return FocusTimerResponse(timer=_item(timer), changed=changed)
+
+    async def restore(
+        request: FocusTimerCancelRequest,
+        context: InvocationContext,
+    ) -> FocusTimerResponse:
+        workspace_id = _workspace(context)
+        async with service.focus_session_lock(workspace_id):
+            active_focus = tuple(
+                timer
+                for timer in await service.active(workspace_id=workspace_id)
+                if timer.focus_session
+            )
+            current_mode = (
+                read_aloud_content_mode(read_aloud.policy(workspace_id))
+                if read_aloud is not None
+                else None
+            )
+            timer, changed = await service.restore_with_change(
+                timer_id=request.timer_id,
+                workspace_id=workspace_id,
+                actor_id=context.actor_id,
+            )
+            try:
+                if (
+                    changed
+                    and timer.focus_session
+                    and read_aloud is not None
+                    and current_mode is not None
+                ):
+                    restore_mode = (
+                        (
+                            active_focus[0].restore_content_mode
+                            or current_mode.value
+                        )
+                        if active_focus
+                        else current_mode.value
+                    )
+                    if restore_mode is not None:
+                        timer = await service.set_restore_content_mode(
+                            timer.timer_id,
+                            restore_mode,
+                        )
+                    if not active_focus:
+                        await read_aloud.set_content_mode(
+                            workspace_id=workspace_id,
+                            mode=ReadAloudContentMode.EVENTS,
+                        )
+            except Exception:
+                if changed:
+                    await service.cancel(
+                        timer_id=timer.timer_id,
+                        workspace_id=workspace_id,
+                        actor_id=context.actor_id,
+                    )
+                raise
+        return FocusTimerResponse(timer=_item(timer), changed=changed)
 
     return (
         endpoint(
@@ -141,7 +234,17 @@ def build_focus_timer_endpoints(
                 summary="Create a persistent Focus Timer and notify its destination.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("timer", "focus", "pomodoro", "reminder"),
+                keywords=(
+                    "timer",
+                    "focus",
+                    "pomodoro",
+                    "reminder",
+                    "タイマー",
+                    "集中",
+                    "ポモドーロ",
+                    "リマインダー",
+                    "通知",
+                ),
                 side_effects=("Persists a timer.",),
                 requires_workspace=True,
                 idempotency="non_idempotent_write",
@@ -158,7 +261,15 @@ def build_focus_timer_endpoints(
                 name="timer.list",
                 summary="List active Focus Timers.",
                 risk=RiskLevel.READ,
-                keywords=("timer", "focus", "status"),
+                keywords=(
+                    "timer",
+                    "focus",
+                    "status",
+                    "タイマー",
+                    "集中",
+                    "一覧",
+                    "確認",
+                ),
                 requires_workspace=True,
                 expected_errors=("workspace.required",),
                 timeout_seconds=10,
@@ -173,7 +284,15 @@ def build_focus_timer_endpoints(
                 summary="Cancel a Focus Timer created by the current actor.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("timer", "focus", "cancel"),
+                keywords=(
+                    "timer",
+                    "focus",
+                    "cancel",
+                    "タイマー",
+                    "取り消し",
+                    "キャンセル",
+                    "中止",
+                ),
                 side_effects=("Cancels a persisted timer.",),
                 requires_workspace=True,
                 idempotency="idempotent_write",
@@ -184,6 +303,37 @@ def build_focus_timer_endpoints(
             FocusTimerCancelRequest,
             FocusTimerResponse,
             cancel,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="timer.restore",
+                summary="Restore a just-cancelled Focus Timer for the same actor.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.ALWAYS,
+                keywords=(
+                    "timer",
+                    "focus",
+                    "restore",
+                    "undo",
+                    "タイマー",
+                    "復元",
+                    "元に戻す",
+                ),
+                side_effects=("Restores a cancelled persisted timer.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "workspace.required",
+                    "timer.not_found",
+                    "timer.not_owner",
+                    "timer.not_cancelled",
+                ),
+                timeout_seconds=10,
+                user_visible_effect="Restores a cancelled timer owned by the requester.",
+            ),
+            FocusTimerCancelRequest,
+            FocusTimerResponse,
+            restore,
         ),
     )
 
@@ -206,11 +356,4 @@ def _item(timer: FocusTimer) -> FocusTimerItem:
 
 
 def _content_mode(policy: ReadAloudPolicy) -> ReadAloudContentMode:
-    read_events = policy.announce_join or policy.announce_leave or policy.announce_move
-    if policy.read_messages and read_events:
-        return ReadAloudContentMode.ALL
-    if policy.read_messages:
-        return ReadAloudContentMode.MESSAGES
-    if read_events:
-        return ReadAloudContentMode.EVENTS
-    return ReadAloudContentMode.OFF
+    return read_aloud_content_mode(policy)

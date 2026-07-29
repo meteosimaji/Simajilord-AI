@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,32 +12,55 @@ import secrets
 import shutil
 import tempfile
 import time
+from collections.abc import Awaitable
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypeAlias, cast
-from urllib.parse import parse_qs, urlparse
+from typing import Literal, TypeAlias, TypeVar, cast
+from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from simajilord.agent import (
+    ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
-    AGENT_AUDIO_WRITE_CAPABILITIES,
-    AGENT_AUTONOMY_ACTOR_ID,
+    AGENT_COMPUTE_GRANT,
     AGENT_FILE_GRANT,
+    AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
+    AGENT_MEDIA_GRANT,
+    AGENT_MEMORY_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_NO_ACTION_CONTENT,
     AGENT_QUOTE_GRANT,
+    AGENT_REACTION_GRANT,
     AGENT_REPOST_GRANT,
+    AGENT_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_TIMER_WRITE_CAPABILITIES,
     AGENT_WEB_GRANT,
+    AgentAutonomyMode,
     AgentBusyError,
+    AgentEvent,
     AgentRateLimitError,
     AgentRequest,
     AgentTrigger,
+    AutonomyEnqueueResult,
+    AutonomyEventBatch,
+    AutonomyEventKind,
+)
+from simajilord.agent.autonomy import (
+    AutonomyDeliveryConflictError,
+    AutonomyDeliveryReceiptState,
+    AutonomyDeliveryRecord,
+    AutonomyDeliverySpec,
+    AutonomyLeaseLostError,
+)
+from simajilord.agent.store import (
+    AgentHostDeliveryRecord,
+    AgentPendingHostDelivery,
 )
 from simajilord.capabilities.audio import (
     AudioAction,
@@ -63,6 +87,7 @@ from simajilord.capabilities.audio import (
     audio_queue_response,
 )
 from simajilord.capabilities.focus_timer import (
+    FocusTimerCancelRequest,
     FocusTimerCreateRequest,
     FocusTimerResponse,
 )
@@ -122,15 +147,14 @@ from simajilord.capabilities.web import (
     WebSearchResponse,
 )
 from simajilord.config import AgentFeatureAccess
-from simajilord.core import InvocationContext
+from simajilord.core import ApprovalMode, InvocationContext
 from simajilord.core.errors import MediaError, ModerationError, UserError, WebError
 from simajilord.domain.audio import AudioKind, LoopMode
 from simajilord.domain.media import DownloadFormat
 from simajilord.domain.web import SearchDepth, WebSource, WebTextMatch
-from simajilord.observability import EventRecord
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.audio import AudioSession
-from simajilord.services.focus_timer import FocusTimer
+from simajilord.services.focus_timer import FocusTimer, FocusTimerStatus
 from simajilord.services.read_aloud import (
     ReadAloudContentMode,
     ReadAloudMode,
@@ -141,6 +165,7 @@ from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
 from .agent_ui import (
     AgentProgressMessage,
+    agent_delivery_nonce,
     agent_error_text,
     agent_message_groups,
     agent_progress_text,
@@ -151,6 +176,7 @@ from .application_emojis import (
     ApplicationEmojiName,
     application_emoji,
 )
+from .attachment_io import read_attachment_bytes
 from .audio import DiscordAudioOutput
 from .capabilities import (
     DiscordConnectVoiceRequest,
@@ -196,6 +222,11 @@ _PLAY_AUDIO_CONTEXT_MENU_NAME = "Play Audio"
 _TRANSLATE_CONTEXT_MENU_NAME = "Translate"
 _MUSIC_DASHBOARD_ATTRIBUTE = "_simajilord_music_dashboard"
 _MUSIC_DASHBOARD_STATE_FILE = "discord_music_dashboards.json"
+_FOCUS_TIMER_DELIVERY_RECOVERY_LIMIT = 1_000
+_AUTONOMY_LEASE_SECONDS = 60
+_AUTONOMY_LEASE_HEARTBEAT_SECONDS = 20
+_AUTONOMY_DELIVERY_RECOVERY_LIMIT = 1_000
+_AutonomyResultT = TypeVar("_AutonomyResultT")
 
 
 class SafeView(discord.ui.View):
@@ -708,12 +739,16 @@ def music_queue_embed(
         uploader = discord.utils.escape_markdown(current.uploader or "Unknown uploader")
         if response.paused:
             timing = f"Paused at `{_duration(elapsed)}`"
-        elif current.duration_seconds > elapsed:
-            remaining = (current.duration_seconds - elapsed) / max(response.speed, 0.01)
-            ends_at = int(time.time() + remaining)
-            timing = f"Ends <t:{ends_at}:R>"
         elif current.duration_seconds <= 0:
             timing = "Playing"
+        elif LoopMode(response.loop_mode) is LoopMode.TRACK:
+            timing = f"Looping track · `{_duration(current.duration_seconds)}` per loop"
+        elif current.duration_seconds > elapsed:
+            # This canonical card is updated on state changes, not every second.
+            # An absolute Discord timestamp becomes a misleading past "Ends" value
+            # when an edit is delayed or the process restarts. Keep only duration,
+            # which remains true for the lifetime of this card.
+            timing = f"Playing · duration `{_duration(current.duration_seconds)}`"
         else:
             timing = "Finishing"
         description_lines = [
@@ -2810,12 +2845,11 @@ class FocusTimerCancelView(SafeView):
             )
             return
         try:
-            await self.runtime.focus_timer.cancel(
-                timer_id=self.timer.timer_id,
-                workspace_id=self.timer.workspace_id,
-                actor_id=self.timer.actor_id,
+            await self.runtime.registry.invoke(
+                "timer.cancel",
+                FocusTimerCancelRequest(self.timer.timer_id),
+                invocation_context(interaction),
             )
-            await _restore_focus_read_aloud(self.runtime, self.timer)
             await interaction.response.edit_message(
                 embed=command_embed(
                     "Focus Timer cancelled",
@@ -2920,6 +2954,13 @@ class FocusTimerCog(commands.Cog):
             await asyncio.sleep(1)
 
     async def _deliver(self, timer: FocusTimer) -> None:
+        async with self.runtime.focus_timer.delivery_lock(timer.timer_id):
+            current = await self.runtime.focus_timer.current(timer.timer_id)
+            if current.status is not FocusTimerStatus.DELIVERING:
+                return
+            await self._deliver_claimed_timer(current)
+
+    async def _deliver_claimed_timer(self, timer: FocusTimer) -> None:
         try:
             try:
                 channel_id = int(timer.delivery_target_id)
@@ -2937,25 +2978,94 @@ class FocusTimerCog(commands.Cog):
                 ),
             ):
                 raise UserError("timer.delivery_target_invalid")
-            await channel.send(
-                embed=command_embed(
+            completion_message = await self._focus_timer_delivery_message(
+                channel,
+                timer,
+            )
+            if completion_message is None:
+                embed = command_embed(
                     "Focus Timer complete",
                     description=discord.utils.escape_markdown(timer.message),
                     fields=(EmbedField("Started by", f"<@{timer.actor_id}>"),),
                     tone=EmbedTone.SUCCESS,
-                ),
-                allowed_mentions=discord.AllowedMentions(users=True),
+                )
+                embed.set_footer(text=_focus_timer_delivery_marker(timer.timer_id))
+                completion_message = await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(users=True),
+                )
+                await self.runtime.focus_timer.set_delivery_message(
+                    timer.timer_id,
+                    str(completion_message.id),
+                )
+            await _publish_autonomy_event(
+                self.runtime,
+                kind=AutonomyEventKind.TIMER_DUE,
+                deduplication_key=f"timer-due:{timer.timer_id}",
+                workspace_id=timer.workspace_id,
+                channel_id=timer.delivery_target_id,
+                actor_id=timer.actor_id,
+                message_id=str(completion_message.id),
+                occurred_at=timer.due_at,
+                payload={
+                    "timer_id": timer.timer_id,
+                    "message_length": len(timer.message),
+                    "voice_notify": timer.voice_notify,
+                },
             )
-        except (discord.DiscordException, UserError):
-            log.exception("Focus timer text delivery failed timer=%s", timer.timer_id)
-            await self.runtime.focus_timer.retry(timer.timer_id)
-            return
+            if timer.voice_notify:
+                with suppress(Exception):
+                    await self._deliver_voice(timer)
+            await _complete_focus_timer(self.runtime, timer)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Focus timer delivery failed timer=%s", timer.timer_id)
+            try:
+                await self.runtime.focus_timer.retry(timer.timer_id)
+            except UserError as exc:
+                if exc.code != "timer.not_active":
+                    log.exception(
+                        "Focus timer retry state update failed timer=%s",
+                        timer.timer_id,
+                    )
+            except Exception:
+                log.exception(
+                    "Focus timer retry state update failed timer=%s",
+                    timer.timer_id,
+                )
 
-        await _restore_focus_read_aloud(self.runtime, timer)
-        if timer.voice_notify:
-            with suppress(Exception):
-                await self._deliver_voice(timer)
-        await self.runtime.focus_timer.complete(timer.timer_id)
+    async def _focus_timer_delivery_message(
+        self,
+        channel: discord.TextChannel | discord.Thread | discord.VoiceChannel,
+        timer: FocusTimer,
+    ) -> discord.Message | None:
+        """Resolve the one timer message across retry and restart boundaries."""
+
+        if timer.delivery_message_id is not None:
+            try:
+                return await channel.fetch_message(int(timer.delivery_message_id))
+            except (ValueError, discord.NotFound):
+                pass
+
+        bot_user = self.bot.user
+        if bot_user is None:
+            raise RuntimeError("Discord bot identity is unavailable")
+        marker = _focus_timer_delivery_marker(timer.timer_id)
+        async for candidate in channel.history(
+            limit=_FOCUS_TIMER_DELIVERY_RECOVERY_LIMIT,
+            after=timer.due_at - timedelta(minutes=5),
+            oldest_first=True,
+        ):
+            if candidate.author.id != bot_user.id:
+                continue
+            if any(embed.footer.text == marker for embed in candidate.embeds):
+                await self.runtime.focus_timer.set_delivery_message(
+                    timer.timer_id,
+                    str(candidate.id),
+                )
+                return candidate
+        return None
 
     async def _deliver_voice(self, timer: FocusTimer) -> None:
         session = self.runtime.audio.find(timer.workspace_id)
@@ -2988,25 +3098,42 @@ class FocusTimerCog(commands.Cog):
         )
 
 
-async def _restore_focus_read_aloud(
+def _focus_timer_delivery_marker(timer_id: str) -> str:
+    return f"Simajilord focus timer · {timer_id}"
+
+
+async def _complete_focus_timer(
     runtime: SimajilordRuntime,
     timer: FocusTimer,
 ) -> None:
-    if not timer.focus_session or timer.restore_content_mode is None:
-        return
-    try:
-        mode = ReadAloudContentMode(timer.restore_content_mode)
-    except ValueError:
-        log.warning(
-            "Focus timer has invalid restore mode timer=%s mode=%s",
-            timer.timer_id,
-            timer.restore_content_mode,
-        )
-        return
-    await runtime.read_aloud.set_content_mode(
-        workspace_id=timer.workspace_id,
-        mode=mode,
-    )
+    async with runtime.focus_timer.focus_session_lock(timer.workspace_id):
+        current = await runtime.focus_timer.current(timer.timer_id)
+        if current.status is not FocusTimerStatus.DELIVERING:
+            return
+        if current.focus_session and current.restore_content_mode is not None:
+            active_focus = tuple(
+                active
+                for active in await runtime.focus_timer.active(
+                    workspace_id=current.workspace_id
+                )
+                if active.focus_session and active.timer_id != current.timer_id
+            )
+            if not active_focus:
+                try:
+                    mode = ReadAloudContentMode(current.restore_content_mode)
+                except ValueError:
+                    log.warning(
+                        "Focus timer has invalid restore mode timer=%s mode=%s",
+                        current.timer_id,
+                        current.restore_content_mode,
+                    )
+                else:
+                    await runtime.read_aloud.compare_and_set_content_mode(
+                        workspace_id=current.workspace_id,
+                        expected=ReadAloudContentMode.EVENTS,
+                        mode=mode,
+                    )
+        await runtime.focus_timer.complete(current.timer_id)
 
 
 def _help_overview_embed() -> discord.Embed:
@@ -3934,206 +4061,6 @@ class MusicCog(commands.Cog):
 
     async def clear_mine(self, interaction: discord.Interaction) -> None:
         await self._control(interaction, AudioAction.CLEAR_MINE)
-
-
-_YOUTUBE_URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
-_YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
-
-
-def _youtube_card_reference(content: str) -> str | None:
-    """Return one conservative YouTube video URL without resolving the page."""
-
-    references: list[str] = []
-    for match in _YOUTUBE_URL_PATTERN.finditer(content):
-        reference = match.group(0).rstrip(".,!?;:、。]})")
-        parsed = urlparse(reference)
-        host = (parsed.hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        video_id: str | None = None
-        if host == "youtu.be":
-            video_id = parsed.path.strip("/").split("/", 1)[0]
-        elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
-            if parsed.path == "/watch":
-                values = parse_qs(parsed.query).get("v", ())
-                video_id = values[0] if values else None
-            elif parsed.path.startswith(("/shorts/", "/live/")):
-                parts = parsed.path.strip("/").split("/")
-                video_id = parts[1] if len(parts) > 1 else None
-        if video_id is not None and _YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id):
-            references.append(f"https://www.youtube.com/watch?v={video_id}")
-    return references[0] if len(dict.fromkeys(references)) == 1 else None
-
-
-class YouTubeLinkCardView(SafeView):
-    """Short-lived, zero-search entry points for one explicit YouTube link."""
-
-    def __init__(
-        self,
-        runtime: SimajilordRuntime,
-        *,
-        reference: str,
-    ) -> None:
-        super().__init__(timeout=5 * 60)
-        self.runtime = runtime
-        self.reference = reference
-        self.message: discord.Message | None = None
-        self._lock = asyncio.Lock()
-        self._finished = False
-
-    async def _enqueue(
-        self,
-        interaction: discord.Interaction,
-        *,
-        connect: bool,
-        radio: bool,
-    ) -> None:
-        async with self._lock:
-            if self._finished:
-                await interaction.response.send_message(
-                    "This link has already been handled.",
-                    ephemeral=True,
-                )
-                return
-            try:
-                await interaction.response.defer()
-                dashboard = getattr(
-                    interaction.client,
-                    _MUSIC_DASHBOARD_ATTRIBUTE,
-                    None,
-                )
-                if isinstance(dashboard, MusicDashboardManager):
-                    dashboard.bind(interaction.guild_id, interaction.channel_id)
-                if connect:
-                    response = await _enqueue_interaction_track(
-                        self.runtime,
-                        interaction,
-                        reference=self.reference,
-                        requested_by_name=interaction.user.display_name,
-                    )
-                else:
-                    session = _discord_audio_session(
-                        cast(commands.Bot, interaction.client),
-                        self.runtime,
-                        interaction.guild_id,
-                    )
-                    _require_same_voice(session, interaction.user)
-                    response = cast(
-                        AudioPlayResponse,
-                        await self.runtime.registry.invoke(
-                            "audio.play",
-                            AudioPlayRequest(
-                                reference=self.reference,
-                                requested_by_name=interaction.user.display_name,
-                            ),
-                            invocation_context(interaction),
-                        ),
-                    )
-                if radio:
-                    await self.runtime.registry.invoke(
-                        "discord.set_audio_radio",
-                        AudioMixRequest(
-                            enabled=True,
-                            seed_references=(response.page_url,),
-                            replace_loop=True,
-                        ),
-                        invocation_context(interaction),
-                    )
-                self._finished = True
-                self.stop()
-                await interaction.edit_original_response(
-                    embed=command_embed(
-                        "Radio started" if radio else "Added to audio",
-                        description=(
-                            f"[{discord.utils.escape_markdown(response.title)}]"
-                            f"({_safe_markdown_url(response.page_url)})\n"
-                            + (
-                                "Related tracks will continue after manually requested music."
-                                if radio
-                                else (
-                                    "Playback will start now."
-                                    if response.playback_state == "playing"
-                                    else "The track is waiting in the queue."
-                                )
-                            )
-                        ),
-                        tone=EmbedTone.SUCCESS,
-                    ),
-                    view=None,
-                )
-                if interaction.message is not None:
-                    _schedule_message_delete(interaction.message, delay=8)
-            except Exception as exc:
-                await edit_deferred_error(interaction, exc)
-
-    @discord.ui.button(label="Play", style=discord.ButtonStyle.success)
-    async def play_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[YouTubeLinkCardView],
-    ) -> None:
-        await self._enqueue(interaction, connect=True, radio=False)
-
-    @discord.ui.button(label="Add", style=discord.ButtonStyle.primary)
-    async def add_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[YouTubeLinkCardView],
-    ) -> None:
-        await self._enqueue(interaction, connect=False, radio=False)
-
-    @discord.ui.button(label="Radio", style=discord.ButtonStyle.secondary)
-    async def radio_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[YouTubeLinkCardView],
-    ) -> None:
-        await self._enqueue(interaction, connect=True, radio=True)
-
-    async def on_timeout(self) -> None:
-        if self.message is not None:
-            with suppress(discord.DiscordException):
-                await self.message.delete()
-        self.stop()
-
-
-class YouTubeLinkCardCog(commands.Cog):
-    """Offer silent audio actions for a single YouTube video link."""
-
-    def __init__(self, runtime: SimajilordRuntime) -> None:
-        self.runtime = runtime
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        if message.guild is None or message.author.bot:
-            return
-        reference = _youtube_card_reference(message.content)
-        if reference is None:
-            return
-        view = YouTubeLinkCardView(self.runtime, reference=reference)
-        try:
-            reply = await message.reply(
-                embed=command_embed(
-                    "YouTube",
-                    description=(
-                        "Play now, add without joining a VC, or use this track to start Radio."
-                    ),
-                    tone=EmbedTone.INFO,
-                ),
-                view=view,
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-                silent=True,
-            )
-        except discord.DiscordException:
-            log.info(
-                "Could not publish YouTube audio card guild=%s channel=%s message=%s",
-                message.guild.id,
-                message.channel.id,
-                message.id,
-            )
-            return
-        view.message = reply
 
 
 _READ_ALOUD_CHANNEL_TYPES = [
@@ -7281,7 +7208,9 @@ class MediaCog(commands.Cog):
         try:
             if media.size > self.runtime.settings.hive_max_media_bytes:
                 raise UserError("moderation.media_too_large")
-            content = await media.read(use_cached=True)
+            content = await read_attachment_bytes(media)
+            if len(content) > self.runtime.settings.hive_max_media_bytes:
+                raise UserError("moderation.media_too_large")
             response = cast(
                 SyntheticMediaAnalyzeResponse,
                 await self.runtime.registry.invoke(
@@ -7971,13 +7900,35 @@ class QuoteComposerView(SafeView):
         self._sync_labels()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
+    async def _toggle_setting(
+        self,
+        interaction: discord.Interaction,
+        setting: Literal["color", "vertical", "bold", "flip", "animate", "include_jump"],
+    ) -> None:
+        previous = getattr(self, setting)
+        setattr(self, setting, not previous)
+        try:
+            await self._refresh_composer(interaction)
+        except Exception:
+            # Discord can reject a component acknowledgement after its short
+            # interaction window. Keep server-side view state aligned with the
+            # still-visible controls when no edit was accepted.
+            setattr(self, setting, previous)
+            self._sync_labels()
+            raise
+
     async def _open_page(
         self,
         interaction: discord.Interaction,
-        page: Literal["layout", "style", "more"],
+        page: Literal["main", "layout", "style", "more"],
     ) -> None:
+        previous = self._page
         self._show_page(page)
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        try:
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        except Exception:
+            self._show_page(previous)
+            raise
 
     @discord.ui.button(label="Layout", style=discord.ButtonStyle.secondary, row=0)
     async def layout_menu_button(
@@ -8009,8 +7960,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.color = not self.color
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "color")
 
     @discord.ui.button(label="Landscape", emoji="↔️", row=2)
     async def vertical_button(
@@ -8018,8 +7968,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.vertical = not self.vertical
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "vertical")
 
     @discord.ui.button(label="Bold Off", emoji="🅱️", row=2)
     async def bold_button(
@@ -8027,8 +7976,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.bold = not self.bold
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "bold")
 
     @discord.ui.button(label="Flip Off", emoji="🔄", row=2)
     async def flip_button(
@@ -8036,8 +7984,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.flip = not self.flip
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "flip")
 
     @discord.ui.button(label="Jump On", emoji="↗️", row=2)
     async def jump_button(
@@ -8045,8 +7992,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.include_jump = not self.include_jump
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "include_jump")
 
     @discord.ui.button(label="Animation Off", emoji="🎞️", row=3)
     async def animation_button(
@@ -8054,8 +8000,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self.animate = not self.animate
-        await self._refresh_composer(interaction)
+        await self._toggle_setting(interaction, "animate")
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, row=4)
     async def back_button(
@@ -8063,8 +8008,7 @@ class QuoteComposerView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[QuoteComposerView],
     ) -> None:
-        self._show_page("main")
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await self._open_page(interaction, "main")
 
     @discord.ui.button(
         label="Generate",
@@ -8137,6 +8081,75 @@ def discord_conversation_id(
     return f"{base}:profile:{profile}"
 
 
+async def _publish_autonomy_event(
+    runtime: SimajilordRuntime,
+    *,
+    kind: AutonomyEventKind,
+    deduplication_key: str,
+    workspace_id: str,
+    channel_id: str,
+    occurred_at: datetime,
+    actor_id: str | None,
+    message_id: str | None,
+    payload: dict[str, object],
+) -> AutonomyEnqueueResult | None:
+    """External-source hook shared by timer, audio, GitHub, and RSS adapters."""
+
+    settings = runtime.settings
+    if (
+        runtime.agent is None
+        or not settings.agent_autonomy_enabled
+        or settings.agent_autonomy_mode is AgentAutonomyMode.OBSERVE
+        or workspace_id not in settings.agent_autonomy_guild_ids
+    ):
+        return None
+    try:
+        await runtime.journal.append(
+            kind=kind.value,
+            actor_id=actor_id,
+            workspace_id=workspace_id,
+            transport="agent",
+            request_id=deduplication_key,
+            payload={"channel_id": channel_id, "message_id": message_id, **payload},
+        )
+        result = await runtime.autonomy_events.enqueue(
+            kind=kind,
+            deduplication_key=deduplication_key,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            occurred_at=occurred_at,
+            actor_id=actor_id,
+            message_id=message_id,
+            payload=payload,
+        )
+        if result in {
+            AutonomyEnqueueResult.QUEUE_FULL,
+            AutonomyEnqueueResult.CHANNEL_QUEUE_FULL,
+            AutonomyEnqueueResult.ACTOR_QUEUE_FULL,
+        }:
+            await runtime.journal.append(
+                kind="agent.autonomy.event_rejected",
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                transport="agent",
+                request_id=deduplication_key,
+                payload={
+                    "event_kind": kind.value,
+                    "channel_id": channel_id,
+                    "reason": result.value,
+                },
+            )
+        return result
+    except Exception:
+        log.exception(
+            "Could not publish autonomy event kind=%s workspace=%s channel=%s",
+            kind.value,
+            workspace_id,
+            channel_id,
+        )
+        return None
+
+
 def _agent_grants(
     runtime: SimajilordRuntime,
     *,
@@ -8144,25 +8157,48 @@ def _agent_grants(
     autonomous: bool = False,
 ) -> frozenset[str]:
     settings = runtime.settings
-    grants: set[str] = {
-        AGENT_AUDIO_GRANT,
-        AGENT_QUOTE_GRANT,
-        AGENT_REPOST_GRANT,
-    }
-    if not autonomous:
-        grants.add(AGENT_MESSAGE_GRANT)
-    if not autonomous and settings.agent_file_sandbox_enabled and runtime.files is not None:
+    autonomy_mode = settings.agent_autonomy_mode if autonomous else None
+    grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
+    if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
+        grants.update((AGENT_QUOTE_GRANT, AGENT_REPOST_GRANT))
+    if not autonomous or autonomy_mode in {
+        AgentAutonomyMode.ASSIST,
+        AgentAutonomyMode.ACT,
+    }:
+        grants.update((AGENT_MESSAGE_GRANT, AGENT_REACTION_GRANT))
+    if (
+        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
+        and settings.agent_file_sandbox_enabled
+        and runtime.files is not None
+    ):
         grants.add(AGENT_FILE_GRANT)
     web_access = settings.agent_web_search_access
     if web_access is AgentFeatureAccess.EVERYONE or (
         web_access is AgentFeatureAccess.ADMINS and actor_id in settings.agent_admin_user_ids
     ):
         grants.add(AGENT_WEB_GRANT)
-    if runtime.moderation.provider is not None:
+    if AGENT_FILE_GRANT in grants and AGENT_WEB_GRANT in grants:
+        grants.add(AGENT_MEDIA_GRANT)
+    compute_access = settings.agent_safe_compute_access
+    if (
+        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
+        and runtime.compute is not None
+        and (
+            compute_access is AgentFeatureAccess.EVERYONE
+            or (
+                compute_access is AgentFeatureAccess.ADMINS
+                and actor_id in settings.agent_admin_user_ids
+            )
+        )
+    ):
+        grants.add(AGENT_COMPUTE_GRANT)
+    if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
         grants.add(AGENT_MODERATION_GRANT)
+    if runtime.moderation.provider is not None:
+        grants.add(AGENT_HIVE_GRANT)
     image_access = settings.image_generation_access
     if (
-        not autonomous
+        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
         and runtime.image.provider is not None
         and (
             image_access is AgentFeatureAccess.EVERYONE
@@ -8173,15 +8209,77 @@ def _agent_grants(
         )
     ):
         grants.add(AGENT_IMAGE_GRANT)
+    if actor_id in settings.agent_admin_user_ids:
+        grants.add(ACTION_UNDO_ANY_GRANT)
     return frozenset(grants)
+
+
+def _autonomy_approvals(
+    runtime: SimajilordRuntime,
+    mode: AgentAutonomyMode,
+) -> frozenset[str]:
+    if mode is AgentAutonomyMode.ASSIST:
+        return frozenset(AGENT_TIMER_WRITE_CAPABILITIES)
+    if mode is not AgentAutonomyMode.ACT:
+        return frozenset()
+    return frozenset(
+        item.descriptor.name
+        for item in runtime.registry.all()
+        if item.descriptor.approval is ApprovalMode.WHEN_REQUESTED
+    )
 
 
 _discord_message_chunks = discord_message_chunks
 _agent_message_groups = agent_message_groups
+_agent_delivery_nonce = agent_delivery_nonce
 _agent_error_text = agent_error_text
 _retry_after_text = retry_after_text
 _agent_progress_text = agent_progress_text
 _AgentProgressMessage = AgentProgressMessage
+
+
+def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
+    """Mirror the provider context for host-delivered Discord action receipts."""
+
+    return InvocationContext(
+        actor_id=request.actor_id,
+        workspace_id=request.workspace_id,
+        transport="agent",
+        request_id=request.event_id,
+        resource_ids=request.resource_ids,
+        grants=request.grants,
+        origin_resource_id=request.channel_id,
+        approvals=request.approvals,
+    )
+
+
+async def _record_agent_host_posts(
+    runtime: SimajilordRuntime,
+    *,
+    channel_id: str,
+    message_ids: tuple[str, ...],
+    context: InvocationContext,
+) -> bool:
+    """Receipt one already-sent response using IDs only."""
+
+    receipts = getattr(runtime, "action_receipts", None)
+    if receipts is None:
+        return True
+    try:
+        await receipts.record_posted_messages(
+            channel_id=channel_id,
+            message_ids=message_ids,
+            context=context,
+        )
+        return True
+    except Exception:
+        log.exception(
+            "Could not receipt agent host response channel=%s messages=%s request=%s",
+            channel_id,
+            ",".join(message_ids),
+            context.request_id,
+        )
+        return False
 
 
 class AgentCog(commands.Cog):
@@ -8191,9 +8289,60 @@ class AgentCog(commands.Cog):
         self.bot = bot
         self.runtime = runtime
         self._active_progress: dict[str, AgentProgressMessage] = {}
+        self._host_delivery_locks: dict[str, asyncio.Lock] = {}
+        self._host_delivery_wakeup = asyncio.Event()
+        self._host_delivery_task: asyncio.Task[None] | None = None
+
+    async def cog_load(self) -> None:
+        if self._host_delivery_task is None or self._host_delivery_task.done():
+            self._host_delivery_task = asyncio.create_task(
+                self._host_delivery_loop(),
+                name="simajilord-agent-host-delivery",
+            )
+
+    async def cog_unload(self) -> None:
+        task = self._host_delivery_task
+        self._host_delivery_task = None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
+        await self._handle_mention(
+            message,
+            event_id=f"discord:message:{message.id}",
+            occurred_at=message.created_at,
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(
+        self,
+        payload: discord.RawMessageUpdateEvent,
+    ) -> None:
+        raw_edited_at = payload.data.get("edited_timestamp")
+        if "content" not in payload.data or not isinstance(raw_edited_at, str):
+            return
+        edited_at = discord.utils.parse_time(raw_edited_at)
+        if edited_at is None:
+            return
+        await self._handle_mention(
+            payload.message,
+            event_id=(
+                f"discord:message-edit:{payload.message_id}:"
+                f"{edited_at.isoformat()}"
+            ),
+            occurred_at=edited_at,
+        )
+
+    async def _handle_mention(
+        self,
+        message: discord.Message,
+        *,
+        event_id: str,
+        occurred_at: datetime,
+    ) -> None:
         agent = self.runtime.agent
         bot_user = self.bot.user
         if (
@@ -8233,21 +8382,21 @@ class AgentCog(commands.Cog):
             return
         actor_id = str(message.author.id)
         grants = _agent_grants(self.runtime, actor_id=actor_id)
-        approvals = frozenset(AGENT_AUDIO_WRITE_CAPABILITIES)
+        approvals = frozenset(AGENT_REQUESTED_WRITE_CAPABILITIES)
         request = AgentRequest(
             conversation_id=discord_conversation_id(
                 guild_id=message.guild.id if message.guild else None,
                 channel_id=message.channel.id,
                 grants=grants,
             ),
-            event_id=f"discord:message:{message.id}",
+            event_id=event_id,
             trigger=AgentTrigger.MENTION,
             actor_id=actor_id,
             actor_name=message.author.display_name,
             workspace_id=str(message.guild.id) if message.guild else None,
             channel_id=str(message.channel.id),
             message_id=str(message.id),
-            occurred_at=message.created_at,
+            occurred_at=occurred_at,
             resource_ids=resource_ids,
             grants=grants,
             approvals=approvals,
@@ -8281,7 +8430,10 @@ class AgentCog(commands.Cog):
             else:
                 await progress.add_temporary_message(acknowledgement)
             return
-        progress = _AgentProgressMessage(message)
+        progress = _AgentProgressMessage(
+            message,
+            delivery_key=request.event_id,
+        )
         self._active_progress[request.event_id] = progress
         try:
             async with message.channel.typing():
@@ -8289,17 +8441,299 @@ class AgentCog(commands.Cog):
                     request,
                     on_progress=progress.update,
                 )
-            await progress.finish(response.content)
         except Exception as exc:
             log.exception("Mention agent turn failed message=%s", message.id)
             await progress.fail(_agent_error_text(exc))
+        else:
+            chunks = await progress.prepare(response.content)
+            pending = await self.runtime.agent_store.pending_host_delivery(
+                request.event_id
+            )
+            if pending is None:
+                log.error(
+                    "Completed agent turn has no pending host record request=%s",
+                    request.event_id,
+                )
+            else:
+                try:
+                    await self._deliver_host_response(
+                        pending,
+                        source=message,
+                        expected_chunks=chunks,
+                    )
+                except Exception:
+                    # The completed model response remains in SQLite and the
+                    # recovery loop will retry without re-running any tools.
+                    log.exception(
+                        "Agent response delivery deferred request=%s channel=%s",
+                        request.event_id,
+                        request.channel_id,
+                    )
+                    self._host_delivery_wakeup.set()
         finally:
             if self._active_progress.get(request.event_id) is progress:
                 self._active_progress.pop(request.event_id, None)
 
+    async def _host_delivery_loop(self) -> None:
+        """Reconcile completed mention responses without rerunning the model."""
+
+        await self.bot.wait_until_ready()
+        retry_delay = 1.0
+        while True:
+            self._host_delivery_wakeup.clear()
+            had_failure = False
+            try:
+                pending = await self.runtime.agent_store.pending_host_deliveries(
+                    limit=100
+                )
+                for delivery in pending:
+                    try:
+                        await self._deliver_host_response(delivery)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        had_failure = True
+                        log.exception(
+                            "Agent host delivery recovery failed request=%s channel=%s",
+                            delivery.event_id,
+                            delivery.channel_id,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                had_failure = True
+                log.exception("Agent host delivery recovery query failed")
+
+            retry_delay = (
+                min(30.0, retry_delay * 2) if had_failure else 1.0
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._host_delivery_wakeup.wait(),
+                    timeout=retry_delay if had_failure else 30.0,
+                )
+
+    async def _deliver_host_response(
+        self,
+        pending: AgentPendingHostDelivery,
+        *,
+        source: discord.Message | None = None,
+        expected_chunks: tuple[str, ...] | None = None,
+    ) -> None:
+        lock = self._host_delivery_locks.setdefault(
+            pending.event_id,
+            asyncio.Lock(),
+        )
+        async with lock:
+            chunks = agent_message_groups(pending.response_content)
+            if pending.response_content.strip() == AGENT_NO_ACTION_CONTENT:
+                chunks = ()
+            if expected_chunks is not None and chunks != expected_chunks:
+                raise RuntimeError("prepared Discord chunks changed before delivery")
+            if not chunks:
+                await self.runtime.agent_store.complete_host_delivery(
+                    pending.event_id,
+                    allow_empty=True,
+                )
+                self._host_delivery_locks.pop(pending.event_id, None)
+                return
+
+            records = await self.runtime.agent_store.plan_host_delivery(
+                event_id=pending.event_id,
+                purpose="response",
+                channel_id=pending.channel_id,
+                contents=chunks,
+            )
+            channel = await self._agent_host_channel(pending.channel_id)
+            source = source or await self._agent_source_message(
+                channel,
+                pending.source_message_id,
+            )
+            records = await self._reconcile_host_messages(
+                channel,
+                pending,
+                records,
+            )
+            context = InvocationContext(
+                actor_id=pending.actor_id,
+                workspace_id=pending.workspace_id,
+                transport="agent",
+                request_id=pending.event_id,
+                resource_ids=(pending.channel_id,),
+                origin_resource_id=pending.channel_id,
+            )
+            for record, content in zip(records, chunks, strict=True):
+                message_id = record.message_id
+                if message_id is None:
+                    posted = await self._send_host_chunk(
+                        channel,
+                        source,
+                        pending,
+                        record,
+                        content,
+                    )
+                    message_id = str(posted.id)
+                    record = await self.runtime.agent_store.record_host_delivery_message(
+                        event_id=pending.event_id,
+                        purpose=record.purpose,
+                        chunk_index=record.chunk_index,
+                        message_id=message_id,
+                    )
+            records = await self.runtime.agent_store.host_delivery_records(
+                event_id=pending.event_id,
+                purpose="response",
+            )
+            unreceipted = tuple(
+                record for record in records if record.receipted_at is None
+            )
+            if unreceipted:
+                message_ids = tuple(
+                    record.message_id
+                    for record in records
+                    if record.message_id is not None
+                )
+                if len(message_ids) != len(records):
+                    raise RuntimeError("agent host delivery message evidence is incomplete")
+                receipted = await _record_agent_host_posts(
+                    self.runtime,
+                    channel_id=pending.channel_id,
+                    message_ids=message_ids,
+                    context=context,
+                )
+                if not receipted:
+                    raise RuntimeError("agent host receipt persistence failed")
+                for record in unreceipted:
+                    await self.runtime.agent_store.mark_host_delivery_receipted(
+                        event_id=pending.event_id,
+                        purpose=record.purpose,
+                        chunk_index=record.chunk_index,
+                    )
+
+            if not await self.runtime.agent_store.complete_host_delivery(
+                pending.event_id
+            ):
+                raise RuntimeError("agent host delivery did not reach terminal state")
+            self._host_delivery_locks.pop(pending.event_id, None)
+
+    async def _agent_host_channel(
+        self,
+        channel_id: str,
+    ) -> discord.abc.Messageable:
+        try:
+            numeric_channel_id = int(channel_id)
+        except ValueError as exc:
+            raise RuntimeError("agent host channel ID is invalid") from exc
+        channel = self.bot.get_channel(numeric_channel_id)
+        if channel is None:
+            channel = await self.bot.fetch_channel(numeric_channel_id)
+        if not isinstance(channel, discord.abc.Messageable):
+            raise RuntimeError("agent host channel cannot contain messages")
+        return channel
+
+    async def _agent_source_message(
+        self,
+        channel: discord.abc.Messageable,
+        source_message_id: str | None,
+    ) -> discord.Message | None:
+        if source_message_id is None:
+            return None
+        try:
+            return await channel.fetch_message(int(source_message_id))
+        except (ValueError, discord.NotFound, discord.Forbidden):
+            return None
+
+    async def _reconcile_host_messages(
+        self,
+        channel: discord.abc.Messageable,
+        pending: AgentPendingHostDelivery,
+        records: tuple[AgentHostDeliveryRecord, ...],
+    ) -> tuple[AgentHostDeliveryRecord, ...]:
+        missing = [record for record in records if record.message_id is None]
+        bot_user = self.bot.user
+        if not missing or bot_user is None:
+            return records
+        candidates: list[discord.Message] = []
+        after = pending.completed_at - timedelta(minutes=1)
+        try:
+            async for candidate in channel.history(
+                limit=1_000,
+                after=after,
+                oldest_first=True,
+            ):
+                if candidate.author.id == bot_user.id:
+                    candidates.append(candidate)
+        except (discord.Forbidden, discord.NotFound):
+            candidates = []
+
+        # Identical chunks are valid. Never let hash fallback reuse a message
+        # that is already durable evidence for another chunk.
+        used_ids = {
+            int(record.message_id)
+            for record in records
+            if record.message_id is not None
+        }
+        reconciled: list[AgentHostDeliveryRecord] = []
+        for record in records:
+            if record.message_id is not None:
+                reconciled.append(record)
+                continue
+            nonce = agent_delivery_nonce(
+                pending.event_id,
+                record.chunk_index,
+                purpose=record.purpose,
+            )
+            match = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.id not in used_ids
+                    and str(candidate.nonce or "") == nonce
+                ),
+                None,
+            )
+            if match is None:
+                reconciled.append(record)
+                continue
+            used_ids.add(match.id)
+            reconciled.append(
+                await self.runtime.agent_store.record_host_delivery_message(
+                    event_id=pending.event_id,
+                    purpose=record.purpose,
+                    chunk_index=record.chunk_index,
+                    message_id=str(match.id),
+                )
+            )
+        return tuple(reconciled)
+
+    async def _send_host_chunk(
+        self,
+        channel: discord.abc.Messageable,
+        source: discord.Message | None,
+        pending: AgentPendingHostDelivery,
+        record: AgentHostDeliveryRecord,
+        content: str,
+    ) -> discord.Message:
+        nonce = agent_delivery_nonce(
+            pending.event_id,
+            record.chunk_index,
+            purpose=record.purpose,
+        )
+        if record.chunk_index == 0 and source is not None:
+            return await source.reply(
+                content,
+                nonce=nonce,
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return await channel.send(
+            content,
+            nonce=nonce,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
 
 class ObservationCog(commands.Cog):
-    """Feed Discord changes into the platform event stream for agent reconciliation."""
+    """Publish Discord gateway events to the durable autonomous-agent queue."""
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
@@ -8310,33 +8744,315 @@ class ObservationCog(commands.Cog):
         if message.guild is None:
             return
         bot_user = self.bot.user
+        mentions_bot = bot_user in message.mentions if bot_user else False
+        payload: dict[str, object] = {
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "author_name": message.author.display_name,
+            "author_is_bot": message.author.bot,
+            "content_length": len(message.content),
+            "mentions_bot": mentions_bot,
+            "attachments": [
+                {
+                    "id": str(attachment.id),
+                    "filename": attachment.filename,
+                    "size": attachment.size,
+                }
+                for attachment in message.attachments
+            ],
+        }
         await self.runtime.journal.append(
             kind="discord.message.created",
             actor_id=str(message.author.id),
             workspace_id=str(message.guild.id),
             transport="discord",
             request_id=str(message.id),
-            payload={
-                "message_id": str(message.id),
-                "channel_id": str(message.channel.id),
-                "author_name": message.author.display_name,
-                "author_is_bot": message.author.bot,
-                "content_length": len(message.content),
-                "mentions_bot": bot_user in message.mentions if bot_user else False,
-                "attachments": [
-                    {
-                        "id": str(attachment.id),
-                        "filename": attachment.filename,
-                        "size": attachment.size,
-                    }
-                    for attachment in message.attachments
-                ],
-            },
+            payload=payload,
         )
+        if (
+            message.author.bot
+            or message.webhook_id is not None
+            or mentions_bot
+            or not self._enabled_for(message.guild.id)
+        ):
+            return
+        get_context = getattr(self.bot, "get_context", None)
+        if callable(get_context):
+            command_context = await get_context(message)
+            if command_context.valid:
+                return
+        await self._enqueue(
+            kind=AutonomyEventKind.MESSAGE_CREATE,
+            deduplication_key=f"message-create:{message.id}",
+            workspace_id=str(message.guild.id),
+            channel_id=str(message.channel.id),
+            actor_id=str(message.author.id),
+            message_id=str(message.id),
+            occurred_at=message.created_at,
+            payload=payload,
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if payload.guild_id is None or not self._enabled_for(payload.guild_id):
+            return
+        raw_edited_at = payload.data.get("edited_timestamp")
+        content_changed = "content" in payload.data
+        attachments_changed = "attachments" in payload.data
+        if (
+            not isinstance(raw_edited_at, str)
+            or not (content_changed or attachments_changed)
+        ):
+            return
+        occurred_at = discord.utils.parse_time(raw_edited_at)
+        if occurred_at is None:
+            return
+        cached = payload.cached_message
+        current = payload.message
+        author_id: str | None = None
+        author_is_bot = False
+        author = getattr(current, "author", None)
+        if author is None and cached is not None:
+            author = cached.author
+        if author is not None:
+            author_id = str(author.id)
+            author_is_bot = author.bot
+        webhook_message = (
+            getattr(current, "webhook_id", None) is not None
+            or (cached is not None and cached.webhook_id is not None)
+            or bool(payload.data.get("webhook_id"))
+        )
+        bot_user = self.bot.user
+        current_mentions = getattr(current, "mentions", ())
+        mentions_bot_after = (
+            bot_user in current_mentions if bot_user is not None else False
+        )
+        mentions_bot_before = (
+            cached is not None
+            and bot_user is not None
+            and bot_user in cached.mentions
+        )
+        mentions_bot = mentions_bot_before or mentions_bot_after
+        event_payload: dict[str, object] = {
+            "message_id": str(payload.message_id),
+            "channel_id": str(payload.channel_id),
+            "source_actor_id": author_id,
+            "author_is_bot": author_is_bot,
+            "mentions_bot": mentions_bot,
+            "mentions_bot_before": mentions_bot_before,
+            "mentions_bot_after": mentions_bot_after,
+            "edited_at_iso": occurred_at.isoformat(),
+            "content_changed": content_changed,
+            "attachments_changed": attachments_changed,
+        }
+        await self.runtime.journal.append(
+            kind=AutonomyEventKind.MESSAGE_EDIT.value,
+            actor_id=author_id,
+            workspace_id=str(payload.guild_id),
+            transport="discord",
+            request_id=f"edit:{payload.message_id}:{occurred_at.isoformat()}",
+            payload=event_payload,
+        )
+        if author_id is None or author_is_bot or webhook_message or mentions_bot:
+            return
+        await self._enqueue(
+            kind=AutonomyEventKind.MESSAGE_EDIT,
+            deduplication_key=(
+                f"message-edit:{payload.message_id}:{occurred_at.isoformat()}"
+            ),
+            workspace_id=str(payload.guild_id),
+            channel_id=str(payload.channel_id),
+            actor_id=author_id,
+            message_id=str(payload.message_id),
+            occurred_at=occurred_at,
+            payload=event_payload,
+        )
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(
+        self,
+        payload: discord.RawReactionActionEvent,
+    ) -> None:
+        if payload.guild_id is None or not self._enabled_for(payload.guild_id):
+            return
+        bot_user = self.bot.user
+        if (
+            (bot_user is not None and payload.user_id == bot_user.id)
+            or (payload.member is not None and payload.member.bot)
+        ):
+            return
+        occurred_at = datetime.now(UTC)
+        emoji = str(payload.emoji)
+        event_payload: dict[str, object] = {
+            "message_id": str(payload.message_id),
+            "channel_id": str(payload.channel_id),
+            "source_actor_id": str(payload.user_id),
+            "emoji": emoji,
+        }
+        await self.runtime.journal.append(
+            kind=AutonomyEventKind.REACTION_ADD.value,
+            actor_id=str(payload.user_id),
+            workspace_id=str(payload.guild_id),
+            transport="discord",
+            request_id=(
+                f"reaction:{payload.message_id}:{payload.user_id}:"
+                f"{occurred_at.isoformat()}"
+            ),
+            payload=event_payload,
+        )
+        await self._enqueue(
+            kind=AutonomyEventKind.REACTION_ADD,
+            deduplication_key=(
+                f"reaction-add:{payload.message_id}:{payload.user_id}:"
+                f"{emoji}:{int(occurred_at.timestamp())}"
+            ),
+            workspace_id=str(payload.guild_id),
+            channel_id=str(payload.channel_id),
+            actor_id=str(payload.user_id),
+            message_id=str(payload.message_id),
+            occurred_at=occurred_at,
+            payload=event_payload,
+        )
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread) -> None:
+        if not self._enabled_for(thread.guild.id):
+            return
+        bot_user = self.bot.user
+        if bot_user is not None and thread.owner_id == bot_user.id:
+            return
+        occurred_at = thread.created_at or datetime.now(UTC)
+        event_payload: dict[str, object] = {
+            "channel_id": str(thread.id),
+            "parent_channel_id": str(thread.parent_id) if thread.parent_id else None,
+            "source_actor_id": str(thread.owner_id) if thread.owner_id else None,
+            "thread_name": thread.name,
+        }
+        await self.runtime.journal.append(
+            kind=AutonomyEventKind.THREAD_CREATE.value,
+            actor_id=str(thread.owner_id) if thread.owner_id else None,
+            workspace_id=str(thread.guild.id),
+            transport="discord",
+            request_id=f"thread:{thread.id}",
+            payload=event_payload,
+        )
+        await self._enqueue(
+            kind=AutonomyEventKind.THREAD_CREATE,
+            deduplication_key=f"thread-create:{thread.id}",
+            workspace_id=str(thread.guild.id),
+            channel_id=str(thread.id),
+            actor_id=str(thread.owner_id) if thread.owner_id else None,
+            message_id=None,
+            occurred_at=occurred_at,
+            payload=event_payload,
+        )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if (
+            member.bot
+            or before.channel == after.channel
+            or not self._enabled_for(member.guild.id)
+        ):
+            return
+        channel = after.channel or before.channel
+        if channel is None:
+            return
+        occurred_at = datetime.now(UTC)
+        event_payload: dict[str, object] = {
+            "channel_id": str(channel.id),
+            "source_actor_id": str(member.id),
+            "before_channel_id": (
+                str(before.channel.id) if before.channel is not None else None
+            ),
+            "after_channel_id": (
+                str(after.channel.id) if after.channel is not None else None
+            ),
+        }
+        await self.runtime.journal.append(
+            kind=AutonomyEventKind.VOICE_STATE_UPDATE.value,
+            actor_id=str(member.id),
+            workspace_id=str(member.guild.id),
+            transport="discord",
+            request_id=f"voice:{member.id}:{occurred_at.isoformat()}",
+            payload=event_payload,
+        )
+        await self._enqueue(
+            kind=AutonomyEventKind.VOICE_STATE_UPDATE,
+            deduplication_key=f"voice-state:{member.id}:{occurred_at.isoformat()}",
+            workspace_id=str(member.guild.id),
+            channel_id=str(channel.id),
+            actor_id=str(member.id),
+            message_id=None,
+            occurred_at=occurred_at,
+            payload=event_payload,
+        )
+
+    def _enabled_for(self, guild_id: int) -> bool:
+        settings = self.runtime.settings
+        return (
+            self.runtime.agent is not None
+            and settings.agent_autonomy_enabled
+            and settings.agent_autonomy_mode is not AgentAutonomyMode.OBSERVE
+            and str(guild_id) in settings.agent_autonomy_guild_ids
+        )
+
+    async def _enqueue(
+        self,
+        *,
+        kind: AutonomyEventKind,
+        deduplication_key: str,
+        workspace_id: str,
+        channel_id: str,
+        occurred_at: datetime,
+        actor_id: str | None,
+        message_id: str | None,
+        payload: dict[str, object],
+    ) -> None:
+        result = await self.runtime.autonomy_events.enqueue(
+            kind=kind,
+            deduplication_key=deduplication_key,
+            workspace_id=workspace_id,
+            channel_id=channel_id,
+            occurred_at=occurred_at,
+            actor_id=actor_id,
+            message_id=message_id,
+            payload=payload,
+        )
+        if result in {
+            AutonomyEnqueueResult.QUEUE_FULL,
+            AutonomyEnqueueResult.CHANNEL_QUEUE_FULL,
+            AutonomyEnqueueResult.ACTOR_QUEUE_FULL,
+        }:
+            await self.runtime.journal.append(
+                kind="agent.autonomy.event_rejected",
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                transport="agent",
+                request_id=deduplication_key,
+                payload={
+                    "event_kind": kind.value,
+                    "channel_id": channel_id,
+                    "reason": result.value,
+                },
+            )
+
+
+class _AutonomyTerminalDrop(RuntimeError):
+    """A queued pointer cannot become actionable without a configuration change."""
+
+
+class _AutonomyReceiptDeferred(RuntimeError):
+    """A delivered message still needs its durable Action Receipt."""
 
 
 class AgentAutonomyCog(commands.Cog):
-    """Bounded default-off patrol over metadata-only Discord events."""
+    """Consume durable same-channel event batches without polling the journal."""
 
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
@@ -8349,6 +9065,7 @@ class AgentAutonomyCog(commands.Cog):
             self.runtime.agent is not None
             and settings.agent_autonomy_enabled
             and bool(settings.agent_autonomy_guild_ids)
+            and settings.agent_autonomy_mode is not AgentAutonomyMode.OBSERVE
             and self._task is None
         ):
             self._task = asyncio.create_task(
@@ -8364,70 +9081,627 @@ class AgentAutonomyCog(commands.Cog):
 
     async def _run(self) -> None:
         settings = self.runtime.settings
-        cursor = await self.runtime.journal.latest_sequence()
-        await self.runtime.journal.append(
+        queue = self.runtime.autonomy_events
+        await self.bot.wait_until_ready()
+        await self._journal(
             kind="agent.autonomy.started",
             transport="agent",
             payload={
-                "interval_seconds": settings.agent_autonomy_interval_seconds,
+                "mode": settings.agent_autonomy_mode.value,
+                "batch_seconds": settings.agent_autonomy_batch_seconds,
                 "max_runs": settings.agent_autonomy_max_runs,
                 "candidate_limit": settings.agent_autonomy_candidate_limit,
             },
         )
         completed_runs = 0
         try:
-            while completed_runs < settings.agent_autonomy_max_runs:
-                await asyncio.sleep(settings.agent_autonomy_interval_seconds)
-                records = await self.runtime.journal.recent(
-                    after_sequence=cursor,
-                    limit=min(1_000, settings.agent_autonomy_candidate_limit * 20),
-                )
-                if records:
-                    cursor = records[-1].sequence
-                candidates = [
-                    record
-                    for record in records
-                    if record.kind == "discord.message.created"
-                    and record.actor_id is not None
-                    and not bool(record.payload.get("author_is_bot"))
-                    and not bool(record.payload.get("mentions_bot"))
-                    and isinstance(record.payload.get("message_id"), str)
-                    and isinstance(record.payload.get("channel_id"), str)
-                    and record.workspace_id in settings.agent_autonomy_guild_ids
-                ][-settings.agent_autonomy_candidate_limit :]
-                completed_runs += 1
-                await self.runtime.journal.append(
-                    kind="agent.autonomy.checked",
-                    transport="agent",
-                    payload={
-                        "run": completed_runs,
-                        "candidate_count": len(candidates),
-                        "model_called": bool(candidates),
-                    },
-                )
-                if candidates:
-                    await self._inspect(candidates[-1])
+            while (
+                settings.agent_autonomy_max_runs == 0
+                or completed_runs < settings.agent_autonomy_max_runs
+            ):
+                try:
+                    batch = await self._next_batch()
+                    if batch is None:
+                        continue
+                    model_called = await self._consume_batch(batch)
+                    if model_called is None:
+                        continue
+                    if model_called:
+                        completed_runs += 1
+                    await self._journal(
+                        kind="agent.autonomy.checked",
+                        workspace_id=batch.workspace_id,
+                        transport="agent",
+                        request_id=batch.batch_id,
+                        payload={
+                            "run": completed_runs,
+                            "candidate_count": len(batch.events),
+                            "model_called": model_called,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One corrupt event or transient SQLite failure must not stop
+                    # the only long-lived consumer task.
+                    log.exception("Autonomous agent queue iteration failed")
+                    await asyncio.sleep(5)
         except asyncio.CancelledError:
             raise
         finally:
-            await self.runtime.journal.append(
+            try:
+                pending_events = await queue.pending_count()
+            except Exception:
+                pending_events = -1
+                log.exception("Could not count pending autonomy events at shutdown")
+            await self._journal(
                 kind="agent.autonomy.stopped",
                 transport="agent",
-                payload={"completed_runs": completed_runs},
+                payload={
+                    "completed_runs": completed_runs,
+                    "pending_events": pending_events,
+                },
             )
 
-    async def _inspect(self, record: EventRecord) -> None:
+    async def _next_batch(self) -> AutonomyEventBatch | None:
+        settings = self.runtime.settings
+        queue = self.runtime.autonomy_events
+        batch = await queue.next_batch(
+            debounce_seconds=settings.agent_autonomy_batch_seconds,
+            candidate_limit=settings.agent_autonomy_candidate_limit,
+            lease_seconds=_AUTONOMY_LEASE_SECONDS,
+        )
+        if batch is None:
+            queue.clear_wake()
+            # Close the clear/enqueue race before sleeping.
+            batch = await queue.next_batch(
+                debounce_seconds=settings.agent_autonomy_batch_seconds,
+                candidate_limit=settings.agent_autonomy_candidate_limit,
+                lease_seconds=_AUTONOMY_LEASE_SECONDS,
+            )
+        if batch is not None:
+            return batch
+        delay = await queue.seconds_until_ready(
+            debounce_seconds=settings.agent_autonomy_batch_seconds,
+            candidate_limit=settings.agent_autonomy_candidate_limit,
+        )
+        await queue.wait(delay)
+        return None
+
+    async def _consume_batch(
+        self,
+        batch: AutonomyEventBatch,
+    ) -> bool | None:
+        heartbeat = asyncio.create_task(
+            self._heartbeat(batch),
+            name=f"simajilord-autonomy-lease-{batch.batch_id}",
+        )
+        try:
+            try:
+                model_called = await self._while_owned(
+                    self._inspect(batch),
+                    heartbeat,
+                )
+                await self._while_owned(
+                    self._ack_with_retry(batch),
+                    heartbeat,
+                    operation_wins_tie=True,
+                )
+                return model_called
+            except AgentRateLimitError as exc:
+                await self._stop_heartbeat(heartbeat)
+                retry_after = exc.retry_after_seconds or 60
+                await self._safe_defer(
+                    batch,
+                    reason="rate_limited",
+                    retry_after_seconds=retry_after,
+                )
+            except AgentBusyError:
+                await self._stop_heartbeat(heartbeat)
+                retry_after = min(
+                    300,
+                    max(
+                        5,
+                        self.runtime.settings.agent_autonomy_batch_seconds,
+                    )
+                    * (2 ** min(batch.deferral_count, 4)),
+                )
+                await self._safe_defer(
+                    batch,
+                    reason="agent_busy",
+                    retry_after_seconds=retry_after,
+                )
+            except _AutonomyReceiptDeferred:
+                await self._stop_heartbeat(heartbeat)
+                await self._safe_defer(
+                    batch,
+                    reason="receipt_unavailable",
+                    retry_after_seconds=60,
+                )
+            except (
+                _AutonomyTerminalDrop,
+                AutonomyDeliveryConflictError,
+            ) as exc:
+                await self._stop_heartbeat(heartbeat)
+                await self._safe_dead_letter(batch, reason=str(exc))
+            except AutonomyLeaseLostError:
+                log.info(
+                    "Autonomous agent batch ownership moved batch=%s",
+                    batch.batch_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await self._stop_heartbeat(heartbeat)
+                if batch.attempt_count >= 7:
+                    await self._safe_dead_letter(
+                        batch,
+                        reason=f"retry_exhausted:{type(exc).__name__}",
+                    )
+                    log.exception(
+                        "Autonomous agent batch dead-lettered batch=%s",
+                        batch.batch_id,
+                    )
+                else:
+                    retry_after = min(
+                        3_600,
+                        60 * (2 ** min(batch.attempt_count, 6)),
+                    )
+                    await self._safe_retry_failure(
+                        batch,
+                        reason=type(exc).__name__,
+                        retry_after_seconds=retry_after,
+                    )
+                    log.exception(
+                        "Autonomous agent batch failed batch=%s",
+                        batch.batch_id,
+                    )
+            return None
+        finally:
+            await self._stop_heartbeat(heartbeat)
+
+    async def _while_owned(
+        self,
+        operation: Awaitable[_AutonomyResultT],
+        heartbeat: asyncio.Task[None],
+        *,
+        operation_wins_tie: bool = False,
+    ) -> _AutonomyResultT:
+        operation_task = asyncio.ensure_future(operation)
+        done, _ = await asyncio.wait(
+            (operation_task, heartbeat),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done and (
+            heartbeat not in done or operation_wins_tie
+        ):
+            return await operation_task
+        operation_task.cancel()
+        await asyncio.gather(operation_task, return_exceptions=True)
+        if heartbeat.cancelled():
+            raise AutonomyLeaseLostError(
+                "Autonomy lease heartbeat ended before the operation"
+            )
+        await heartbeat
+        raise AutonomyLeaseLostError(
+            "Autonomy lease heartbeat stopped unexpectedly"
+        )
+
+    async def _heartbeat(self, batch: AutonomyEventBatch) -> None:
+        lease_until = batch.lease_until
+        while True:
+            await asyncio.sleep(_AUTONOMY_LEASE_HEARTBEAT_SECONDS)
+            while True:
+                try:
+                    lease_until = await self.runtime.autonomy_events.renew_lease(
+                        batch,
+                        lease_seconds=_AUTONOMY_LEASE_SECONDS,
+                    )
+                    break
+                except AutonomyLeaseLostError:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    remaining = (lease_until - datetime.now(UTC)).total_seconds()
+                    if remaining <= 0:
+                        raise AutonomyLeaseLostError(
+                            f"Autonomy lease renewal failed until expiry: "
+                            f"{batch.batch_id}"
+                        ) from exc
+                    log.exception(
+                        "Autonomy lease heartbeat failed batch=%s remaining=%s",
+                        batch.batch_id,
+                        round(remaining),
+                    )
+                    await asyncio.sleep(min(5.0, remaining))
+
+    async def _ack_with_retry(self, batch: AutonomyEventBatch) -> None:
+        attempt = 0
+        while True:
+            try:
+                await self.runtime.autonomy_events.mark_processed(batch)
+                return
+            except AutonomyLeaseLostError:
+                raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                delay = min(30, 2 ** min(attempt, 5))
+                attempt += 1
+                log.exception(
+                    "Autonomous agent batch ACK failed; retrying batch=%s "
+                    "delay=%s",
+                    batch.batch_id,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+    @staticmethod
+    async def _stop_heartbeat(heartbeat: asyncio.Task[None]) -> None:
+        if not heartbeat.done():
+            heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _journal(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, object],
+        actor_id: str | None = None,
+        workspace_id: str | None = None,
+        transport: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        try:
+            await self.runtime.journal.append(
+                kind=kind,
+                payload=payload,
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                transport=transport,
+                request_id=request_id,
+            )
+        except Exception:
+            log.exception(
+                "Could not append autonomous-agent journal event kind=%s",
+                kind,
+            )
+
+    async def _safe_dead_letter(
+        self,
+        batch: AutonomyEventBatch,
+        *,
+        reason: str,
+    ) -> bool:
+        try:
+            await self.runtime.autonomy_events.dead_letter(batch, reason=reason)
+        except AutonomyLeaseLostError:
+            log.info(
+                "Autonomy dead-letter skipped after ownership moved batch=%s",
+                batch.batch_id,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Autonomy dead-letter persistence failed batch=%s",
+                batch.batch_id,
+            )
+            return False
+        await self._journal(
+            kind="agent.autonomy.dead_lettered",
+            workspace_id=batch.workspace_id,
+            transport="agent",
+            request_id=batch.batch_id,
+            payload={
+                "channel_id": batch.channel_id,
+                "event_count": len(batch.events),
+                "attempt_count": batch.attempt_count + 1,
+                "reason": reason,
+            },
+        )
+        return True
+
+    async def _safe_defer(
+        self,
+        batch: AutonomyEventBatch,
+        *,
+        reason: str,
+        retry_after_seconds: int,
+    ) -> bool:
+        try:
+            await self.runtime.autonomy_events.defer(
+                batch,
+                retry_after_seconds=retry_after_seconds,
+            )
+        except AutonomyLeaseLostError:
+            log.info(
+                "Autonomy deferral skipped after ownership moved batch=%s",
+                batch.batch_id,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Autonomy deferral persistence failed batch=%s",
+                batch.batch_id,
+            )
+            return False
+        await self._record_retry(
+            batch,
+            reason,
+            retry_after_seconds,
+            failure=False,
+        )
+        return True
+
+    async def _safe_retry_failure(
+        self,
+        batch: AutonomyEventBatch,
+        *,
+        reason: str,
+        retry_after_seconds: int,
+    ) -> bool:
+        try:
+            await self.runtime.autonomy_events.reschedule(
+                batch,
+                retry_after_seconds=retry_after_seconds,
+            )
+        except AutonomyLeaseLostError:
+            log.info(
+                "Autonomy retry skipped after ownership moved batch=%s",
+                batch.batch_id,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Autonomy retry persistence failed batch=%s",
+                batch.batch_id,
+            )
+            return False
+        await self._record_retry(
+            batch,
+            reason,
+            retry_after_seconds,
+            failure=True,
+        )
+        return True
+
+    async def _record_retry(
+        self,
+        batch: AutonomyEventBatch,
+        reason: str,
+        retry_after_seconds: int,
+        *,
+        failure: bool,
+    ) -> None:
+        await self._journal(
+            kind="agent.autonomy.deferred",
+            workspace_id=batch.workspace_id,
+            transport="agent",
+            request_id=batch.batch_id,
+            payload={
+                "channel_id": batch.channel_id,
+                "event_count": len(batch.events),
+                "reason": reason,
+                "retry_after_seconds": retry_after_seconds,
+                "failure": failure,
+                "failure_count": batch.attempt_count + int(failure),
+                "deferral_count": batch.deferral_count + int(not failure),
+            },
+        )
+
+    async def _deliver_response(
+        self,
+        batch: AutonomyEventBatch,
+        *,
+        channel: (
+            discord.TextChannel
+            | discord.Thread
+            | discord.VoiceChannel
+            | discord.StageChannel
+        ),
+        target: discord.Message | None,
+        messages: tuple[str, ...],
+        context: InvocationContext,
+        bot_user_id: int,
+    ) -> None:
+        purpose = "response"
+        specs = tuple(
+            AutonomyDeliverySpec(
+                purpose=purpose,
+                chunk_index=index,
+                content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+                nonce=agent_delivery_nonce(
+                    batch.batch_id,
+                    index,
+                    purpose=purpose,
+                ),
+            )
+            for index, content in enumerate(messages)
+        )
+        records = await self.runtime.autonomy_events.prepare_deliveries(
+            batch,
+            specs,
+        )
+        resolved: dict[int, discord.Message | None] = {}
+        missing: list[AutonomyDeliveryRecord] = []
+        for record in records:
+            if record.message_id is None:
+                missing.append(record)
+                continue
+            try:
+                candidate = await channel.fetch_message(int(record.message_id))
+            except discord.NotFound:
+                # A saved ID proves the chunk was sent. Manual deletion must not
+                # turn a queue ACK retry into an unsolicited repost.
+                resolved[record.chunk_index] = None
+                continue
+            except discord.Forbidden as exc:
+                raise _AutonomyTerminalDrop("channel_not_postable") from exc
+            except discord.DiscordException as exc:
+                raise RuntimeError(
+                    "Saved autonomy delivery is temporarily unavailable"
+                ) from exc
+            self._validate_reconciled_message(
+                batch,
+                record,
+                candidate,
+                bot_user_id=bot_user_id,
+            )
+            resolved[record.chunk_index] = candidate
+
+        if missing:
+            unresolved = {
+                (record.chunk_index, record.purpose): record
+                for record in missing
+            }
+            # A previously persisted chunk can have the same body as a later
+            # missing chunk. Only the event-owned nonce may recover an unsaved
+            # message; a content hash alone could claim an unrelated bot post.
+            used_message_ids = {
+                int(record.message_id)
+                for record in records
+                if record.message_id is not None
+            }
+            search_after = min(
+                record.prepared_at for record in missing
+            ) - timedelta(minutes=1)
+            try:
+                async for candidate in channel.history(
+                    limit=_AUTONOMY_DELIVERY_RECOVERY_LIMIT,
+                    after=search_after,
+                    oldest_first=True,
+                ):
+                    if candidate.author.id != bot_user_id:
+                        continue
+                    nonce = str(getattr(candidate, "nonce", None) or "")
+                    matched_record = next(
+                        (
+                            item
+                            for item in unresolved.values()
+                            if candidate.id not in used_message_ids
+                            and nonce == item.nonce
+                        ),
+                        None,
+                    )
+                    if matched_record is None:
+                        continue
+                    self._validate_reconciled_message(
+                        batch,
+                        matched_record,
+                        candidate,
+                        bot_user_id=bot_user_id,
+                    )
+                    resolved[matched_record.chunk_index] = candidate
+                    used_message_ids.add(candidate.id)
+                    unresolved.pop(
+                        (matched_record.chunk_index, matched_record.purpose)
+                    )
+                    if not unresolved:
+                        break
+            except discord.Forbidden as exc:
+                raise _AutonomyTerminalDrop("channel_not_postable") from exc
+            except discord.DiscordException as exc:
+                raise RuntimeError(
+                    "Recent autonomy deliveries could not be reconciled"
+                ) from exc
+
+        records_by_index = {record.chunk_index: record for record in records}
+        delivered_records: list[AutonomyDeliveryRecord] = []
+        for index, content in enumerate(messages):
+            record = records_by_index[index]
+            posted = resolved.get(index)
+            if record.message_id is None:
+                if posted is None:
+                    if index == 0 and target is not None:
+                        posted = await target.reply(
+                            content,
+                            nonce=record.nonce,
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        posted = await channel.send(
+                            content,
+                            nonce=record.nonce,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                record = await self.runtime.autonomy_events.mark_delivery_sent(
+                    batch,
+                    purpose=purpose,
+                    chunk_index=index,
+                    message_id=str(posted.id),
+                )
+            delivered_records.append(record)
+
+        pending_receipts = tuple(
+            record
+            for record in delivered_records
+            if record.receipt_state is AutonomyDeliveryReceiptState.PENDING
+        )
+        if pending_receipts:
+            message_ids = tuple(
+                record.message_id
+                for record in delivered_records
+                if record.message_id is not None
+            )
+            if len(message_ids) != len(delivered_records):
+                raise AutonomyDeliveryConflictError(
+                    f"Autonomy delivery evidence is incomplete for {batch.batch_id}"
+                )
+            receipted = await _record_agent_host_posts(
+                self.runtime,
+                channel_id=batch.channel_id,
+                message_ids=message_ids,
+                context=context,
+            )
+            if not receipted:
+                raise _AutonomyReceiptDeferred
+            for record in pending_receipts:
+                await self.runtime.autonomy_events.mark_delivery_receipted(
+                    batch,
+                    purpose=purpose,
+                    chunk_index=record.chunk_index,
+                )
+
+    @staticmethod
+    def _validate_reconciled_message(
+        batch: AutonomyEventBatch,
+        record: AutonomyDeliveryRecord,
+        message: discord.Message,
+        *,
+        bot_user_id: int,
+    ) -> None:
+        nonce = getattr(message, "nonce", None)
+        if message.author.id != bot_user_id or (
+            nonce is not None and str(nonce) != record.nonce
+        ) or (
+            hashlib.sha256(message.content.encode()).hexdigest()
+            != record.content_sha256
+        ):
+            raise AutonomyDeliveryConflictError(
+                f"Autonomy delivery reconciliation conflict for "
+                f"{batch.batch_id}:{record.purpose}:{record.chunk_index}"
+            )
+
+    async def _inspect(self, batch: AutonomyEventBatch) -> bool:
         agent = self.runtime.agent
         if agent is None:
-            return
-        payload = record.payload
-        channel_id = str(payload["channel_id"])
-        message_id = str(payload["message_id"])
-        workspace_id = record.workspace_id
-        occurred_at = record.occurred_at
-        guild = self.bot.get_guild(int(workspace_id)) if workspace_id else None
+            raise _AutonomyTerminalDrop("agent_disabled")
+        channel_id = batch.channel_id
+        message_id = batch.message_id
+        workspace_id = batch.workspace_id
+        if workspace_id not in self.runtime.settings.agent_autonomy_guild_ids:
+            raise _AutonomyTerminalDrop("guild_not_allowlisted")
+        guild = self.bot.get_guild(int(workspace_id))
         if guild is None:
-            return
+            raise _AutonomyTerminalDrop("guild_unavailable")
         resource_ids = agent_readable_channel_ids(
             guild,
             None,
@@ -8435,11 +9709,75 @@ class AgentAutonomyCog(commands.Cog):
             trigger_channel_id=int(channel_id),
         )
         if channel_id not in resource_ids:
-            return
+            raise _AutonomyTerminalDrop("channel_not_readable")
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            except (discord.NotFound, discord.Forbidden) as exc:
+                raise _AutonomyTerminalDrop("channel_not_messageable") from exc
+            except discord.DiscordException as exc:
+                raise RuntimeError(
+                    "Autonomy response channel is temporarily unavailable"
+                ) from exc
+        if not isinstance(
+            channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            raise _AutonomyTerminalDrop("channel_not_messageable")
+        bot_member = guild.me
+        if bot_member is None:
+            raise RuntimeError("Discord bot member is temporarily unavailable")
+        permissions = channel.permissions_for(bot_member)
+        can_send = (
+            permissions.send_messages_in_threads
+            if isinstance(channel, discord.Thread)
+            else permissions.send_messages
+        )
+        if (
+            not permissions.view_channel
+            or not permissions.read_message_history
+            or not can_send
+            or (
+                isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+                and not permissions.connect
+            )
+            or (
+                isinstance(channel, discord.Thread)
+                and (channel.archived or channel.locked)
+            )
+        ):
+            raise _AutonomyTerminalDrop("channel_not_postable")
+        bot_user = self.bot.user
+        if bot_user is None:
+            raise RuntimeError("Discord bot identity is temporarily unavailable")
+        autonomy_actor_id = str(bot_user.id)
         grants = _agent_grants(
             self.runtime,
-            actor_id=AGENT_AUTONOMY_ACTOR_ID,
+            actor_id=autonomy_actor_id,
             autonomous=True,
+        )
+        mode = self.runtime.settings.agent_autonomy_mode
+        approvals = _autonomy_approvals(self.runtime, mode)
+        event_pointers = tuple(
+            AgentEvent(
+                event_id=f"autonomy:queue:{event.sequence}",
+                kind=event.kind.value,
+                occurred_at=event.occurred_at,
+                workspace_id=event.workspace_id,
+                payload={
+                    **event.payload,
+                    "source_actor_id": event.actor_id,
+                    "channel_id": event.channel_id,
+                    "message_id": event.message_id,
+                },
+            )
+            for event in batch.events
         )
         request = AgentRequest(
             conversation_id=discord_conversation_id(
@@ -8447,59 +9785,79 @@ class AgentAutonomyCog(commands.Cog):
                 channel_id=int(channel_id),
                 grants=grants,
             ),
-            event_id=f"autonomy:event:{record.sequence}",
+            event_id=batch.batch_id,
             trigger=AgentTrigger.AUTONOMOUS,
-            actor_id=AGENT_AUTONOMY_ACTOR_ID,
+            actor_id=autonomy_actor_id,
             actor_name="Simajilord autonomy",
             workspace_id=workspace_id,
             channel_id=channel_id,
             message_id=message_id,
-            occurred_at=occurred_at if isinstance(occurred_at, datetime) else datetime.now(UTC),
+            occurred_at=max(event.occurred_at for event in batch.events),
             resource_ids=resource_ids,
             grants=grants,
+            approvals=approvals,
+            events=event_pointers,
         )
-        try:
-            response = await agent.respond(request)
-            if response.content.strip() == AGENT_NO_ACTION_CONTENT:
-                return
-            channel = self.bot.get_channel(int(channel_id))
-            if not isinstance(
-                channel,
-                (
-                    discord.TextChannel,
-                    discord.Thread,
-                    discord.VoiceChannel,
-                    discord.StageChannel,
-                ),
-            ):
-                return
-            messages = _agent_message_groups(response.content)
-            if not messages:
-                return
+        response = await agent.respond(request)
+        if response.content.strip() == AGENT_NO_ACTION_CONTENT:
+            return True
+        messages = _agent_message_groups(response.content)
+        if not messages:
+            return True
+        target = None
+        if message_id is not None:
             try:
                 target = await channel.fetch_message(int(message_id))
-            except discord.DiscordException:
+            except discord.NotFound:
                 target = None
-            if target is not None:
-                await target.reply(
-                    messages[0],
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await channel.send(
-                    messages[0],
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            for message in messages[1:]:
-                await channel.send(
-                    message,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-        except (AgentBusyError, AgentRateLimitError):
-            log.info("Autonomous agent check skipped by local budget.")
-        except Exception:
-            log.exception("Autonomous agent check failed message=%s", message_id)
+            except discord.Forbidden as exc:
+                raise _AutonomyTerminalDrop("channel_not_postable") from exc
+            except discord.DiscordException as exc:
+                raise RuntimeError(
+                    "Autonomy reply target is temporarily unavailable"
+                ) from exc
+        source_actor_ids = {
+            event.actor_id
+            for event in batch.events
+            if event.actor_id is not None
+        }
+        if len(source_actor_ids) == 1:
+            host_post_actor_id = next(iter(source_actor_ids))
+        else:
+            host_post_actor_id = autonomy_actor_id
+        host_post_context = InvocationContext(
+            actor_id=host_post_actor_id,
+            workspace_id=workspace_id,
+            transport="agent",
+            request_id=batch.batch_id,
+            resource_ids=resource_ids,
+            origin_resource_id=channel_id,
+        )
+        try:
+            await self._deliver_response(
+                batch,
+                channel=channel,
+                target=target,
+                messages=messages,
+                context=host_post_context,
+                bot_user_id=bot_user.id,
+            )
+        except discord.Forbidden as exc:
+            raise _AutonomyTerminalDrop("channel_not_postable") from exc
+        await self._journal(
+            kind="agent.autonomy.acted",
+            actor_id=autonomy_actor_id,
+            workspace_id=workspace_id,
+            transport="agent",
+            request_id=batch.batch_id,
+            payload={
+                "channel_id": channel_id,
+                "event_count": len(batch.events),
+                "message_count": len(messages),
+                "mode": mode.value,
+            },
+        )
+        return True
 
 
 class PrefixCog(commands.Cog):
@@ -8682,6 +10040,9 @@ class PrefixCog(commands.Cog):
             if media.size > self.runtime.settings.hive_max_media_bytes:
                 raise UserError("moderation.media_too_large")
             async with context.typing():
+                content = await read_attachment_bytes(media)
+                if len(content) > self.runtime.settings.hive_max_media_bytes:
+                    raise UserError("moderation.media_too_large")
                 response = cast(
                     SyntheticMediaAnalyzeResponse,
                     await self.runtime.registry.invoke(
@@ -8689,7 +10050,7 @@ class PrefixCog(commands.Cog):
                         SyntheticMediaAnalyzeRequest(
                             filename=media.filename,
                             content_type=media.content_type,
-                            content=await media.read(use_cached=True),
+                            content=content,
                         ),
                         prefix_context(context),
                     ),
@@ -9000,7 +10361,6 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
             callback=music_cog.play_attachment,
         )
     )
-    await bot.add_cog(YouTubeLinkCardCog(runtime))
     await bot.add_cog(ReadAloudCog(bot, runtime))
     await bot.add_cog(VoiceLifecycleCog(bot, runtime))
     await bot.add_cog(WebCog(runtime))

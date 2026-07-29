@@ -117,6 +117,9 @@ class ReadAloudAnnouncementsSetRequest:
     join: bool | None = None
     leave: bool | None = None
     move: bool | None = None
+    expected_join: bool | None = None
+    expected_leave: bool | None = None
+    expected_move: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,11 +135,29 @@ class ReadAloudSemanticsSetRequest:
             )
         },
     )
+    expected_author_names: bool | None = None
+    expected_replies: bool | None = None
+    expected_attachments: bool | None = None
+    expected_vc_members_only: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ReadAloudContentModeSetRequest:
     mode: ReadAloudContentMode
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAloudContentStateRestoreRequest:
+    """Internal exact inverse for the four booleans collapsed by a mode preset."""
+
+    read_messages: bool
+    announce_join: bool
+    announce_leave: bool
+    announce_move: bool
+    expected_read_messages: bool | None = None
+    expected_announce_join: bool | None = None
+    expected_announce_leave: bool | None = None
+    expected_announce_move: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +195,15 @@ class ReadAloudPolicyResponse:
     content_mode: str = ReadAloudContentMode.MESSAGES.value
     default_voice_preset: str = ReadAloudVoicePreset.CLEAR.value
     user_voice_presets: tuple[tuple[str, str], ...] = ()
+    previous_announce_join: bool | None = None
+    previous_announce_leave: bool | None = None
+    previous_announce_move: bool | None = None
+    previous_read_author_names: bool | None = None
+    previous_read_replies: bool | None = None
+    previous_read_attachments: bool | None = None
+    previous_vc_members_only: bool | None = None
+    previous_content_mode: str | None = None
+    previous_read_messages: bool | None = None
 
 
 def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
@@ -443,40 +473,76 @@ def build_read_aloud_policy_endpoints(
         request: ReadAloudAnnouncementsSetRequest,
         context: InvocationContext,
     ) -> ReadAloudPolicyResponse:
+        workspace_id = _workspace_id(context)
         try:
-            policy = await service.set_announcements(
-                workspace_id=_workspace_id(context),
+            policy, previous = await service.set_announcements_with_previous(
+                workspace_id=workspace_id,
                 join=request.join,
                 leave=request.leave,
                 move=request.move,
+                expected_join=request.expected_join,
+                expected_leave=request.expected_leave,
+                expected_move=request.expected_move,
             )
         except ValueError as exc:
             raise UserError("read_aloud.announcement_value_invalid") from exc
-        return _policy_response(policy)
+        return _policy_response(
+            policy,
+            previous_announcements=previous,
+        )
 
     async def semantics_set(
         request: ReadAloudSemanticsSetRequest,
         context: InvocationContext,
     ) -> ReadAloudPolicyResponse:
+        workspace_id = _workspace_id(context)
         try:
-            policy = await service.set_semantic_options(
-                workspace_id=_workspace_id(context),
+            policy, previous = await service.set_semantic_options_with_previous(
+                workspace_id=workspace_id,
                 author_names=request.author_names,
                 replies=request.replies,
                 attachments=request.attachments,
                 vc_members_only=request.vc_members_only,
+                expected_author_names=request.expected_author_names,
+                expected_replies=request.expected_replies,
+                expected_attachments=request.expected_attachments,
+                expected_vc_members_only=request.expected_vc_members_only,
             )
         except ValueError as exc:
             raise UserError("read_aloud.semantic_value_invalid") from exc
-        return _policy_response(policy)
+        return _policy_response(
+            policy,
+            previous_semantics=previous,
+        )
 
     async def content_mode_set(
         request: ReadAloudContentModeSetRequest,
         context: InvocationContext,
     ) -> ReadAloudPolicyResponse:
-        policy = await service.set_content_mode(
+        policy, previous = await service.set_content_mode_with_previous(
             workspace_id=_workspace_id(context),
             mode=request.mode,
+        )
+        return _policy_response(
+            policy,
+            previous_announcements=previous,
+            previous_content_mode=previous,
+        )
+
+    async def content_state_restore(
+        request: ReadAloudContentStateRestoreRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        policy = await service.restore_content_state(
+            workspace_id=_workspace_id(context),
+            read_messages=request.read_messages,
+            announce_join=request.announce_join,
+            announce_leave=request.announce_leave,
+            announce_move=request.announce_move,
+            expected_read_messages=request.expected_read_messages,
+            expected_announce_join=request.expected_announce_join,
+            expected_announce_leave=request.expected_announce_leave,
+            expected_announce_move=request.expected_announce_move,
         )
         return _policy_response(policy)
 
@@ -538,10 +604,24 @@ def build_read_aloud_policy_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "messages", "events", "off", "mode"),
                 side_effects=("Persists which content types are read aloud.",),
+                idempotency="idempotent_write",
             ),
             ReadAloudContentModeSetRequest,
             ReadAloudPolicyResponse,
             content_mode_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="speech.read_aloud_content_state_restore",
+                summary="Internal exact Undo for a recorded read-aloud content-mode change.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.ALWAYS,
+                side_effects=("Restores four recorded read-aloud policy switches.",),
+                idempotency="idempotent_write",
+            ),
+            ReadAloudContentStateRestoreRequest,
+            ReadAloudPolicyResponse,
+            content_state_restore,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -612,6 +692,7 @@ def build_read_aloud_policy_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("read aloud", "join", "leave", "move", "announce"),
                 side_effects=("Updates persistent voice-event announcement settings.",),
+                idempotency="idempotent_write",
             ),
             ReadAloudAnnouncementsSetRequest,
             ReadAloudPolicyResponse,
@@ -634,6 +715,7 @@ def build_read_aloud_policy_endpoints(
                     "voice members",
                 ),
                 side_effects=("Updates persistent semantic read-aloud settings.",),
+                idempotency="idempotent_write",
             ),
             ReadAloudSemanticsSetRequest,
             ReadAloudPolicyResponse,
@@ -662,24 +744,14 @@ def _route_response(
     )
 
 
-def _policy_response(policy: ReadAloudPolicy) -> ReadAloudPolicyResponse:
-    has_events = (
-        policy.announce_join
-        or policy.announce_leave
-        or policy.announce_move
-    )
-    if policy.read_messages:
-        content_mode = (
-            ReadAloudContentMode.ALL
-            if has_events
-            else ReadAloudContentMode.MESSAGES
-        )
-    else:
-        content_mode = (
-            ReadAloudContentMode.EVENTS
-            if has_events
-            else ReadAloudContentMode.OFF
-        )
+def _policy_response(
+    policy: ReadAloudPolicy,
+    *,
+    previous_announcements: ReadAloudPolicy | None = None,
+    previous_semantics: ReadAloudPolicy | None = None,
+    previous_content_mode: ReadAloudPolicy | None = None,
+) -> ReadAloudPolicyResponse:
+    content_mode = _content_mode(policy)
     return ReadAloudPolicyResponse(
         dictionary=tuple(
             ReadAloudDictionaryItem(entry.surface, entry.reading)
@@ -701,4 +773,68 @@ def _policy_response(policy: ReadAloudPolicy) -> ReadAloudPolicyResponse:
             (user_id, preset.value)
             for user_id, preset in policy.user_voice_presets
         ),
+        previous_announce_join=(
+            previous_announcements.announce_join
+            if previous_announcements is not None
+            else None
+        ),
+        previous_announce_leave=(
+            previous_announcements.announce_leave
+            if previous_announcements is not None
+            else None
+        ),
+        previous_announce_move=(
+            previous_announcements.announce_move
+            if previous_announcements is not None
+            else None
+        ),
+        previous_read_author_names=(
+            previous_semantics.read_author_names
+            if previous_semantics is not None
+            else None
+        ),
+        previous_read_replies=(
+            previous_semantics.read_replies
+            if previous_semantics is not None
+            else None
+        ),
+        previous_read_attachments=(
+            previous_semantics.read_attachments
+            if previous_semantics is not None
+            else None
+        ),
+        previous_vc_members_only=(
+            previous_semantics.vc_members_only
+            if previous_semantics is not None
+            else None
+        ),
+        previous_content_mode=(
+            _content_mode(previous_content_mode).value
+            if previous_content_mode is not None
+            else None
+        ),
+        previous_read_messages=(
+            previous_content_mode.read_messages
+            if previous_content_mode is not None
+            else None
+        ),
+    )
+
+
+def _content_mode(policy: ReadAloudPolicy) -> ReadAloudContentMode:
+    has_events = (
+        policy.announce_join
+        or policy.announce_leave
+        or policy.announce_move
+    )
+    if policy.read_messages:
+        return (
+            ReadAloudContentMode.ALL
+            if has_events
+            else ReadAloudContentMode.MESSAGES
+        )
+    return (
+        ReadAloudContentMode.EVENTS
+        if has_events
+        else ReadAloudContentMode.OFF
     )

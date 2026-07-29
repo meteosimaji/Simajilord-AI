@@ -9,8 +9,9 @@ import re
 import secrets
 import sqlite3
 import uuid
-from collections.abc import Awaitable, Callable
-from dataclasses import asdict
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,12 @@ _DISALLOWED_PROMPT = re.compile(
     r"(?:non[- ]?consensual intimate|盗撮|児童ポルノ|csam)",
     flags=re.IGNORECASE | re.DOTALL,
 )
+
+
+@dataclass(slots=True)
+class _DeliveryLockState:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 class ImageGenerationStore:
@@ -194,11 +201,21 @@ class ImageGenerationStore:
             )
         return self.require(job_id)
 
-    def mark_delivered(self, job_id: str) -> None:
+    def mark_delivered(
+        self,
+        job_id: str,
+        *,
+        message_id: str | None = None,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE image_generation_jobs SET delivered = 1 WHERE job_id = ?",
-                (job_id,),
+                """
+                UPDATE image_generation_jobs
+                SET delivered = 1,
+                    delivery_message_id = COALESCE(?, delivery_message_id)
+                WHERE job_id = ?
+                """,
+                (message_id, job_id),
             )
 
     def set_delivery_message(self, job_id: str, message_id: str) -> None:
@@ -477,6 +494,7 @@ class ImageGenerationService:
         self._worker: asyncio.Task[None] | None = None
         self._delivery_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._delivery_retry_requested: set[str] = set()
+        self._delivery_locks: dict[str, _DeliveryLockState] = {}
         self._closed = False
 
     async def start(self, delivery_handler: ImageDeliveryHandler) -> None:
@@ -534,26 +552,37 @@ class ImageGenerationService:
         )
         if rejection_code is not None:
             raise UserError(rejection_code)
-        await self.journal.append(
-            kind="image.job.queued",
-            actor_id=actor_id,
-            workspace_id=workspace_id,
-            transport="image",
-            request_id=job.job_id,
-            payload={
-                "job_id": job.job_id,
-                "aspect_ratio": prompt.aspect_ratio.value,
-                "rendering": prompt.rendering.value,
-                "width": width,
-                "height": height,
-            },
-        )
         self._ensure_worker()
-        self._wake.set()
+        try:
+            await self._append_journal(
+                kind="image.job.queued",
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                transport="image",
+                request_id=job.job_id,
+                payload={
+                    "job_id": job.job_id,
+                    "aspect_ratio": prompt.aspect_ratio.value,
+                    "rendering": prompt.rendering.value,
+                    "width": width,
+                    "height": height,
+                },
+            )
+        finally:
+            self._wake.set()
         return job
 
-    async def mark_delivered(self, job_id: str) -> None:
-        await asyncio.to_thread(self.store.mark_delivered, job_id)
+    async def mark_delivered(
+        self,
+        job_id: str,
+        *,
+        message_id: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.store.mark_delivered,
+            job_id,
+            message_id=message_id,
+        )
 
     async def set_delivery_message(self, job_id: str, message_id: str) -> None:
         await asyncio.to_thread(self.store.set_delivery_message, job_id, message_id)
@@ -583,6 +612,7 @@ class ImageGenerationService:
             await asyncio.gather(*retry_tasks, return_exceptions=True)
         self._delivery_retry_tasks.clear()
         self._delivery_retry_requested.clear()
+        self._delivery_locks.clear()
 
     def _ensure_worker(self) -> None:
         if self._closed or self.provider is None:
@@ -618,18 +648,6 @@ class ImageGenerationService:
                     output_path=output,
                     generation_seconds=result.generation_seconds,
                 )
-                await self.journal.append(
-                    kind="image.job.completed",
-                    actor_id=job.actor_id,
-                    workspace_id=job.workspace_id,
-                    transport="image",
-                    request_id=job.job_id,
-                    payload={
-                        "job_id": job.job_id,
-                        "generation_seconds": result.generation_seconds,
-                        "model": result.model,
-                    },
-                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -639,7 +657,7 @@ class ImageGenerationService:
                     job.job_id,
                     error_code=_image_error_code(exc),
                 )
-                await self.journal.append(
+                await self._append_journal(
                     kind="image.job.failed",
                     actor_id=job.actor_id,
                     workspace_id=job.workspace_id,
@@ -649,6 +667,19 @@ class ImageGenerationService:
                         "job_id": job.job_id,
                         "error_type": type(exc).__name__,
                         "error_code": terminal.error_code,
+                    },
+                )
+            else:
+                await self._append_journal(
+                    kind="image.job.completed",
+                    actor_id=job.actor_id,
+                    workspace_id=job.workspace_id,
+                    transport="image",
+                    request_id=job.job_id,
+                    payload={
+                        "job_id": job.job_id,
+                        "generation_seconds": result.generation_seconds,
+                        "model": result.model,
                     },
                 )
             await self._notify(terminal)
@@ -669,7 +700,7 @@ class ImageGenerationService:
         if self._delivery_handler is None:
             return
         try:
-            await self._delivery_handler(job)
+            await self._deliver_latest(job.job_id)
         except Exception:
             log.exception("Image job delivery update failed job=%s", job.job_id)
             self._schedule_delivery_retry(job.job_id)
@@ -706,7 +737,7 @@ class ImageGenerationService:
                 if handler is None:
                     return
                 try:
-                    await handler(job)
+                    await self._deliver_latest(job_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -717,14 +748,92 @@ class ImageGenerationService:
                     )
                     delay = min(max(1.0, delay * 2), 60.0)
                     continue
+                current = await asyncio.to_thread(self.store.get, job_id)
+                if current is None or current.delivered:
+                    return
                 if job_id in self._delivery_retry_requested:
                     delay = 0.0
+                    continue
+                if current.status in {
+                    ImageJobStatus.COMPLETED,
+                    ImageJobStatus.FAILED,
+                }:
+                    log.warning(
+                        "Image terminal delivery returned without being marked "
+                        "delivered job=%s",
+                        job_id,
+                    )
+                    delay = min(max(1.0, delay * 2), 60.0)
                     continue
                 return
         finally:
             if self._delivery_retry_tasks.get(job_id) is asyncio.current_task():
                 self._delivery_retry_tasks.pop(job_id, None)
             self._delivery_retry_requested.discard(job_id)
+
+    async def _deliver_latest(self, job_id: str) -> None:
+        """Serialize delivery and hand the transport the latest durable job state."""
+
+        async with self._delivery_lock(job_id):
+            job = await asyncio.to_thread(self.store.get, job_id)
+            if job is None or job.delivered:
+                return
+            handler = self._delivery_handler
+            if handler is None:
+                return
+            await handler(job)
+
+    @asynccontextmanager
+    async def _delivery_lock(self, job_id: str) -> AsyncIterator[None]:
+        state = self._delivery_locks.get(job_id)
+        if state is None:
+            state = _DeliveryLockState(lock=asyncio.Lock())
+            self._delivery_locks[job_id] = state
+        state.users += 1
+        acquired = False
+        try:
+            await state.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                state.lock.release()
+            state.users -= 1
+            if (
+                state.users == 0
+                and self._delivery_locks.get(job_id) is state
+            ):
+                self._delivery_locks.pop(job_id, None)
+
+    async def _append_journal(
+        self,
+        *,
+        kind: str,
+        actor_id: str,
+        workspace_id: str,
+        transport: str,
+        request_id: str,
+        payload: dict[str, object],
+    ) -> None:
+        """Keep best-effort observability from changing durable job outcomes."""
+
+        try:
+            await self.journal.append(
+                kind=kind,
+                actor_id=actor_id,
+                workspace_id=workspace_id,
+                transport=transport,
+                request_id=request_id,
+                payload=payload,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Image job journal append failed kind=%s job=%s",
+                kind,
+                request_id,
+            )
 
 
 def build_ideogram_caption(prompt: ImageGenerationPrompt) -> str:

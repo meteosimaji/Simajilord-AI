@@ -36,6 +36,8 @@ class FileReadRequest:
     path: str
     offset: int = 0
     max_characters: int = 4_000
+    page_start: int = 1
+    page_count: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +81,8 @@ def build_file_endpoints(
             request.path,
             offset=request.offset,
             max_characters=request.max_characters,
+            page_start=request.page_start,
+            page_count=request.page_count,
         )
 
     async def write_text(
@@ -113,7 +117,16 @@ def build_file_endpoints(
                 summary="List files in this Discord server's isolated workspace.",
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
-                keywords=("files", "workspace", "attachments", "documents"),
+                keywords=(
+                    "files",
+                    "workspace",
+                    "attachments",
+                    "documents",
+                    "ファイル",
+                    "添付",
+                    "文書",
+                    "一覧",
+                ),
                 requires_workspace=True,
                 expected_errors=("files.workspace_required",),
                 timeout_seconds=10,
@@ -127,13 +140,32 @@ def build_file_endpoints(
                 name="files.read",
                 summary=(
                     "Read text or inspect PDF and ZIP files in the isolated workspace. "
-                    "Use an offset to continue long content."
+                    "Use offset/next_offset within one chunk. For PDF files, use "
+                    "page_start/page_count and continue from next_page until complete."
                 ),
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
-                keywords=("file", "read", "pdf", "zip", "document", "inspect"),
+                keywords=(
+                    "file",
+                    "read",
+                    "pdf",
+                    "zip",
+                    "document",
+                    "inspect",
+                    "ファイル",
+                    "読む",
+                    "読み取り",
+                    "添付",
+                    "文書",
+                    "内容",
+                ),
                 requires_workspace=True,
-                expected_errors=("files.workspace_required",),
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.read_range_invalid",
+                    "files.page_range_invalid",
+                    "files.page_range_unsupported",
+                ),
                 timeout_seconds=30,
             ),
             FileReadRequest,
@@ -149,7 +181,21 @@ def build_file_endpoints(
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
-                keywords=("file", "write", "create", "edit", "document", "code"),
+                keywords=(
+                    "file",
+                    "write",
+                    "create",
+                    "edit",
+                    "document",
+                    "code",
+                    "ファイル",
+                    "書く",
+                    "作成",
+                    "編集",
+                    "修正",
+                    "直して",
+                    "文書",
+                ),
                 side_effects=(
                     "Creates or updates a text file in the isolated workspace.",
                 ),
@@ -169,7 +215,18 @@ def build_file_endpoints(
                 summary="Replace one unique text match with optional SHA-256 locking.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
-                keywords=("file", "edit", "replace", "patch"),
+                keywords=(
+                    "file",
+                    "edit",
+                    "replace",
+                    "patch",
+                    "ファイル",
+                    "編集",
+                    "置換",
+                    "修正",
+                    "書き換え",
+                    "直して",
+                ),
                 side_effects=("Edits a text file in the isolated workspace.",),
                 requires_workspace=True,
                 idempotency="idempotent_write",

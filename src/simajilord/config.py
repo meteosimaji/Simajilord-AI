@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
+from .agent.contracts import AgentAutonomyMode
 from .core.errors import ConfigurationError
 
 
@@ -126,12 +127,18 @@ class Settings:
     agent_max_conversation_turns: int
     agent_max_context_ratio: float
     agent_max_response_characters: int
+    agent_max_active_turns: int
     agent_max_pending_turns: int
+    agent_max_pending_turns_per_user: int
     agent_autonomy_enabled: bool
     agent_autonomy_guild_ids: frozenset[str]
-    agent_autonomy_interval_seconds: int
+    agent_autonomy_mode: AgentAutonomyMode
+    agent_autonomy_batch_seconds: int
     agent_autonomy_max_runs: int
     agent_autonomy_candidate_limit: int
+    agent_autonomy_max_pending_events: int
+    agent_autonomy_max_pending_events_per_channel: int
+    agent_autonomy_max_pending_events_per_actor: int
 
 
 def _required(name: str) -> str:
@@ -150,6 +157,20 @@ def _positive_int(name: str, default: int, *, maximum: int) -> int:
     if not 1 <= value <= maximum:
         raise ConfigurationError(f"{name} must be between 1 and {maximum}.")
     return value
+
+
+def _positive_int_with_legacy_name(
+    name: str,
+    legacy_name: str,
+    default: int,
+    *,
+    maximum: int,
+) -> int:
+    """Prefer the explicit queue setting while preserving existing deployments."""
+
+    if name in os.environ:
+        return _positive_int(name, default, maximum=maximum)
+    return _positive_int(legacy_name, default, maximum=maximum)
 
 
 def _positive_float(name: str, default: float, *, maximum: float) -> float:
@@ -290,6 +311,15 @@ def _feature_access(name: str, default: AgentFeatureAccess) -> AgentFeatureAcces
         raise ConfigurationError(f"{name} must be one of: {choices}.") from exc
 
 
+def _autonomy_mode(name: str, default: AgentAutonomyMode) -> AgentAutonomyMode:
+    raw_value = os.getenv(name, default.value).strip().lower()
+    try:
+        return AgentAutonomyMode(raw_value)
+    except ValueError as exc:
+        choices = ", ".join(item.value for item in AgentAutonomyMode)
+        raise ConfigurationError(f"{name} must be one of: {choices}.") from exc
+
+
 def _snowflake_set(name: str) -> frozenset[str]:
     raw_value = os.getenv(name, "").strip()
     if not raw_value:
@@ -406,6 +436,37 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         raise ConfigurationError(
             "AGENT_AUTONOMY_GUILD_IDS must be a subset of AGENT_ALLOWED_GUILD_IDS."
         )
+    agent_autonomy_max_pending_events = _positive_int(
+        "AGENT_AUTONOMY_MAX_PENDING_EVENTS",
+        1_000,
+        maximum=100_000,
+    )
+    agent_autonomy_max_pending_events_per_channel = _positive_int(
+        "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL",
+        100,
+        maximum=10_000,
+    )
+    agent_autonomy_max_pending_events_per_actor = _positive_int(
+        "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_ACTOR",
+        50,
+        maximum=10_000,
+    )
+    if (
+        agent_autonomy_max_pending_events_per_channel
+        > agent_autonomy_max_pending_events
+    ):
+        raise ConfigurationError(
+            "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL must not exceed "
+            "AGENT_AUTONOMY_MAX_PENDING_EVENTS."
+        )
+    if (
+        agent_autonomy_max_pending_events_per_actor
+        > agent_autonomy_max_pending_events
+    ):
+        raise ConfigurationError(
+            "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_ACTOR must not exceed "
+            "AGENT_AUTONOMY_MAX_PENDING_EVENTS."
+        )
     agent_web_search_access = _feature_access(
         "AGENT_WEB_SEARCH_ACCESS",
         AgentFeatureAccess.DISABLED,
@@ -414,6 +475,18 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         "AGENT_SAFE_COMPUTE_ACCESS",
         AgentFeatureAccess.DISABLED,
     )
+    agent_file_sandbox_enabled = _boolean(
+        "AGENT_FILE_SANDBOX_ENABLED",
+        False,
+    )
+    if (
+        agent_safe_compute_access is not AgentFeatureAccess.DISABLED
+        and not agent_file_sandbox_enabled
+    ):
+        raise ConfigurationError(
+            "AGENT_FILE_SANDBOX_ENABLED must be true when "
+            "AGENT_SAFE_COMPUTE_ACCESS is enabled."
+        )
     image_generation_access = _feature_access(
         "IMAGE_GENERATION_ACCESS",
         AgentFeatureAccess.DISABLED,
@@ -677,7 +750,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_rate_limit_exempt_user_ids=agent_rate_limit_exempt_user_ids,
         agent_web_search_access=agent_web_search_access,
         agent_safe_compute_access=agent_safe_compute_access,
-        agent_file_sandbox_enabled=_boolean("AGENT_FILE_SANDBOX_ENABLED", False),
+        agent_file_sandbox_enabled=agent_file_sandbox_enabled,
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
         agent_model=_text("AGENT_MODEL", "gpt-5.6-terra"),
@@ -688,20 +761,20 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         agent_timeout_seconds=_positive_float(
             "AGENT_TIMEOUT_SECONDS",
-            120.0,
-            maximum=600.0,
+            600.0,
+            maximum=1_800.0,
         ),
         agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "medium"),
         agent_max_tool_calls=_positive_int(
             "AGENT_MAX_TOOL_CALLS",
-            8,
-            maximum=12,
+            32,
+            maximum=64,
         ),
         agent_max_tool_output_characters=_bounded_int(
             "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
-            6_000,
+            24_000,
             minimum=500,
-            maximum=20_000,
+            maximum=80_000,
         ),
         agent_per_user_requests=_positive_int(
             "AGENT_PER_USER_REQUESTS",
@@ -749,23 +822,38 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             minimum=200,
             maximum=8_000,
         ),
-        agent_max_pending_turns=_positive_int(
+        agent_max_active_turns=_positive_int(
+            "MAX_ACTIVE_AGENT_TURNS",
+            4,
+            maximum=20,
+        ),
+        agent_max_pending_turns=_positive_int_with_legacy_name(
+            "MAX_PENDING_AGENT_TURNS",
             "AGENT_MAX_PENDING_TURNS",
             20,
             maximum=100,
         ),
-        agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", False),
+        agent_max_pending_turns_per_user=_positive_int(
+            "MAX_PENDING_AGENT_TURNS_PER_USER",
+            2,
+            maximum=20,
+        ),
+        agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", True),
         agent_autonomy_guild_ids=agent_autonomy_guild_ids,
-        agent_autonomy_interval_seconds=_bounded_int(
-            "AGENT_AUTONOMY_INTERVAL_SECONDS",
-            120,
-            minimum=60,
-            maximum=86_400,
+        agent_autonomy_mode=_autonomy_mode(
+            "AGENT_AUTONOMY_MODE",
+            AgentAutonomyMode.ACT,
+        ),
+        agent_autonomy_batch_seconds=_bounded_int(
+            "AGENT_AUTONOMY_BATCH_SECONDS",
+            10,
+            minimum=5,
+            maximum=15,
         ),
         agent_autonomy_max_runs=_bounded_int(
             "AGENT_AUTONOMY_MAX_RUNS",
-            1,
-            minimum=1,
+            0,
+            minimum=0,
             maximum=1_000,
         ),
         agent_autonomy_candidate_limit=_bounded_int(
@@ -773,6 +861,13 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             5,
             minimum=1,
             maximum=20,
+        ),
+        agent_autonomy_max_pending_events=agent_autonomy_max_pending_events,
+        agent_autonomy_max_pending_events_per_channel=(
+            agent_autonomy_max_pending_events_per_channel
+        ),
+        agent_autonomy_max_pending_events_per_actor=(
+            agent_autonomy_max_pending_events_per_actor
         ),
     )
 

@@ -355,6 +355,29 @@ async def test_announcement_and_semantic_options_are_selectively_updated(
     assert ReadAloudService(path).policy("guild") == semantic
 
 
+@pytest.mark.asyncio
+async def test_read_aloud_undo_setter_retry_accepts_restored_target(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.set_announcements(workspace_id="guild", join=True)
+
+    first, _ = await service.set_announcements_with_previous(
+        workspace_id="guild",
+        join=False,
+        expected_join=True,
+    )
+    retried, previous = await service.set_announcements_with_previous(
+        workspace_id="guild",
+        join=False,
+        expected_join=True,
+    )
+
+    assert first.announce_join is False
+    assert retried.announce_join is False
+    assert previous == retried
+
+
 def test_default_policy_is_not_stored_or_shared(tmp_path) -> None:
     service = ReadAloudService(tmp_path / "read_aloud.json")
 

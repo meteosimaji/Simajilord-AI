@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import field as dataclass_field
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
 from typing import Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
 import discord
+from discord.http import Route
 from PIL import Image, UnidentifiedImageError
 
 from simajilord.capabilities.audio import (
@@ -81,6 +85,7 @@ from simajilord.services.quote import (
     QuoteStickerAsset,
 )
 
+from .attachment_io import read_attachment_bytes
 from .audio import DiscordAudioOutput
 from .local_media import attachment_can_play, import_discord_attachment
 from .permissions import (
@@ -98,6 +103,10 @@ from .permissions import (
 from .permissions import (
     can_read_private_thread as _can_read_private_thread,
 )
+from .permissions import channel_visibility as _channel_visibility
+from .permissions import (
+    disclosure_audience_relation as _disclosure_audience_relation,
+)
 from .presenter import (
     expanded_message_embeds,
     expanded_message_view,
@@ -109,17 +118,54 @@ log = logging.getLogger(__name__)
 DiscordMessageChannel: TypeAlias = (
     discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel
 )
+DiscordReadableChannel: TypeAlias = DiscordMessageChannel | discord.ForumChannel
 _CUSTOM_EMOJI_PATTERN = re.compile(
     r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>[0-9]{15,22})>"
 )
 _CUSTOM_EMOJI_PREVIEW_LIMIT = 25
 _CUSTOM_EMOJI_MEDIA_MAX_BYTES = 5_000_000
 _QUOTE_AVATAR_MAX_BYTES = 8_000_000
+_UNCHANGED_CHANNEL_TOPIC = "__simajilord_unchanged_topic__"
+_NO_EXPECTED_STRING_STATE = "__simajilord_no_expected_state__"
 
 
 @dataclass(frozen=True, slots=True)
 class DiscordServerRequest:
-    pass
+    guild_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListServersRequest:
+    offset: int = dataclass_field(
+        default=0,
+        metadata={
+            "description": (
+                "Zero-based bot-server page offset. For the next page, copy "
+                "next_offset from the prior response."
+            )
+        },
+    )
+    limit: int = dataclass_field(
+        default=15,
+        metadata={"description": "Bot servers checked per page, from 1 through 15."},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordServerRecord:
+    server_id: str
+    name: str
+    readable_channel_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListServersResponse:
+    servers: tuple[DiscordServerRecord, ...]
+    checked_server_count: int = 0
+    uncertain_membership_count: int = 0
+    membership_checks_complete: bool = True
+    next_offset: int | None = None
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,8 +223,83 @@ class DiscordUserResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordListRolesRequest:
+    query: str = dataclass_field(
+        default="",
+        metadata={
+            "description": (
+                "Optional case-insensitive role-name fragment. Empty returns all roles."
+            )
+        },
+    )
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+    offset: int = dataclass_field(
+        default=0,
+        metadata={"description": "Zero-based offset; copy next_offset for the next page."},
+    )
+    limit: int = dataclass_field(
+        default=15,
+        metadata={"description": "Role records returned per page, from 1 through 25."},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordRoleRecord:
+    role_id: str
+    name: str
+    position: int
+    colour_value: int
+    managed: bool
+    mentionable: bool
+    hoist: bool
+    cached_member_count: int
+    member_cache_complete: bool
+    assignable_by_requester: bool
+    assignable_by_bot: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListRolesResponse:
+    roles: tuple[DiscordRoleRecord, ...]
+    source_guild_id: str = ""
+    next_offset: int | None = None
+    complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordListChannelsRequest:
-    include_threads: bool = True
+    include_threads: bool = dataclass_field(
+        default=True,
+        metadata={"description": "Include currently discoverable threads."},
+    )
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+    offset: int = dataclass_field(
+        default=0,
+        metadata={
+            "description": (
+                "Zero-based readable-channel offset. For the next page, copy "
+                "next_offset from the prior response."
+            )
+        },
+    )
+    limit: int = dataclass_field(
+        default=15,
+        metadata={"description": "Readable channels returned per page, from 1 through 15."},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,13 +313,92 @@ class DiscordChannelRecord:
 @dataclass(frozen=True, slots=True)
 class DiscordListChannelsResponse:
     channels: tuple[DiscordChannelRecord, ...]
+    source_guild_id: str = ""
+    next_offset: int | None = None
+    complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListArchivedThreadsRequest:
+    parent_channel_id: str = dataclass_field(
+        metadata={
+            "description": (
+                "Readable text or forum channel ID returned by discord.list_channels."
+            )
+        }
+    )
+    before_iso: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "For an older page, copy next_before_iso from the prior response."
+            )
+        },
+    )
+    limit: int = dataclass_field(
+        default=15,
+        metadata={"description": "Archived public threads per page, from 1 through 25."},
+    )
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordArchivedThreadRecord:
+    channel_id: str
+    name: str
+    parent_channel_id: str
+    kind: str
+    locked: bool
+    archived_at_iso: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListArchivedThreadsResponse:
+    threads: tuple[DiscordArchivedThreadRecord, ...]
+    source_guild_id: str = ""
+    source_parent_channel_id: str = ""
+    has_more: bool = False
+    next_before_iso: str | None = None
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class DiscordReadMessagesRequest:
-    channel_id: str
-    limit: int = 10
-    before_message_id: str | None = None
+    channel_id: str = dataclass_field(
+        metadata={
+            "description": (
+                "Readable channel or thread ID returned by discord.list_channels."
+            )
+        }
+    )
+    limit: int = dataclass_field(
+        default=10,
+        metadata={"description": "Messages per chronological page, from 1 through 25."},
+    )
+    before_message_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "For an older page, copy next_before_message_id from the prior "
+                "response; otherwise omit."
+            )
+        },
+    )
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,9 +428,19 @@ class DiscordStickerRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordReactionSummaryRecord:
+    emoji: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordMessageRecord:
     message_id: str
     channel_id: str
+    guild_id: str
+    visibility: Literal["guild_public", "restricted", "uncertain"]
+    disclosure_to_origin: Literal["same_or_narrower", "broader", "uncertain"]
+    disclosure_warning: str | None
     author_id: str
     author_name: str
     author_is_bot: bool
@@ -240,12 +450,162 @@ class DiscordMessageRecord:
     created_at_iso: str
     attachments: tuple[DiscordAttachmentRecord, ...]
     reference_message_id: str | None
+    edited_at_iso: str | None = None
+    reaction_count: int = 0
+    reaction_summary: tuple[DiscordReactionSummaryRecord, ...] = ()
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DiscordReadMessagesResponse:
     messages: tuple[DiscordMessageRecord, ...]
     oldest_message_id: str | None
+    newest_message_id: str | None = None
+    order: Literal["oldest_to_newest"] = "oldest_to_newest"
+    source_guild_id: str = ""
+    source_channel_id: str = ""
+    visibility: Literal["guild_public", "restricted", "uncertain"] = "uncertain"
+    disclosure_to_origin: Literal[
+        "same_or_narrower", "broader", "uncertain"
+    ] = "uncertain"
+    disclosure_warning: str | None = None
+    has_more: bool = False
+    next_before_message_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSearchMessagesRequest:
+    content: str = dataclass_field(
+        default="",
+        metadata={
+            "description": (
+                "Words or phrase likely present in the original Discord text; this "
+                "is indexed lexical search, not semantic paraphrase search. May be "
+                "empty only when author or time filters are supplied."
+            )
+        },
+    )
+    channel_ids: tuple[str, ...] = dataclass_field(
+        default=(),
+        metadata={
+            "description": (
+                "Optional channel/thread IDs from discord.list_channels. Empty "
+                "searches every channel currently readable by both requester and bot."
+            )
+        },
+    )
+    author_ids: tuple[str, ...] = dataclass_field(
+        default=(),
+        metadata={
+            "description": (
+                "Optional Discord user IDs. Combine with text or time filters when useful."
+            )
+        },
+    )
+    offset: int = dataclass_field(
+        default=0,
+        metadata={
+            "description": (
+                "For the next relevance page, copy next_offset only when it is returned. "
+                "If next_cursor is returned instead, keep offset=0 and copy that cursor. "
+                "Keep 0 when sort_by is timestamp."
+            )
+        },
+    )
+    cursor: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Opaque cursor returned as next_cursor when a relevance search spans "
+                "more than 500 channels. Copy it unchanged and keep offset=0."
+            )
+        },
+    )
+    limit: int = dataclass_field(
+        default=10,
+        metadata={"description": "Results per page, from 1 through 25."},
+    )
+    sort_by: Literal["timestamp", "relevance"] = dataclass_field(
+        default="relevance",
+        metadata={
+            "description": (
+                "Use relevance for finding a phrase; use timestamp for chronological "
+                "research or cursor paging."
+            )
+        },
+    )
+    sort_order: Literal["asc", "desc"] = dataclass_field(
+        default="desc",
+        metadata={
+            "description": (
+                "Newest first with desc or oldest first with asc for timestamp "
+                "search. Discord ignores this field for relevance sorting."
+            )
+        },
+    )
+    before_message_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "For the next desc page, copy next_before_message_id from the prior "
+                "response. Do not also set before_iso."
+            )
+        },
+    )
+    after_message_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "For the next asc page, copy next_after_message_id from the prior "
+                "response. Do not also set after_iso."
+            )
+        },
+    )
+    before_iso: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Optional exclusive RFC 3339 upper time bound. Do not combine with "
+                "before_message_id."
+            )
+        },
+    )
+    after_iso: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Optional exclusive RFC 3339 lower time bound. Do not combine with "
+                "after_message_id."
+            )
+        },
+    )
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSearchMessagesResponse:
+    messages: tuple[DiscordMessageRecord, ...]
+    total_results: int
+    indexing: bool = False
+    retry_after_seconds: float | None = None
+    source_guild_id: str = ""
+    oldest_message_id: str | None = None
+    newest_message_id: str | None = None
+    has_more: bool = False
+    next_offset: int | None = None
+    next_cursor: str | None = None
+    cursor_pagination: bool = False
+    next_before_message_id: str | None = None
+    next_after_message_id: str | None = None
+    search_window_exhausted: bool = False
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +616,7 @@ class DiscordGetMessageRequest:
     max_characters: int = 600
     include_reply_context: bool = True
     max_reply_depth: int = 2
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +637,10 @@ class DiscordReplyContextRecord:
 class DiscordGetMessageResponse:
     message_id: str
     channel_id: str
+    guild_id: str
+    visibility: Literal["guild_public", "restricted", "uncertain"]
+    disclosure_to_origin: Literal["same_or_narrower", "broader", "uncertain"]
+    disclosure_warning: str | None
     author_id: str
     author_name: str
     author_is_bot: bool
@@ -290,6 +655,11 @@ class DiscordGetMessageResponse:
     stickers: tuple[DiscordStickerRecord, ...]
     reference_message_id: str | None
     reply_context: tuple[DiscordReplyContextRecord, ...]
+    edited_at_iso: str | None = None
+    reaction_count: int = 0
+    reaction_summary: tuple[DiscordReactionSummaryRecord, ...] = ()
+    thread_id: str | None = None
+    content_format: Literal["discord_display_segments"] = "discord_display_segments"
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +832,22 @@ class DiscordSendMessageRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordReactionRequest:
+    channel_id: str
+    message_id: str
+    emoji: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordReactionResponse:
+    channel_id: str
+    message_id: str
+    emoji: str
+    reacted: bool
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordAnalyzeAttachmentRequest:
     channel_id: str
     message_id: str
@@ -550,6 +936,253 @@ class DiscordSendMessageResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordMessageWriteRequest:
+    channel_id: str
+    message_id: str
+    content: str = ""
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_pinned: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordMessageWriteResponse:
+    channel_id: str
+    message_id: str
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadCreateRequest:
+    channel_id: str
+    name: str
+    message_id: str | None = None
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadResponse:
+    channel_id: str
+    thread_id: str
+    name: str
+    archived: bool
+    undo_fingerprint: str
+    old_name: str | None = None
+    old_archived: bool | None = None
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadUpdateRequest:
+    thread_id: str
+    name: str | None = None
+    archived: bool | None = None
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_name: str | None = None
+    expected_archived: bool | None = None
+    expected_undo_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadMemberRequest:
+    thread_id: str
+    user_id: str
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_present: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadMemberResponse:
+    thread_id: str
+    user_id: str
+    present: bool
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordForumPostRequest:
+    forum_id: str
+    title: str
+    content: str
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordForumPostResponse:
+    channel_id: str
+    message_id: str
+    thread_id: str
+    name: str
+    archived: bool
+    undo_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordRoleCreateRequest:
+    name: str
+    colour: int = 0
+    hoist: bool = False
+    mentionable: bool = False
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordRoleResponse:
+    role_id: str
+    name: str
+    undo_fingerprint: str
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordCreatedRoleDeleteRequest:
+    role_id: str
+    undo_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordCreatedChannelDeleteRequest:
+    channel_id: str
+    undo_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordCreatedEntityDeleteResponse:
+    entity_id: str
+    deleted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordRoleMemberRequest:
+    user_id: str
+    role_id: str
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_assigned: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordRoleMemberResponse:
+    user_id: str
+    role_id: str
+    assigned: bool
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordChannelSettingRequest:
+    channel_id: str
+    topic: str | None = _UNCHANGED_CHANNEL_TOPIC
+    slowmode_seconds: int | None = None
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_topic: str | None = _NO_EXPECTED_STRING_STATE
+    expected_slowmode_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordChannelSettingResponse:
+    channel_id: str
+    topic: str | None
+    slowmode_seconds: int
+    old_topic: str | None
+    old_slowmode_seconds: int
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordChannelCreateRequest:
+    name: str
+    topic: str | None = None
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordChannelCreateResponse:
+    channel_id: str
+    name: str
+    undo_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordTimeoutRequest:
+    user_id: str
+    until_iso: str | None = None
+    reason: str = ""
+    evidence_message_ids: tuple[str, ...] = ()
+    expected_until_iso: str | None = _NO_EXPECTED_STRING_STATE
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordTimeoutResponse:
+    user_id: str
+    until_iso: str | None
+    previous_until_iso: str | None
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordMemberModerationRequest:
+    user_id: str
+    reason: str
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordMemberModerationResponse:
+    user_id: str
+    action: str
+    changed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordBulkDeleteRequest:
+    channel_id: str
+    message_ids: tuple[str, ...]
+    reason: str
+    evidence_message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordBulkDeleteResponse:
+    channel_id: str
+    deleted_message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordDeleteOwnMessageRequest:
+    channel_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordDeleteOwnMessageResponse:
+    message_id: str
+    channel_id: str
+    deleted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordDeleteOwnMessagesRequest:
+    """Internal bounded Undo request for one multi-post agent response."""
+
+    channel_id: str
+    message_ids: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordDeleteOwnMessagesResponse:
+    channel_id: str
+    deleted_message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordPollRequest:
     channel_id: str
     question: str
@@ -580,10 +1213,12 @@ def build_discord_endpoints(
     runtime: SimajilordRuntime,
 ) -> tuple[CapabilityEndpoint, ...]:
     async def inspect_server(
-        _: DiscordServerRequest,
+        request: DiscordServerRequest,
         context: InvocationContext,
     ) -> DiscordServerResponse:
-        guild = _guild(client, context)
+        guild = _requested_guild(client, context, request.guild_id)
+        if context.transport == "agent":
+            await _require_common_guild(guild, context)
         cached_members_complete = guild.chunked or (
             guild.member_count is not None and len(guild.members) >= guild.member_count
         )
@@ -622,6 +1257,78 @@ def build_discord_endpoints(
             verification_level=str(guild.verification_level),
             explicit_content_filter=str(guild.explicit_content_filter),
             features=tuple(sorted(guild.features)),
+        )
+
+    async def list_servers(
+        request: DiscordListServersRequest,
+        context: InvocationContext,
+    ) -> DiscordListServersResponse:
+        if context.transport != "agent":
+            guild = _guild(client, context)
+            return DiscordListServersResponse(
+                servers=(
+                    DiscordServerRecord(
+                        server_id=str(guild.id),
+                        name=guild.name,
+                        readable_channel_count=len(guild.text_channels),
+                    ),
+                ),
+                checked_server_count=1,
+            )
+        if request.offset < 0:
+            raise UserError("discord.server_offset_invalid")
+        if not 1 <= request.limit <= 15:
+            raise UserError("discord.server_limit_invalid")
+        try:
+            actor_id = int(context.actor_id)
+        except ValueError as exc:
+            raise UserError("discord.member_required") from exc
+        guilds = sorted(
+            client.guilds,
+            key=lambda item: (item.name.casefold(), str(item.id)),
+        )
+        page = guilds[request.offset : request.offset + request.limit]
+        records: list[DiscordServerRecord] = []
+        uncertain_membership_count = 0
+        for guild in page:
+            actor = guild.get_member(actor_id)
+            if actor is None:
+                try:
+                    actor = await guild.fetch_member(actor_id)
+                except discord.NotFound:
+                    continue
+                except (discord.Forbidden, discord.HTTPException):
+                    uncertain_membership_count += 1
+                    continue
+                if actor.id != actor_id:
+                    uncertain_membership_count += 1
+                    continue
+            if guild.me is None:
+                uncertain_membership_count += 1
+                continue
+            readable = agent_readable_channel_ids(
+                guild,
+                actor,
+                trusted_guild=False,
+                trigger_channel_id=None,
+            )
+            records.append(
+                DiscordServerRecord(
+                    server_id=str(guild.id),
+                    name=guild.name,
+                    readable_channel_count=len(readable),
+                )
+            )
+        page_end = request.offset + len(page)
+        next_offset = page_end if page_end < len(guilds) else None
+        membership_checks_complete = uncertain_membership_count == 0
+        return DiscordListServersResponse(
+            servers=tuple(records),
+            checked_server_count=len(page),
+            uncertain_membership_count=uncertain_membership_count,
+            membership_checks_complete=membership_checks_complete,
+            next_offset=next_offset,
+            complete=next_offset is None and membership_checks_complete,
         )
 
     async def inspect_user(
@@ -684,12 +1391,78 @@ def build_discord_endpoints(
             colour_value=member.colour.value if member is not None else 0,
         )
 
+    async def list_roles(
+        request: DiscordListRolesRequest,
+        context: InvocationContext,
+    ) -> DiscordListRolesResponse:
+        if request.offset < 0:
+            raise UserError("discord.role_offset_invalid")
+        if not 1 <= request.limit <= 25:
+            raise UserError("discord.role_limit_invalid")
+        query = " ".join(request.query.split()).casefold()
+        if len(query) > 100:
+            raise UserError("discord.role_query_invalid")
+        guild = _requested_guild(client, context, request.guild_id)
+        actor = await _require_common_guild(guild, context)
+        bot = guild.me
+        if bot is None:
+            raise UserError("discord.guild_unavailable")
+        roles = [
+            role
+            for role in guild.roles
+            if not role.is_default() and (not query or query in role.name.casefold())
+        ]
+        roles.sort(key=lambda role: (-role.position, role.name.casefold(), role.id))
+        records = tuple(
+            DiscordRoleRecord(
+                role_id=str(role.id),
+                name=role.name,
+                position=role.position,
+                colour_value=role.colour.value,
+                managed=role.managed,
+                mentionable=role.mentionable,
+                hoist=role.hoist,
+                cached_member_count=len(role.members),
+                member_cache_complete=guild.chunked is True
+                or (
+                    isinstance(guild.member_count, int)
+                    and not isinstance(guild.member_count, bool)
+                    and len(guild.members) >= guild.member_count
+                ),
+                assignable_by_requester=_role_assignable_by(actor, role),
+                assignable_by_bot=_role_assignable_by(bot, role),
+            )
+            for role in roles[request.offset : request.offset + request.limit]
+        )
+        page_end = request.offset + len(records)
+        next_offset = page_end if page_end < len(roles) else None
+        return DiscordListRolesResponse(
+            roles=records,
+            source_guild_id=str(guild.id),
+            next_offset=next_offset,
+            complete=next_offset is None,
+        )
+
     async def list_channels(
         request: DiscordListChannelsRequest,
         context: InvocationContext,
     ) -> DiscordListChannelsResponse:
-        guild = _guild(client, context)
-        allowed_ids = set(context.resource_ids) if context.transport == "agent" else None
+        if request.offset < 0:
+            raise UserError("discord.channel_offset_invalid")
+        if not 1 <= request.limit <= 15:
+            raise UserError("discord.channel_limit_invalid")
+        guild = _requested_guild(client, context, request.guild_id)
+        allowed_ids: set[str] | None = None
+        if context.transport == "agent":
+            actor = await _require_common_guild(guild, context)
+            allowed_ids = set(
+                agent_readable_channel_ids(
+                    guild,
+                    actor,
+                    trusted_guild=False,
+                    trigger_channel_id=None,
+                )
+            )
         records = [
             DiscordChannelRecord(
                 channel_id=str(channel.id),
@@ -712,15 +1485,91 @@ def build_discord_endpoints(
                 if allowed_ids is None or str(thread.id) in allowed_ids
             )
         records.sort(key=lambda item: (item.kind, item.name, item.channel_id))
-        return DiscordListChannelsResponse(channels=tuple(records))
+        page = records[request.offset : request.offset + request.limit]
+        page_end = request.offset + len(page)
+        next_offset = page_end if page_end < len(records) else None
+        return DiscordListChannelsResponse(
+            channels=tuple(page),
+            source_guild_id=str(guild.id),
+            next_offset=next_offset,
+            complete=next_offset is None,
+        )
+
+    async def list_archived_threads(
+        request: DiscordListArchivedThreadsRequest,
+        context: InvocationContext,
+    ) -> DiscordListArchivedThreadsResponse:
+        if not 1 <= request.limit <= 25:
+            raise UserError("discord.archived_thread_limit_invalid")
+        guild = _requested_guild(client, context, request.guild_id)
+        actor = await _require_common_guild(guild, context)
+        bot = guild.me
+        if bot is None:
+            raise UserError("discord.guild_unavailable")
+        parent_id = _snowflake(request.parent_channel_id, "channel")
+        parent = guild.get_channel(parent_id)
+        if not isinstance(parent, (discord.TextChannel, discord.ForumChannel)):
+            raise UserError("discord.archived_thread_parent_invalid")
+        for member in (actor, bot):
+            if not _can_read_messages(parent, member):
+                raise UserError("discord.agent_read_channel_forbidden")
+        before = _archived_threads_before(request.before_iso)
+        discovered: list[discord.Thread] = []
+        async for thread in parent.archived_threads(
+            limit=request.limit + 1,
+            before=before,
+        ):
+            if (
+                not _can_read_messages(thread, actor)
+                or not _can_read_private_thread(thread, actor)
+                or not _can_read_messages(thread, bot)
+                or not _can_read_private_thread(thread, bot)
+            ):
+                continue
+            discovered.append(thread)
+            if len(discovered) > request.limit:
+                break
+        has_more = len(discovered) > request.limit
+        page = discovered[: request.limit]
+        records = tuple(
+            DiscordArchivedThreadRecord(
+                channel_id=str(thread.id),
+                name=thread.name,
+                parent_channel_id=str(parent.id),
+                kind=str(thread.type),
+                locked=thread.locked,
+                archived_at_iso=(
+                    thread.archive_timestamp.isoformat()
+                    if thread.archive_timestamp is not None
+                    else None
+                ),
+            )
+            for thread in page
+        )
+        next_before_iso = (
+            records[-1].archived_at_iso if records and has_more else None
+        )
+        return DiscordListArchivedThreadsResponse(
+            threads=records,
+            source_guild_id=str(guild.id),
+            source_parent_channel_id=str(parent.id),
+            has_more=has_more,
+            next_before_iso=next_before_iso,
+            complete=not has_more,
+        )
 
     async def read_messages(
         request: DiscordReadMessagesRequest,
         context: InvocationContext,
     ) -> DiscordReadMessagesResponse:
-        guild = _guild(client, context)
-        _assert_agent_channel_scope(context, request.channel_id)
-        channel = _message_channel(guild, request.channel_id)
+        guild, channel = await _readable_message_channel(
+            client,
+            context,
+            guild_id=request.guild_id,
+            channel_id=request.channel_id,
+        )
+        disclosure = _disclosure_to_origin(client, context, guild, channel)
+        visibility = _channel_visibility(guild, channel)
         if not 1 <= request.limit <= 25:
             raise UserError("discord.message_limit_invalid")
         before = (
@@ -729,22 +1578,406 @@ def build_discord_endpoints(
             else None
         )
         event_message_id = _discord_event_message_id(context)
-        messages = [
-            _message_record(message, event_message_id=event_message_id)
-            async for message in channel.history(limit=request.limit, before=before)
+        newest_first_with_lookahead = [
+            _message_record(
+                message,
+                guild_id=str(guild.id),
+                visibility=visibility,
+                disclosure_to_origin=disclosure,
+                event_message_id=event_message_id,
+            )
+            async for message in channel.history(
+                limit=request.limit + 1,
+                before=before,
+            )
         ]
+        has_more = len(newest_first_with_lookahead) > request.limit
+        newest_first = newest_first_with_lookahead[: request.limit]
+        messages = tuple(reversed(newest_first))
         return DiscordReadMessagesResponse(
-            messages=tuple(messages),
-            oldest_message_id=messages[-1].message_id if messages else None,
+            messages=messages,
+            oldest_message_id=messages[0].message_id if messages else None,
+            newest_message_id=messages[-1].message_id if messages else None,
+            source_guild_id=str(guild.id),
+            source_channel_id=str(channel.id),
+            visibility=visibility,
+            disclosure_to_origin=disclosure,
+            disclosure_warning=_disclosure_warning(disclosure),
+            has_more=has_more,
+            next_before_message_id=(
+                messages[0].message_id if messages and has_more else None
+            ),
+        )
+
+    async def search_messages(
+        request: DiscordSearchMessagesRequest,
+        context: InvocationContext,
+    ) -> DiscordSearchMessagesResponse:
+        guild = _requested_guild(client, context, request.guild_id)
+        content = request.content.strip()
+        if len(content) > 1_024:
+            raise UserError("discord.message_search_query_invalid")
+        if (
+            not isinstance(request.offset, int)
+            or isinstance(request.offset, bool)
+            or not 0 <= request.offset <= 9_975
+            or (request.sort_by == "timestamp" and request.offset != 0)
+        ):
+            raise UserError("discord.message_search_offset_invalid")
+        if (
+            request.cursor is not None
+            and (
+                request.sort_by != "relevance"
+                or request.offset != 0
+                or not 1 <= len(request.cursor) <= 8_192
+            )
+        ):
+            raise UserError("discord.message_search_cursor_invalid")
+        if not 1 <= request.limit <= 25:
+            raise UserError("discord.message_search_limit_invalid")
+        before_message_id = _search_boundary_message_id(
+            request.before_message_id,
+            request.before_iso,
+            high=False,
+        )
+        after_message_id = _search_boundary_message_id(
+            request.after_message_id,
+            request.after_iso,
+            high=True,
+        )
+        if (
+            not content
+            and not request.author_ids
+            and before_message_id is None
+            and after_message_id is None
+        ):
+            raise UserError("discord.message_search_filter_required")
+        if (
+            before_message_id is not None
+            and after_message_id is not None
+            and int(after_message_id) >= int(before_message_id)
+        ):
+            raise UserError("discord.message_search_range_invalid")
+
+        requested_ids = tuple(dict.fromkeys(request.channel_ids))
+        actor: discord.Member | None = None
+        readable_ids: set[str] | None = None
+        if context.transport == "agent":
+            actor = await _actor_member(guild, context)
+            readable_ids = set(
+                agent_readable_channel_ids(
+                    guild,
+                    actor,
+                    trusted_guild=False,
+                    trigger_channel_id=None,
+                )
+            )
+            if any(channel_id not in readable_ids for channel_id in requested_ids):
+                raise UserError("discord.agent_read_channel_forbidden")
+            scoped_ids = (
+                requested_ids
+                if requested_ids
+                else tuple(sorted(readable_ids, key=int))
+            )
+            if not scoped_ids:
+                return DiscordSearchMessagesResponse(
+                    messages=(),
+                    total_results=0,
+                    source_guild_id=str(guild.id),
+                )
+        else:
+            scoped_ids = requested_ids
+        for channel_id in scoped_ids:
+            _snowflake(channel_id, "channel")
+        for author_id in request.author_ids:
+            _snowflake(author_id, "user")
+        if before_message_id:
+            _snowflake(before_message_id, "message")
+        if after_message_id:
+            _snowflake(after_message_id, "message")
+
+        channel_batches: tuple[tuple[str, ...], ...]
+        if scoped_ids:
+            channel_batches = tuple(
+                scoped_ids[index : index + 500]
+                for index in range(0, len(scoped_ids), 500)
+            )
+        else:
+            channel_batches = ((),)
+        cursor_fingerprint = _message_search_cursor_fingerprint(
+            guild_id=str(guild.id),
+            channel_batches=channel_batches,
+            content=content,
+            author_ids=request.author_ids,
+            before_message_id=before_message_id,
+            after_message_id=after_message_id,
+            sort_by=request.sort_by,
+            sort_order=request.sort_order,
+        )
+        if request.sort_by == "relevance":
+            if request.cursor is not None:
+                batch_offsets, next_batch_index = _decode_message_search_cursor(
+                    request.cursor,
+                    expected_fingerprint=cursor_fingerprint,
+                    batch_count=len(channel_batches),
+                )
+            elif len(channel_batches) > 1:
+                if request.offset != 0:
+                    raise UserError("discord.message_search_cursor_required")
+                batch_offsets = (0,) * len(channel_batches)
+                next_batch_index = 0
+            else:
+                batch_offsets = (request.offset,)
+                next_batch_index = 0
+        else:
+            batch_offsets = (0,) * len(channel_batches)
+            next_batch_index = 0
+
+        batch_hits: list[list[tuple[int, DiscordMessageRecord]]] = [
+            [] for _ in channel_batches
+        ]
+        batch_fetched_counts = [0 for _ in channel_batches]
+        batch_totals = [0 for _ in channel_batches]
+        indexing = False
+        retry_after_seconds: float | None = None
+        for batch_index, channel_batch in enumerate(channel_batches):
+            params: list[tuple[str, str]] = [
+                ("limit", str(request.limit)),
+                ("sort_by", request.sort_by),
+                ("sort_order", request.sort_order),
+                ("include_nsfw", "false"),
+            ]
+            if content:
+                params.append(("content", content))
+            if request.sort_by == "relevance":
+                params.append(("offset", str(batch_offsets[batch_index])))
+            params.extend(("channel_id", channel_id) for channel_id in channel_batch)
+            params.extend(("author_id", author_id) for author_id in request.author_ids)
+            if before_message_id:
+                params.append(("max_id", before_message_id))
+            if after_message_id:
+                params.append(("min_id", after_message_id))
+            try:
+                payload = await client.http.request(
+                    Route(
+                        "GET",
+                        "/guilds/{guild_id}/messages/search",
+                        guild_id=guild.id,
+                    ),
+                    params=params,
+                )
+            except discord.Forbidden as exc:
+                raise UserError("discord.message_search_forbidden") from exc
+            except discord.DiscordException as exc:
+                raise UserError("discord.message_search_failed") from exc
+            if not isinstance(payload, dict):
+                raise UserError("discord.message_search_failed")
+            if payload.get("code") == 110000:
+                indexing = True
+                retry = payload.get("retry_after")
+                if isinstance(retry, (int, float)) and not isinstance(retry, bool):
+                    retry_after_seconds = max(retry_after_seconds or 0.0, float(retry))
+                continue
+            if payload.get("doing_deep_historical_index") is True:
+                # Discord can return usable recent hits while its older index is
+                # still being built. Expose that partial state instead of
+                # presenting the current page as complete.
+                indexing = True
+            raw_total = payload.get("total_results")
+            if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+                batch_totals[batch_index] = max(0, raw_total)
+            raw_groups = payload.get("messages")
+            if not isinstance(raw_groups, list):
+                continue
+            batch_fetched_counts[batch_index] = len(raw_groups)
+            raw_thread_parents = _search_thread_parents(payload)
+            for group_position, raw_group in enumerate(raw_groups, start=1):
+                if not isinstance(raw_group, list):
+                    continue
+                group_record: DiscordMessageRecord | None = None
+                for raw_message in raw_group:
+                    record = _search_message_record(raw_message)
+                    if record is None:
+                        continue
+                    source = _search_result_source(
+                        guild,
+                        channel_id=record.channel_id,
+                        readable_ids=readable_ids,
+                        actor=actor,
+                        raw_thread_parents=raw_thread_parents,
+                    )
+                    if source is None:
+                        continue
+                    disclosure = _disclosure_to_origin(
+                        client,
+                        context,
+                        guild,
+                        source,
+                    )
+                    record = DiscordMessageRecord(
+                        message_id=record.message_id,
+                        channel_id=record.channel_id,
+                        guild_id=str(guild.id),
+                        visibility=_channel_visibility(guild, source),
+                        disclosure_to_origin=disclosure,
+                        disclosure_warning=_disclosure_warning(disclosure),
+                        author_id=record.author_id,
+                        author_name=record.author_name,
+                        author_is_bot=record.author_is_bot,
+                        content_preview=record.content_preview,
+                        content_length=record.content_length,
+                        preview_truncated=record.preview_truncated,
+                        created_at_iso=record.created_at_iso,
+                        attachments=record.attachments,
+                        reference_message_id=record.reference_message_id,
+                        edited_at_iso=record.edited_at_iso,
+                        reaction_count=record.reaction_count,
+                        reaction_summary=record.reaction_summary,
+                        thread_id=record.thread_id,
+                    )
+                    group_record = record
+                    break
+                if group_record is not None:
+                    batch_hits[batch_index].append(
+                        (group_position, group_record)
+                    )
+
+        total_results = sum(batch_totals)
+        next_cursor: str | None = None
+        if request.sort_by == "timestamp":
+            records = [
+                record
+                for hits in batch_hits
+                for _, record in hits
+            ]
+            records.sort(
+                key=lambda item: (item.created_at_iso, int(item.message_id)),
+                reverse=request.sort_order == "desc",
+            )
+            page = tuple(records[: request.limit])
+            has_more = bool(page) and total_results > len(page)
+            next_offset = None
+            search_window_exhausted = False
+        else:
+            merged: list[DiscordMessageRecord] = []
+            consumed_positions = [0 for _ in channel_batches]
+            next_offsets = list(batch_offsets)
+            seen_message_ids: set[str] = set()
+            last_batch_index = next_batch_index
+            while len(merged) < request.limit:
+                progressed = False
+                for step in range(len(channel_batches)):
+                    batch_index = (
+                        next_batch_index + step
+                    ) % len(channel_batches)
+                    position = consumed_positions[batch_index]
+                    hits = batch_hits[batch_index]
+                    if position >= len(hits):
+                        continue
+                    raw_position, record = hits[position]
+                    consumed_positions[batch_index] += 1
+                    next_offsets[batch_index] = (
+                        batch_offsets[batch_index] + raw_position
+                    )
+                    last_batch_index = batch_index
+                    progressed = True
+                    if record.message_id not in seen_message_ids:
+                        seen_message_ids.add(record.message_id)
+                        merged.append(record)
+                    if len(merged) >= request.limit:
+                        break
+                if not progressed:
+                    break
+                next_batch_index = (last_batch_index + 1) % len(channel_batches)
+            for batch_index, hits in enumerate(batch_hits):
+                if consumed_positions[batch_index] >= len(hits):
+                    next_offsets[batch_index] = (
+                        batch_offsets[batch_index]
+                        + batch_fetched_counts[batch_index]
+                    )
+            page = tuple(merged)
+            batch_has_more = tuple(
+                total > consumed
+                for total, consumed in zip(
+                    batch_totals,
+                    next_offsets,
+                    strict=True,
+                )
+            )
+            has_more = any(batch_has_more)
+            search_window_exhausted = any(
+                more and offset > 9_975
+                for more, offset in zip(
+                    batch_has_more,
+                    next_offsets,
+                    strict=True,
+                )
+            )
+            if has_more and not search_window_exhausted:
+                if len(channel_batches) == 1 and request.cursor is None:
+                    next_offset = next_offsets[0]
+                else:
+                    next_offset = None
+                    next_cursor = _encode_message_search_cursor(
+                        fingerprint=cursor_fingerprint,
+                        offsets=tuple(next_offsets),
+                        next_batch_index=next_batch_index,
+                    )
+            else:
+                next_offset = None
+        oldest_message_id = (
+            min((item.message_id for item in page), key=int) if page else None
+        )
+        newest_message_id = (
+            max((item.message_id for item in page), key=int) if page else None
+        )
+        return DiscordSearchMessagesResponse(
+            messages=page,
+            total_results=total_results,
+            indexing=indexing,
+            retry_after_seconds=retry_after_seconds,
+            source_guild_id=str(guild.id),
+            oldest_message_id=oldest_message_id,
+            newest_message_id=newest_message_id,
+            has_more=has_more,
+            next_offset=next_offset,
+            next_cursor=next_cursor,
+            cursor_pagination=(
+                request.sort_by == "relevance" and len(channel_batches) > 1
+            ),
+            next_before_message_id=(
+                oldest_message_id
+                if (
+                    has_more
+                    and request.sort_by == "timestamp"
+                    and request.sort_order == "desc"
+                )
+                else None
+            ),
+            next_after_message_id=(
+                newest_message_id
+                if (
+                    has_more
+                    and request.sort_by == "timestamp"
+                    and request.sort_order == "asc"
+                )
+                else None
+            ),
+            search_window_exhausted=search_window_exhausted,
+            complete=not indexing and not has_more,
         )
 
     async def get_message(
         request: DiscordGetMessageRequest,
         context: InvocationContext,
     ) -> DiscordGetMessageResponse:
-        guild = _guild(client, context)
-        _assert_agent_channel_scope(context, request.channel_id)
-        channel = _message_channel(guild, request.channel_id)
+        guild, channel = await _readable_message_channel(
+            client,
+            context,
+            guild_id=request.guild_id,
+            channel_id=request.channel_id,
+        )
+        disclosure = _disclosure_to_origin(client, context, guild, channel)
         message_id = _snowflake(request.message_id, "message")
         if request.offset < 0:
             raise UserError("discord.message_offset_invalid")
@@ -762,7 +1995,8 @@ def build_discord_endpoints(
             raise UserError("discord.message_not_found") from exc
         except discord.DiscordException as exc:
             raise UserError("discord.message_fetch_failed") from exc
-        content_length = len(message.content)
+        context_text = _message_context_text(message)
+        content_length = len(context_text)
         if request.offset > content_length:
             raise UserError("discord.message_offset_invalid")
         end = min(content_length, request.offset + chunk_characters)
@@ -780,10 +2014,14 @@ def build_discord_endpoints(
         return DiscordGetMessageResponse(
             message_id=str(message.id),
             channel_id=str(message.channel.id),
+            guild_id=str(guild.id),
+            visibility=_channel_visibility(guild, channel),
+            disclosure_to_origin=disclosure,
+            disclosure_warning=_disclosure_warning(disclosure),
             author_id=str(message.author.id),
             author_name=message.author.display_name,
             author_is_bot=message.author.bot,
-            content_chunk=message.content[request.offset : end],
+            content_chunk=context_text[request.offset : end],
             content_length=content_length,
             offset=request.offset,
             next_offset=next_offset,
@@ -798,6 +2036,15 @@ def build_discord_endpoints(
                 else None
             ),
             reply_context=reply_context,
+            edited_at_iso=_message_edited_at_iso(message),
+            reaction_count=sum(
+                reaction.count for reaction in getattr(message, "reactions", ())
+            ),
+            reaction_summary=tuple(
+                DiscordReactionSummaryRecord(str(reaction.emoji), reaction.count)
+                for reaction in getattr(message, "reactions", ())[:10]
+            ),
+            thread_id=_message_thread_id(message),
         )
 
     async def expand_message(
@@ -1171,27 +2418,21 @@ def build_discord_endpoints(
         request: DiscordAnalyzeAttachmentRequest,
         context: InvocationContext,
     ) -> SyntheticMediaAnalyzeResponse:
-        guild = _guild(client, context)
-        _assert_agent_channel_scope(context, request.channel_id)
-        channel = _message_channel(guild, request.channel_id)
-        if not 0 <= request.attachment_index <= 9:
-            raise UserError("discord.attachment_index_invalid")
-        try:
-            message = await channel.fetch_message(_snowflake(request.message_id, "message"))
-        except discord.NotFound as exc:
-            raise UserError("discord.message_not_found") from exc
-        except discord.DiscordException as exc:
-            raise UserError("discord.message_fetch_failed") from exc
-        try:
-            attachment = message.attachments[request.attachment_index]
-        except IndexError as exc:
-            raise UserError("discord.attachment_missing") from exc
+        _, attachment = await _attachment(
+            client,
+            context,
+            request.channel_id,
+            request.message_id,
+            request.attachment_index,
+        )
         if attachment.size > runtime.settings.hive_max_media_bytes:
             raise UserError("moderation.media_too_large")
         try:
-            content = await attachment.read(use_cached=True)
+            content = await read_attachment_bytes(attachment)
         except discord.DiscordException as exc:
             raise UserError("discord.attachment_unavailable") from exc
+        if len(content) > runtime.settings.hive_max_media_bytes:
+            raise UserError("moderation.media_too_large")
         return cast(
             SyntheticMediaAnalyzeResponse,
             await runtime.registry.invoke(
@@ -1224,11 +2465,14 @@ def build_discord_endpoints(
         if attachment.size > runtime.files.max_file_bytes:
             raise UserError("files.file_too_large")
         try:
-            content = await attachment.read(use_cached=True)
+            content = await read_attachment_bytes(attachment)
         except discord.DiscordException as exc:
             raise UserError("discord.attachment_unavailable") from exc
+        if len(content) > runtime.files.max_file_bytes:
+            raise UserError("files.file_too_large")
         destination = request.destination_path or (
-            f"attachments/{request.message_id}/{PurePath(attachment.filename).name}"
+            f"attachments/{request.message_id}/"
+            f"{_workspace_attachment_name(attachment)}"
         )
         return await asyncio.to_thread(
             runtime.files.import_bytes,
@@ -1251,9 +2495,11 @@ def build_discord_endpoints(
         if attachment.size > 8 * 1024 * 1024:
             raise UserError("discord.image_attachment_too_large")
         try:
-            content = await attachment.read(use_cached=True)
+            content = await read_attachment_bytes(attachment)
         except discord.DiscordException as exc:
             raise UserError("discord.attachment_unavailable") from exc
+        if len(content) > 8 * 1024 * 1024:
+            raise UserError("discord.image_attachment_too_large")
         media_type = _image_media_type(content)
         if media_type is None:
             raise UserError("discord.attachment_not_supported_image")
@@ -1269,25 +2515,13 @@ def build_discord_endpoints(
         request: DiscordSendMessageRequest,
         context: InvocationContext,
     ) -> DiscordSendMessageResponse:
-        guild = _guild(client, context)
-        _assert_agent_update_scope(context, request.channel_id)
+        _guild_value, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        for member in (actor, bot):
+            _require_channel_permissions(channel, member, "send_messages")
         if not 1 <= len(request.content) <= 2_000:
             raise UserError("discord.message_length_invalid")
-        try:
-            channel_id = int(request.channel_id)
-        except ValueError as exc:
-            raise UserError("discord.channel_id_invalid") from exc
-        channel = guild.get_channel_or_thread(channel_id)
-        if not isinstance(
-            channel,
-            (
-                discord.TextChannel,
-                discord.Thread,
-                discord.VoiceChannel,
-                discord.StageChannel,
-            ),
-        ):
-            raise UserError("discord.message_destination_invalid")
         message = await channel.send(
             request.content,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1295,6 +2529,761 @@ def build_discord_endpoints(
         return DiscordSendMessageResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
+        )
+
+    async def reply_message(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+    ) -> DiscordSendMessageResponse:
+        guild, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        del guild
+        _require_channel_permissions(channel, actor, "send_messages")
+        _require_channel_permissions(channel, bot, "send_messages")
+        if not 1 <= len(request.content) <= 2_000:
+            raise UserError("discord.message_length_invalid")
+        message = await _fetch_message_for_write(channel, request.message_id)
+        reply = await message.reply(
+            request.content,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return DiscordSendMessageResponse(str(reply.id), str(channel.id))
+
+    async def edit_own_message(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+    ) -> DiscordMessageWriteResponse:
+        guild, channel, _actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        del guild
+        if not 1 <= len(request.content) <= 2_000:
+            raise UserError("discord.message_length_invalid")
+        message = await _fetch_message_for_write(channel, request.message_id)
+        if message.author.id != bot.id:
+            raise UserError("discord.message_not_owned")
+        if message.content == request.content:
+            return DiscordMessageWriteResponse(
+                request.channel_id, request.message_id, changed=False
+            )
+        await message.edit(
+            content=request.content,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return DiscordMessageWriteResponse(request.channel_id, request.message_id)
+
+    async def set_message_pin(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+        *,
+        pinned: bool,
+    ) -> DiscordMessageWriteResponse:
+        _guild_value, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        _require_channel_permissions(channel, actor, "manage_messages")
+        _require_channel_permissions(channel, bot, "manage_messages")
+        message = await _fetch_message_for_write(channel, request.message_id)
+        if bool(message.pinned) == pinned:
+            return DiscordMessageWriteResponse(
+                request.channel_id, request.message_id, changed=False
+            )
+        if (
+            request.expected_pinned is not None
+            and bool(message.pinned) != request.expected_pinned
+        ):
+            raise UserError("action.undo_conflict")
+        operation = message.pin if pinned else message.unpin
+        await operation(reason=_audit_reason(request.reason, context))
+        return DiscordMessageWriteResponse(request.channel_id, request.message_id)
+
+    async def pin_message(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+    ) -> DiscordMessageWriteResponse:
+        return await set_message_pin(request, context, pinned=True)
+
+    async def unpin_message(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+    ) -> DiscordMessageWriteResponse:
+        return await set_message_pin(request, context, pinned=False)
+
+    async def create_thread(
+        request: DiscordThreadCreateRequest,
+        context: InvocationContext,
+    ) -> DiscordThreadResponse:
+        _guild_value, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        if not isinstance(channel, discord.TextChannel):
+            raise UserError("discord.thread_parent_invalid")
+        for member in (actor, bot):
+            _require_channel_permissions(channel, member, "create_public_threads")
+            _require_channel_permissions(channel, member, "send_messages")
+        message = (
+            await _fetch_message_for_write(channel, request.message_id)
+            if request.message_id is not None
+            else None
+        )
+        thread = await channel.create_thread(
+            name=_bounded_name(request.name, "discord.thread_name_invalid"),
+            message=message,
+            reason=_audit_reason(request.reason, context),
+        )
+        return DiscordThreadResponse(
+            channel_id=str(channel.id),
+            thread_id=str(thread.id),
+            name=thread.name,
+            archived=bool(thread.archived),
+            undo_fingerprint=_thread_undo_fingerprint(thread),
+        )
+
+    async def update_thread(
+        request: DiscordThreadUpdateRequest,
+        context: InvocationContext,
+    ) -> DiscordThreadResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        thread = guild.get_thread(_snowflake(request.thread_id, "channel"))
+        if thread is None:
+            raise UserError("discord.thread_not_found")
+        actor, bot = await _write_members(guild, context)
+        for member in (actor, bot):
+            _require_channel_permissions(thread, member, "manage_threads")
+        old_name = thread.name
+        old_archived = bool(thread.archived)
+        name = (
+            _bounded_name(request.name, "discord.thread_name_invalid")
+            if request.name is not None
+            else old_name
+        )
+        archived = old_archived if request.archived is None else request.archived
+        if name == old_name and archived == old_archived:
+            return DiscordThreadResponse(
+                channel_id=str(thread.parent_id),
+                thread_id=str(thread.id),
+                name=old_name,
+                archived=old_archived,
+                undo_fingerprint=_thread_undo_fingerprint(thread),
+                old_name=old_name,
+                old_archived=old_archived,
+                changed=False,
+            )
+        if (
+            request.expected_name is not None
+            and old_name != request.expected_name
+        ) or (
+            request.expected_archived is not None
+            and old_archived != request.expected_archived
+        ) or (
+            request.expected_undo_fingerprint is not None
+            and _thread_undo_fingerprint(thread)
+            != request.expected_undo_fingerprint
+        ):
+            raise UserError("action.undo_conflict")
+        updated = await thread.edit(
+            name=name,
+            archived=archived,
+            reason=_audit_reason(request.reason, context),
+        )
+        return DiscordThreadResponse(
+            channel_id=str(updated.parent_id),
+            thread_id=str(updated.id),
+            name=updated.name,
+            archived=bool(updated.archived),
+            undo_fingerprint=_thread_undo_fingerprint(updated),
+            old_name=old_name,
+            old_archived=old_archived,
+        )
+
+    async def set_thread_member(
+        request: DiscordThreadMemberRequest,
+        context: InvocationContext,
+        *,
+        present: bool,
+    ) -> DiscordThreadMemberResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        thread = guild.get_thread(_snowflake(request.thread_id, "channel"))
+        if thread is None:
+            raise UserError("discord.thread_not_found")
+        actor, bot = await _write_members(guild, context)
+        for member in (actor, bot):
+            _require_channel_permissions(thread, member, "manage_threads")
+        target = await _guild_member(guild, request.user_id)
+        existing = any(item.id == target.id for item in thread.members)
+        if existing == present:
+            return DiscordThreadMemberResponse(
+                request.thread_id, request.user_id, present, changed=False
+            )
+        if (
+            request.expected_present is not None
+            and existing != request.expected_present
+        ):
+            raise UserError("action.undo_conflict")
+        if present:
+            await thread.add_user(target)
+        else:
+            await thread.remove_user(target)
+        return DiscordThreadMemberResponse(request.thread_id, request.user_id, present)
+
+    async def add_thread_member(
+        request: DiscordThreadMemberRequest,
+        context: InvocationContext,
+    ) -> DiscordThreadMemberResponse:
+        return await set_thread_member(request, context, present=True)
+
+    async def remove_thread_member(
+        request: DiscordThreadMemberRequest,
+        context: InvocationContext,
+    ) -> DiscordThreadMemberResponse:
+        return await set_thread_member(request, context, present=False)
+
+    async def create_forum_post(
+        request: DiscordForumPostRequest,
+        context: InvocationContext,
+    ) -> DiscordForumPostResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        forum = guild.get_channel(_snowflake(request.forum_id, "channel"))
+        if not isinstance(forum, discord.ForumChannel):
+            raise UserError("discord.forum_channel_required")
+        actor, bot = await _write_members(guild, context)
+        for member in (actor, bot):
+            _require_channel_permissions(forum, member, "send_messages")
+            _require_channel_permissions(forum, member, "create_public_threads")
+        created = await forum.create_thread(
+            name=_bounded_name(request.title, "discord.thread_name_invalid"),
+            content=request.content,
+            reason=_audit_reason(request.reason, context),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return DiscordForumPostResponse(
+            channel_id=str(created.thread.id),
+            message_id=str(created.message.id),
+            thread_id=str(created.thread.id),
+            name=created.thread.name,
+            archived=bool(created.thread.archived),
+            undo_fingerprint=_thread_undo_fingerprint(created.thread),
+        )
+
+    async def create_role(
+        request: DiscordRoleCreateRequest,
+        context: InvocationContext,
+    ) -> DiscordRoleResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        actor, bot = await _write_members(guild, context)
+        _require_guild_permission(actor, "manage_roles")
+        _require_guild_permission(bot, "manage_roles")
+        if not 0 <= request.colour <= 0xFFFFFF:
+            raise UserError("discord.role_colour_invalid")
+        role = await guild.create_role(
+            name=_bounded_name(request.name, "discord.role_name_invalid"),
+            colour=discord.Colour(request.colour),
+            hoist=request.hoist,
+            mentionable=request.mentionable,
+            reason=_audit_reason(request.reason, context),
+        )
+        return DiscordRoleResponse(
+            str(role.id),
+            role.name,
+            _role_undo_fingerprint(role),
+        )
+
+    async def delete_created_role(
+        request: DiscordCreatedRoleDeleteRequest,
+        context: InvocationContext,
+    ) -> DiscordCreatedEntityDeleteResponse:
+        guild = _guild(client, context)
+        actor, bot = await _write_members(guild, context)
+        role = guild.get_role(_snowflake(request.role_id, "role"))
+        if role is None:
+            return DiscordCreatedEntityDeleteResponse(request.role_id, True)
+        if (
+            request.undo_fingerprint is not None
+            and _role_undo_fingerprint(role) != request.undo_fingerprint
+        ):
+            raise UserError("action.undo_conflict")
+        if not (
+            guild.chunked
+            or (
+                guild.member_count is not None
+                and len(guild.members) >= guild.member_count
+            )
+        ):
+            raise UserError("action.undo_target_state_uncertain")
+        if role.members:
+            raise UserError("action.undo_target_in_use")
+        for member in (actor, bot):
+            _require_guild_permission(member, "manage_roles")
+            _require_role_above(member, role)
+        await role.delete(reason=_audit_reason("Undo created role", context))
+        return DiscordCreatedEntityDeleteResponse(request.role_id, True)
+
+    async def set_member_role(
+        request: DiscordRoleMemberRequest,
+        context: InvocationContext,
+        *,
+        assigned: bool,
+    ) -> DiscordRoleMemberResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        actor, bot = await _write_members(guild, context)
+        target = await _guild_member(guild, request.user_id)
+        role = guild.get_role(_snowflake(request.role_id, "role"))
+        if role is None or role.is_default() or role.managed:
+            raise UserError("discord.role_unassignable")
+        _require_guild_permission(actor, "manage_roles")
+        _require_guild_permission(bot, "manage_roles")
+        _require_role_above(actor, role)
+        _require_role_above(bot, role)
+        _require_member_below(actor, target, guild)
+        _require_member_below(bot, target, guild)
+        existing = role in target.roles
+        if existing == assigned:
+            return DiscordRoleMemberResponse(
+                request.user_id, request.role_id, assigned, changed=False
+            )
+        if (
+            request.expected_assigned is not None
+            and existing != request.expected_assigned
+        ):
+            raise UserError("action.undo_conflict")
+        operation = target.add_roles if assigned else target.remove_roles
+        await operation(role, reason=_audit_reason(request.reason, context))
+        return DiscordRoleMemberResponse(request.user_id, request.role_id, assigned)
+
+    async def assign_role(
+        request: DiscordRoleMemberRequest,
+        context: InvocationContext,
+    ) -> DiscordRoleMemberResponse:
+        return await set_member_role(request, context, assigned=True)
+
+    async def remove_role(
+        request: DiscordRoleMemberRequest,
+        context: InvocationContext,
+    ) -> DiscordRoleMemberResponse:
+        return await set_member_role(request, context, assigned=False)
+
+    async def update_channel_settings(
+        request: DiscordChannelSettingRequest,
+        context: InvocationContext,
+    ) -> DiscordChannelSettingResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        channel = guild.get_channel(_snowflake(request.channel_id, "channel"))
+        if not isinstance(channel, discord.TextChannel):
+            raise UserError("discord.text_destination_invalid")
+        actor, bot = await _write_members(guild, context)
+        _require_channel_permissions(channel, actor, "manage_channels")
+        _require_channel_permissions(channel, bot, "manage_channels")
+        old_topic = channel.topic
+        old_slowmode = channel.slowmode_delay
+        topic = (
+            old_topic
+            if request.topic == _UNCHANGED_CHANNEL_TOPIC
+            else request.topic
+        )
+        slowmode = (
+            old_slowmode
+            if request.slowmode_seconds is None
+            else request.slowmode_seconds
+        )
+        if len(topic or "") > 1_024 or not 0 <= slowmode <= 21_600:
+            raise UserError("discord.channel_setting_invalid")
+        changed = topic != old_topic or slowmode != old_slowmode
+        if not changed:
+            return DiscordChannelSettingResponse(
+                request.channel_id,
+                topic,
+                slowmode,
+                old_topic,
+                old_slowmode,
+                False,
+            )
+        if (
+            request.expected_topic != _NO_EXPECTED_STRING_STATE
+            and old_topic != request.expected_topic
+        ) or (
+            request.expected_slowmode_seconds is not None
+            and old_slowmode != request.expected_slowmode_seconds
+        ):
+            raise UserError("action.undo_conflict")
+        edit_arguments: dict[str, object] = {
+            "slowmode_delay": slowmode,
+            "reason": _audit_reason(request.reason, context),
+        }
+        edit_arguments["topic"] = topic
+        await channel.edit(**edit_arguments)
+        return DiscordChannelSettingResponse(
+            request.channel_id,
+            topic,
+            slowmode,
+            old_topic,
+            old_slowmode,
+            changed,
+        )
+
+    async def create_channel(
+        request: DiscordChannelCreateRequest,
+        context: InvocationContext,
+    ) -> DiscordChannelCreateResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        actor, bot = await _write_members(guild, context)
+        _require_guild_permission(actor, "manage_channels")
+        _require_guild_permission(bot, "manage_channels")
+        channel_name = _bounded_name(request.name, "discord.channel_name_invalid")
+        audit_reason = _audit_reason(request.reason, context)
+        channel = (
+            await guild.create_text_channel(
+                channel_name,
+                reason=audit_reason,
+            )
+            if request.topic is None
+            else await guild.create_text_channel(
+                channel_name,
+                topic=request.topic,
+                reason=audit_reason,
+            )
+        )
+        return DiscordChannelCreateResponse(
+            str(channel.id),
+            channel.name,
+            _channel_undo_fingerprint(channel),
+        )
+
+    async def delete_created_channel(
+        request: DiscordCreatedChannelDeleteRequest,
+        context: InvocationContext,
+    ) -> DiscordCreatedEntityDeleteResponse:
+        guild = _guild(client, context)
+        actor, bot = await _write_members(guild, context)
+        channel = guild.get_channel(_snowflake(request.channel_id, "channel"))
+        if channel is None:
+            return DiscordCreatedEntityDeleteResponse(request.channel_id, True)
+        if (
+            request.undo_fingerprint is not None
+            and (
+                not isinstance(channel, discord.TextChannel)
+                or _channel_undo_fingerprint(channel) != request.undo_fingerprint
+            )
+        ):
+            raise UserError("action.undo_conflict")
+        if isinstance(channel, discord.TextChannel):
+            async for _message in channel.history(limit=1):
+                raise UserError("action.undo_target_in_use")
+        for member in (actor, bot):
+            _require_guild_permission(member, "manage_channels")
+        await channel.delete(reason=_audit_reason("Undo created channel", context))
+        return DiscordCreatedEntityDeleteResponse(request.channel_id, True)
+
+    async def set_timeout(
+        request: DiscordTimeoutRequest,
+        context: InvocationContext,
+    ) -> DiscordTimeoutResponse:
+        _require_moderation_reason(request.reason)
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        actor, bot = await _write_members(guild, context)
+        target = await _guild_member(guild, request.user_id)
+        for member in (actor, bot):
+            _require_guild_permission(member, "moderate_members")
+            _require_member_below(member, target, guild)
+        until = _timeout_datetime(request.until_iso)
+        previous = target.timed_out_until
+        if previous == until:
+            return DiscordTimeoutResponse(
+                request.user_id,
+                request.until_iso,
+                previous.isoformat() if previous is not None else None,
+                changed=False,
+            )
+        if request.expected_until_iso != _NO_EXPECTED_STRING_STATE:
+            expected_until = _timeout_state_datetime(request.expected_until_iso)
+            normalized_previous = (
+                previous.astimezone(UTC) if previous is not None else None
+            )
+            if normalized_previous != expected_until:
+                raise UserError("action.undo_conflict")
+        await target.timeout(until, reason=_audit_reason(request.reason, context))
+        return DiscordTimeoutResponse(
+            request.user_id,
+            until.isoformat() if until is not None else None,
+            previous.isoformat() if previous is not None else None,
+        )
+
+    async def delete_message(
+        request: DiscordMessageWriteRequest,
+        context: InvocationContext,
+    ) -> DiscordMessageWriteResponse:
+        _require_moderation_reason(request.reason)
+        _guild_value, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        _require_channel_permissions(channel, actor, "manage_messages")
+        _require_channel_permissions(channel, bot, "manage_messages")
+        message = await _fetch_message_for_write(channel, request.message_id)
+        await message.delete()
+        return DiscordMessageWriteResponse(request.channel_id, request.message_id)
+
+    async def bulk_delete_messages(
+        request: DiscordBulkDeleteRequest,
+        context: InvocationContext,
+    ) -> DiscordBulkDeleteResponse:
+        _require_moderation_reason(request.reason)
+        _guild_value, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
+        )
+        _require_channel_permissions(channel, actor, "manage_messages")
+        _require_channel_permissions(channel, bot, "manage_messages")
+        ids = tuple(dict.fromkeys(request.message_ids))
+        if not 2 <= len(ids) <= 100:
+            raise UserError("discord.bulk_delete_limit_invalid")
+        messages = [
+            await _fetch_message_for_write(channel, message_id)
+            for message_id in ids
+        ]
+        await channel.delete_messages(
+            messages,
+            reason=_audit_reason(request.reason, context),
+        )
+        return DiscordBulkDeleteResponse(request.channel_id, ids)
+
+    async def moderate_member(
+        request: DiscordMemberModerationRequest,
+        context: InvocationContext,
+        *,
+        action: Literal["kick", "ban", "unban"],
+    ) -> DiscordMemberModerationResponse:
+        _require_moderation_reason(request.reason)
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        actor, bot = await _write_members(guild, context)
+        user_id = _snowflake(request.user_id, "user")
+        if action == "unban":
+            for member in (actor, bot):
+                _require_guild_permission(member, "ban_members")
+            try:
+                await guild.unban(
+                    discord.Object(user_id),
+                    reason=_audit_reason(request.reason, context),
+                )
+            except discord.NotFound:
+                return DiscordMemberModerationResponse(
+                    request.user_id,
+                    action,
+                    changed=False,
+                )
+        else:
+            target = await _guild_member(guild, request.user_id)
+            permission = "kick_members" if action == "kick" else "ban_members"
+            for member in (actor, bot):
+                _require_guild_permission(member, permission)
+                _require_member_below(member, target, guild)
+            if action == "kick":
+                await target.kick(reason=_audit_reason(request.reason, context))
+            else:
+                await guild.ban(
+                    target,
+                    reason=_audit_reason(request.reason, context),
+                    delete_message_seconds=0,
+                )
+        return DiscordMemberModerationResponse(request.user_id, action)
+
+    async def kick_member(
+        request: DiscordMemberModerationRequest,
+        context: InvocationContext,
+    ) -> DiscordMemberModerationResponse:
+        return await moderate_member(request, context, action="kick")
+
+    async def ban_member(
+        request: DiscordMemberModerationRequest,
+        context: InvocationContext,
+    ) -> DiscordMemberModerationResponse:
+        return await moderate_member(request, context, action="ban")
+
+    async def unban_member(
+        request: DiscordMemberModerationRequest,
+        context: InvocationContext,
+    ) -> DiscordMemberModerationResponse:
+        return await moderate_member(request, context, action="unban")
+
+    async def delete_own_message(
+        request: DiscordDeleteOwnMessageRequest,
+        context: InvocationContext,
+    ) -> DiscordDeleteOwnMessageResponse:
+        guild = _guild(client, context)
+        channel = _message_channel(guild, request.channel_id)
+        bot_member = guild.me
+        if bot_member is None:
+            raise UserError("discord.message_delete_forbidden")
+        actor = await _actor_member(guild, context)
+        if not _can_read_messages(channel, actor) or not _can_read_private_thread(
+            channel,
+            actor,
+        ):
+            raise UserError("discord.message_delete_forbidden")
+        if not _can_read_messages(channel, bot_member) or not _can_read_private_thread(
+            channel,
+            bot_member,
+        ):
+            raise UserError("discord.message_delete_forbidden")
+        try:
+            message = await channel.fetch_message(
+                _snowflake(request.message_id, "message")
+            )
+        except discord.NotFound:
+            return DiscordDeleteOwnMessageResponse(
+                message_id=request.message_id,
+                channel_id=request.channel_id,
+                deleted=True,
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.message_delete_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.message_delete_failed") from exc
+        if message.author.id != bot_member.id:
+            raise UserError("discord.message_not_owned")
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden as exc:
+            raise UserError("discord.message_delete_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.message_delete_failed") from exc
+        return DiscordDeleteOwnMessageResponse(
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            deleted=True,
+        )
+
+    async def delete_own_messages(
+        request: DiscordDeleteOwnMessagesRequest,
+        context: InvocationContext,
+    ) -> DiscordDeleteOwnMessagesResponse:
+        guild = _guild(client, context)
+        channel = _message_channel(guild, request.channel_id)
+        bot_member = guild.me
+        if bot_member is None:
+            raise UserError("discord.message_delete_forbidden")
+        actor = await _actor_member(guild, context)
+        if not _can_read_messages(channel, actor) or not _can_read_private_thread(
+            channel,
+            actor,
+        ):
+            raise UserError("discord.message_delete_forbidden")
+        if not _can_read_messages(
+            channel,
+            bot_member,
+        ) or not _can_read_private_thread(channel, bot_member):
+            raise UserError("discord.message_delete_forbidden")
+
+        message_ids = tuple(request.message_ids.split(","))
+        if (
+            not 1 <= len(message_ids) <= 100
+            or len(set(message_ids)) != len(message_ids)
+        ):
+            raise UserError("action.undo_target_state_uncertain")
+        numeric_ids = tuple(
+            _snowflake(message_id, "message") for message_id in message_ids
+        )
+        messages: list[discord.Message] = []
+        for message_id in numeric_ids:
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                continue
+            except discord.Forbidden as exc:
+                raise UserError("discord.message_delete_forbidden") from exc
+            except discord.DiscordException as exc:
+                raise UserError("discord.message_delete_failed") from exc
+            if message.author.id != bot_member.id:
+                raise UserError("discord.message_not_owned")
+            messages.append(message)
+
+        for message in messages:
+            try:
+                await message.delete()
+            except discord.NotFound:
+                continue
+            except discord.Forbidden as exc:
+                raise UserError("discord.message_delete_forbidden") from exc
+            except discord.DiscordException as exc:
+                raise UserError("discord.message_delete_failed") from exc
+        return DiscordDeleteOwnMessagesResponse(
+            channel_id=str(channel.id),
+            deleted_message_ids=message_ids,
+        )
+
+    async def add_reaction(
+        request: DiscordReactionRequest,
+        context: InvocationContext,
+    ) -> DiscordReactionResponse:
+        guild = _guild(client, context)
+        _, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        emoji = _reaction_emoji(request.emoji)
+        already_reacted = _bot_has_reaction(message, emoji)
+        try:
+            await message.add_reaction(emoji)
+        except TypeError as exc:
+            raise UserError("discord.reaction_emoji_invalid") from exc
+        except discord.Forbidden as exc:
+            raise UserError("discord.reaction_forbidden") from exc
+        except discord.NotFound as exc:
+            raise UserError("discord.reaction_target_not_found") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.reaction_failed") from exc
+        return DiscordReactionResponse(
+            channel_id=str(message.channel.id),
+            message_id=str(message.id),
+            emoji=emoji,
+            reacted=True,
+            changed=not already_reacted,
+        )
+
+    async def remove_own_reaction(
+        request: DiscordReactionRequest,
+        context: InvocationContext,
+    ) -> DiscordReactionResponse:
+        guild = _guild(client, context)
+        _, message = await _fetch_readable_message(
+            guild,
+            channel_id=request.channel_id,
+            message_id=request.message_id,
+            context=context,
+        )
+        bot_member = guild.me
+        if bot_member is None:
+            raise UserError("discord.reaction_unavailable")
+        emoji = _reaction_emoji(request.emoji)
+        already_reacted = _bot_has_reaction(message, emoji)
+        try:
+            await message.remove_reaction(emoji, bot_member)
+        except TypeError as exc:
+            raise UserError("discord.reaction_emoji_invalid") from exc
+        except discord.Forbidden as exc:
+            raise UserError("discord.reaction_forbidden") from exc
+        except discord.NotFound as exc:
+            raise UserError("discord.reaction_target_not_found") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.reaction_failed") from exc
+        return DiscordReactionResponse(
+            channel_id=str(message.channel.id),
+            message_id=str(message.id),
+            emoji=emoji,
+            reacted=False,
+            changed=already_reacted,
         )
 
     async def send_file(
@@ -1305,24 +3294,37 @@ def build_discord_endpoints(
             raise UserError("files.disabled")
         if context.workspace_id is None:
             raise UserError("files.workspace_required")
-        _assert_agent_update_scope(context, request.channel_id)
         if len(request.caption) > 2_000:
             raise UserError("discord.file_caption_too_long")
-        guild = _guild(client, context)
-        channel = _message_channel(guild, request.channel_id)
-        path = runtime.files.path_for_delivery(context.workspace_id, request.path)
-        if path.stat().st_size > 25 * 1024 * 1024:
-            raise UserError("discord.file_too_large")
-        message = await channel.send(
-            request.caption or None,
-            file=discord.File(path, filename=path.name),
-            allowed_mentions=discord.AllowedMentions.none(),
+        guild, channel, actor, bot = await _write_message_channel(
+            client, context, request.channel_id
         )
+        for member in (actor, bot):
+            _require_channel_permissions(channel, member, "send_messages")
+            _require_channel_permissions(channel, member, "attach_files")
+        filename, content = await asyncio.to_thread(
+            runtime.files.snapshot_for_delivery,
+            context.workspace_id,
+            request.path,
+        )
+        size_bytes = len(content)
+        if size_bytes > guild.filesize_limit:
+            raise UserError("discord.file_too_large")
+        try:
+            message = await channel.send(
+                request.caption or None,
+                file=discord.File(io.BytesIO(content), filename=filename),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.file_send_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.file_send_failed") from exc
         return DiscordSendFileResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
-            filename=path.name,
-            size_bytes=path.stat().st_size,
+            filename=filename,
+            size_bytes=size_bytes,
         )
 
     async def create_poll(
@@ -1330,7 +3332,26 @@ def build_discord_endpoints(
         context: InvocationContext,
     ) -> DiscordPollResponse:
         guild = _guild(client, context)
+        _assert_agent_update_scope(context, request.channel_id)
         channel = _text_channel(guild, request.channel_id)
+        actor = await _actor_member(guild, context)
+        bot_member = guild.me
+        actor_permissions = channel.permissions_for(actor)
+        bot_permissions = (
+            channel.permissions_for(bot_member)
+            if bot_member is not None
+            else None
+        )
+        if (
+            not actor_permissions.view_channel
+            or not actor_permissions.send_messages
+            or not actor_permissions.create_polls
+            or bot_permissions is None
+            or not bot_permissions.view_channel
+            or not bot_permissions.send_messages
+            or not bot_permissions.create_polls
+        ):
+            raise UserError("discord.poll_forbidden")
         question = request.question.strip()
         options = tuple(option.strip() for option in request.options if option.strip())
         if not 1 <= len(question) <= 300:
@@ -1348,7 +3369,15 @@ def build_discord_endpoints(
         )
         for option in options:
             poll.add_answer(text=option)
-        message = await channel.send(poll=poll)
+        try:
+            message = await channel.send(
+                poll=poll,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.poll_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.poll_failed") from exc
         return DiscordPollResponse(message_id=str(message.id), channel_id=str(channel.id))
 
     async def connect_voice(
@@ -1359,6 +3388,11 @@ def build_discord_endpoints(
         channel = guild.get_channel(_snowflake(request.channel_id, "voice channel"))
         if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
             raise UserError("discord.voice_channel_unavailable")
+        if context.transport == "agent":
+            actor = await _actor_member(guild, context)
+            actor_channel = _member_voice_channel(actor)
+            if actor_channel is None or actor_channel.id != channel.id:
+                raise UserError("audio.same_voice_required")
         workspace_id = str(guild.id)
         session = runtime.audio.get_or_create(
             workspace_id,
@@ -1844,10 +3878,53 @@ def build_discord_endpoints(
     return (
         endpoint(
             CapabilityDescriptor(
-                name="discord.inspect_server",
-                summary="Inspect the current Discord server's structure and identifiers.",
+                name="discord.list_servers",
+                summary=(
+                    "Page through Discord servers shared by the active requester and "
+                    "bot. Uncached memberships are checked live; follow next_offset, "
+                    "and treat membership_checks_complete=false on any page as "
+                    "incomplete discovery."
+                ),
                 risk=RiskLevel.READ,
-                keywords=("server", "guild", "channels", "roles", "members"),
+                keywords=(
+                    "discord",
+                    "servers",
+                    "guilds",
+                    "shared",
+                    "search",
+                    "サーバー",
+                    "共有",
+                    "横断検索",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.server_offset_invalid",
+                    "discord.server_limit_invalid",
+                ),
+                timeout_seconds=10,
+            ),
+            DiscordListServersRequest,
+            DiscordListServersResponse,
+            list_servers,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.inspect_server",
+                summary="Inspect an accessible Discord server's structure and identifiers.",
+                risk=RiskLevel.READ,
+                keywords=(
+                    "server",
+                    "guild",
+                    "channels",
+                    "roles",
+                    "members",
+                    "サーバー",
+                    "チャンネル",
+                    "メンバー",
+                ),
+                requires_workspace=True,
+                expected_errors=("discord.guild_unavailable",),
             ),
             DiscordServerRequest,
             DiscordServerResponse,
@@ -1858,7 +3935,20 @@ def build_discord_endpoints(
                 name="discord.inspect_user",
                 summary="Inspect a Discord user's public account and server membership details.",
                 risk=RiskLevel.READ,
-                keywords=("user", "member", "avatar", "role"),
+                keywords=(
+                    "user",
+                    "member",
+                    "avatar",
+                    "role",
+                    "ユーザー",
+                    "メンバー",
+                    "役職",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.user_id_invalid",
+                    "discord.user_not_found",
+                ),
             ),
             DiscordUserRequest,
             DiscordUserResponse,
@@ -1866,12 +3956,59 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
-                name="discord.list_channels",
-                summary="List channels and identifiers in the current Discord server.",
+                name="discord.list_roles",
+                summary=(
+                    "Search and page through existing server roles with stable IDs and "
+                    "requester/bot assignability signals."
+                ),
                 risk=RiskLevel.READ,
-                keywords=("discord", "channels", "threads", "where"),
+                keywords=(
+                    "discord",
+                    "roles",
+                    "existing",
+                    "assign",
+                    "役職",
+                    "ロール",
+                    "既存",
+                    "一覧",
+                    "検索",
+                ),
                 requires_workspace=True,
-                expected_errors=("discord.member_required",),
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.role_query_invalid",
+                    "discord.role_offset_invalid",
+                    "discord.role_limit_invalid",
+                ),
+                timeout_seconds=10,
+            ),
+            DiscordListRolesRequest,
+            DiscordListRolesResponse,
+            list_roles,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.list_channels",
+                summary=(
+                    "Page through text, forum, voice, stage, and active-thread identifiers "
+                    "currently readable by both requester and bot in a shared server."
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "channels",
+                    "threads",
+                    "where",
+                    "チャンネル",
+                    "スレッド",
+                    "一覧",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.channel_offset_invalid",
+                    "discord.channel_limit_invalid",
+                ),
                 timeout_seconds=10,
             ),
             DiscordListChannelsRequest,
@@ -1880,10 +4017,63 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
-                name="discord.read_messages",
-                summary="Read a bounded number of messages from an authorized Discord channel.",
+                name="discord.list_archived_threads",
+                summary=(
+                    "Page through archived public threads or forum posts under one "
+                    "readable text/forum parent, returning IDs usable for retrieval."
+                ),
                 risk=RiskLevel.READ,
-                keywords=("discord", "messages", "history", "conversation", "moderation"),
+                keywords=(
+                    "discord",
+                    "archived",
+                    "threads",
+                    "forum",
+                    "posts",
+                    "アーカイブ",
+                    "過去スレッド",
+                    "フォーラム",
+                    "投稿",
+                    "一覧",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.archived_thread_parent_invalid",
+                    "discord.archived_thread_limit_invalid",
+                    "discord.archived_thread_time_invalid",
+                    "discord.agent_read_channel_forbidden",
+                ),
+                timeout_seconds=20,
+            ),
+            DiscordListArchivedThreadsRequest,
+            DiscordListArchivedThreadsResponse,
+            list_archived_threads,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.read_messages",
+                summary=(
+                    "Read one bounded chronological page from an authorized channel, with "
+                    "reply/thread and cached reaction signals for trend analysis."
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "messages",
+                    "history",
+                    "conversation",
+                    "moderation",
+                    "trend",
+                    "popularity",
+                    "engagement",
+                    "メッセージ",
+                    "履歴",
+                    "会話",
+                    "読む",
+                    "前後",
+                    "人気",
+                    "分析",
+                ),
                 requires_workspace=True,
                 expected_errors=(
                     "discord.member_required",
@@ -1897,13 +4087,74 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
+                name="discord.search_messages",
+                summary=(
+                    "Search indexed text guild-wide or in selected authorized channels by "
+                    "phrase, author, and message-ID/ISO time range. Results are capped at 25 "
+                    "and return safe offset/time/opaque page cursors plus IDs for "
+                    "discord.get_message. Forum posts are included through readable forum "
+                    "parents. Discord's "
+                    "total_results is approximate; complete means no known next page, not "
+                    "proof that every historical message was indexed."
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "messages",
+                    "search",
+                    "history",
+                    "find",
+                    "context",
+                    "trend",
+                    "popularity",
+                    "engagement",
+                    "メッセージ検索",
+                    "過去メッセージ",
+                    "履歴",
+                    "探す",
+                    "検索",
+                    "人気",
+                    "話題",
+                    "分析",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.message_search_query_invalid",
+                    "discord.message_search_offset_invalid",
+                    "discord.message_search_cursor_invalid",
+                    "discord.message_search_cursor_required",
+                    "discord.message_search_limit_invalid",
+                    "discord.message_search_filter_required",
+                    "discord.message_search_time_invalid",
+                    "discord.message_search_forbidden",
+                ),
+                timeout_seconds=20,
+            ),
+            DiscordSearchMessagesRequest,
+            DiscordSearchMessagesResponse,
+            search_messages,
+        ),
+        endpoint(
+            CapabilityDescriptor(
                 name="discord.get_message",
                 summary=(
                     "Read a Discord message by ID in bounded chunks, optionally including "
                     "the message it replies to in the same channel."
                 ),
                 risk=RiskLevel.READ,
-                keywords=("discord", "message", "chunk", "mention", "content"),
+                keywords=(
+                    "discord",
+                    "message",
+                    "chunk",
+                    "mention",
+                    "content",
+                    "メッセージ",
+                    "取得",
+                    "読む",
+                    "本文",
+                    "原文",
+                    "メンション",
+                ),
                 requires_workspace=True,
                 expected_errors=(
                     "discord.member_required",
@@ -2100,7 +4351,11 @@ def build_discord_endpoints(
                 idempotency="non_idempotent_write",
                 expected_errors=(
                     "discord.member_required",
+                    "discord.agent_read_channel_forbidden",
+                    "discord.message_not_found",
+                    "discord.message_fetch_failed",
                     "discord.attachment_missing",
+                    "discord.attachment_unavailable",
                     "moderation.media_too_large",
                 ),
                 timeout_seconds=120,
@@ -2124,7 +4379,12 @@ def build_discord_endpoints(
                 idempotency="idempotent_write",
                 expected_errors=(
                     "files.workspace_required",
+                    "discord.member_required",
+                    "discord.agent_read_channel_forbidden",
+                    "discord.message_not_found",
+                    "discord.message_fetch_failed",
                     "discord.attachment_missing",
+                    "discord.attachment_unavailable",
                     "files.file_too_large",
                 ),
                 timeout_seconds=60,
@@ -2147,7 +4407,12 @@ def build_discord_endpoints(
                 requires_workspace=True,
                 expected_errors=(
                     "discord.member_required",
+                    "discord.agent_read_channel_forbidden",
+                    "discord.message_not_found",
+                    "discord.message_fetch_failed",
                     "discord.attachment_missing",
+                    "discord.attachment_unavailable",
+                    "discord.image_attachment_too_large",
                     "discord.attachment_not_supported_image",
                 ),
                 timeout_seconds=30,
@@ -2155,6 +4420,58 @@ def build_discord_endpoints(
             DiscordViewImageAttachmentRequest,
             DiscordViewImageAttachmentResponse,
             view_image_attachment,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.add_reaction",
+                summary=(
+                    "Add one intentional bot reaction to an authorized Discord message."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "reaction",
+                    "emoji",
+                    "acknowledge",
+                    "celebrate",
+                ),
+                side_effects=("Adds the bot's reaction to one visible message.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.reaction_emoji_invalid",
+                    "discord.reaction_forbidden",
+                    "discord.reaction_target_not_found",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Adds one bot-authored reaction to a message.",
+            ),
+            DiscordReactionRequest,
+            DiscordReactionResponse,
+            add_reaction,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.remove_own_reaction",
+                summary="Remove only the bot's own selected reaction from a Discord message.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=("discord", "reaction", "emoji", "remove", "undo"),
+                side_effects=("Removes the bot's selected reaction from one message.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.reaction_emoji_invalid",
+                    "discord.reaction_forbidden",
+                    "discord.reaction_target_not_found",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Removes one reaction previously added by the bot.",
+            ),
+            DiscordReactionRequest,
+            DiscordReactionResponse,
+            remove_own_reaction,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -2183,17 +4500,560 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
+                name="discord.reply_message",
+                summary="Reply as the bot to one readable Discord message.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "reply",
+                    "respond",
+                    "message",
+                    "返信",
+                    "返事",
+                    "メッセージ",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordMessageWriteRequest,
+            DiscordSendMessageResponse,
+            reply_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.edit_own_message",
+                summary="Edit one message authored by this bot.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "edit",
+                    "own",
+                    "message",
+                    "correct",
+                    "編集",
+                    "修正",
+                    "訂正",
+                    "メッセージ",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordMessageWriteRequest,
+            DiscordMessageWriteResponse,
+            edit_own_message,
+        ),
+        *(
+            endpoint(
+                CapabilityDescriptor(
+                    name=name,
+                    summary=summary,
+                    risk=RiskLevel.WRITE,
+                    approval=ApprovalMode.WHEN_REQUESTED,
+                    keywords=keywords,
+                    requires_workspace=True,
+                    idempotency="idempotent_write",
+                ),
+                DiscordMessageWriteRequest,
+                DiscordMessageWriteResponse,
+                handler,
+            )
+            for name, summary, keywords, handler in (
+                (
+                    "discord.pin_message",
+                    "Pin one readable message after checking requester and bot permissions.",
+                    ("discord", "pin", "message", "bookmark", "ピン留め", "固定"),
+                    pin_message,
+                ),
+                (
+                    "discord.unpin_message",
+                    "Unpin one message after checking requester and bot permissions.",
+                    (
+                        "discord",
+                        "unpin",
+                        "message",
+                        "undo",
+                        "ピン留め解除",
+                        "固定解除",
+                    ),
+                    unpin_message,
+                ),
+            )
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.create_thread",
+                summary="Create a public thread in the current Discord server.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "thread",
+                    "create",
+                    "discussion",
+                    "split",
+                    "スレッド",
+                    "議論",
+                    "会話",
+                    "分ける",
+                    "作成",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordThreadCreateRequest,
+            DiscordThreadResponse,
+            create_thread,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.update_thread",
+                summary="Rename, archive, or unarchive a Discord thread.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "thread",
+                    "rename",
+                    "archive",
+                    "unarchive",
+                    "スレッド",
+                    "名前変更",
+                    "アーカイブ",
+                    "再開",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordThreadUpdateRequest,
+            DiscordThreadResponse,
+            update_thread,
+        ),
+        *(
+            endpoint(
+                CapabilityDescriptor(
+                    name=name,
+                    summary=summary,
+                    risk=RiskLevel.WRITE,
+                    approval=ApprovalMode.WHEN_REQUESTED,
+                    keywords=keywords,
+                    requires_workspace=True,
+                    idempotency="idempotent_write",
+                ),
+                DiscordThreadMemberRequest,
+                DiscordThreadMemberResponse,
+                handler,
+            )
+            for name, summary, keywords, handler in (
+                (
+                    "discord.add_thread_member",
+                    "Add one server member to a Discord thread.",
+                    (
+                        "discord",
+                        "thread",
+                        "member",
+                        "add",
+                        "invite",
+                        "スレッド",
+                        "メンバー",
+                        "追加",
+                        "招待",
+                    ),
+                    add_thread_member,
+                ),
+                (
+                    "discord.remove_thread_member",
+                    "Remove one server member from a Discord thread.",
+                    (
+                        "discord",
+                        "thread",
+                        "member",
+                        "remove",
+                        "スレッド",
+                        "メンバー",
+                        "削除",
+                        "外す",
+                    ),
+                    remove_thread_member,
+                ),
+            )
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.create_forum_post",
+                summary="Create a forum post with an initial bot-authored message.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "forum",
+                    "post",
+                    "bug",
+                    "discussion",
+                    "フォーラム",
+                    "投稿",
+                    "バグ報告",
+                    "議論",
+                    "整理",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordForumPostRequest,
+            DiscordForumPostResponse,
+            create_forum_post,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.create_role",
+                summary="Create a role below the bot and requester's role hierarchy.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "role",
+                    "create",
+                    "permission",
+                    "役職",
+                    "ロール",
+                    "作成",
+                    "権限",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordRoleCreateRequest,
+            DiscordRoleResponse,
+            create_role,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.delete_created_role",
+                summary="Internal Undo for a role created by a recorded action receipt.",
+                risk=RiskLevel.DESTRUCTIVE,
+                approval=ApprovalMode.ALWAYS,
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordCreatedRoleDeleteRequest,
+            DiscordCreatedEntityDeleteResponse,
+            delete_created_role,
+        ),
+        *(
+            endpoint(
+                CapabilityDescriptor(
+                    name=name,
+                    summary=summary,
+                    risk=RiskLevel.WRITE,
+                    approval=ApprovalMode.WHEN_REQUESTED,
+                    keywords=keywords,
+                    requires_workspace=True,
+                    idempotency="idempotent_write",
+                ),
+                DiscordRoleMemberRequest,
+                DiscordRoleMemberResponse,
+                handler,
+            )
+            for name, summary, keywords, handler in (
+                (
+                    "discord.assign_role",
+                    "Assign an eligible role to one lower-ranked server member.",
+                    (
+                        "discord",
+                        "role",
+                        "assign",
+                        "member",
+                        "grant",
+                        "役職",
+                        "ロール",
+                        "付与",
+                        "割り当て",
+                        "メンバー",
+                    ),
+                    assign_role,
+                ),
+                (
+                    "discord.remove_role",
+                    "Remove an eligible role from one lower-ranked server member.",
+                    (
+                        "discord",
+                        "role",
+                        "remove",
+                        "member",
+                        "revoke",
+                        "役職",
+                        "ロール",
+                        "解除",
+                        "外す",
+                        "メンバー",
+                    ),
+                    remove_role,
+                ),
+            )
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.update_channel_settings",
+                summary="Update a text channel topic or slowmode with scalar Undo support.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "channel",
+                    "topic",
+                    "slowmode",
+                    "edit",
+                    "チャンネル",
+                    "トピック",
+                    "低速モード",
+                    "編集",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordChannelSettingRequest,
+            DiscordChannelSettingResponse,
+            update_channel_settings,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.create_channel",
+                summary="Create a text channel in the current Discord server.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "channel",
+                    "create",
+                    "text",
+                    "チャンネル",
+                    "作成",
+                    "テキスト",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordChannelCreateRequest,
+            DiscordChannelCreateResponse,
+            create_channel,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.delete_created_channel",
+                summary="Internal Undo for a channel created by a recorded action receipt.",
+                risk=RiskLevel.DESTRUCTIVE,
+                approval=ApprovalMode.ALWAYS,
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordCreatedChannelDeleteRequest,
+            DiscordCreatedEntityDeleteResponse,
+            delete_created_channel,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.set_timeout",
+                summary="Set or clear a member timeout after permission and hierarchy checks.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "moderation",
+                    "timeout",
+                    "clear",
+                    "member",
+                    "モデレーション",
+                    "タイムアウト",
+                    "発言禁止",
+                    "ミュート",
+                    "解除",
+                    "メンバー",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+            ),
+            DiscordTimeoutRequest,
+            DiscordTimeoutResponse,
+            set_timeout,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.delete_message",
+                summary="Delete one message as a moderated, audited non-undoable action.",
+                risk=RiskLevel.DESTRUCTIVE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "moderation",
+                    "delete",
+                    "message",
+                    "モデレーション",
+                    "削除",
+                    "メッセージ",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordMessageWriteRequest,
+            DiscordMessageWriteResponse,
+            delete_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.bulk_delete_messages",
+                summary="Delete 2-100 exact message IDs without an unbounded history scan.",
+                risk=RiskLevel.DESTRUCTIVE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "discord",
+                    "moderation",
+                    "bulk",
+                    "delete",
+                    "messages",
+                    "モデレーション",
+                    "一括削除",
+                    "メッセージ",
+                ),
+                requires_workspace=True,
+            ),
+            DiscordBulkDeleteRequest,
+            DiscordBulkDeleteResponse,
+            bulk_delete_messages,
+        ),
+        *(
+            endpoint(
+                CapabilityDescriptor(
+                    name=name,
+                    summary=summary,
+                    risk=(
+                        RiskLevel.DESTRUCTIVE
+                        if name in {"discord.kick_member", "discord.ban_member"}
+                        else RiskLevel.WRITE
+                    ),
+                    approval=ApprovalMode.WHEN_REQUESTED,
+                    keywords=keywords,
+                    requires_workspace=True,
+                    idempotency=(
+                        "idempotent_write"
+                        if name == "discord.unban_member"
+                        else "non_idempotent_write"
+                    ),
+                ),
+                DiscordMemberModerationRequest,
+                DiscordMemberModerationResponse,
+                handler,
+            )
+            for name, summary, keywords, handler in (
+                (
+                    "discord.kick_member",
+                    "Kick a lower-ranked member with an explicit reason and evidence IDs.",
+                    (
+                        "discord",
+                        "moderation",
+                        "kick",
+                        "member",
+                        "モデレーション",
+                        "キック",
+                        "退出",
+                        "メンバー",
+                    ),
+                    kick_member,
+                ),
+                (
+                    "discord.ban_member",
+                    "Ban a lower-ranked member without deleting message history.",
+                    (
+                        "discord",
+                        "moderation",
+                        "ban",
+                        "member",
+                        "モデレーション",
+                        "BAN",
+                        "追放",
+                        "メンバー",
+                    ),
+                    ban_member,
+                ),
+                (
+                    "discord.unban_member",
+                    "Remove a server ban for one user ID.",
+                    (
+                        "discord",
+                        "moderation",
+                        "unban",
+                        "member",
+                        "モデレーション",
+                        "BAN解除",
+                        "追放解除",
+                        "メンバー",
+                    ),
+                    unban_member,
+                ),
+            )
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.delete_own_message",
+                summary="Delete only a Discord message authored by this bot.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=("discord", "message", "delete", "own", "undo"),
+                side_effects=("Deletes one bot-authored Discord message.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.message_not_owned",
+                    "discord.message_delete_forbidden",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Deletes one message previously posted by the bot.",
+            ),
+            DiscordDeleteOwnMessageRequest,
+            DiscordDeleteOwnMessageResponse,
+            delete_own_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.delete_own_messages",
+                summary="Internal Undo for one multi-post agent response.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.ALWAYS,
+                side_effects=("Deletes only bot-authored messages from one response.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.message_not_owned",
+                    "discord.message_delete_forbidden",
+                    "discord.message_delete_failed",
+                    "action.undo_target_state_uncertain",
+                ),
+                timeout_seconds=30,
+                user_visible_effect="Deletes one complete multi-message agent response.",
+            ),
+            DiscordDeleteOwnMessagesRequest,
+            DiscordDeleteOwnMessagesResponse,
+            delete_own_messages,
+        ),
+        endpoint(
+            CapabilityDescriptor(
                 name="discord.send_file",
                 summary="Send a file from the isolated workspace to the current channel.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
-                keywords=("discord", "file", "attachment", "send", "deliver", "export"),
+                keywords=(
+                    "discord",
+                    "file",
+                    "attachment",
+                    "send",
+                    "deliver",
+                    "export",
+                    "ファイル",
+                    "添付",
+                    "送る",
+                    "届ける",
+                ),
                 side_effects=("Creates one Discord message with an attachment.",),
                 requires_workspace=True,
                 idempotency="non_idempotent_write",
                 expected_errors=(
                     "files.workspace_required",
                     "discord.file_too_large",
+                    "discord.file_send_forbidden",
                 ),
                 timeout_seconds=30,
                 user_visible_effect="Posts a Discord message containing the selected file.",
@@ -2208,8 +5068,28 @@ def build_discord_endpoints(
                 summary="Create a native poll in a Discord text channel.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "poll", "vote", "question"),
+                keywords=(
+                    "discord",
+                    "poll",
+                    "vote",
+                    "question",
+                    "投票",
+                    "アンケート",
+                ),
                 side_effects=("Creates a user-visible poll in a Discord channel.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.agent_update_channel_forbidden",
+                    "discord.poll_forbidden",
+                    "discord.poll_question_invalid",
+                    "discord.poll_option_count_invalid",
+                    "discord.poll_option_too_long",
+                    "discord.poll_duration_invalid",
+                    "discord.poll_failed",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Posts a native Discord poll in the active channel.",
             ),
             DiscordPollRequest,
             DiscordPollResponse,
@@ -2221,8 +5101,29 @@ def build_discord_endpoints(
                 summary="Connect Simajilord's audio output to a Discord voice channel.",
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
-                keywords=("discord", "voice", "join", "connect", "vc"),
+                keywords=(
+                    "discord",
+                    "voice",
+                    "join",
+                    "connect",
+                    "vc",
+                    "ボイス",
+                    "通話",
+                    "参加",
+                ),
                 side_effects=("Makes the bot join or move to a voice channel.",),
+                requires_workspace=True,
+                requires_voice=True,
+                requires_same_voice=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.voice_channel_unavailable",
+                    "audio.same_voice_required",
+                    "audio.other_voice_active",
+                ),
+                timeout_seconds=30,
+                user_visible_effect="Joins the requester's current Discord voice channel.",
             ),
             DiscordConnectVoiceRequest,
             DiscordConnectVoiceResponse,
@@ -2342,77 +5243,77 @@ def build_discord_endpoints(
         discord_audio_endpoint(
             "discord.pause_audio",
             "Pause music playing in the requester's voice channel.",
-            ("pause",),
+            ("pause", "一時停止", "止める"),
             AudioNoArgsRequest,
             pause_audio,
         ),
         discord_audio_endpoint(
             "discord.resume_audio",
             "Resume paused music in the requester's voice channel.",
-            ("resume",),
+            ("resume", "再開", "続き"),
             AudioNoArgsRequest,
             resume_audio,
         ),
         discord_audio_endpoint(
             "discord.skip_audio",
             "Skip the current track in the requester's voice channel.",
-            ("skip",),
+            ("skip", "スキップ", "次の曲", "飛ばす"),
             AudioNoArgsRequest,
             skip_audio,
         ),
         discord_audio_endpoint(
             "discord.stop_audio",
             "Stop playback and clear the music queue in the requester's voice channel.",
-            ("stop", "clear"),
+            ("stop", "clear", "停止", "終了", "キューを空にする"),
             AudioNoArgsRequest,
             stop_audio,
         ),
         discord_audio_endpoint(
             "discord.leave_audio",
             "Clear the music queue and disconnect from the requester's voice channel.",
-            ("leave", "disconnect"),
+            ("leave", "disconnect", "切断", "退出"),
             AudioNoArgsRequest,
             leave_audio,
         ),
         discord_audio_endpoint(
             "discord.set_audio_loop",
             "Set the music loop mode.",
-            ("loop", "repeat"),
+            ("loop", "repeat", "ループ", "リピート", "繰り返し"),
             AudioLoopRequest,
             set_audio_loop,
         ),
         discord_audio_endpoint(
             "discord.remove_audio",
             "Remove a waiting track at a specified queue position.",
-            ("remove", "queue"),
+            ("remove", "queue", "削除", "キュー"),
             AudioQueuePositionRequest,
             remove_audio,
         ),
         discord_audio_endpoint(
             "discord.set_audio_auto_leave",
             "Configure automatic disconnect when no listeners remain.",
-            ("auto", "leave"),
+            ("auto", "leave", "自動退出", "自動切断"),
             AudioAutoLeaveRequest,
             set_audio_auto_leave,
         ),
         discord_audio_endpoint(
             "discord.shuffle_audio",
             "Shuffle the waiting music queue.",
-            ("shuffle", "queue"),
+            ("shuffle", "queue", "シャッフル", "キュー"),
             AudioNoArgsRequest,
             shuffle_audio,
         ),
         discord_audio_endpoint(
             "discord.seek_audio",
             "Seek the current track to a specified time in seconds.",
-            ("seek", "position"),
+            ("seek", "position", "シーク", "再生位置"),
             AudioSeekRequest,
             seek_audio,
         ),
         discord_audio_endpoint(
             "discord.tune_audio",
             "Set music playback speed and pitch.",
-            ("speed", "pitch", "tune"),
+            ("speed", "pitch", "tune", "速度", "ピッチ"),
             AudioTuneRequest,
             tune_audio,
         ),
@@ -2439,6 +5340,9 @@ def build_discord_endpoints(
                     "autoplay",
                     "radio",
                     "related",
+                    "自動再生",
+                    "ラジオ",
+                    "関連曲",
                 ),
                 side_effects=("Changes the server's persistent automatic selection settings.",),
                 requires_workspace=True,
@@ -2460,14 +5364,14 @@ def build_discord_endpoints(
         discord_audio_endpoint(
             "discord.move_audio",
             "Move a waiting track to another queue position.",
-            ("move", "queue", "reorder"),
+            ("move", "queue", "reorder", "移動", "並べ替え", "キュー"),
             AudioMoveRequest,
             move_audio,
         ),
         discord_audio_endpoint(
             "discord.clear_my_audio",
             "Remove only the waiting tracks added by the requester.",
-            ("clear", "mine", "requester"),
+            ("clear", "mine", "requester", "自分の曲", "取り消し"),
             AudioNoArgsRequest,
             clear_my_audio,
         ),
@@ -2691,6 +5595,17 @@ def build_discord_endpoints(
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=("discord", "read aloud", "author", "reply", "attachment"),
                 side_effects=("Updates semantic read-aloud settings.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "discord.member_required",
+                    "discord.manage_guild_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect=(
+                    "Changes how authors, replies, attachments, and VC membership "
+                    "are narrated."
+                ),
             ),
             ReadAloudSemanticsSetRequest,
             ReadAloudPolicyResponse,
@@ -2726,6 +5641,143 @@ def _guild(client: discord.Client, context: InvocationContext) -> discord.Guild:
     if guild is None:
         raise UserError("discord.guild_unavailable")
     return guild
+
+
+def _requested_guild(
+    client: discord.Client,
+    context: InvocationContext,
+    requested_guild_id: str | None,
+) -> discord.Guild:
+    """Resolve a guild without allowing a command to forge another workspace."""
+
+    if requested_guild_id is None:
+        return _guild(client, context)
+    guild_id = _snowflake(requested_guild_id, "guild")
+    if context.transport != "agent" and requested_guild_id != context.workspace_id:
+        raise UserError("discord.cross_guild_read_forbidden")
+    guild = client.get_guild(guild_id)
+    if guild is None:
+        raise UserError("discord.guild_unavailable")
+    return guild
+
+
+async def _readable_message_channel(
+    client: discord.Client,
+    context: InvocationContext,
+    *,
+    guild_id: str | None,
+    channel_id: str,
+) -> tuple[discord.Guild, DiscordMessageChannel]:
+    """Enforce effective requester and bot permissions at retrieval time."""
+
+    guild = _requested_guild(client, context, guild_id)
+    resolved_channel_id = _snowflake(channel_id, "channel")
+    cached = guild.get_channel_or_thread(resolved_channel_id)
+    if isinstance(
+        cached,
+        (
+            discord.TextChannel,
+            discord.Thread,
+            discord.VoiceChannel,
+            discord.StageChannel,
+        ),
+    ):
+        channel = cached
+    else:
+        try:
+            fetched = await client.fetch_channel(resolved_channel_id)
+        except discord.NotFound as exc:
+            raise UserError("discord.message_destination_invalid") from exc
+        except discord.Forbidden as exc:
+            raise UserError("discord.agent_read_channel_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.message_channel_fetch_failed") from exc
+        if (
+            not isinstance(
+                fetched,
+                (
+                    discord.TextChannel,
+                    discord.Thread,
+                    discord.VoiceChannel,
+                    discord.StageChannel,
+                ),
+            )
+            or fetched.guild.id != guild.id
+        ):
+            raise UserError("discord.message_destination_invalid")
+        channel = fetched
+    actor = await _require_common_guild(guild, context)
+    bot_member = guild.me
+    if (
+        bot_member is None
+        or not _can_read_messages(channel, actor)
+        or not _can_read_private_thread(channel, actor)
+        or not _can_read_messages(channel, bot_member)
+        or not _can_read_private_thread(channel, bot_member)
+    ):
+        raise UserError("discord.agent_read_channel_forbidden")
+    if context.transport != "agent":
+        current_guild = _guild(client, context)
+        if guild.id != current_guild.id:
+            raise UserError("discord.cross_guild_read_forbidden")
+    return guild, channel
+
+
+async def _require_common_guild(
+    guild: discord.Guild,
+    context: InvocationContext,
+) -> discord.Member:
+    actor = await _actor_member(guild, context)
+    if guild.me is None:
+        raise UserError("discord.guild_unavailable")
+    return actor
+
+
+def _disclosure_to_origin(
+    client: discord.Client,
+    context: InvocationContext,
+    source_guild: discord.Guild,
+    source: DiscordReadableChannel,
+) -> Literal["same_or_narrower", "broader", "uncertain"]:
+    if context.workspace_id is None or context.origin_resource_id is None:
+        return "uncertain"
+    try:
+        destination_guild_id = int(context.workspace_id)
+        destination_channel_id = int(context.origin_resource_id)
+    except ValueError:
+        return "uncertain"
+    destination_guild = client.get_guild(destination_guild_id)
+    if destination_guild is None:
+        return "uncertain"
+    destination = destination_guild.get_channel_or_thread(destination_channel_id)
+    if not isinstance(
+        destination,
+        (
+            discord.TextChannel,
+            discord.Thread,
+            discord.VoiceChannel,
+            discord.StageChannel,
+        ),
+    ):
+        return "uncertain"
+    return _disclosure_audience_relation(
+        source_guild,
+        source,
+        destination_guild,
+        destination,
+    )
+
+
+def _disclosure_warning(
+    relation: Literal["same_or_narrower", "broader", "uncertain"],
+) -> str | None:
+    if relation != "broader":
+        return None
+    return (
+        "The destination has at least one known reader who cannot read the source. "
+        "Before replying, decide whether disclosure is necessary and minimize or omit "
+        "quotes, summaries, identifiers, and sensitive details."
+    )
 
 
 async def _actor_member(
@@ -2802,8 +5854,462 @@ def _snowflake(value: str, label: str) -> int:
             "message": "discord.message_id_invalid",
             "channel": "discord.channel_id_invalid",
             "voice channel": "discord.voice_channel_id_invalid",
+            "guild": "discord.guild_id_invalid",
+            "user": "discord.user_id_invalid",
+            "role": "discord.role_id_invalid",
         }.get(label, "discord.snowflake_invalid")
         raise UserError(code) from exc
+
+
+def _search_boundary_message_id(
+    message_id: str | None,
+    timestamp_iso: str | None,
+    *,
+    high: bool,
+) -> str | None:
+    if message_id is not None and timestamp_iso is not None:
+        raise UserError("discord.message_search_range_invalid")
+    if message_id is not None:
+        _snowflake(message_id, "message")
+        return message_id
+    if timestamp_iso is None:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(timestamp_iso.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserError("discord.message_search_time_invalid") from exc
+    if timestamp.tzinfo is None:
+        raise UserError("discord.message_search_time_invalid")
+    return str(discord.utils.time_snowflake(timestamp.astimezone(UTC), high=high))
+
+
+def _archived_threads_before(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserError("discord.archived_thread_time_invalid") from exc
+    if timestamp.tzinfo is None:
+        raise UserError("discord.archived_thread_time_invalid")
+    return timestamp.astimezone(UTC)
+
+
+def _message_search_cursor_fingerprint(
+    *,
+    guild_id: str,
+    channel_batches: tuple[tuple[str, ...], ...],
+    content: str,
+    author_ids: tuple[str, ...],
+    before_message_id: str | None,
+    after_message_id: str | None,
+    sort_by: str,
+    sort_order: str,
+) -> str:
+    canonical = json.dumps(
+        {
+            "guild_id": guild_id,
+            "channel_batches": channel_batches,
+            "content": content,
+            "author_ids": author_ids,
+            "before_message_id": before_message_id,
+            "after_message_id": after_message_id,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def _encode_message_search_cursor(
+    *,
+    fingerprint: str,
+    offsets: tuple[int, ...],
+    next_batch_index: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "v": 1,
+            "fingerprint": fingerprint,
+            "offsets": offsets,
+            "next_batch_index": next_batch_index,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_message_search_cursor(
+    value: str,
+    *,
+    expected_fingerprint: str,
+    batch_count: int,
+) -> tuple[tuple[int, ...], int]:
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(
+            base64.b64decode(
+                value + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+        )
+        offsets = payload["offsets"]
+        next_batch_index = payload["next_batch_index"]
+        if (
+            payload.get("v") != 1
+            or payload.get("fingerprint") != expected_fingerprint
+            or not isinstance(offsets, list)
+            or len(offsets) != batch_count
+            or any(
+                not isinstance(offset, int)
+                or isinstance(offset, bool)
+                or not 0 <= offset <= 9_975
+                for offset in offsets
+            )
+            or not isinstance(next_batch_index, int)
+            or isinstance(next_batch_index, bool)
+            or not 0 <= next_batch_index < batch_count
+        ):
+            raise ValueError("cursor payload mismatch")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise UserError("discord.message_search_cursor_invalid") from exc
+    return tuple(offsets), next_batch_index
+
+
+def _search_thread_parents(
+    payload: dict[str, Any],
+) -> dict[str, tuple[str, int | None]]:
+    raw_threads = payload.get("threads")
+    if not isinstance(raw_threads, list):
+        return {}
+    parents: dict[str, tuple[str, int | None]] = {}
+    for raw_thread in raw_threads:
+        if not isinstance(raw_thread, dict):
+            continue
+        thread_id = raw_thread.get("id")
+        parent_id = raw_thread.get("parent_id")
+        raw_type = raw_thread.get("type")
+        if not isinstance(thread_id, str) or not isinstance(parent_id, str):
+            continue
+        parents[thread_id] = (
+            parent_id,
+            raw_type
+            if isinstance(raw_type, int) and not isinstance(raw_type, bool)
+            else None,
+        )
+    return parents
+
+
+def _search_result_source(
+    guild: discord.Guild,
+    *,
+    channel_id: str,
+    readable_ids: set[str] | None,
+    actor: discord.Member | None,
+    raw_thread_parents: dict[str, tuple[str, int | None]],
+) -> DiscordReadableChannel | None:
+    channel = guild.get_channel_or_thread(_snowflake(channel_id, "channel"))
+    if isinstance(
+        channel,
+        (
+            discord.TextChannel,
+            discord.Thread,
+            discord.VoiceChannel,
+            discord.StageChannel,
+        ),
+    ) and (readable_ids is None or channel_id in readable_ids):
+        return channel
+    parent_record = raw_thread_parents.get(channel_id)
+    if parent_record is None:
+        return None
+    parent_id, raw_type = parent_record
+    if readable_ids is not None and parent_id not in readable_ids:
+        return None
+    parent = guild.get_channel(_snowflake(parent_id, "channel"))
+    if not isinstance(parent, (discord.TextChannel, discord.ForumChannel)):
+        return None
+    if raw_type == discord.ChannelType.private_thread.value:
+        if actor is None:
+            return None
+        permissions = parent.permissions_for(actor)
+        if not (permissions.administrator or permissions.manage_threads):
+            return None
+    return parent
+
+
+def _assert_origin_guild(
+    context: InvocationContext,
+    guild: discord.Guild,
+) -> None:
+    if isinstance(guild.id, int) and context.workspace_id != str(guild.id):
+        raise UserError("discord.agent_write_cross_guild_forbidden")
+
+
+async def _write_members(
+    guild: discord.Guild,
+    context: InvocationContext,
+) -> tuple[discord.Member, discord.Member]:
+    actor = await _actor_member(guild, context)
+    bot = guild.me
+    if bot is None:
+        raise UserError("discord.bot_member_required")
+    return actor, bot
+
+
+async def _write_message_channel(
+    client: discord.Client,
+    context: InvocationContext,
+    channel_id: str,
+) -> tuple[discord.Guild, DiscordMessageChannel, discord.Member, discord.Member]:
+    guild = _guild(client, context)
+    _assert_origin_guild(context, guild)
+    _assert_agent_update_scope(context, channel_id)
+    channel = _message_channel(guild, channel_id)
+    actor, bot = await _write_members(guild, context)
+    for member in (actor, bot):
+        if not _can_read_messages(channel, member) or not _can_read_private_thread(
+            channel, member
+        ):
+            raise UserError("discord.agent_write_channel_forbidden")
+    return guild, channel, actor, bot
+
+
+async def _guild_member(guild: discord.Guild, user_id: str) -> discord.Member:
+    member_id = _snowflake(user_id, "user")
+    member = guild.get_member(member_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(member_id)
+        except (discord.NotFound, discord.Forbidden) as exc:
+            raise UserError("discord.member_required") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.member_lookup_failed") from exc
+    return member
+
+
+def _require_channel_permissions(
+    channel: DiscordMessageChannel | discord.ForumChannel,
+    member: discord.Member,
+    permission: str,
+) -> None:
+    permissions = channel.permissions_for(member)
+    effective = permission
+    if permission == "send_messages" and isinstance(channel, discord.Thread):
+        effective = "send_messages_in_threads"
+    if not permissions.view_channel or not bool(getattr(permissions, effective, False)):
+        raise UserError(f"discord.{permission}_required")
+
+
+def _require_guild_permission(member: discord.Member, permission: str) -> None:
+    if not bool(getattr(member.guild_permissions, permission, False)):
+        raise UserError(f"discord.{permission}_required")
+
+
+def _require_role_above(member: discord.Member, role: discord.Role) -> None:
+    if member.guild.owner_id == member.id or member.guild_permissions.administrator:
+        return
+    if member.top_role <= role:
+        raise UserError("discord.role_hierarchy_forbidden")
+
+
+def _role_assignable_by(member: discord.Member, role: discord.Role) -> bool:
+    if role.is_default() or role.managed:
+        return False
+    permissions = member.guild_permissions
+    if member.guild.owner_id == member.id or permissions.administrator:
+        return True
+    return permissions.manage_roles and member.top_role > role
+
+
+def _require_member_below(
+    member: discord.Member,
+    target: discord.Member,
+    guild: discord.Guild,
+) -> None:
+    if target.id == guild.owner_id or target.id == member.id:
+        raise UserError("discord.member_hierarchy_forbidden")
+    if member.id == guild.owner_id or member.guild_permissions.administrator:
+        return
+    if member.top_role <= target.top_role:
+        raise UserError("discord.member_hierarchy_forbidden")
+
+
+async def _fetch_message_for_write(
+    channel: DiscordMessageChannel,
+    message_id: str | None,
+) -> discord.Message:
+    if message_id is None:
+        raise UserError("discord.message_id_invalid")
+    try:
+        return await channel.fetch_message(_snowflake(message_id, "message"))
+    except discord.NotFound as exc:
+        raise UserError("discord.message_not_found") from exc
+    except discord.Forbidden as exc:
+        raise UserError("discord.message_write_forbidden") from exc
+    except discord.DiscordException as exc:
+        raise UserError("discord.message_fetch_failed") from exc
+
+
+def _bounded_name(value: str, code: str) -> str:
+    name = value.strip()
+    if not 1 <= len(name) <= 100:
+        raise UserError(code)
+    return name
+
+
+def _undo_state_fingerprint(payload: object) -> str:
+    """Hash a small live-state projection without retaining message bodies."""
+
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _thread_undo_fingerprint(thread: discord.Thread) -> str:
+    applied_tag_ids = sorted(
+        str(tag.id)
+        for tag in getattr(thread, "applied_tags", ())
+    )
+    return _undo_state_fingerprint(
+        {
+            "name": thread.name,
+            "archived": bool(thread.archived),
+            "locked": bool(getattr(thread, "locked", False)),
+            "invitable": bool(getattr(thread, "invitable", True)),
+            "auto_archive_duration": getattr(
+                thread,
+                "auto_archive_duration",
+                None,
+            ),
+            "slowmode_delay": getattr(thread, "slowmode_delay", 0),
+            "last_message_id": (
+                str(thread.last_message_id)
+                if thread.last_message_id is not None
+                else None
+            ),
+            "applied_tag_ids": applied_tag_ids,
+        }
+    )
+
+
+def _role_undo_fingerprint(role: discord.Role) -> str:
+    display_icon = getattr(role, "display_icon", None)
+    return _undo_state_fingerprint(
+        {
+            "name": role.name,
+            "colour": role.colour.value,
+            "permissions": role.permissions.value,
+            "hoist": bool(role.hoist),
+            "mentionable": bool(role.mentionable),
+            "display_icon": str(display_icon) if display_icon is not None else None,
+        }
+    )
+
+
+def _channel_undo_fingerprint(channel: discord.TextChannel) -> str:
+    overwrites: list[tuple[str, str, int, int]] = []
+    for target, overwrite in channel.overwrites.items():
+        allow, deny = overwrite.pair()
+        overwrites.append(
+            (
+                "role" if isinstance(target, discord.Role) else "member",
+                str(target.id),
+                allow.value,
+                deny.value,
+            )
+        )
+    return _undo_state_fingerprint(
+        {
+            "name": channel.name,
+            "topic": channel.topic,
+            "slowmode_delay": channel.slowmode_delay,
+            "nsfw": bool(channel.nsfw),
+            "category_id": (
+                str(channel.category_id)
+                if channel.category_id is not None
+                else None
+            ),
+            "default_auto_archive_duration": getattr(
+                channel,
+                "default_auto_archive_duration",
+                None,
+            ),
+            "default_thread_slowmode_delay": getattr(
+                channel,
+                "default_thread_slowmode_delay",
+                0,
+            ),
+            "overwrites": sorted(overwrites),
+        }
+    )
+
+
+def _audit_reason(reason: str, context: InvocationContext) -> str:
+    text = " ".join(reason.split())
+    if len(text) > 400:
+        raise UserError("discord.audit_reason_too_long")
+    return f"Simajilord actor={context.actor_id} request={context.request_id}: {text}"[:512]
+
+
+def _require_moderation_reason(reason: str) -> None:
+    if not reason.strip():
+        raise UserError("discord.moderation_reason_required")
+
+
+def _timeout_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserError("discord.timeout_invalid") from exc
+    if parsed.tzinfo is None:
+        raise UserError("discord.timeout_invalid")
+    parsed = parsed.astimezone(UTC)
+    now = datetime.now(UTC)
+    if not now < parsed <= now + timedelta(days=28):
+        raise UserError("discord.timeout_invalid")
+    return parsed
+
+
+def _timeout_state_datetime(value: str | None) -> datetime | None:
+    """Parse a persisted current-state guard without applying future-time limits."""
+
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserError("discord.timeout_invalid") from exc
+    if parsed.tzinfo is None:
+        raise UserError("discord.timeout_invalid")
+    return parsed.astimezone(UTC)
+
+
+def _reaction_emoji(value: str) -> str:
+    emoji = value.strip()
+    if not emoji or len(emoji) > 100 or any(character.isspace() for character in emoji):
+        raise UserError("discord.reaction_emoji_invalid")
+    return emoji
+
+
+def _bot_has_reaction(message: discord.Message, emoji: str) -> bool:
+    reactions = getattr(message, "reactions", ())
+    if not isinstance(reactions, (list, tuple)):
+        return False
+    return any(
+        reaction.me and str(reaction.emoji) == emoji
+        for reaction in reactions
+    )
 
 
 def _assert_agent_update_scope(
@@ -2811,12 +6317,6 @@ def _assert_agent_update_scope(
     channel_id: str,
 ) -> None:
     _assert_agent_channel_scope(context, channel_id)
-    if (
-        context.transport == "agent"
-        and context.origin_resource_id is not None
-        and channel_id != context.origin_resource_id
-    ):
-        raise UserError("discord.agent_update_channel_forbidden")
 
 
 def _text_channel(
@@ -2850,20 +6350,28 @@ def _message_channel(
 def _message_record(
     message: discord.Message,
     *,
+    guild_id: str,
+    visibility: Literal["guild_public", "restricted", "uncertain"],
+    disclosure_to_origin: Literal["same_or_narrower", "broader", "uncertain"],
     event_message_id: str | None = None,
 ) -> DiscordMessageRecord:
+    context_text = _message_context_text(message)
     if str(message.id) == event_message_id:
-        preview, truncated = _bounded_event_message(message.content)
+        preview, truncated = _bounded_event_message(context_text)
     else:
-        preview, truncated = _message_preview(message.content)
+        preview, truncated = _message_preview(context_text)
     return DiscordMessageRecord(
         message_id=str(message.id),
         channel_id=str(message.channel.id),
+        guild_id=guild_id,
+        visibility=visibility,
+        disclosure_to_origin=disclosure_to_origin,
+        disclosure_warning=_disclosure_warning(disclosure_to_origin),
         author_id=str(message.author.id),
         author_name=message.author.display_name,
         author_is_bot=message.author.bot,
         content_preview=preview,
-        content_length=len(message.content),
+        content_length=len(context_text),
         preview_truncated=truncated,
         created_at_iso=message.created_at.isoformat(),
         attachments=tuple(_attachment_record(attachment) for attachment in message.attachments),
@@ -2872,6 +6380,15 @@ def _message_record(
             if message.reference and message.reference.message_id
             else None
         ),
+        edited_at_iso=_message_edited_at_iso(message),
+        reaction_count=sum(
+            reaction.count for reaction in getattr(message, "reactions", ())
+        ),
+        reaction_summary=tuple(
+            DiscordReactionSummaryRecord(str(reaction.emoji), reaction.count)
+            for reaction in getattr(message, "reactions", ())[:10]
+        ),
+        thread_id=_message_thread_id(message),
     )
 
 
@@ -2881,6 +6398,136 @@ def _attachment_record(attachment: discord.Attachment) -> DiscordAttachmentRecor
         filename=attachment.filename,
         content_type=attachment.content_type,
         size_bytes=attachment.size,
+    )
+
+
+def _message_edited_at_iso(message: discord.Message) -> str | None:
+    edited_at = getattr(message, "edited_at", None)
+    return edited_at.isoformat() if isinstance(edited_at, datetime) else None
+
+
+def _message_thread_id(message: discord.Message) -> str | None:
+    thread = getattr(message, "thread", None)
+    return str(thread.id) if isinstance(thread, discord.Thread) else None
+
+
+def _workspace_attachment_name(attachment: discord.Attachment) -> str:
+    """Keep separate same-named uploads collision-free and within sandbox limits."""
+
+    filename = PurePath(attachment.filename).name or "attachment"
+    prefix = f"{attachment.id}-"
+    maximum_filename_characters = 180 - len(prefix)
+    if len(filename) > maximum_filename_characters:
+        suffix = PurePath(filename).suffix[:20]
+        stem_limit = max(1, maximum_filename_characters - len(suffix))
+        filename = f"{filename[:stem_limit]}{suffix}"
+    return f"{prefix}{filename}"
+
+
+def _search_message_record(value: object) -> DiscordMessageRecord | None:
+    if not isinstance(value, dict):
+        return None
+    message_id = value.get("id")
+    channel_id = value.get("channel_id")
+    author = value.get("author")
+    timestamp = value.get("timestamp")
+    if not (
+        isinstance(message_id, str)
+        and message_id.isdecimal()
+        and isinstance(channel_id, str)
+        and channel_id.isdecimal()
+        and isinstance(author, dict)
+        and isinstance(timestamp, str)
+    ):
+        return None
+    author_id = author.get("id")
+    if not isinstance(author_id, str):
+        return None
+    content = value.get("content")
+    text = content if isinstance(content, str) else ""
+    preview, truncated = _message_preview(text)
+    raw_attachments = value.get("attachments")
+    attachments: list[DiscordAttachmentRecord] = []
+    if isinstance(raw_attachments, list):
+        for raw_attachment in raw_attachments[:10]:
+            if not isinstance(raw_attachment, dict):
+                continue
+            attachment_id = raw_attachment.get("id")
+            filename = raw_attachment.get("filename")
+            size = raw_attachment.get("size")
+            content_type = raw_attachment.get("content_type")
+            if not (
+                isinstance(attachment_id, str)
+                and isinstance(filename, str)
+                and isinstance(size, int)
+                and not isinstance(size, bool)
+            ):
+                continue
+            attachments.append(
+                DiscordAttachmentRecord(
+                    attachment_id=attachment_id,
+                    filename=filename,
+                    content_type=content_type if isinstance(content_type, str) else None,
+                    size_bytes=max(0, size),
+                )
+            )
+    reference = value.get("message_reference")
+    reference_message_id = (
+        reference.get("message_id") if isinstance(reference, dict) else None
+    )
+    display_name = author.get("global_name") or author.get("username") or author_id
+    raw_reactions = value.get("reactions")
+    reaction_summary: list[DiscordReactionSummaryRecord] = []
+    if isinstance(raw_reactions, list):
+        for raw_reaction in raw_reactions[:10]:
+            if not isinstance(raw_reaction, dict):
+                continue
+            count = raw_reaction.get("count")
+            emoji = raw_reaction.get("emoji")
+            if not isinstance(count, int) or isinstance(count, bool) or not isinstance(
+                emoji, dict
+            ):
+                continue
+            emoji_name = emoji.get("name")
+            emoji_id = emoji.get("id")
+            if not isinstance(emoji_name, str):
+                continue
+            rendered = (
+                f"<:{emoji_name}:{emoji_id}>"
+                if isinstance(emoji_id, str)
+                else emoji_name
+            )
+            reaction_summary.append(
+                DiscordReactionSummaryRecord(rendered, max(0, count))
+            )
+    thread = value.get("thread")
+    raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
+    return DiscordMessageRecord(
+        message_id=message_id,
+        channel_id=channel_id,
+        guild_id="",
+        visibility="uncertain",
+        disclosure_to_origin="uncertain",
+        disclosure_warning=_disclosure_warning("uncertain"),
+        author_id=author_id,
+        author_name=str(display_name),
+        author_is_bot=bool(author.get("bot")),
+        content_preview=preview,
+        content_length=len(text),
+        preview_truncated=truncated,
+        created_at_iso=timestamp,
+        attachments=tuple(attachments),
+        reference_message_id=(
+            reference_message_id if isinstance(reference_message_id, str) else None
+        ),
+        edited_at_iso=(
+            str(value["edited_timestamp"])
+            if isinstance(value.get("edited_timestamp"), str)
+            else None
+        ),
+        reaction_count=sum(item.count for item in reaction_summary),
+        reaction_summary=tuple(reaction_summary),
+        thread_id=raw_thread_id if isinstance(raw_thread_id, str) else None,
     )
 
 
@@ -3092,6 +6739,18 @@ def discord_translation_segments(
     return tuple(output)
 
 
+def _message_context_text(message: discord.Message) -> str:
+    """Render every bounded Discord text surface with stable source labels."""
+
+    lines: list[str] = []
+    for segment in discord_translation_segments(message):
+        if segment.identifier == "content":
+            lines.append(segment.text)
+        else:
+            lines.append(f"[{segment.identifier}] {segment.text}")
+    return "\n".join(lines)
+
+
 def _append_component_text(
     value: object,
     *,
@@ -3140,10 +6799,21 @@ async def _attachment(
     attachment_index: int,
 ) -> tuple[discord.Message, discord.Attachment]:
     guild = _guild(client, context)
-    _assert_agent_channel_scope(context, channel_id)
     channel = _message_channel(guild, channel_id)
     if not 0 <= attachment_index <= 9:
         raise UserError("discord.attachment_index_invalid")
+    if context.transport == "agent":
+        _assert_agent_channel_scope(context, channel_id)
+    actor = await _actor_member(guild, context)
+    bot_member = guild.me
+    if (
+        bot_member is None
+        or not _can_read_messages(channel, actor)
+        or not _can_read_private_thread(channel, actor)
+        or not _can_read_messages(channel, bot_member)
+        or not _can_read_private_thread(channel, bot_member)
+    ):
+        raise UserError("discord.agent_read_channel_forbidden")
     try:
         message = await channel.fetch_message(_snowflake(message_id, "message"))
     except discord.NotFound as exc:
@@ -3196,7 +6866,8 @@ async def _reply_context(
                 parent = await channel.fetch_message(reference.message_id)
             except (discord.NotFound, discord.DiscordException):
                 break
-        chunk = parent.content[:chunk_characters]
+        context_text = _message_context_text(parent)
+        chunk = context_text[:chunk_characters]
         records.append(
             DiscordReplyContextRecord(
                 message_id=str(parent.id),
@@ -3204,8 +6875,8 @@ async def _reply_context(
                 author_name=parent.author.display_name,
                 author_is_bot=parent.author.bot,
                 content_chunk=chunk,
-                content_length=len(parent.content),
-                complete=len(chunk) == len(parent.content),
+                content_length=len(context_text),
+                complete=len(chunk) == len(context_text),
                 created_at_iso=parent.created_at.isoformat(),
                 attachments=tuple(
                     _attachment_record(attachment) for attachment in parent.attachments
@@ -3222,11 +6893,12 @@ async def _reply_context(
 
 
 def _message_preview(content: str) -> tuple[str, bool]:
-    """Show all short content, otherwise a 25-character head and 5-character tail."""
+    """Keep enough surrounding text to identify a historical Discord message."""
 
-    if len(content) <= 30:
+    maximum = 240
+    if len(content) <= maximum:
         return content, False
-    return f"{content[:25]}…{content[-5:]}", True
+    return f"{content[:200]}…{content[-39:]}", True
 
 
 def _bounded_event_message(content: str) -> tuple[str, bool]:
@@ -3267,10 +6939,12 @@ async def _fetch_readable_message(
         raise UserError("discord.expand_unavailable")
     if context.transport == "agent":
         _assert_agent_channel_scope(context, channel_id)
-    else:
-        actor = await _actor_member(guild, context)
-        if not _can_read_messages(channel, actor) or not _can_read_private_thread(channel, actor):
-            raise UserError("discord.expand_unavailable")
+    actor = await _actor_member(guild, context)
+    if not _can_read_messages(channel, actor) or not _can_read_private_thread(
+        channel,
+        actor,
+    ):
+        raise UserError("discord.expand_unavailable")
     if not _can_read_messages(channel, bot_member) or not _can_read_private_thread(
         channel, bot_member
     ):

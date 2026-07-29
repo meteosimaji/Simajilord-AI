@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from .contracts import (
     AgentResponse,
     AgentResponseStatus,
     AgentTokenUsage,
+    AgentTrigger,
 )
 
 
@@ -28,6 +30,35 @@ class AgentConversationRecord:
     turn_count: int
     last_input_tokens: int
     model_context_window: int | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentPendingHostDelivery:
+    """One completed turn whose Discord response is not durably delivered."""
+
+    event_id: str
+    actor_id: str
+    workspace_id: str | None
+    channel_id: str
+    source_message_id: str | None
+    response_content: str
+    occurred_at: datetime
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHostDeliveryRecord:
+    """Body-free delivery evidence for one Discord response chunk."""
+
+    event_id: str
+    purpose: str
+    chunk_index: int
+    content_sha256: str
+    channel_id: str
+    message_id: str | None
+    receipted_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -60,6 +91,109 @@ class AgentConversationStore:
     async def completed_response(self, event_id: str) -> AgentResponse | None:
         async with self._lock:
             return await asyncio.to_thread(self._select_completed_response, event_id)
+
+    async def pending_host_deliveries(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[AgentPendingHostDelivery, ...]:
+        """Return completed turns whose host delivery still needs reconciliation."""
+
+        if limit < 1 or limit > 1_000:
+            raise ValueError("host delivery query limit must be between 1 and 1000")
+        async with self._lock:
+            return await asyncio.to_thread(self._pending_host_deliveries, limit)
+
+    async def pending_host_delivery(
+        self,
+        event_id: str,
+    ) -> AgentPendingHostDelivery | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._pending_host_delivery,
+                event_id,
+            )
+
+    async def plan_host_delivery(
+        self,
+        *,
+        event_id: str,
+        purpose: str,
+        channel_id: str,
+        contents: tuple[str, ...],
+    ) -> tuple[AgentHostDeliveryRecord, ...]:
+        """Persist body-free chunk intents before any Discord send."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._plan_host_delivery,
+                event_id,
+                purpose,
+                channel_id,
+                contents,
+            )
+
+    async def host_delivery_records(
+        self,
+        *,
+        event_id: str,
+        purpose: str,
+    ) -> tuple[AgentHostDeliveryRecord, ...]:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._host_delivery_records,
+                event_id,
+                purpose,
+            )
+
+    async def record_host_delivery_message(
+        self,
+        *,
+        event_id: str,
+        purpose: str,
+        chunk_index: int,
+        message_id: str,
+    ) -> AgentHostDeliveryRecord:
+        """Persist the Discord message ID without replacing prior evidence."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._record_host_delivery_message,
+                event_id,
+                purpose,
+                chunk_index,
+                message_id,
+            )
+
+    async def mark_host_delivery_receipted(
+        self,
+        *,
+        event_id: str,
+        purpose: str,
+        chunk_index: int,
+    ) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                self._mark_host_delivery_receipted,
+                event_id,
+                purpose,
+                chunk_index,
+            )
+
+    async def complete_host_delivery(
+        self,
+        event_id: str,
+        *,
+        allow_empty: bool = False,
+    ) -> bool:
+        """Mark a response delivered only after every planned chunk is receipted."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._complete_host_delivery,
+                event_id,
+                allow_empty,
+            )
 
     async def begin(self, request: AgentRequest, *, model: str) -> None:
         async with self._lock:
@@ -107,6 +241,7 @@ class AgentConversationStore:
         workspace_id: str | None,
         since: datetime,
         excluded_actor_ids: frozenset[str] = frozenset(),
+        included_triggers: frozenset[AgentTrigger] = frozenset(),
     ) -> tuple[int, datetime | None]:
         async with self._lock:
             return await asyncio.to_thread(
@@ -115,6 +250,7 @@ class AgentConversationStore:
                 workspace_id,
                 since,
                 excluded_actor_ids,
+                included_triggers,
             )
 
     async def token_usage_since(
@@ -171,8 +307,24 @@ class AgentConversationStore:
                     occurred_at TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     completed_at TEXT,
+                    host_delivered_at TEXT,
                     FOREIGN KEY(conversation_id)
                         REFERENCES agent_conversations(conversation_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_host_deliveries (
+                    event_id TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT,
+                    receipted_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(event_id, purpose, chunk_index),
+                    FOREIGN KEY(event_id)
+                        REFERENCES agent_requests(event_id) ON DELETE CASCADE
                 );
 
                 CREATE INDEX IF NOT EXISTS agent_requests_actor_started
@@ -181,6 +333,30 @@ class AgentConversationStore:
                     ON agent_requests(workspace_id, started_at);
                 CREATE INDEX IF NOT EXISTS agent_requests_completed
                     ON agent_requests(completed_at);
+                """
+            )
+            request_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(agent_requests)")
+            }
+            if "host_delivered_at" not in request_columns:
+                connection.execute(
+                    "ALTER TABLE agent_requests ADD COLUMN host_delivered_at TEXT"
+                )
+                # Pre-outbox responses were delivered synchronously. Treat them
+                # as terminal so the first upgraded start never reposts history.
+                connection.execute(
+                    """
+                    UPDATE agent_requests
+                    SET host_delivered_at = completed_at
+                    WHERE status = ? AND completed_at IS NOT NULL
+                    """,
+                    (AgentResponseStatus.COMPLETED.value,),
+                )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS agent_requests_host_pending
+                ON agent_requests(status, host_delivered_at, completed_at)
                 """
             )
             connection.commit()
@@ -255,6 +431,297 @@ class AgentConversationStore:
                 content=str(row["response_content"] or ""),
                 usage=_usage_from_row(row),
             )
+        finally:
+            connection.close()
+
+    def _pending_host_deliveries(
+        self,
+        limit: int,
+    ) -> tuple[AgentPendingHostDelivery, ...]:
+        connection = _connection(self.path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_id, actor_id, workspace_id, channel_id, message_id,
+                       response_content, occurred_at, completed_at
+                FROM agent_requests
+                WHERE status = ?
+                  AND trigger = ?
+                  AND host_delivered_at IS NULL
+                  AND completed_at IS NOT NULL
+                ORDER BY completed_at, event_id
+                LIMIT ?
+                """,
+                (
+                    AgentResponseStatus.COMPLETED.value,
+                    AgentTrigger.MENTION.value,
+                    limit,
+                ),
+            ).fetchall()
+            return tuple(_pending_host_delivery_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def _pending_host_delivery(
+        self,
+        event_id: str,
+    ) -> AgentPendingHostDelivery | None:
+        connection = _connection(self.path)
+        try:
+            row = connection.execute(
+                """
+                SELECT event_id, actor_id, workspace_id, channel_id, message_id,
+                       response_content, occurred_at, completed_at
+                FROM agent_requests
+                WHERE event_id = ?
+                  AND status = ?
+                  AND trigger = ?
+                  AND host_delivered_at IS NULL
+                  AND completed_at IS NOT NULL
+                """,
+                (
+                    event_id,
+                    AgentResponseStatus.COMPLETED.value,
+                    AgentTrigger.MENTION.value,
+                ),
+            ).fetchone()
+            return (
+                _pending_host_delivery_from_row(row)
+                if row is not None
+                else None
+            )
+        finally:
+            connection.close()
+
+    def _plan_host_delivery(
+        self,
+        event_id: str,
+        purpose: str,
+        channel_id: str,
+        contents: tuple[str, ...],
+    ) -> tuple[AgentHostDeliveryRecord, ...]:
+        normalized_event_id = event_id.strip()
+        normalized_purpose = purpose.strip()
+        normalized_channel_id = channel_id.strip()
+        if (
+            not normalized_event_id
+            or not normalized_purpose
+            or len(normalized_purpose) > 40
+            or not normalized_channel_id
+        ):
+            raise ValueError("host delivery identifiers must be bounded and non-empty")
+        if not contents:
+            return ()
+        if any(not content for content in contents):
+            raise ValueError("host delivery chunks must be non-empty")
+        now = datetime.now(UTC).isoformat()
+        connection = _connection(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            request_row = connection.execute(
+                "SELECT status FROM agent_requests WHERE event_id = ?",
+                (normalized_event_id,),
+            ).fetchone()
+            if (
+                request_row is None
+                or str(request_row["status"]) != AgentResponseStatus.COMPLETED.value
+            ):
+                raise ValueError("host delivery requires a completed agent request")
+            for index, content in enumerate(contents):
+                content_sha256 = hashlib.sha256(content.encode()).hexdigest()
+                connection.execute(
+                    """
+                    INSERT INTO agent_host_deliveries(
+                        event_id, purpose, chunk_index, content_sha256,
+                        channel_id, message_id, receipted_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    ON CONFLICT(event_id, purpose, chunk_index) DO NOTHING
+                    """,
+                    (
+                        normalized_event_id,
+                        normalized_purpose,
+                        index,
+                        content_sha256,
+                        normalized_channel_id,
+                        now,
+                        now,
+                    ),
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_host_deliveries
+                WHERE event_id = ? AND purpose = ?
+                ORDER BY chunk_index
+                """,
+                (normalized_event_id, normalized_purpose),
+            ).fetchall()
+            records = tuple(_host_delivery_from_row(row) for row in rows)
+            expected = tuple(
+                (
+                    index,
+                    hashlib.sha256(content.encode()).hexdigest(),
+                    normalized_channel_id,
+                )
+                for index, content in enumerate(contents)
+            )
+            actual = tuple(
+                (record.chunk_index, record.content_sha256, record.channel_id)
+                for record in records
+            )
+            if actual != expected:
+                raise ValueError("host delivery plan conflicts with persisted intent")
+            connection.commit()
+            return records
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _host_delivery_records(
+        self,
+        event_id: str,
+        purpose: str,
+    ) -> tuple[AgentHostDeliveryRecord, ...]:
+        connection = _connection(self.path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM agent_host_deliveries
+                WHERE event_id = ? AND purpose = ?
+                ORDER BY chunk_index
+                """,
+                (event_id, purpose),
+            ).fetchall()
+            return tuple(_host_delivery_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def _record_host_delivery_message(
+        self,
+        event_id: str,
+        purpose: str,
+        chunk_index: int,
+        message_id: str,
+    ) -> AgentHostDeliveryRecord:
+        normalized_message_id = message_id.strip()
+        if chunk_index < 0 or not normalized_message_id:
+            raise ValueError("host delivery message evidence is invalid")
+        now = datetime.now(UTC).isoformat()
+        connection = _connection(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM agent_host_deliveries
+                WHERE event_id = ? AND purpose = ? AND chunk_index = ?
+                """,
+                (event_id, purpose, chunk_index),
+            ).fetchone()
+            if row is None:
+                raise ValueError("host delivery intent does not exist")
+            existing_message_id = _optional_text(row["message_id"])
+            if (
+                existing_message_id is not None
+                and existing_message_id != normalized_message_id
+            ):
+                raise ValueError("host delivery already has different message evidence")
+            connection.execute(
+                """
+                UPDATE agent_host_deliveries
+                SET message_id = ?, updated_at = ?
+                WHERE event_id = ? AND purpose = ? AND chunk_index = ?
+                """,
+                (
+                    normalized_message_id,
+                    now,
+                    event_id,
+                    purpose,
+                    chunk_index,
+                ),
+            )
+            updated = connection.execute(
+                """
+                SELECT * FROM agent_host_deliveries
+                WHERE event_id = ? AND purpose = ? AND chunk_index = ?
+                """,
+                (event_id, purpose, chunk_index),
+            ).fetchone()
+            assert updated is not None
+            connection.commit()
+            return _host_delivery_from_row(updated)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _mark_host_delivery_receipted(
+        self,
+        event_id: str,
+        purpose: str,
+        chunk_index: int,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        connection = _connection(self.path)
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE agent_host_deliveries
+                SET receipted_at = COALESCE(receipted_at, ?), updated_at = ?
+                WHERE event_id = ? AND purpose = ? AND chunk_index = ?
+                  AND message_id IS NOT NULL
+                """,
+                (now, now, event_id, purpose, chunk_index),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("delivered message must exist before it is receipted")
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _complete_host_delivery(self, event_id: str, allow_empty: bool) -> bool:
+        now = datetime.now(UTC).isoformat()
+        connection = _connection(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(
+                           CASE
+                               WHEN message_id IS NOT NULL
+                                AND receipted_at IS NOT NULL
+                               THEN 1 ELSE 0
+                           END
+                       ) AS complete
+                FROM agent_host_deliveries
+                WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            assert row is not None
+            total = int(row["total"])
+            completed = int(row["complete"] or 0)
+            if (total == 0 and not allow_empty) or completed != total:
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                """
+                UPDATE agent_requests
+                SET host_delivered_at = COALESCE(host_delivered_at, ?)
+                WHERE event_id = ? AND status = ?
+                """,
+                (now, event_id, AgentResponseStatus.COMPLETED.value),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -494,16 +961,19 @@ class AgentConversationStore:
         workspace_id: str | None,
         since: datetime,
         excluded_actor_ids: frozenset[str],
+        included_triggers: frozenset[AgentTrigger],
     ) -> tuple[int, datetime | None]:
         connection = sqlite3.connect(self.path)
         try:
+            trigger_sql, trigger_values = _trigger_filter(included_triggers)
             if actor_id is not None:
                 row = connection.execute(
-                    """
-                    SELECT COUNT(*), MIN(started_at) FROM agent_requests
-                    WHERE actor_id = ? AND started_at >= ?
-                    """,
-                    (actor_id, since.isoformat()),
+                    (
+                        "SELECT COUNT(*), MIN(started_at) FROM agent_requests "
+                        "WHERE actor_id = ? AND started_at >= ?"
+                        f"{trigger_sql}"
+                    ),
+                    (actor_id, since.isoformat(), *trigger_values),
                 ).fetchone()
             elif workspace_id is not None:
                 exclusion_sql, exclusion_values = _actor_exclusion(excluded_actor_ids)
@@ -512,8 +982,14 @@ class AgentConversationStore:
                         "SELECT COUNT(*), MIN(started_at) FROM agent_requests "
                         "WHERE workspace_id = ? AND started_at >= ?"
                         f"{exclusion_sql}"
+                        f"{trigger_sql}"
                     ),
-                    (workspace_id, since.isoformat(), *exclusion_values),
+                    (
+                        workspace_id,
+                        since.isoformat(),
+                        *exclusion_values,
+                        *trigger_values,
+                    ),
                 ).fetchone()
             else:
                 raise ValueError("actor_id or workspace_id is required")
@@ -545,6 +1021,7 @@ class AgentConversationStore:
 def _connection(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
     return connection
 
 
@@ -558,6 +1035,42 @@ def _conversation_from_row(row: sqlite3.Row) -> AgentConversationRecord:
         turn_count=int(row["turn_count"]),
         last_input_tokens=int(row["last_input_tokens"]),
         model_context_window=int(context_window) if context_window is not None else None,
+        created_at=datetime.fromisoformat(str(row["created_at"])),
+        updated_at=datetime.fromisoformat(str(row["updated_at"])),
+    )
+
+
+def _pending_host_delivery_from_row(
+    row: sqlite3.Row,
+) -> AgentPendingHostDelivery:
+    completed_at = row["completed_at"]
+    assert completed_at is not None
+    return AgentPendingHostDelivery(
+        event_id=str(row["event_id"]),
+        actor_id=str(row["actor_id"]),
+        workspace_id=_optional_text(row["workspace_id"]),
+        channel_id=str(row["channel_id"]),
+        source_message_id=_optional_text(row["message_id"]),
+        response_content=str(row["response_content"] or ""),
+        occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
+        completed_at=datetime.fromisoformat(str(completed_at)),
+    )
+
+
+def _host_delivery_from_row(row: sqlite3.Row) -> AgentHostDeliveryRecord:
+    receipted_at = row["receipted_at"]
+    return AgentHostDeliveryRecord(
+        event_id=str(row["event_id"]),
+        purpose=str(row["purpose"]),
+        chunk_index=int(row["chunk_index"]),
+        content_sha256=str(row["content_sha256"]),
+        channel_id=str(row["channel_id"]),
+        message_id=_optional_text(row["message_id"]),
+        receipted_at=(
+            datetime.fromisoformat(str(receipted_at))
+            if receipted_at is not None
+            else None
+        ),
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
     )
@@ -585,6 +1098,16 @@ def _actor_exclusion(actor_ids: frozenset[str]) -> tuple[str, tuple[str, ...]]:
         return "", ()
     placeholders = ",".join("?" for _ in values)
     return f" AND actor_id NOT IN ({placeholders})", values
+
+
+def _trigger_filter(
+    triggers: frozenset[AgentTrigger],
+) -> tuple[str, tuple[str, ...]]:
+    values = tuple(sorted(trigger.value for trigger in triggers))
+    if not values:
+        return "", ()
+    placeholders = ",".join("?" for _ in values)
+    return f" AND trigger IN ({placeholders})", values
 
 
 def _conversation_profile(conversation_id: str) -> tuple[str, frozenset[str]]:

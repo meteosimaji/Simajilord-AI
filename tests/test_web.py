@@ -27,7 +27,7 @@ from simajilord.domain.web import (
 from simajilord.providers.web import AiohttpPublicWebFetcher, normalize_public_web_url
 from simajilord.providers.web import searxng as searxng_module
 from simajilord.providers.web.searxng import SearxngSearchProvider
-from simajilord.services.web import WebService
+from simajilord.services.web import WebService, _pdf_text
 
 
 class FakeSearchProvider:
@@ -151,6 +151,8 @@ async def test_fetch_chunks_and_find_reuse_one_safe_page_fetch() -> None:
     assert "Example page" not in fetched.text
     assert "ignore this phrase" not in fetched.text
     assert fetched.next_offset == 200
+    assert fetched.complete is False
+    assert fetched.source_truncated is False
     assert fetched.links == ("https://example.com/next",)
 
     found = await registry.invoke(
@@ -164,8 +166,56 @@ async def test_fetch_chunks_and_find_reuse_one_safe_page_fetch() -> None:
     )
     assert isinstance(found, WebFindResponse)
     assert found.total_matches == 20
+    assert found.source_truncated is False
     assert len(found.matches) == 3
     assert page_fetcher.calls == ["https://example.com/start"]
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_reports_when_extracted_source_is_truncated() -> None:
+    class LargePageFetcher(FakePageFetcher):
+        async def fetch(
+            self,
+            url: str,
+            *,
+            max_bytes: int,
+        ) -> FetchedWebResource:
+            assert max_bytes == 2_000_000
+            self.calls.append(url)
+            return FetchedWebResource(
+                final_url=url,
+                content_type="text/html",
+                charset="utf-8",
+                body=("<html><body><p>" + ("x" * 250_000) + "</p></body></html>").encode(),
+            )
+
+    search_provider = FakeSearchProvider()
+    page_fetcher = LargePageFetcher()
+    service = WebService(
+        search_provider=search_provider,
+        page_fetcher=page_fetcher,
+        max_fetch_bytes=2_000_000,
+    )
+    registry = CapabilityRegistry()
+    for capability in build_web_endpoints(service):
+        registry.register(capability)
+
+    fetched = await registry.invoke(
+        "web.fetch",
+        WebFetchRequest(
+            url="https://example.com/large",
+            offset=199_900,
+            max_characters=200,
+        ),
+        InvocationContext("actor", "workspace", "test", "request"),
+    )
+
+    assert isinstance(fetched, WebFetchResponse)
+    assert fetched.total_characters == 200_000
+    assert fetched.next_offset is None
+    assert fetched.source_truncated is True
+    assert fetched.complete is False
     await service.close()
 
 
@@ -233,6 +283,38 @@ def test_public_web_url_boundary_keeps_public_url_and_removes_fragment() -> None
 def test_public_fetcher_can_be_composed_before_an_event_loop_starts() -> None:
     fetcher = AiohttpPublicWebFetcher(timeout_seconds=5)
     assert fetcher.timeout_seconds == 5
+
+
+def test_web_pdf_reader_bounds_page_work_and_reports_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Page:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def extract_text(self) -> str:
+            return f"page {self.index}"
+
+    class Reader:
+        is_encrypted = False
+        metadata = None
+
+        def __init__(self) -> None:
+            self.pages = [Page(index) for index in range(201)]
+
+    monkeypatch.setattr(
+        "simajilord.services.web.PdfReader",
+        lambda *args, **kwargs: Reader(),
+    )
+    text, title, source_truncated = _pdf_text(
+        b"%PDF",
+        "https://example.com/large.pdf",
+    )
+
+    assert "page 199" in text
+    assert "page 200" not in text
+    assert title == "large.pdf"
+    assert source_truncated is True
 
 
 @pytest.mark.asyncio

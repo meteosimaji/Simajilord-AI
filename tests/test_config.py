@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
+from simajilord.agent import AgentAutonomyMode
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core.errors import ConfigurationError
 
@@ -18,8 +19,22 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_SAFE_COMPUTE_ACCESS",
     "AGENT_FILE_SANDBOX_ENABLED",
     "AGENT_CURATED_SKILLS_ENABLED",
+    "AGENT_MAX_TOOL_CALLS",
+    "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
+    "AGENT_MAX_PENDING_TURNS",
+    "MAX_ACTIVE_AGENT_TURNS",
+    "MAX_PENDING_AGENT_TURNS",
+    "MAX_PENDING_AGENT_TURNS_PER_USER",
     "AGENT_AUTONOMY_ENABLED",
     "AGENT_AUTONOMY_GUILD_IDS",
+    "AGENT_AUTONOMY_MODE",
+    "AGENT_AUTONOMY_BATCH_SECONDS",
+    "AGENT_AUTONOMY_INTERVAL_SECONDS",
+    "AGENT_AUTONOMY_MAX_RUNS",
+    "AGENT_AUTONOMY_CANDIDATE_LIMIT",
+    "AGENT_AUTONOMY_MAX_PENDING_EVENTS",
+    "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL",
+    "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_ACTOR",
     "WEB_SEARCH_BASE_URL",
     "WEB_SEARCH_SHARED_SECRET",
     "WEB_REQUEST_TIMEOUT_SECONDS",
@@ -92,6 +107,16 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_model == "gpt-5.6-terra"
     assert settings.agent_escalation_model == "gpt-5.6-terra"
     assert settings.agent_reasoning_effort == "medium"
+    assert settings.agent_max_tool_calls == 32
+    assert settings.agent_max_tool_output_characters == 24_000
+    assert settings.agent_max_active_turns == 4
+    assert settings.agent_max_pending_turns == 20
+    assert settings.agent_max_pending_turns_per_user == 2
+    assert settings.agent_autonomy_enabled is True
+    assert settings.agent_autonomy_mode is AgentAutonomyMode.ACT
+    assert settings.agent_autonomy_batch_seconds == 10
+    assert settings.agent_autonomy_max_runs == 0
+    assert settings.agent_autonomy_max_pending_events_per_actor == 50
 
 
 def test_agent_security_policies_are_explicit_and_typed(
@@ -138,6 +163,75 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.discord_emoji_radio_id is None
     assert settings.activity_enabled is False
     assert settings.activity_client_secret is None
+
+
+def test_safe_compute_requires_the_isolated_file_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_SAFE_COMPUTE_ACCESS", "everyone")
+    monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "false")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="AGENT_FILE_SANDBOX_ENABLED must be true",
+    ):
+        load_settings(dotenv_path=dotenv_path)
+
+
+def test_autonomy_mode_batching_and_unbounded_runs_are_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_ALLOWED_GUILD_IDS", "10")
+    monkeypatch.setenv("AGENT_AUTONOMY_GUILD_IDS", "10")
+    monkeypatch.setenv("AGENT_AUTONOMY_MODE", "assist")
+    monkeypatch.setenv("AGENT_AUTONOMY_BATCH_SECONDS", "5")
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_RUNS", "0")
+
+    settings = load_settings(dotenv_path=dotenv_path)
+
+    assert settings.agent_autonomy_enabled is True
+    assert settings.agent_autonomy_mode is AgentAutonomyMode.ASSIST
+    assert settings.agent_autonomy_batch_seconds == 5
+    assert settings.agent_autonomy_max_runs == 0
+
+    monkeypatch.setenv("AGENT_AUTONOMY_MODE", "unrestricted")
+    with pytest.raises(ConfigurationError, match="observe, assist, act"):
+        load_settings(dotenv_path=dotenv_path)
+
+
+def test_autonomy_per_channel_queue_cannot_exceed_global_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_PENDING_EVENTS", "5")
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL", "6")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="MAX_PENDING_EVENTS_PER_CHANNEL must not exceed",
+    ):
+        load_settings(dotenv_path=dotenv_path)
+
+
+def test_autonomy_per_actor_queue_cannot_exceed_global_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_PENDING_EVENTS", "5")
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL", "5")
+    monkeypatch.setenv("AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_ACTOR", "6")
+
+    with pytest.raises(
+        ConfigurationError,
+        match="MAX_PENDING_EVENTS_PER_ACTOR must not exceed",
+    ):
+        load_settings(dotenv_path=dotenv_path)
 
 
 def test_activity_requires_a_hidden_client_secret_when_enabled(
@@ -238,6 +332,21 @@ def test_admin_only_feature_requires_a_fixed_admin_id(
         ConfigurationError,
         match="AGENT_ADMIN_USER_IDS is required",
     ):
+        load_settings(dotenv_path=dotenv_path)
+
+
+def test_agent_tool_output_budget_accepts_eighty_thousand_character_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_MAX_TOOL_OUTPUT_CHARACTERS", "80000")
+
+    settings = load_settings(dotenv_path=dotenv_path)
+    assert settings.agent_max_tool_output_characters == 80_000
+
+    monkeypatch.setenv("AGENT_MAX_TOOL_OUTPUT_CHARACTERS", "80001")
+    with pytest.raises(ConfigurationError, match="must be between 500 and 80000"):
         load_settings(dotenv_path=dotenv_path)
 
 

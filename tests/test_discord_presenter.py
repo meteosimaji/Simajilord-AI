@@ -43,6 +43,7 @@ from simajilord.integrations.discord.cogs import (
 from simajilord.integrations.discord.presenter import (
     EmbedField,
     EmbedTone,
+    _bounded_quote_text,
     command_embed,
     expanded_message_embeds,
     expanded_message_view,
@@ -62,6 +63,12 @@ def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
     assert embed.footer.text is None
     assert embed.fields[0].name == "Status"
     assert embed.fields[0].value == "ok"
+
+
+def test_quote_text_respects_limits_shorter_than_its_suffix() -> None:
+    assert _bounded_quote_text("abcdef", maximum=0) == ""
+    assert _bounded_quote_text("abcdef", maximum=1) == "…"
+    assert _bounded_quote_text("abcdef", maximum=3) == "…"
 
 
 def test_async_progress_embed_has_loading_fallback_and_no_success_claim() -> None:
@@ -322,7 +329,8 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
     upcoming = next(field.value for field in embed.fields if field.name.startswith("Up Next"))
-    assert "Ends <t:" in (embed.description or "")
+    assert "Playing · duration `3:00`" in (embed.description or "")
+    assert "Ends <t:" not in (embed.description or "")
     assert "0:45 / 3:00" not in (embed.description or "")
     assert ":T>" not in (embed.description or "")
     assert "Next" in upcoming
@@ -336,6 +344,33 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert "Speed 1.25x" in fields["Tuning"]
     assert "Bob" in upcoming
     assert embed.thumbnail.url == "https://img.example.com/current.jpg"
+
+
+def test_track_loop_does_not_render_an_expiring_end_timestamp() -> None:
+    embed = music_queue_embed(
+        AudioQueueResponse(
+            current=AudioQueueItem(
+                title="Looped",
+                page_url="https://example.com/looped",
+                kind="music",
+                duration_seconds=180,
+                requested_by_name="Alice",
+            ),
+            pending=(),
+            paused=False,
+            loop_mode="track",
+            destination_id="123",
+            auto_leave=True,
+            position_seconds=175,
+            speed=1.0,
+            pitch=1.0,
+            waiting_for_voice=False,
+            connected=True,
+        )
+    )
+
+    assert "Looping track · `3:00` per loop" in (embed.description or "")
+    assert "Ends <t:" not in (embed.description or "")
 
 
 def test_music_embed_explains_explicit_resume_after_voice_reentry() -> None:
@@ -538,6 +573,8 @@ def test_web_fetch_embed_preserves_continuation_offset() -> None:
             total_characters=900,
             next_offset=213,
             links=(),
+            complete=False,
+            source_truncated=False,
         )
     )
     fields = {field.name: field.value for field in embed.fields}
