@@ -17,6 +17,8 @@ from simajilord.domain.audio import AudioItem, AudioKind
 log = logging.getLogger(__name__)
 _SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
 _EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
+_READ_ALOUD_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+_MUSIC_DUCK_GAIN = 0.25
 
 
 class _PrefetchedAudioSource(discord.AudioSource):
@@ -329,6 +331,11 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
     if item.start_seconds > 0:
         before_parts.extend(("-ss", f"{item.start_seconds:.3f}"))
     filters: list[str] = []
+    if item.kind is AudioKind.SPEECH:
+        # VOICEVOX output is materially quieter than mastered music at the same
+        # nominal volume. Normalise speech first, then retain the user-facing
+        # speech volume as a predictable multiplier.
+        filters.append(_READ_ALOUD_LOUDNESS_FILTER)
     if item.volume != 1.0:
         filters.append(f"volume={item.volume:.6f}")
     if item.pitch != 1.0:
@@ -348,18 +355,14 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
     options: list[str]
     if item.speech_overlay_source is not None:
         music_filter = ",".join(filters) if filters else "anull"
-        speech_filter = "aresample=48000"
+        speech_filter = f"aresample=48000,{_READ_ALOUD_LOUDNESS_FILTER}"
         if item.speech_overlay_volume != 1.0:
             speech_filter += f",volume={item.speech_overlay_volume:.6f}"
         filter_graph = (
-            f"[0:a]{speech_filter},asplit=2[speech_sc_raw][speech_mix_raw];"
-            "[speech_sc_raw]apad[speech_sc];"
-            "[speech_mix_raw]apad[speech_mix];"
-            f"[1:a]{music_filter}[music];"
-            "[music][speech_sc]sidechaincompress="
-            "threshold=0.015:ratio=8:attack=20:release=350[ducked];"
-            "[ducked][speech_mix]amix="
-            "inputs=2:duration=shortest:dropout_transition=0:normalize=0[sum];"
+            f"[0:a]{speech_filter}[speech];"
+            f"[1:a]{music_filter},volume={_MUSIC_DUCK_GAIN:.6f}[ducked];"
+            "[ducked][speech]amix="
+            "inputs=2:duration=longest:dropout_transition=0:normalize=0[sum];"
             "[sum]alimiter=limit=0.95:attack=5:release=50[mixed]"
         )
         options = ["-filter_complex", filter_graph, "-map", "[mixed]", "-vn"]

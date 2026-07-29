@@ -96,6 +96,7 @@ class AudioPlayResponse:
     destination_id: str | None
     playback_state: str
     requested_by_name: str | None
+    requested_by_id: str | None = None
     uploader: str | None = None
     thumbnail_url: str | None = None
 
@@ -112,6 +113,7 @@ class AudioQueueItem:
     kind: str
     duration_seconds: float
     requested_by_name: str | None
+    requested_by_id: str | None = None
     uploader: str | None = None
     thumbnail_url: str | None = None
     queue_lane: str = "request"
@@ -153,6 +155,7 @@ class AudioHistoryItem:
     duration_seconds: float
     requested_by_name: str | None
     played_at_epoch: int | None
+    requested_by_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,19 +301,23 @@ def build_audio_endpoints(
     ) -> AudioPlayResponse:
         workspace_id = _workspace(context)
         session = sessions.require(workspace_id)
-        item = await media.resolve_audio(
-            request.reference,
-            workspace_id=workspace_id,
-            priority=MediaPriority.INTERACTIVE,
-        )
-        item.requested_by_id = context.actor_id
-        item.requested_by_name = request.requested_by_name
-        item.request_source = context.transport
-        item.request_id = context.request_id
-        item.requested_at_epoch = int(time())
-        if not session.output.connected:
-            await session.wait_for_listener(context.actor_id)
-        position = await session.enqueue(item)
+        reservation = await session.reserve_manual_music_start()
+        try:
+            item = await media.resolve_audio(
+                request.reference,
+                workspace_id=workspace_id,
+                priority=MediaPriority.INTERACTIVE,
+            )
+            item.requested_by_id = context.actor_id
+            item.requested_by_name = request.requested_by_name
+            item.request_source = context.transport
+            item.request_id = context.request_id
+            item.requested_at_epoch = int(time())
+            if not session.output.connected:
+                await session.wait_for_listener(context.actor_id)
+            position = await session.enqueue(item)
+        finally:
+            await reservation.release()
         snapshot = await session.snapshot()
         if snapshot.current is not None:
             playback_state = "playing"
@@ -326,6 +333,7 @@ def build_audio_endpoints(
             destination_id=snapshot.destination_id,
             playback_state=playback_state,
             requested_by_name=item.requested_by_name,
+            requested_by_id=item.requested_by_id,
             uploader=item.uploader,
             thumbnail_url=item.thumbnail_url,
         )
@@ -376,6 +384,7 @@ def build_audio_endpoints(
                     duration_seconds=item.duration_seconds,
                     requested_by_name=item.requested_by_name,
                     played_at_epoch=item.played_at_epoch,
+                    requested_by_id=item.requested_by_id,
                 )
                 for item in snapshot.history[: request.limit]
                 if item.kind is AudioKind.MUSIC
@@ -838,6 +847,7 @@ def _queue_item(item: AudioItem) -> AudioQueueItem:
         kind=item.kind.value,
         duration_seconds=item.duration_seconds,
         requested_by_name=item.requested_by_name,
+        requested_by_id=item.requested_by_id,
         uploader=item.uploader,
         thumbnail_url=item.thumbnail_url,
         queue_lane=item.queue_lane.value,

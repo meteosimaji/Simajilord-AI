@@ -59,7 +59,9 @@ def test_discord_source_uses_bounded_fades(tmp_path) -> None:
         source.cleanup()
 
 
-def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> None:
+def test_discord_source_keeps_music_at_a_stable_duck_level_during_speech(
+    tmp_path,
+) -> None:
     music = tmp_path / "music.wav"
     speech = tmp_path / "speech.wav"
     for path, frame_count in (
@@ -86,10 +88,14 @@ def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> N
     )
     try:
         arguments = " ".join(str(value) for value in source._process.args)
-        assert "sidechaincompress=" in arguments
+        assert "sidechaincompress=" not in arguments
         assert "amix=" in arguments
-        assert "[1:a]volume=0.600000[music]" in arguments
-        assert "aresample=48000,volume=1.250000" in arguments
+        assert "duration=longest" in arguments
+        assert "[1:a]volume=0.600000,volume=0.250000[ducked]" in arguments
+        assert (
+            "aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11,"
+            "volume=1.250000"
+        ) in arguments
         assert "[mixed]" in arguments
         assert str(speech) in arguments
         packets = 0
@@ -98,5 +104,34 @@ def test_discord_source_mixes_speech_with_sidechain_music_ducking(tmp_path) -> N
         # Discord Opus packets are 20 ms. The old duration=longest graph ended
         # after the 100 ms speech input; the music source must remain near 1 s.
         assert packets >= 40
+    finally:
+        source.cleanup()
+
+
+def test_standalone_speech_is_loudness_normalized_before_user_volume(
+    tmp_path,
+) -> None:
+    speech = tmp_path / "speech.wav"
+    with wave.open(str(speech), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        output.writeframes(b"\0" * 9_600)
+
+    source = build_discord_audio_source(
+        AudioItem(
+            str(speech),
+            "Read aloud",
+            speech.as_uri(),
+            kind=AudioKind.SPEECH,
+            volume=1.25,
+        )
+    )
+    try:
+        arguments = " ".join(str(value) for value in source._process.args)
+        assert (
+            "loudnorm=I=-16:TP=-1.5:LRA=11,volume=1.250000"
+            in arguments
+        )
     finally:
         source.cleanup()

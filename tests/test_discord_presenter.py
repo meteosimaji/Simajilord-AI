@@ -279,7 +279,7 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert "Radio" not in fields["Playback"]
     assert "Levels" not in fields
     assert "Read aloud" not in fields
-    assert "requested by Alice" in (embed.description or "")
+    assert "requested\u00a0by\u00a0Alice" in (embed.description or "")
     assert "Current Artist" in (embed.description or "")
     assert "Speed 1.25x" in fields["Tuning"]
     assert "Bob" in upcoming
@@ -367,7 +367,7 @@ def test_audio_embed_uses_application_emoji_only_for_real_async_state() -> None:
     fields = {field.name: field.value for field in embed.fields}
     assert "<a:audio_wave:11>" in (embed.description or "")
     assert fields["<:radio:12> Radio"].startswith(
-        "<a:loading:10> Finding the next track…"
+        "<a:loading:10> Finding the next related track…"
     )
 
 

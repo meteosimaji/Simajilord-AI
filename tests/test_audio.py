@@ -1385,7 +1385,90 @@ async def test_mix_refills_after_automatic_lane_is_consumed() -> None:
     assert output.played[:2] == ["automatic-1", "automatic-2"]
     assert len(supplied) >= 2
     assert supplied[0] == (seed,)
-    assert supplied[1][-1] == "https://www.youtube.com/watch?v=auto1"
+    # Generated Radio tracks must not silently replace the listener's station
+    # intent. Every refill remains anchored to the explicit seed.
+    assert supplied[1] == (seed,)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_idle_manual_start_reservation_wins_an_inflight_radio_refill() -> None:
+    supplier_started = asyncio.Event()
+    supplier_cancelled = asyncio.Event()
+
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        del seeds, limit
+        supplier_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            supplier_cancelled.set()
+            raise
+        return ()
+
+    output = FakeOutput()
+    session = AudioSession(
+        "guild",
+        output,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    await session.enable_autoplay(("https://www.youtube.com/watch?v=seed",))
+    await supplier_started.wait()
+
+    reservation = await session.reserve_manual_music_start()
+    await supplier_cancelled.wait()
+    await session.enqueue(
+        AudioItem(
+            "manual-stream",
+            "manual-request",
+            "https://www.youtube.com/watch?v=manual",
+            resolver_reference="https://www.youtube.com/watch?v=manual",
+            requested_by_id="listener",
+        )
+    )
+    await reservation.release()
+
+    for _ in range(50):
+        if output.played:
+            break
+        await asyncio.sleep(0)
+    assert output.played == ["manual-request"]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_radio_seeds_replace_an_older_station_intent() -> None:
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        del seeds, limit
+        return ()
+
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession(
+        "guild",
+        output,
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    await session.enable_autoplay(("https://www.youtube.com/watch?v=old",))
+    await session.enable_autoplay(
+        (
+            "https://www.youtube.com/watch?v=new-one",
+            "https://www.youtube.com/watch?v=new-two",
+        )
+    )
+
+    assert (await session.snapshot()).mix_seed_references == (
+        "https://www.youtube.com/watch?v=new-one",
+        "https://www.youtube.com/watch?v=new-two",
+    )
     await session.close()
 
 

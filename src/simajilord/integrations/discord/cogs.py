@@ -197,16 +197,10 @@ _ERROR_MESSAGES = {
     "audio.capacity_reached": "The concurrent voice-server limit has been reached.",
     "audio.history_limit_invalid": "History limit must be between 1 and 25.",
     "audio.loop_mode_required": "Choose a loop mode.",
-    "audio.loop_mix_conflict": (
-        "Radio is on. Turn it off before enabling Loop."
-    ),
-    "audio.mix_loop_conflict": (
-        "Loop is on. Turn it off before enabling Radio."
-    ),
+    "audio.loop_mix_conflict": ("Radio is on. Turn it off before enabling Loop."),
+    "audio.mix_loop_conflict": ("Loop is on. Turn it off before enabling Radio."),
     "audio.mix_seed_limit": "Radio accepts at most eight seed tracks.",
-    "audio.mix_seed_required": (
-        "Provide a public seed track or add music before starting Radio."
-    ),
+    "audio.mix_seed_required": ("Provide a public seed track or add music before starting Radio."),
     "audio.mix_unavailable": "Radio is unavailable in this environment.",
     "audio.not_paused": "Playback is not paused.",
     "audio.nothing_playing": "No track is playing.",
@@ -222,9 +216,7 @@ _ERROR_MESSAGES = {
     "audio.search_limit_invalid": "Search limit must be between 1 and 10.",
     "audio.session_closed": "This audio session has ended.",
     "audio.session_missing": "This server has no audio session.",
-    "audio.same_voice_required": (
-        "Join the same voice channel as the BOT to control audio."
-    ),
+    "audio.same_voice_required": ("Join the same voice channel as the BOT to control audio."),
     "audio.waiting_queue_restricted": (
         "Only the requester may start or alter a queue waiting for voice."
     ),
@@ -284,9 +276,7 @@ _ERROR_MESSAGES = {
     "discord.member_lookup_failed": (
         "Could not retrieve the member from Discord. Try again shortly."
     ),
-    "discord.member_required": (
-        "Could not resolve that member in this server."
-    ),
+    "discord.member_required": ("Could not resolve that member in this server."),
     "discord.expand_cross_guild_forbidden": "Messages from another server cannot be expanded.",
     "discord.expand_unavailable": (
         "This message cannot be expanded. Check that you can view the source."
@@ -295,26 +285,17 @@ _ERROR_MESSAGES = {
         "Cannot post the expanded message here. Check the BOT's Send Messages "
         "and Embed Links permissions."
     ),
-    "discord.expand_failed": (
-        "Could not retrieve the source message from Discord."
-    ),
+    "discord.expand_failed": ("Could not retrieve the source message from Discord."),
     "discord.quote_destination_unavailable": (
-        "Cannot post the quote here. Check the BOT's Send Messages and "
-        "Attach Files permissions."
+        "Cannot post the quote here. Check the BOT's Send Messages and Attach Files permissions."
     ),
-    "discord.quote_failed": (
-        "Could not send the quote image to Discord."
-    ),
-    "discord.quote_render_failed": (
-        "Could not render the quote image. Check the source message."
-    ),
+    "discord.quote_failed": ("Could not send the quote image to Discord."),
+    "discord.quote_render_failed": ("Could not render the quote image. Check the source message."),
     "discord.manage_guild_required": (
         "Manage Server permission is required. Ask an administrator to run "
         "`/readaloud setup` to change managed routes."
     ),
-    "read_aloud.route_fields_required": (
-        "Choose a conversation source and a voice destination."
-    ),
+    "read_aloud.route_fields_required": ("Choose a conversation source and a voice destination."),
     "read_aloud.destination_conflict": "Read aloud is configured for another VC.",
     "read_aloud.source_channel_required": "Choose a conversation source.",
     "read_aloud.source_channel_limit": "Choose between 1 and 25 source channels.",
@@ -520,7 +501,9 @@ def _parse_position(value: str) -> tuple[float, bool]:
     return sign * float(seconds), relative
 
 
-def _requester(name: str | None) -> str:
+def _requester(name: str | None, actor_id: str | None = None) -> str:
+    if actor_id and actor_id.isdigit():
+        return f"<@{actor_id}>"
     return discord.utils.escape_markdown(name) if name else "Unknown"
 
 
@@ -528,7 +511,10 @@ def _queue_requester(item: object) -> str:
     lane = getattr(item, "queue_lane", "request")
     if lane == "autoplay":
         return "Radio"
-    return _requester(getattr(item, "requested_by_name", None))
+    return _requester(
+        getattr(item, "requested_by_name", None),
+        getattr(item, "requested_by_id", None),
+    )
 
 
 def _loop_mode_label(mode: str) -> str:
@@ -609,7 +595,10 @@ def music_added_embed(response: AudioPlayResponse) -> discord.Embed:
     fields = [
         EmbedField("Status", playback, inline=False),
         EmbedField("Duration", _duration(response.duration_seconds)),
-        EmbedField("Requested by", _requester(response.requested_by_name)),
+        EmbedField(
+            "Requested by",
+            _requester(response.requested_by_name, response.requested_by_id),
+        ),
     ]
     if response.uploader:
         fields.append(EmbedField("Source", discord.utils.escape_markdown(response.uploader)))
@@ -667,14 +656,12 @@ def music_queue_embed(
                 f"### {audio_wave_emoji} "
                 f"{_media_title_link(current.title, current.page_url, maximum=96)}"
                 if current.kind == AudioKind.SPEECH.value
-                else (
-                    f"### {_media_title_link(current.title, current.page_url, maximum=96)}"
-                )
+                else (f"### {_media_title_link(current.title, current.page_url, maximum=96)}")
             ),
             timing,
             (
                 f"{_compact_panel_text(uploader, maximum=54)} · "
-                f"requested by {_queue_requester(current)}"
+                f"requested\u00a0by\u00a0{_queue_requester(current)}"
             ),
         ]
 
@@ -699,7 +686,7 @@ def music_queue_embed(
     if response.music_volume_percent != 100 or response.speech_volume_percent != 100:
         fields.append(
             EmbedField(
-                "Levels",
+                "Mix levels",
                 f"Music **{response.music_volume_percent}%** · "
                 f"Read aloud **{response.speech_volume_percent}%**",
                 inline=False,
@@ -732,19 +719,23 @@ def music_queue_embed(
             )
         )
     if response.autoplay_enabled:
-        autoplay_text = (
-            _media_title_link(
+        if response.autoplay_next is not None:
+            autoplay_text = _media_title_link(
                 response.autoplay_next.title,
                 response.autoplay_next.page_url,
                 maximum=80,
             )
-            if response.autoplay_next is not None
-            else f"{loading_emoji} Finding the next track…"
-        )
+        elif upcoming:
+            count = len(upcoming)
+            autoplay_text = (
+                f"Waiting behind **{count} manual {'request' if count == 1 else 'requests'}**."
+            )
+        else:
+            autoplay_text = f"{loading_emoji} Finding the next related track…"
         fields.append(
             EmbedField(
                 f"{radio_emoji} Radio",
-                f"{autoplay_text}\nManual requests take priority.",
+                f"{autoplay_text}\nYour requests always play first.",
                 inline=False,
             )
         )
@@ -914,6 +905,25 @@ class MusicDashboardManager:
         self._repost_tasks.clear()
         self._expiry_tasks.clear()
 
+    async def dismiss(self, workspace_id: str) -> None:
+        """Delete the visible panel while preserving the durable audio session."""
+
+        for tasks in (self._repost_tasks, self._expiry_tasks):
+            task = tasks.pop(workspace_id, None)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+        async with self._locks.setdefault(workspace_id, asyncio.Lock()):
+            message = self._messages.get(workspace_id)
+            if message is None:
+                message = await self._fetch_stored_message(workspace_id)
+            if message is not None:
+                with suppress(discord.DiscordException):
+                    await message.delete()
+            self._messages.pop(workspace_id, None)
+            self._fingerprints.pop(workspace_id, None)
+            if self._stored_messages.pop(workspace_id, None) is not None:
+                await self._persist_stored_messages()
+
     async def prune_stale_records(self, valid_workspace_ids: frozenset[str]) -> int:
         """Drop dashboard pointers for guilds the BOT no longer belongs to."""
 
@@ -967,9 +977,7 @@ class MusicDashboardManager:
         if (
             not force
             and response.current is None
-            and not any(
-                item.kind == AudioKind.MUSIC.value for item in response.pending
-            )
+            and not any(item.kind == AudioKind.MUSIC.value for item in response.pending)
             and not response.autoplay_enabled
             and response.destination_id is None
             and not response.waiting_for_voice
@@ -1049,8 +1057,7 @@ class MusicDashboardManager:
                     return
                 if status == 429:
                     log.warning(
-                        "Music dashboard edit remained rate-limited after one retry "
-                        "guild=%s",
+                        "Music dashboard edit remained rate-limited after one retry guild=%s",
                         workspace_id,
                     )
                     return
@@ -1063,8 +1070,7 @@ class MusicDashboardManager:
                 if code == 30046:
                     await self._record_metric("discord.dashboard_30046", "rollover")
                 log.warning(
-                    "Could not edit music dashboard; posting a replacement "
-                    "guild=%s error=%s",
+                    "Could not edit music dashboard; posting a replacement guild=%s error=%s",
                     workspace_id,
                     edit_error,
                 )
@@ -1078,10 +1084,7 @@ class MusicDashboardManager:
                 if self._stored_messages.get(workspace_id) != stored_message:
                     self._stored_messages[workspace_id] = stored_message
                     await self._persist_stored_messages()
-                if (
-                    obsolete_message is not None
-                    and obsolete_message.id != current_message.id
-                ):
+                if obsolete_message is not None and obsolete_message.id != current_message.id:
                     with suppress(discord.DiscordException):
                         await obsolete_message.delete()
                 self._refresh_expiry(
@@ -1327,10 +1330,7 @@ def _audio_dashboard_is_idle(response: AudioQueueResponse) -> bool:
 
     return (
         response.current is None
-        and not any(
-            item.kind == AudioKind.MUSIC.value
-            for item in response.pending
-        )
+        and not any(item.kind == AudioKind.MUSIC.value for item in response.pending)
         and not response.waiting_for_voice
         and not response.voice_activation_required
         and not response.connected
@@ -1397,7 +1397,8 @@ def music_history_embed(response: AudioHistoryResponse) -> discord.Embed:
         when = f" · <t:{item.played_at_epoch}:R>" if item.played_at_epoch else ""
         lines.append(
             f"`{index:02d}` {_media_title_link(item.title, item.page_url, maximum=80)} · "
-            f"`{_duration(item.duration_seconds)}` · {_requester(item.requested_by_name)}{when}"
+            f"`{_duration(item.duration_seconds)}` · "
+            f"{_requester(item.requested_by_name, item.requested_by_id)}{when}"
         )
     return command_embed("Playback history", description="\n".join(lines))
 
@@ -1766,9 +1767,7 @@ class MusicControlsView(discord.ui.View):
         if response is None:
             return
         active = response.current is not None
-        has_manual_queue = any(
-            item.kind == AudioKind.MUSIC.value for item in response.pending
-        )
+        has_manual_queue = any(item.kind == AudioKind.MUSIC.value for item in response.pending)
         can_start = response.waiting_for_voice or response.voice_activation_required
         if not can_start:
             self.remove_item(self.start_button)
@@ -1894,24 +1893,27 @@ class MusicControlsView(discord.ui.View):
         current = LoopMode(response.loop_mode)
         next_mode = modes[(modes.index(current) + 1) % len(modes)]
         if response.autoplay_enabled and next_mode is not LoopMode.NONE:
+            conflict_view = LoopMixConflictView(
+                self.runtime,
+                self.dashboard,
+                requester_id=interaction.user.id,
+                loop_mode=next_mode,
+            )
             await interaction.response.send_message(
                 embed=command_embed(
                     "Radio is on",
                     description=(
                         "Loop and Radio cannot run together.\n"
                         "Switch Radio off and use "
-                        f"**{_loop_mode_label(next_mode.value)} loop**?"
+                        f"**{_loop_mode_label(next_mode.value)} loop**?\n"
+                        "Confirm within **1 minute**."
                     ),
                     tone=EmbedTone.WARNING,
                 ),
-                view=LoopMixConflictView(
-                    self.runtime,
-                    self.dashboard,
-                    requester_id=interaction.user.id,
-                    loop_mode=next_mode,
-                ),
+                view=conflict_view,
                 ephemeral=True,
             )
+            await conflict_view.bind_to_original_response(interaction)
             return
         await self._run(
             interaction,
@@ -1933,26 +1935,26 @@ class MusicControlsView(discord.ui.View):
                     invocation_context(interaction),
                 ),
             )
-            if (
-                not current.autoplay_enabled
-                and LoopMode(current.loop_mode) is not LoopMode.NONE
-            ):
+            if not current.autoplay_enabled and LoopMode(current.loop_mode) is not LoopMode.NONE:
+                conflict_view = LoopMixConflictView(
+                    self.runtime,
+                    self.dashboard,
+                    requester_id=interaction.user.id,
+                )
                 await interaction.response.send_message(
                     embed=command_embed(
                         "Loop is on",
                         description=(
                             "Loop and Radio cannot run together.\n"
-                            "Turn Loop off and switch to **Radio**?"
+                            "Turn Loop off and switch to **Radio**?\n"
+                            "Confirm within **1 minute**."
                         ),
                         tone=EmbedTone.WARNING,
                     ),
-                    view=LoopMixConflictView(
-                        self.runtime,
-                        self.dashboard,
-                        requester_id=interaction.user.id,
-                    ),
+                    view=conflict_view,
                     ephemeral=True,
                 )
+                await conflict_view.bind_to_original_response(interaction)
                 return
             await interaction.response.defer()
             await self.runtime.registry.invoke(
@@ -1998,7 +2000,7 @@ class MusicControlsView(discord.ui.View):
                 emoji="📋",
             ),
             discord.SelectOption(
-                label="Levels",
+                label="Mix levels",
                 value="levels",
                 description="Set music and read-aloud volume",
                 emoji="🔊",
@@ -2325,39 +2327,43 @@ class MusicAddModal(discord.ui.Modal, title="Add music"):
             if self.dashboard is not None:
                 self.dashboard.bind(interaction.guild_id, interaction.channel_id)
             bot = cast(commands.Bot, interaction.client)
-            _discord_audio_session(bot, self.runtime, interaction.guild_id)
-            reference = str(self.reference).strip()
-            selected_reference = reference
-            if "://" not in reference:
-                search = cast(
-                    AudioSearchResponse,
-                    await self.runtime.registry.invoke(
-                        "audio.search",
-                        AudioSearchRequest(query=reference, limit=5),
-                        invocation_context(interaction),
-                    ),
-                )
-                if search.selection_required:
-                    await interaction.edit_original_response(
-                        embed=music_search_embed(search),
-                        view=MusicSearchChoiceView(
-                            bot,
-                            self.runtime,
-                            search,
-                            requester_id=interaction.user.id,
-                            requester_name=interaction.user.display_name,
+            session = _discord_audio_session(bot, self.runtime, interaction.guild_id)
+            reservation = await session.reserve_manual_music_start()
+            try:
+                reference = str(self.reference).strip()
+                selected_reference = reference
+                if "://" not in reference:
+                    search = cast(
+                        AudioSearchResponse,
+                        await self.runtime.registry.invoke(
+                            "audio.search",
+                            AudioSearchRequest(query=reference, limit=5),
+                            invocation_context(interaction),
                         ),
                     )
-                    return
-                if search.selected_index is None:
-                    raise UserError("audio.search_empty")
-                selected_reference = search.candidates[search.selected_index].reference
-            response = await _enqueue_interaction_track(
-                self.runtime,
-                interaction,
-                reference=selected_reference,
-                requested_by_name=interaction.user.display_name,
-            )
+                    if search.selection_required:
+                        await interaction.edit_original_response(
+                            embed=music_search_embed(search),
+                            view=MusicSearchChoiceView(
+                                bot,
+                                self.runtime,
+                                search,
+                                requester_id=interaction.user.id,
+                                requester_name=interaction.user.display_name,
+                            ),
+                        )
+                        return
+                    if search.selected_index is None:
+                        raise UserError("audio.search_empty")
+                    selected_reference = search.candidates[search.selected_index].reference
+                response = await _enqueue_interaction_track(
+                    self.runtime,
+                    interaction,
+                    reference=selected_reference,
+                    requested_by_name=interaction.user.display_name,
+                )
+            finally:
+                await reservation.release()
             await interaction.edit_original_response(
                 embed=music_added_embed(response),
                 view=None,
@@ -2366,7 +2372,7 @@ class MusicAddModal(discord.ui.Modal, title="Add music"):
             await edit_deferred_error(interaction, exc)
 
 
-class AudioLevelsModal(discord.ui.Modal, title="Audio levels"):
+class AudioLevelsModal(discord.ui.Modal, title="Mix levels"):
     music: discord.ui.TextInput[AudioLevelsModal] = discord.ui.TextInput(
         label="Music volume (0-200%)",
         placeholder="100",
@@ -2433,6 +2439,8 @@ def _bounded_percent(value: str, *, label: str) -> int:
 class LoopMixConflictView(discord.ui.View):
     """Ask before replacing one mutually exclusive playback mode."""
 
+    _TIMEOUT_SECONDS = 60
+
     def __init__(
         self,
         runtime: SimajilordRuntime,
@@ -2442,15 +2450,31 @@ class LoopMixConflictView(discord.ui.View):
         loop_mode: LoopMode | None = None,
         seed_references: tuple[str, ...] = (),
     ) -> None:
-        super().__init__(timeout=60)
+        super().__init__(timeout=self._TIMEOUT_SECONDS)
         self.runtime = runtime
         self.dashboard = dashboard
         self.requester_id = requester_id
         self.loop_mode = loop_mode
         self.seed_references = seed_references
-        self.confirm_button.label = (
-            "Switch to Radio" if loop_mode is None else "Switch to Loop"
-        )
+        self.message: discord.InteractionMessage | None = None
+        self.confirm_button.label = "Switch to Radio" if loop_mode is None else "Switch to Loop"
+
+    async def bind_to_original_response(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """Remember the ephemeral response so expired controls can be disabled."""
+
+        with suppress(discord.DiscordException):
+            self.message = await interaction.original_response()
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message is not None:
+            with suppress(discord.DiscordException):
+                await self.message.edit(view=self)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id:
@@ -2501,8 +2525,7 @@ class LoopMixConflictView(discord.ui.View):
                 )
                 title = "Switched to Loop"
                 description = (
-                    "Radio is off. Loop is now "
-                    f"**{_loop_mode_label(self.loop_mode.value)}**."
+                    f"Radio is off. Loop is now **{_loop_mode_label(self.loop_mode.value)}**."
                 )
             await interaction.edit_original_response(
                 embed=command_embed(
@@ -2512,6 +2535,7 @@ class LoopMixConflictView(discord.ui.View):
                 ),
                 view=None,
             )
+            self.stop()
         except Exception as exc:
             await edit_deferred_error(interaction, exc)
 
@@ -2532,6 +2556,8 @@ class LoopMixConflictView(discord.ui.View):
             ),
             view=None,
         )
+        self.stop()
+
 
 def invocation_context(interaction: discord.Interaction) -> InvocationContext:
     return InvocationContext(
@@ -2573,9 +2599,7 @@ def async_progress_embed(
 
     return command_embed(
         "Working",
-        description=(
-            f"{application_emoji(client, ApplicationEmojiName.LOADING)} {text}"
-        ),
+        description=(f"{application_emoji(client, ApplicationEmojiName.LOADING)} {text}"),
     )
 
 
@@ -2730,15 +2754,11 @@ class FocusTimerCog(commands.Cog):
                     invocation_context(interaction),
                 ),
             )
-            timer = (
-                await self.runtime.focus_timer.active(
-                    workspace_id=workspace_id,
-                    actor_id=str(interaction.user.id),
-                )
+            timer = await self.runtime.focus_timer.active(
+                workspace_id=workspace_id,
+                actor_id=str(interaction.user.id),
             )
-            created = next(
-                item for item in timer if item.timer_id == response.timer.timer_id
-            )
+            created = next(item for item in timer if item.timer_id == response.timer.timer_id)
             await interaction.response.send_message(
                 embed=command_embed(
                     "Focus Timer started",
@@ -2813,11 +2833,7 @@ class FocusTimerCog(commands.Cog):
 
     async def _deliver_voice(self, timer: FocusTimer) -> None:
         session = self.runtime.audio.find(timer.workspace_id)
-        if (
-            session is None
-            or not session.output.connected
-            or session.destination_id is None
-        ):
+        if session is None or not session.output.connected or session.destination_id is None:
             return
         guild = self.bot.get_guild(int(timer.workspace_id))
         if guild is None:
@@ -2870,10 +2886,7 @@ async def _restore_focus_read_aloud(
 def _help_overview_embed() -> discord.Embed:
     fields = tuple(
         EmbedField(
-            (
-                f"{category} · "
-                f"{sum(entry.category == category for entry in HELP_ENTRIES)} commands"
-            ),
+            (f"{category} · {sum(entry.category == category for entry in HELP_ENTRIES)} commands"),
             description,
             inline=False,
         )
@@ -2902,15 +2915,25 @@ def _help_category_embed(category: str) -> discord.Embed:
         )
         for entry in entries
     )
+    command_groups: list[list[str]] = []
+    for line in lines:
+        if command_groups and len("\n".join((*command_groups[-1], line))) <= 1024:
+            command_groups[-1].append(line)
+        else:
+            command_groups.append([line])
+    command_fields = tuple(
+        EmbedField(
+            "Commands" if index == 0 else "Commands · continued",
+            "\n".join(group),
+            inline=False,
+        )
+        for index, group in enumerate(command_groups)
+    )
     return command_embed(
         category,
         description=HELP_CATEGORY_DESCRIPTIONS[category],
         fields=(
-            EmbedField(
-                "Commands",
-                "\n".join(lines),
-                inline=False,
-            ),
+            *command_fields,
             EmbedField(
                 "Next",
                 "Choose a command below to see its complete usage and examples.",
@@ -2924,9 +2947,7 @@ def _help_entry_embed(entry: PublicCommandSpec) -> discord.Embed:
     examples = "\n".join(f"`{example}`" for example in entry.examples)
     permissions = "\n".join(f"• {item}" for item in entry.permissions)
     side_effects = (
-        "\n".join(f"• {item}" for item in entry.side_effects)
-        if entry.side_effects
-        else "None."
+        "\n".join(f"• {item}" for item in entry.side_effects) if entry.side_effects else "None."
     )
     notes = "\n".join(f"• {note}" for note in entry.notes) if entry.notes else "None."
     common_errors = "\n".join(f"• {item}" for item in entry.common_errors)
@@ -2981,8 +3002,7 @@ class HelpView(discord.ui.View):
         topic_control = next(
             child
             for child in self.children
-            if isinstance(child, discord.ui.Select)
-            and child.placeholder == "Choose a command"
+            if isinstance(child, discord.ui.Select) and child.placeholder == "Choose a command"
         )
         topic_control.options = [
             discord.SelectOption(
@@ -3078,9 +3098,7 @@ class HelpCog(commands.Cog):
         matches = tuple(
             entry
             for entry in HELP_ENTRIES
-            if not query
-            or query in entry.topic.casefold()
-            or query in entry.summary.casefold()
+            if not query or query in entry.topic.casefold() or query in entry.summary.casefold()
         )
         return [
             app_commands.Choice(
@@ -3276,11 +3294,7 @@ class SystemCog(commands.Cog):
                         (
                             f"Used: **{_storage_size(response.storage_used_bytes)}** / "
                             f"{_storage_size(response.storage_limit_bytes)}"
-                            + (
-                                " · **Limit exceeded**"
-                                if response.storage_over_capacity
-                                else ""
-                            )
+                            + (" · **Limit exceeded**" if response.storage_over_capacity else "")
                             + f"\nQueued audio: **{response.queued_audio_count}**"
                             + (
                                 "\nLast cleanup: "
@@ -3424,11 +3438,7 @@ class MusicCog(commands.Cog):
         message: discord.Message,
     ) -> None:
         attachment = next(
-            (
-                item
-                for item in message.attachments
-                if attachment_can_play(item)
-            ),
+            (item for item in message.attachments if attachment_can_play(item)),
             None,
         )
         if attachment is None:
@@ -3527,23 +3537,26 @@ class MusicCog(commands.Cog):
                     ),
                 )
                 if LoopMode(current.loop_mode) is not LoopMode.NONE:
+                    conflict_view = LoopMixConflictView(
+                        self.runtime,
+                        self.dashboard,
+                        requester_id=interaction.user.id,
+                        seed_references=references,
+                    )
                     await interaction.response.send_message(
                         embed=command_embed(
                             "Loop is on",
                             description=(
                                 "Loop and Radio cannot run together.\n"
-                                "Would you like to turn off Loop and switch to **Radio**?"
+                                "Would you like to turn off Loop and switch to **Radio**?\n"
+                                "Confirm within **1 minute**."
                             ),
                             tone=EmbedTone.WARNING,
                         ),
-                        view=LoopMixConflictView(
-                            self.runtime,
-                            self.dashboard,
-                            requester_id=interaction.user.id,
-                            seed_references=references,
-                        ),
+                        view=conflict_view,
                         ephemeral=True,
                     )
+                    await conflict_view.bind_to_original_response(interaction)
                     return
             response = cast(
                 AudioMixResponse,
@@ -3563,9 +3576,7 @@ class MusicCog(commands.Cog):
                     "automatic selections."
                 )
             else:
-                description = (
-                    "Automatic selection is off. Pending manual requests are unchanged."
-                )
+                description = "Automatic selection is off. Pending manual requests are unchanged."
             await interaction.response.send_message(
                 embed=command_embed(
                     "Radio started" if response.enabled else "Radio stopped",
@@ -3646,8 +3657,7 @@ class MusicCog(commands.Cog):
                 message = f"Moved playback to `{formatted_position}`."
             elif response.action == AudioAction.TUNE.value:
                 message = (
-                    f"Speed **{response.speed:.2f}x** · "
-                    f"Pitch **{response.pitch:.2f}x**"
+                    f"Speed **{response.speed:.2f}x** · Pitch **{response.pitch:.2f}x**"
                     if response.speed is not None and response.pitch is not None
                     else "Playback tuning updated."
                 )
@@ -3980,8 +3990,7 @@ class YouTubeLinkCardCog(commands.Cog):
                 embed=command_embed(
                     "YouTube",
                     description=(
-                        "Play now, add without joining a VC, "
-                        "or use this track to start Radio."
+                        "Play now, add without joining a VC, or use this track to start Radio."
                     ),
                     tone=EmbedTone.INFO,
                 ),
@@ -4215,8 +4224,7 @@ def _read_aloud_setup(
     embed = command_embed(
         "Audio · Read aloud",
         description=(
-            "Choose up to 25 text channels, threads, or voice-channel chats, "
-            "then select **Start**."
+            "Choose up to 25 text channels, threads, or voice-channel chats, then select **Start**."
         ),
         fields=(
             EmbedField("Current channel", source.mention),
@@ -4519,11 +4527,7 @@ class ReadAloudCog(commands.Cog):
                             "Entries",
                             (
                                 f"{len(policy.dictionary)}"
-                                + (
-                                    " · showing the first 20"
-                                    if len(policy.dictionary) > 20
-                                    else ""
-                                )
+                                + (" · showing the first 20" if len(policy.dictionary) > 20 else "")
                             ),
                         ),
                     ),
@@ -4838,10 +4842,7 @@ class ReadAloudCog(commands.Cog):
     ) -> None:
         try:
             member = interaction.user
-            if (
-                not isinstance(member, discord.Member)
-                or not member.guild_permissions.manage_guild
-            ):
+            if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
                 raise UserError("Manage Server permission is required.")
             policy = cast(
                 ReadAloudPolicyResponse,
@@ -4889,11 +4890,7 @@ class ReadAloudCog(commands.Cog):
         preset: app_commands.Choice[str],
     ) -> None:
         try:
-            selected = (
-                None
-                if preset.value == "default"
-                else ReadAloudVoicePreset(preset.value)
-            )
+            selected = None if preset.value == "default" else ReadAloudVoicePreset(preset.value)
             await self.runtime.registry.invoke(
                 "speech.read_aloud_user_voice_set",
                 ReadAloudUserVoiceSetRequest(preset=selected),
@@ -5055,10 +5052,7 @@ class ReadAloudCog(commands.Cog):
                 self._message_burst_tasks.pop(key, None)
             message = burst[0][0]
             prepared = merge_read_aloud_messages(
-                tuple(
-                    (str(item.author.id), item_prepared)
-                    for item, item_prepared in burst
-                )
+                tuple((str(item.author.id), item_prepared) for item, item_prepared in burst)
             )
             await self._deliver_read_aloud(message, prepared)
         except asyncio.CancelledError:
@@ -5314,9 +5308,7 @@ class VoiceLifecycleCog(commands.Cog):
         )
         if joined_expected_channel and after.channel is not None:
             if self.dashboard is not None and (
-                session.has_music
-                or session.waiting_for_voice
-                or session.voice_activation_required
+                session.has_music or session.waiting_for_voice or session.voice_activation_required
             ):
                 self.dashboard.bind(member.guild.id, after.channel.id)
             task = self._leave_tasks.pop(workspace_id, None)
@@ -5357,10 +5349,14 @@ class VoiceLifecycleCog(commands.Cog):
                 channel = guild.get_channel(destination_id)
                 if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
                     await session.suspend()
+                    if self.dashboard is not None:
+                        await self.dashboard.dismiss(workspace_id)
                     return
                 if any(not listener.bot for listener in channel.members):
                     return
                 await session.suspend()
+                if self.dashboard is not None:
+                    await self.dashboard.dismiss(workspace_id)
                 log.info(
                     "Auto-left empty voice channel while preserving queue guild=%s channel=%s",
                     workspace_id,
@@ -5665,9 +5661,7 @@ def synthetic_media_embed(
             )
         )
     cache_line = (
-        "Cached result · no additional HIVE request"
-        if response.cached
-        else "New HIVE analysis"
+        "Cached result · no additional HIVE request" if response.cached else "New HIVE analysis"
     )
     sample_name = {
         "image": " image",
@@ -5752,9 +5746,7 @@ def _translation_result_embeds(
     description = value("content")
     summary = command_embed(
         f"Translation · {response.source_language} → {response.target_language}",
-        description=_translation_text(description, maximum=4_000)
-        if description
-        else None,
+        description=_translation_text(description, maximum=4_000) if description else None,
         fields=(
             (EmbedField("Author", discord.utils.escape_markdown(response.author_name)),)
             if response.author_name
@@ -5812,9 +5804,7 @@ def _translation_result_embeds(
     supplemental = tuple(
         item
         for item in response.segments
-        if item.identifier.startswith(
-            ("poll.", "component.", "attachment.")
-        )
+        if item.identifier.startswith(("poll.", "component.", "attachment."))
     )
     if supplemental and len(embeds) < 10:
         fields: list[EmbedField] = []
@@ -5871,6 +5861,9 @@ def _resolve_translation_target(
     normalized = value.strip().replace("_", "-").casefold()
     if not normalized:
         raise UserError("translation.target_required")
+    formatted_code = re.search(r"\(([A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*)\)\s*$", value)
+    if formatted_code is not None:
+        normalized = formatted_code.group(1).casefold()
     for language in languages:
         if language.code.casefold() == normalized:
             return language.code
@@ -5910,9 +5903,7 @@ def _locale_target(
         if base in by_code:
             return by_code[base]
         variants = tuple(
-            item.code
-            for item in languages
-            if item.code.casefold().split("-", 1)[0] == base
+            item.code for item in languages if item.code.casefold().split("-", 1)[0] == base
         )
         if len(variants) == 1:
             return variants[0]
@@ -5923,11 +5914,7 @@ def _locale_target(
                 else "hans"
             )
             matched = next(
-                (
-                    code
-                    for code in variants
-                    if preferred_token in code.casefold()
-                ),
+                (code for code in variants if preferred_token in code.casefold()),
                 None,
             )
             if matched is not None:
@@ -5963,11 +5950,296 @@ def _translation_target_autocomplete_choices(
     )
     return [
         app_commands.Choice(
-            name=f"{item.english_name} · {item.native_name} ({item.code})"[:100],
+            name=(
+                f"{_TRANSLATION_LANGUAGE_FLAGS.get(item.code, '🌐')} "
+                f"{item.english_name} · {item.native_name} ({item.code})"
+            )[:100],
             value=item.code,
         )
         for item in matches
     ][:25]
+
+
+_TRANSLATION_RELIABLE_CONFIDENCE = 0.80
+_TRANSLATION_SHORT_TEXT_CONFIDENCE = 0.95
+_TRANSLATION_RELIABLE_MARGIN = 0.20
+_TRANSLATION_RECOMMENDED_DETECTION_CHARACTERS = 20
+
+_TRANSLATION_LANGUAGE_FLAGS = {
+    "ar-AE": "🇦🇪",
+    "zh-TW": "🇹🇼",
+    "zh-HK": "🇭🇰",
+    "zh": "🇨🇳",
+    "da": "🇩🇰",
+    "nl": "🇳🇱",
+    "en-IN": "🇮🇳",
+    "en-CA": "🇨🇦",
+    "en-SG": "🇸🇬",
+    "en-GB": "🇬🇧",
+    "en-ZA": "🇿🇦",
+    "en-AU": "🇦🇺",
+    "en": "🌐",
+    "en-IE": "🇮🇪",
+    "en-NZ": "🇳🇿",
+    "fr-CA": "🇨🇦",
+    "fr": "🇫🇷",
+    "de-CH": "🇨🇭",
+    "de": "🇩🇪",
+    "hi": "🇮🇳",
+    "id": "🇮🇩",
+    "it-CH": "🇨🇭",
+    "it": "🇮🇹",
+    "ja": "🇯🇵",
+    "ko": "🇰🇷",
+    "nb": "🇳🇴",
+    "pl": "🇵🇱",
+    "pt": "🇧🇷",
+    "pt-PT": "🇵🇹",
+    "ru": "🇷🇺",
+    "es-MX": "🇲🇽",
+    "es": "🇪🇸",
+    "es-US": "🇺🇸",
+    "sv": "🇸🇪",
+    "th": "🇹🇭",
+    "tr": "🇹🇷",
+    "uk": "🇺🇦",
+    "vi": "🇻🇳",
+}
+
+_TRANSLATION_LANGUAGE_REGIONS: dict[str, tuple[str, ...]] = {
+    "Asia & Pacific": (
+        "zh-TW",
+        "zh-HK",
+        "zh",
+        "en-IN",
+        "en-SG",
+        "en-AU",
+        "en-NZ",
+        "hi",
+        "id",
+        "ja",
+        "ko",
+        "th",
+        "vi",
+    ),
+    "Europe": (
+        "da",
+        "nl",
+        "en-GB",
+        "en-IE",
+        "fr",
+        "de-CH",
+        "de",
+        "it-CH",
+        "it",
+        "nb",
+        "pl",
+        "pt-PT",
+        "ru",
+        "es",
+        "sv",
+        "tr",
+        "uk",
+    ),
+    "Americas": ("en-CA", "fr-CA", "es-MX", "es-US"),
+    "Middle East & Africa": ("ar-AE", "en-ZA"),
+    "Global": ("en", "pt"),
+}
+
+
+def _translation_language_name(
+    code: str,
+    languages: tuple[TranslationLanguageItem, ...],
+) -> str:
+    matched = next(
+        (item for item in languages if item.code.casefold() == code.casefold()),
+        None,
+    )
+    return f"{matched.english_name} ({matched.code})" if matched is not None else code
+
+
+def _translation_detection_margin(
+    detection: TranslationDetectResponse,
+) -> float:
+    alternative = max(
+        (
+            confidence
+            for code, confidence in detection.hypotheses
+            if code.casefold() != detection.language.casefold()
+        ),
+        default=0.0,
+    )
+    return max(0.0, detection.confidence - alternative)
+
+
+def _translation_detection_is_uncertain(
+    text: str,
+    detection: TranslationDetectResponse,
+) -> bool:
+    meaningful_length = len(re.sub(r"\s+", "", text))
+    if detection.confidence < _TRANSLATION_RELIABLE_CONFIDENCE:
+        return True
+    if _translation_detection_margin(detection) < _TRANSLATION_RELIABLE_MARGIN:
+        return True
+    return (
+        meaningful_length < _TRANSLATION_RECOMMENDED_DETECTION_CHARACTERS
+        and detection.confidence < _TRANSLATION_SHORT_TEXT_CONFIDENCE
+    )
+
+
+class TranslationRegionSelect(discord.ui.Select["TranslationLanguagePickerView"]):
+    """Choose a compact geographic group before selecting a language."""
+
+    def __init__(self, languages: tuple[TranslationLanguageItem, ...]) -> None:
+        available = {item.code for item in languages}
+        super().__init__(
+            placeholder="Choose a region",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=region,
+                    value=region,
+                    description=f"{sum(code in available for code in codes)} languages",
+                    emoji={
+                        "Asia & Pacific": "🌏",
+                        "Europe": "🌍",
+                        "Americas": "🌎",
+                        "Middle East & Africa": "🌍",
+                        "Global": "🌐",
+                    }[region],
+                )
+                for region, codes in _TRANSLATION_LANGUAGE_REGIONS.items()
+                if any(code in available for code in codes)
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        assert self.view is not None
+        await self.view.choose_region(interaction, self.values[0])
+
+
+class TranslationLanguageSelect(discord.ui.Select["TranslationLanguagePickerView"]):
+    """Choose one language from a region-sized set of at most 25."""
+
+    def __init__(
+        self,
+        region: str,
+        languages: tuple[TranslationLanguageItem, ...],
+    ) -> None:
+        by_code = {item.code: item for item in languages}
+        regional = tuple(
+            by_code[code] for code in _TRANSLATION_LANGUAGE_REGIONS[region] if code in by_code
+        )
+        super().__init__(
+            placeholder=f"Choose a language · {region}",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"{item.english_name} ({item.code})"[:100],
+                    value=item.code,
+                    description=item.native_name[:100],
+                    emoji=_TRANSLATION_LANGUAGE_FLAGS.get(item.code, "🌐"),
+                )
+                for item in regional
+            ],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        assert self.view is not None
+        await self.view.choose_language(interaction, self.values[0])
+
+
+class TranslationLanguagePickerView(discord.ui.View):
+    """Region-first language picker without pagination or Next buttons."""
+
+    def __init__(
+        self,
+        cog: TranslationCog,
+        *,
+        requester_id: int,
+        message: discord.Message,
+        languages: tuple[TranslationLanguageItem, ...],
+        source_language: str,
+        target_language: str,
+        show_original: bool,
+        mode: Literal["source", "target"],
+    ) -> None:
+        super().__init__(timeout=5 * 60)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.message = message
+        self.languages = languages
+        self.source_language = source_language
+        self.target_language = target_language
+        self.show_original = show_original
+        self.mode = mode
+        self.add_item(TranslationRegionSelect(languages))
+        self.add_item(
+            discord.ui.Button(
+                label="Jump",
+                style=discord.ButtonStyle.link,
+                url=message.jump_url,
+                row=2,
+            )
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Use Apps → Translate to choose your own language.",
+            ephemeral=True,
+        )
+        return False
+
+    async def choose_region(
+        self,
+        interaction: discord.Interaction,
+        region: str,
+    ) -> None:
+        for item in tuple(self.children):
+            if isinstance(item, TranslationLanguageSelect):
+                self.remove_item(item)
+        self.add_item(TranslationLanguageSelect(region, self.languages))
+        await interaction.response.edit_message(view=self)
+
+    async def choose_language(
+        self,
+        interaction: discord.Interaction,
+        language: str,
+    ) -> None:
+        source: str = language if self.mode == "source" else self.source_language
+        target: str = language if self.mode == "target" else self.target_language
+        await self.cog._translate_message_from_language_override(
+            interaction,
+            message=self.message,
+            source_language=source,
+            target_language=target,
+            show_original=self.show_original,
+        )
+
+    @discord.ui.button(label="Type language", style=discord.ButtonStyle.secondary, row=2)
+    async def type_language(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationLanguagePickerView],
+    ) -> None:
+        await interaction.response.send_modal(
+            TranslationLanguageOverrideModal(
+                self.cog,
+                requester_id=self.requester_id,
+                message=self.message,
+                languages=self.languages,
+                source_language=self.source_language,
+                target_language=self.target_language,
+                show_original=self.show_original,
+                require_source_confirmation=self.mode == "source",
+            )
+        )
 
 
 class TranslationPostView(discord.ui.View):
@@ -5987,9 +6259,7 @@ class TranslationPostView(discord.ui.View):
         self.message = message
         self.response = response
         self.show_original = show_original
-        self.toggle_original.label = (
-            "Hide original" if show_original else "Show original"
-        )
+        self.toggle_original.label = "Hide original" if show_original else "Show original"
         if preference_saved:
             self.use_by_default.disabled = True
             self.use_by_default.label = "Default saved"
@@ -6017,9 +6287,7 @@ class TranslationPostView(discord.ui.View):
         button: discord.ui.Button[TranslationPostView],
     ) -> None:
         self.show_original = not self.show_original
-        button.label = (
-            "Hide original" if self.show_original else "Show original"
-        )
+        button.label = "Hide original" if self.show_original else "Show original"
         await interaction.response.edit_message(
             embeds=_translation_result_embeds(
                 self.message,
@@ -6035,29 +6303,20 @@ class TranslationPostView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button[TranslationPostView],
     ) -> None:
-        languages = self.cog._ranked_languages(
-            await self.cog._languages(self.response.source_language),
-            recent=await self.cog.runtime.translation.recent_targets(
-                actor_id=str(interaction.user.id)
-            ),
-            source_language=self.response.source_language,
-        )
         await interaction.response.edit_message(
-            embeds=[
-                command_embed(
-                    "Choose a language",
-                    description=(
-                        "Only you can see this selector. The message is translated "
-                        "again after one choice."
-                    ),
-                )
-            ],
-            view=TranslationTargetSelectView(
+            embed=command_embed(
+                "Choose a target language",
+                description="Select a region, then the language you want.",
+            ),
+            view=TranslationLanguagePickerView(
                 self.cog,
                 requester_id=self.requester_id,
                 message=self.message,
-                detected_language=self.response.source_language,
-                languages=languages,
+                languages=await self.cog._languages(),
+                source_language=self.response.source_language,
+                target_language=self.response.target_language,
+                show_original=self.show_original,
+                mode="target",
             ),
         )
 
@@ -6101,8 +6360,7 @@ class TranslationPostView(discord.ui.View):
                 self.response,
                 show_original=self.show_original,
             ),
-            view=_translation_jump_view(self.response.jump_url)
-            or discord.utils.MISSING,
+            view=_translation_jump_view(self.response.jump_url) or discord.utils.MISSING,
             allowed_mentions=discord.AllowedMentions.none(),
             silent=True,
         )
@@ -6204,46 +6462,8 @@ class TranslationPreferenceScopeView(discord.ui.View):
         )
 
 
-class TranslationTargetSelect(discord.ui.Select["TranslationTargetSelectView"]):
-    def __init__(self, languages: tuple[TranslationLanguageItem, ...]) -> None:
-        super().__init__(
-            placeholder="Choose a target language",
-            min_values=1,
-            max_values=1,
-            options=[
-                discord.SelectOption(
-                    label=language.english_name[:100],
-                    value=language.code,
-                    description=(
-                        f"{language.native_name} · {language.code}"
-                    )[:100],
-                )
-                for language in languages[:25]
-            ],
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        assert self.view is not None
-        await self.view.translate(interaction, self.values[0])
-
-
-class TranslationPageButton(discord.ui.Button["TranslationTargetSelectView"]):
-    def __init__(self, *, delta: int, disabled: bool) -> None:
-        super().__init__(
-            label="Previous" if delta < 0 else "Next",
-            style=discord.ButtonStyle.secondary,
-            disabled=disabled,
-            row=1,
-        )
-        self.delta = delta
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        assert self.view is not None
-        await self.view.change_page(interaction, self.delta)
-
-
-class TranslationTargetSelectView(discord.ui.View):
-    PAGE_SIZE = 25
+class TranslationLanguageOverrideModal(discord.ui.Modal):
+    """Resolve source and target by name or BCP-47 without paginated menus."""
 
     def __init__(
         self,
@@ -6251,110 +6471,149 @@ class TranslationTargetSelectView(discord.ui.View):
         *,
         requester_id: int,
         message: discord.Message,
-        detected_language: str,
         languages: tuple[TranslationLanguageItem, ...],
+        source_language: str,
+        target_language: str,
+        show_original: bool,
+        require_source_confirmation: bool,
+    ) -> None:
+        super().__init__(title="Translation languages", timeout=5 * 60)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.message = message
+        self.languages = languages
+        self.show_original = show_original
+        source_default = (
+            None
+            if require_source_confirmation
+            else _translation_language_name(source_language, languages)
+        )
+        self.source: discord.ui.TextInput[TranslationLanguageOverrideModal] = discord.ui.TextInput(
+            label="Source language",
+            placeholder="English, 日本語, or en",
+            default=source_default,
+            min_length=2,
+            max_length=100,
+        )
+        self.target: discord.ui.TextInput[TranslationLanguageOverrideModal] = discord.ui.TextInput(
+            label="Target language",
+            placeholder="Japanese, 日本語, or ja",
+            default=_translation_language_name(target_language, languages),
+            min_length=2,
+            max_length=100,
+        )
+        self.add_item(self.source)
+        self.add_item(self.target)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Use Apps → Translate to open your own translation.",
+                ephemeral=True,
+            )
+            return
+        try:
+            source_language = _resolve_translation_target(
+                str(self.source),
+                self.languages,
+            )
+            target_language = _resolve_translation_target(
+                str(self.target),
+                self.languages,
+            )
+            await self.cog._translate_message_from_language_override(
+                interaction,
+                message=self.message,
+                source_language=source_language,
+                target_language=target_language,
+                show_original=self.show_original,
+            )
+        except Exception as exc:
+            await edit_deferred_error(interaction, exc)
+
+
+class TranslationDetectionReviewView(discord.ui.View):
+    """Let the requester correct uncertain automatic language detection."""
+
+    def __init__(
+        self,
+        cog: TranslationCog,
+        *,
+        requester_id: int,
+        message: discord.Message,
+        languages: tuple[TranslationLanguageItem, ...],
+        detected_language: str,
+        target_language: str,
+        show_original: bool,
     ) -> None:
         super().__init__(timeout=5 * 60)
         self.cog = cog
         self.requester_id = requester_id
         self.message = message
-        self.detected_language = detected_language
         self.languages = languages
-        self.page = 0
-        self._rebuild()
-
-    @property
-    def page_count(self) -> int:
-        return max(
-            1,
-            (len(self.languages) + self.PAGE_SIZE - 1) // self.PAGE_SIZE,
-        )
-
-    def _rebuild(self) -> None:
-        self.clear_items()
-        start = self.page * self.PAGE_SIZE
+        self.detected_language = detected_language
+        self.target_language = target_language
+        self.show_original = show_original
         self.add_item(
-            TranslationTargetSelect(
-                self.languages[start : start + self.PAGE_SIZE]
+            discord.ui.Button(
+                label="Jump",
+                style=discord.ButtonStyle.link,
+                url=message.jump_url,
             )
         )
-        if self.page_count > 1:
-            self.add_item(
-                TranslationPageButton(
-                    delta=-1,
-                    disabled=self.page == 0,
-                )
-            )
-            self.add_item(
-                TranslationPageButton(
-                    delta=1,
-                    disabled=self.page >= self.page_count - 1,
-                )
-            )
-
-    async def change_page(
-        self,
-        interaction: discord.Interaction,
-        delta: int,
-    ) -> None:
-        self.page = min(max(self.page + delta, 0), self.page_count - 1)
-        self._rebuild()
-        await interaction.response.edit_message(view=self)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id:
             return True
         await interaction.response.send_message(
-            "Use Apps → Translate to open your own language selector.",
+            "Use Apps → Translate to review your own language detection.",
             ephemeral=True,
         )
         return False
 
-    async def translate(
+    def _picker(
+        self,
+        *,
+        mode: Literal["source", "target"],
+    ) -> TranslationLanguagePickerView:
+        return TranslationLanguagePickerView(
+            self.cog,
+            requester_id=self.requester_id,
+            message=self.message,
+            languages=self.languages,
+            source_language=self.detected_language,
+            target_language=self.target_language,
+            show_original=self.show_original,
+            mode=mode,
+        )
+
+    @discord.ui.button(label="Choose source", style=discord.ButtonStyle.primary)
+    async def choose_source(
         self,
         interaction: discord.Interaction,
-        target_language: str,
+        _: discord.ui.Button[TranslationDetectionReviewView],
     ) -> None:
-        try:
-            await interaction.response.edit_message(
-                embed=async_progress_embed(
-                    interaction.client,
-                    "Translating…",
-                ),
-                view=None,
-            )
-            response = cast(
-                DiscordTranslateMessageResponse,
-                await self.cog.runtime.registry.invoke(
-                    "discord.translate_message",
-                    DiscordTranslateMessageRequest(
-                        channel_id=str(self.message.channel.id),
-                        message_id=str(self.message.id),
-                        source_language=self.detected_language,
-                        target_language=target_language,
-                    ),
-                    invocation_context(interaction),
-                ),
-            )
-            await self.cog.runtime.translation.record_recent_target(
-                actor_id=str(interaction.user.id),
-                code=target_language,
-            )
-            await interaction.edit_original_response(
-                embeds=_translation_result_embeds(
-                    self.message,
-                    response,
-                    show_original=False,
-                ),
-                view=TranslationPostView(
-                    self.cog,
-                    requester_id=interaction.user.id,
-                    message=self.message,
-                    response=response,
-                ),
-            )
-        except Exception as exc:
-            await edit_deferred_error(interaction, exc)
+        await interaction.response.edit_message(
+            embed=command_embed(
+                "Choose the source language",
+                description="Select a region, then the language used by the message.",
+            ),
+            view=self._picker(mode="source"),
+        )
+
+    @discord.ui.button(label="Change target", style=discord.ButtonStyle.secondary)
+    async def change_target(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationDetectionReviewView],
+    ) -> None:
+        await interaction.response.edit_message(
+            embed=command_embed(
+                "Choose a target language",
+                description="Select a region, then the language you want.",
+            ),
+            view=self._picker(mode="target"),
+        )
 
 
 class TranslationCog(commands.Cog):
@@ -6441,11 +6700,7 @@ class TranslationCog(commands.Cog):
     ) -> tuple[str, bool]:
         preference = await self.runtime.translation.preference(
             actor_id=str(interaction.user.id),
-            workspace_id=(
-                str(interaction.guild_id)
-                if interaction.guild_id is not None
-                else None
-            ),
+            workspace_id=(str(interaction.guild_id) if interaction.guild_id is not None else None),
         )
         candidates = (
             ((preference.target_language,) if preference is not None else ())
@@ -6457,17 +6712,82 @@ class TranslationCog(commands.Cog):
             raise UserError("translation.target_required")
         return resolved, preference.show_original if preference is not None else False
 
+    async def _translate_message_from_language_override(
+        self,
+        interaction: discord.Interaction,
+        *,
+        message: discord.Message,
+        source_language: str,
+        target_language: str,
+        show_original: bool,
+    ) -> None:
+        if source_language.casefold() == target_language.casefold():
+            raise UserError("translation.same_language")
+        source_targets = await self._languages(source_language)
+        target_status = next(
+            (
+                item.availability
+                for item in source_targets
+                if item.code.casefold() == target_language.casefold()
+            ),
+            "unsupported",
+        )
+        if target_status == "unsupported":
+            raise UserError("translation.language_pair_unsupported")
+        if target_status == "supported":
+            raise UserError("translation.language_pair_not_installed")
+        await interaction.response.edit_message(
+            embed=async_progress_embed(
+                interaction.client,
+                "Translating…",
+            ),
+            view=None,
+        )
+        response = cast(
+            DiscordTranslateMessageResponse,
+            await self.runtime.registry.invoke(
+                "discord.translate_message",
+                DiscordTranslateMessageRequest(
+                    channel_id=str(message.channel.id),
+                    message_id=str(message.id),
+                    source_language=source_language,
+                    target_language=target_language,
+                ),
+                invocation_context(interaction),
+            ),
+        )
+        await self.runtime.translation.record_recent_target(
+            actor_id=str(interaction.user.id),
+            code=target_language,
+        )
+        await interaction.edit_original_response(
+            embeds=_translation_result_embeds(
+                message,
+                response,
+                show_original=show_original,
+            ),
+            view=TranslationPostView(
+                self,
+                requester_id=interaction.user.id,
+                message=message,
+                response=response,
+                show_original=show_original,
+            ),
+        )
+
     @app_commands.command(
         name="translate",
         description="Translate text locally with Apple's on-device language models.",
     )
     @app_commands.describe(
+        source="Source language; omit to detect it automatically",
         target="Target language; omit to follow your Discord language",
         text="Text to translate; omit to use the latest visible message",
     )
     async def translate_command(
         self,
         interaction: discord.Interaction,
+        source: str | None = None,
         target: str | None = None,
         text: str | None = None,
     ) -> None:
@@ -6501,12 +6821,15 @@ class TranslationCog(commands.Cog):
             if source_text is None and source_message is None:
                 raise UserError("translation.text_required")
             languages = await self._languages()
+            source_code = (
+                _resolve_translation_target(source, languages) if source is not None else None
+            )
             if target is not None:
                 target_code = _resolve_translation_target(target, languages)
                 show_original = False
             else:
-                target_code, show_original = (
-                    await self._default_translation_settings(interaction, languages)
+                target_code, show_original = await self._default_translation_settings(
+                    interaction, languages
                 )
             if source_message is not None:
                 document_response = cast(
@@ -6517,6 +6840,7 @@ class TranslationCog(commands.Cog):
                             channel_id=str(source_message.channel.id),
                             message_id=str(source_message.id),
                             target_language=target_code,
+                            source_language=source_code,
                         ),
                         invocation_context(interaction),
                     ),
@@ -6548,6 +6872,7 @@ class TranslationCog(commands.Cog):
                     TranslationTranslateRequest(
                         text=source_text,
                         target_language=target_code,
+                        source_language=source_code,
                     ),
                     invocation_context(interaction),
                 ),
@@ -6568,6 +6893,22 @@ class TranslationCog(commands.Cog):
             )
         except Exception as exc:
             await edit_deferred_error(interaction, exc)
+
+    @translate_command.autocomplete("source")
+    async def source_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        try:
+            languages = self._ranked_languages(
+                await self._languages(),
+                recent=(),
+                source_language=None,
+            )
+        except Exception:
+            return []
+        return _translation_target_autocomplete_choices(languages, current)
 
     @translate_command.autocomplete("target")
     async def target_autocomplete(
@@ -6614,6 +6955,7 @@ class TranslationCog(commands.Cog):
                     invocation_context(interaction),
                 ),
             )
+            all_languages = await self._languages()
             source_languages = await self._languages(detection.language)
             languages = self._ranked_languages(
                 source_languages,
@@ -6626,7 +6968,7 @@ class TranslationCog(commands.Cog):
                 raise UserError("translation.language_pair_unsupported")
             target_language, show_original = await self._default_translation_settings(
                 interaction,
-                await self._languages(),
+                all_languages,
             )
             target_status = next(
                 (
@@ -6636,26 +6978,70 @@ class TranslationCog(commands.Cog):
                 ),
                 "unsupported",
             )
-            if target_status in {"unsupported", "same_language"}:
-                description = (
-                    f"This message is already **{detection.language}**."
-                    if target_status == "same_language"
-                    else (
-                        "Your Discord language is unavailable for this source. "
-                        "Choose another language."
-                    )
+            detection_text = "\n".join(item.text for item in segments)[:4_000]
+            uncertain = _translation_detection_is_uncertain(
+                detection_text,
+                detection,
+            )
+            if uncertain or target_status != "installed":
+                confidence = round(detection.confidence * 100)
+                detected_name = _translation_language_name(
+                    detection.language,
+                    all_languages,
                 )
+                if target_status == "same_language":
+                    status_text = (
+                        "The best match is also your target language. "
+                        "This is an estimate, not proof that translation is unnecessary."
+                    )
+                elif target_status == "unsupported":
+                    status_text = (
+                        "That source and target pair is unavailable. "
+                        "Choose the source or a different target."
+                    )
+                elif target_status == "supported":
+                    status_text = (
+                        "The selected language pair is supported but is not installed yet."
+                    )
+                else:
+                    status_text = (
+                        "Short and mixed-language messages can be misidentified. "
+                        "Confirm the source or choose another target."
+                    )
+                with suppress(Exception):
+                    await self.runtime.journal.append(
+                        kind="translation.detection_review",
+                        payload={
+                            "detected_language": detection.language,
+                            "confidence": detection.confidence,
+                            "margin": _translation_detection_margin(detection),
+                            "meaningful_characters": len(re.sub(r"\s+", "", detection_text)),
+                            "target_language": target_language,
+                            "target_status": target_status,
+                            "uncertain": uncertain,
+                        },
+                        actor_id=str(interaction.user.id),
+                        workspace_id=(
+                            str(interaction.guild_id) if interaction.guild_id is not None else None
+                        ),
+                        transport="discord",
+                        request_id=str(interaction.id),
+                    )
                 await interaction.edit_original_response(
                     embed=command_embed(
-                        "Choose a language",
-                        description=description,
+                        "Check the language",
+                        description=(
+                            f"Best match: **{detected_name}** · **{confidence}%**\n{status_text}"
+                        ),
                     ),
-                    view=TranslationTargetSelectView(
+                    view=TranslationDetectionReviewView(
                         self,
                         requester_id=interaction.user.id,
                         message=message,
+                        languages=all_languages,
                         detected_language=detection.language,
-                        languages=languages,
+                        target_language=target_language,
+                        show_original=show_original,
                     ),
                 )
                 return
@@ -6747,6 +7133,7 @@ class MediaCog(commands.Cog):
             )
         except Exception as exc:
             await edit_deferred_error(interaction, exc)
+
     @media.command(
         name="download",
         description="Save video or audio from a supported public URL.",
@@ -6945,16 +7332,12 @@ def server_info_embed(response: DiscordServerResponse) -> discord.Embed:
     if response.owner_name:
         owner += f"\n{discord.utils.escape_markdown(response.owner_name)}"
     member_count = (
-        str(response.member_count)
-        if response.member_count is not None
-        else "Unavailable"
+        str(response.member_count) if response.member_count is not None else "Unavailable"
     )
     population = f"**{member_count}** total"
     if response.human_count is not None and response.bot_count is not None:
         population += f"\n{response.human_count} people · {response.bot_count} bots"
-    features = ", ".join(
-        feature.replace("_", " ").title() for feature in response.features[:10]
-    )
+    features = ", ".join(feature.replace("_", " ").title() for feature in response.features[:10])
     if len(response.features) > 10:
         features += f" · +{len(response.features) - 10} more"
     description = (
@@ -7022,8 +7405,7 @@ def user_info_embed(
     embed = command_embed(
         response.display_name,
         description=(
-            f"{mention} · `@{discord.utils.escape_markdown(username)}`\n"
-            f"`{response.user_id}`"
+            f"{mention} · `@{discord.utils.escape_markdown(username)}`\n`{response.user_id}`"
         ),
         fields=(),
     )
@@ -7047,20 +7429,15 @@ def user_info_embed(
         )
     status_lines = [f"Presence: **{(response.status or 'unknown').title()}**"]
     if response.nickname:
-        status_lines.append(
-            f"Nickname: **{discord.utils.escape_markdown(response.nickname)}**"
-        )
+        status_lines.append(f"Nickname: **{discord.utils.escape_markdown(response.nickname)}**")
     if response.pending:
         status_lines.append("Membership screening: **Pending**")
     if response.timed_out_until_iso:
-        status_lines.append(
-            f"Timeout ends {_discord_time_pair(response.timed_out_until_iso)}"
-        )
+        status_lines.append(f"Timeout ends {_discord_time_pair(response.timed_out_until_iso)}")
     embed.add_field(name="Status", value="\n".join(status_lines), inline=False)
     if response.role_names:
         visible_roles = tuple(
-            discord.utils.escape_markdown(name)
-            for name in reversed(response.role_names[-10:])
+            discord.utils.escape_markdown(name) for name in reversed(response.role_names[-10:])
         )
         role_text = " · ".join(visible_roles)
         if response.role_count > len(visible_roles):
@@ -8313,46 +8690,50 @@ class PrefixCog(commands.Cog):
         try:
             self._bind_music_dashboard(context)
             guild_id = context.guild.id if context.guild else None
-            _discord_audio_session(self.bot, self.runtime, guild_id)
-            selected_reference = reference
-            if "://" not in reference:
-                search = cast(
-                    AudioSearchResponse,
+            session = _discord_audio_session(self.bot, self.runtime, guild_id)
+            reservation = await session.reserve_manual_music_start()
+            try:
+                selected_reference = reference
+                if "://" not in reference:
+                    search = cast(
+                        AudioSearchResponse,
+                        await self.runtime.registry.invoke(
+                            "audio.search",
+                            AudioSearchRequest(query=reference, limit=5),
+                            prefix_context(context),
+                        ),
+                    )
+                    if search.selection_required:
+                        view = MusicSearchChoiceView(
+                            self.bot,
+                            self.runtime,
+                            search,
+                            requester_id=context.author.id,
+                            requester_name=context.author.display_name,
+                        )
+                        message = await context.send(
+                            embed=music_search_embed(search),
+                            view=view,
+                            silent=True,
+                        )
+                        view.message = message
+                        return
+                    if search.selected_index is None:
+                        raise UserError("audio.search_empty")
+                    selected_reference = search.candidates[search.selected_index].reference
+                response = cast(
+                    AudioPlayResponse,
                     await self.runtime.registry.invoke(
-                        "audio.search",
-                        AudioSearchRequest(query=reference, limit=5),
+                        "discord.play_audio",
+                        AudioPlayRequest(
+                            reference=selected_reference,
+                            requested_by_name=context.author.display_name,
+                        ),
                         prefix_context(context),
                     ),
                 )
-                if search.selection_required:
-                    view = MusicSearchChoiceView(
-                        self.bot,
-                        self.runtime,
-                        search,
-                        requester_id=context.author.id,
-                        requester_name=context.author.display_name,
-                    )
-                    message = await context.send(
-                        embed=music_search_embed(search),
-                        view=view,
-                        silent=True,
-                    )
-                    view.message = message
-                    return
-                if search.selected_index is None:
-                    raise UserError("audio.search_empty")
-                selected_reference = search.candidates[search.selected_index].reference
-            response = cast(
-                AudioPlayResponse,
-                await self.runtime.registry.invoke(
-                    "discord.play_audio",
-                    AudioPlayRequest(
-                        reference=selected_reference,
-                        requested_by_name=context.author.display_name,
-                    ),
-                    prefix_context(context),
-                ),
-            )
+            finally:
+                await reservation.release()
             await context.send(
                 embed=music_added_embed(response),
                 silent=True,
@@ -8490,13 +8871,10 @@ class PrefixCog(commands.Cog):
             )
             if response.action == AudioAction.MOVE.value:
                 description = (
-                    f"Moved **{response.affected_title}** to pending position "
-                    f"**{to_position}**."
+                    f"Moved **{response.affected_title}** to pending position **{to_position}**."
                 )
             elif response.action == AudioAction.CLEAR_MINE.value:
-                description = (
-                    f"Removed **{response.removed_count or 0}** of your pending tracks."
-                )
+                description = f"Removed **{response.removed_count or 0}** of your pending tracks."
             elif response.action == AudioAction.VOLUME.value:
                 description = (
                     f"Music **{response.music_volume_percent}%** · "

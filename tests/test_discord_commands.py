@@ -45,7 +45,10 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
 )
-from simajilord.capabilities.translation import TranslationLanguageItem
+from simajilord.capabilities.translation import (
+    TranslationDetectResponse,
+    TranslationLanguageItem,
+)
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
 from simajilord.core import CapabilityRegistry, InvocationContext
@@ -95,8 +98,9 @@ from simajilord.integrations.discord.cogs import (
     ReadAloudCog,
     SystemCog,
     TranslationCog,
-    TranslationTargetSelect,
-    TranslationTargetSelectView,
+    TranslationLanguagePickerView,
+    TranslationLanguageSelect,
+    TranslationRegionSelect,
     UtilityCog,
     VoiceLifecycleCog,
     WebCog,
@@ -108,9 +112,12 @@ from simajilord.integrations.discord.cogs import (
     _agent_message_groups,
     _AgentProgressMessage,
     _discord_message_chunks,
+    _help_category_embed,
     _locale_target,
     _resolve_translation_target,
     _retry_after_text,
+    _translation_detection_is_uncertain,
+    _translation_detection_margin,
     _translation_result_embeds,
     _translation_target_autocomplete_choices,
     _youtube_card_reference,
@@ -260,9 +267,7 @@ def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
             assert parameter.description and parameter.description != "…", (
                 f"/{topic} option `{parameter.name}` has no Discord description"
             )
-            assert parameter.name in usage, (
-                f"/{topic} help omits the `{parameter.name}` option"
-            )
+            assert parameter.name in usage, f"/{topic} help omits the `{parameter.name}` option"
 
 
 def test_public_command_and_option_descriptions_use_the_official_english_surface() -> None:
@@ -311,14 +316,19 @@ def test_help_categories_fit_discord_select_limits() -> None:
         entries = [entry for entry in HELP_ENTRIES if entry.category == category]
         assert 1 <= len(entries) <= 25
         assert all(len(entry.summary) <= 100 for entry in entries)
+        embed = _help_category_embed(category)
+        command_fields = tuple(
+            field for field in embed.fields if field.name.startswith("Commands")
+        )
+        assert command_fields
+        assert all(1 <= len(field.value) <= 1024 for field in command_fields)
+        assert sum(field.value.count("\n") + 1 for field in command_fields) == len(entries)
 
 
 def test_prefix_surface_is_derived_from_canonical_primary_commands() -> None:
     registered = {command.name for command in PrefixCog.__cog_commands__}
     canonical = {
-        entry.prefix_name
-        for entry in PUBLIC_COMMAND_SPECS
-        if entry.prefix_name is not None
+        entry.prefix_name for entry in PUBLIC_COMMAND_SPECS if entry.prefix_name is not None
     }
     assert registered == canonical == {"help", "audio", "play"}
 
@@ -343,48 +353,110 @@ def test_translation_target_accepts_code_english_and_native_name() -> None:
     assert _resolve_translation_target("EN_gb", languages) == "en-GB"
     assert _resolve_translation_target("English", languages) == "en"
     assert _resolve_translation_target("日本語", languages) == "ja"
+    assert _resolve_translation_target("🇯🇵 Japanese (ja)", languages) == "ja"
     with pytest.raises(UserError, match=r"translation\.language_invalid"):
         _resolve_translation_target("not-a-language", languages)
 
 
-def test_translation_context_menu_pages_every_available_language() -> None:
+def test_translation_context_menu_groups_every_language_by_region() -> None:
+    codes = (
+        "ar-AE",
+        "zh-TW",
+        "zh-HK",
+        "zh",
+        "da",
+        "nl",
+        "en-IN",
+        "en-CA",
+        "en-SG",
+        "en-GB",
+        "en-ZA",
+        "en-AU",
+        "en",
+        "en-IE",
+        "en-NZ",
+        "fr-CA",
+        "fr",
+        "de-CH",
+        "de",
+        "hi",
+        "id",
+        "it-CH",
+        "it",
+        "ja",
+        "ko",
+        "nb",
+        "pl",
+        "pt",
+        "pt-PT",
+        "ru",
+        "es-MX",
+        "es",
+        "es-US",
+        "sv",
+        "th",
+        "tr",
+        "uk",
+        "vi",
+    )
     languages = tuple(
         TranslationLanguageItem(
-            code=f"x-{index}",
+            code=code,
             english_name=f"Language {index:02d}",
             native_name=f"Native {index:02d}",
             availability="installed",
         )
-        for index in range(38)
+        for index, code in enumerate(codes)
     )
     message = Mock(spec=discord.Message)
-    view = TranslationTargetSelectView(
+    message.jump_url = "https://discord.com/channels/1/2/3"
+    view = TranslationLanguagePickerView(
         Mock(spec=TranslationCog),
         requester_id=7,
         message=message,
-        detected_language="ja",
         languages=languages,
+        source_language="en",
+        target_language="ja",
+        show_original=False,
+        mode="target",
     )
 
-    assert view.page_count == 2
-    first = next(
-        item
-        for item in view.children
-        if isinstance(item, TranslationTargetSelect)
+    assert any(isinstance(item, TranslationRegionSelect) for item in view.children)
+    selects = tuple(
+        TranslationLanguageSelect(region, languages)
+        for region in (
+            "Asia & Pacific",
+            "Europe",
+            "Americas",
+            "Middle East & Africa",
+            "Global",
+        )
     )
-    assert len(first.options) == 25
-    view.page = 1
-    view._rebuild()
-    second = next(
-        item
-        for item in view.children
-        if isinstance(item, TranslationTargetSelect)
+    assert all(1 <= len(select.options) <= 25 for select in selects)
+    assert {option.value for select in selects for option in select.options} == set(codes)
+    assert all(option.emoji is not None for select in selects for option in select.options)
+
+
+def test_translation_region_picker_has_no_next_or_previous_controls() -> None:
+    languages = (
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+        TranslationLanguageItem("en", "English", "English", "installed"),
     )
-    assert len(second.options) == 13
-    assert {
-        option.value
-        for option in (*first.options, *second.options)
-    } == {language.code for language in languages}
+    message = Mock(spec=discord.Message)
+    message.jump_url = "https://discord.com/channels/1/2/3"
+    view = TranslationLanguagePickerView(
+        Mock(spec=TranslationCog),
+        requester_id=7,
+        message=message,
+        languages=languages,
+        source_language="en",
+        target_language="ja",
+        show_original=False,
+        mode="source",
+    )
+    labels = {item.label for item in view.children if isinstance(item, discord.ui.Button)}
+    assert "Next" not in labels
+    assert "Previous" not in labels
 
 
 def test_translation_slash_autocomplete_filters_all_languages_and_caps_results() -> None:
@@ -413,6 +485,47 @@ def test_translation_slash_autocomplete_filters_all_languages_and_caps_results()
             "Native 36",
         )
     ] == ["x-36"]
+    japanese = _translation_target_autocomplete_choices(
+        (
+            TranslationLanguageItem(
+                "ja",
+                "Japanese",
+                "日本語",
+                "installed",
+            ),
+        ),
+        "",
+    )
+    assert japanese[0].name.startswith("🇯🇵 Japanese")
+
+
+def test_translation_detection_treats_short_or_close_hypotheses_as_uncertain() -> None:
+    short = TranslationDetectResponse(
+        language="fr",
+        confidence=0.127,
+        hypotheses=(("fr", 0.127), ("nl", 0.113), ("en", 0.112)),
+    )
+    close = TranslationDetectResponse(
+        language="ja",
+        confidence=0.88,
+        hypotheses=(("ja", 0.88), ("zh", 0.76)),
+    )
+    reliable = TranslationDetectResponse(
+        language="en",
+        confidence=0.999,
+        hypotheses=(("en", 0.999), ("nl", 0.001)),
+    )
+
+    assert _translation_detection_margin(short) == pytest.approx(0.014)
+    assert _translation_detection_is_uncertain("test", short) is True
+    assert _translation_detection_is_uncertain("これは短いテストです", close) is True
+    assert (
+        _translation_detection_is_uncertain(
+            "This is a sufficiently long and unambiguous English sentence.",
+            reliable,
+        )
+        is False
+    )
 
 
 def test_translation_locale_resolution_supports_exact_base_and_chinese_script() -> None:
@@ -556,11 +669,14 @@ def test_structured_translation_extracts_and_rebuilds_discord_message() -> None:
     assert translated_embed.colour == discord.Colour.blurple()
     assert translated_embed.image.url == "https://example.com/image.png"
     assert all(item.title != "Original" for item in rendered)
-    assert _translation_result_embeds(
-        message,
-        response,
-        show_original=True,
-    )[-1].title == "Original"
+    assert (
+        _translation_result_embeds(
+            message,
+            response,
+            show_original=True,
+        )[-1].title
+        == "Original"
+    )
 
 
 def test_human_audio_controls_map_to_exact_agent_capabilities() -> None:
@@ -606,8 +722,7 @@ def test_human_audio_controls_map_to_exact_agent_capabilities() -> None:
     )
 
     assert {
-        audio_control_capability_call(action, **arguments)[0]
-        for action, arguments, _ in calls
+        audio_control_capability_call(action, **arguments)[0] for action, arguments, _ in calls
     } == {expected for _, _, expected in calls}
 
 
@@ -621,9 +736,7 @@ def test_japanese_requests_find_the_intended_discord_capability() -> None:
 
     expected_by_query = {
         "この曲流して": "discord.play_audio",
-        "読み上げを入退室だけにして": (
-            "discord.read_aloud_announcements_set"
-        ),
+        "読み上げを入退室だけにして": ("discord.read_aloud_announcements_set"),
         "音楽を少し下げて": "discord.set_audio_volume",
         "このメッセージをドイツ語にして": "discord.translate_message",
         "この添付音声を流して": "discord.play_attachment",
@@ -703,9 +816,7 @@ def test_user_info_embed_contains_account_membership_roles_and_permissions() -> 
     assert "Member" in fields["Roles · 2"]
     assert fields["Key server permissions"] == "Manage Messages"
     assert not next(field for field in embed.fields if field.name == "Account").inline
-    assert not next(
-        field for field in embed.fields if field.name == "Server membership"
-    ).inline
+    assert not next(field for field in embed.fields if field.name == "Server membership").inline
     assert not next(field for field in embed.fields if field.name == "Status").inline
     assert embed.thumbnail.url == "https://cdn.example/avatar.png"
 
@@ -1323,8 +1434,7 @@ async def test_music_pause_button_changes_to_resume_without_duplicate_control() 
     assert [button.label for button in buttons].count("Resume") == 1
     assert "Pause" not in [button.label for button in buttons]
     assert any(
-        isinstance(child, discord.ui.Select)
-        and child.placeholder == "More actions"
+        isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
     )
 
@@ -1357,13 +1467,10 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         cast(SimajilordRuntime, object()),
         response=response,
     )
-    labels = [
-        child.label for child in view.children if isinstance(child, discord.ui.Button)
-    ]
+    labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
     assert labels == ["Start", "Add music"]
     assert any(
-        isinstance(child, discord.ui.Select)
-        and child.placeholder == "More actions"
+        isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
     )
 
@@ -1389,14 +1496,11 @@ async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() 
         cast(SimajilordRuntime, object()),
         response=response,
     )
-    labels = [
-        child.label for child in view.children if isinstance(child, discord.ui.Button)
-    ]
+    labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
     assert labels == ["Add music"]
     assert any(
-        isinstance(child, discord.ui.Select)
-        and child.placeholder == "More actions"
+        isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
     )
 
@@ -1809,16 +1913,34 @@ def test_loop_mix_conflict_view_offers_one_click_switch() -> None:
         loop_mode=LoopMode.TRACK,
     )
 
+    assert [child.label for child in mix_view.children if isinstance(child, discord.ui.Button)] == [
+        "Switch to Radio",
+        "Keep current mode",
+    ]
     assert [
-        child.label
-        for child in mix_view.children
-        if isinstance(child, discord.ui.Button)
-    ] == ["Switch to Radio", "Keep current mode"]
-    assert [
-        child.label
-        for child in loop_view.children
-        if isinstance(child, discord.ui.Button)
+        child.label for child in loop_view.children if isinstance(child, discord.ui.Button)
     ] == ["Switch to Loop", "Keep current mode"]
+
+
+@pytest.mark.asyncio
+async def test_loop_mix_conflict_controls_disable_after_one_minute() -> None:
+    view = LoopMixConflictView(
+        cast(SimajilordRuntime, object()),
+        None,
+        requester_id=7,
+    )
+    message = Mock(spec=discord.InteractionMessage)
+    message.edit = AsyncMock()
+    view.message = message
+
+    await view.on_timeout()
+
+    assert all(
+        child.disabled
+        for child in view.children
+        if isinstance(child, (discord.ui.Button, discord.ui.Select))
+    )
+    message.edit.assert_awaited_once_with(view=view)
 
 
 def test_ambiguous_results_are_direct_one_click_buttons() -> None:
@@ -1895,9 +2017,7 @@ def test_public_command_tree_has_no_legacy_or_duplicate_top_level_names() -> Non
         InfoCog,
     )
     top_level = [
-        command.name
-        for cog_type in cog_types
-        for command in cog_type.__cog_app_commands__
+        command.name for cog_type in cog_types for command in cog_type.__cog_app_commands__
     ]
     assert len(top_level) == len(set(top_level))
     assert set(top_level) == {
@@ -2025,10 +2145,7 @@ async def test_join_selection_is_staged_until_start_is_pressed() -> None:
     interaction.edit_original_response.assert_awaited_once()
     embed = interaction.edit_original_response.await_args.kwargs["embed"]
     assert embed.title == "Read aloud is ready"
-    assert any(
-        field.name == "Connection" and field.value == "Ready"
-        for field in embed.fields
-    )
+    assert any(field.name == "Connection" and field.value == "Ready" for field in embed.fields)
 
 
 @pytest.mark.asyncio
@@ -2098,9 +2215,7 @@ def test_quote_composer_uses_hierarchical_native_menu() -> None:
         has_animation=True,
     )
 
-    assert [
-        item.label for item in view.children if isinstance(item, discord.ui.Button)
-    ] == [
+    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
         "Layout · Landscape",
         "Style · B/W",
         "More · 1 On",
@@ -2109,14 +2224,18 @@ def test_quote_composer_uses_hierarchical_native_menu() -> None:
     ]
 
     view._show_page("more")
-    assert [
-        item.label for item in view.children if isinstance(item, discord.ui.Button)
-    ] == ["Flip Off", "Jump On", "Animation Off", "Back"]
+    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
+        "Flip Off",
+        "Jump On",
+        "Animation Off",
+        "Back",
+    ]
 
     view._show_page("layout")
-    assert [
-        item.label for item in view.children if isinstance(item, discord.ui.Button)
-    ] == ["Landscape", "Back"]
+    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
+        "Landscape",
+        "Back",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2154,9 +2273,11 @@ def test_youtube_card_has_three_direct_actions() -> None:
         reference="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     )
 
-    assert [
-        item.label for item in view.children if isinstance(item, discord.ui.Button)
-    ] == ["Play", "Add", "Radio"]
+    assert [item.label for item in view.children if isinstance(item, discord.ui.Button)] == [
+        "Play",
+        "Add",
+        "Radio",
+    ]
 
 
 def test_fresh_mix_and_duplicate_music_aliases_are_hidden() -> None:

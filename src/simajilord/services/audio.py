@@ -145,6 +145,23 @@ class SpeechQueueReservation:
         await self._session._release_speech_reservation(self._token)
 
 
+class ManualMusicStartReservation:
+    """Temporarily keep Radio idle while an explicit request is being resolved."""
+
+    def __init__(self, session: AudioSession, token: str | None) -> None:
+        self._session = session
+        self._token = token
+        self._active = token is not None
+
+    async def release(self) -> None:
+        """Release the hold; safe after enqueue, failure, or cancellation."""
+
+        if not self._active or self._token is None:
+            return
+        self._active = False
+        await self._session._release_manual_music_start(self._token)
+
+
 class AudioSession:
     """A transport-neutral queue with recovery, persistence hooks, and one worker."""
 
@@ -176,6 +193,7 @@ class AudioSession:
         self._autoplay: deque[AudioItem] = deque()
         self._speech: deque[AudioItem] = deque()
         self._speech_reservations: set[str] = set()
+        self._manual_music_start_reservations: set[str] = set()
         self._history: deque[AudioItem] = deque(maxlen=_MAX_HISTORY_ITEMS)
         self._current: AudioItem | None = None
         self._waiting_actor_ids: set[str] = set()
@@ -284,6 +302,33 @@ class AudioSession:
             token = uuid.uuid4().hex
             self._speech_reservations.add(token)
         return SpeechQueueReservation(self, token)
+
+    async def reserve_manual_music_start(self) -> ManualMusicStartReservation:
+        """Hold an idle session so a slow explicit lookup starts before Radio.
+
+        Radio is not interrupted when a track is already playing. The hold only
+        closes the race between an idle session's background refill and a
+        user's interactive search/resolve operation.
+        """
+
+        async with self._lock:
+            if self._closed:
+                raise UserError("audio.session_closed")
+            if self._current is not None or self._music:
+                return ManualMusicStartReservation(self, None)
+            token = uuid.uuid4().hex
+            self._manual_music_start_reservations.add(token)
+            self._invalidate_autoplay_locked()
+            self._wake.set()
+        await self._state_changed()
+        return ManualMusicStartReservation(self, token)
+
+    async def _release_manual_music_start(self, token: str) -> None:
+        async with self._lock:
+            self._manual_music_start_reservations.discard(token)
+            self._wake.set()
+        self._ensure_autoplay_refill()
+        await self._state_changed()
 
     async def _commit_speech_reservation(
         self,
@@ -475,8 +520,12 @@ class AudioSession:
                     "audio.mix_loop_conflict",
                     loop_mode=self._loop_mode.value,
                 )
-            for reference in seed_references:
-                self._remember_mix_seed_reference(reference)
+            if seed_references:
+                # Explicit seeds describe the listener's current intent. Do not
+                # blend them with unrelated tracks left by an older station.
+                self._mix_seed_references.clear()
+                for reference in seed_references:
+                    self._remember_mix_seed_reference(reference)
             if not self._mix_seed_references:
                 candidates = (
                     *((self._current,) if self._current is not None else ()),
@@ -934,7 +983,10 @@ class AudioSession:
             )
 
     def _remember_mix_seed(self, item: AudioItem) -> None:
-        if item.kind is not AudioKind.MUSIC:
+        if (
+            item.kind is not AudioKind.MUSIC
+            or item.queue_lane is AudioQueueLane.AUTOPLAY
+        ):
             return
         self._remember_mix_seed_reference(item.resolver_reference or item.page_url)
 
@@ -965,6 +1017,7 @@ class AudioSession:
             not self._autoplay_enabled
             or self._autoplay_supplier is None
             or not self._mix_seed_references
+            or self._manual_music_start_reservations
             or self._autoplay
             or (self._autoplay_refill_task is not None and not self._autoplay_refill_task.done())
             or monotonic() < self._autoplay_retry_at
@@ -1062,23 +1115,26 @@ class AudioSession:
             await self._state_changed()
 
     def _radio_seed_sample(self, generation: int) -> tuple[str, ...]:
-        """Use the newest seed plus up to two deterministic recency-weighted seeds."""
+        """Prefer active manual intent instead of blending unrelated old history."""
 
-        references = tuple(self._mix_seed_references)
-        if len(references) <= 3:
-            return references
-        primary = references[-1]
-        older = list(reversed(references[:-1]))
-        randomizer = random.Random(
-            _stable_radio_seed(self.workspace_id, generation, "seeds")
+        del generation  # Candidate ordering still varies by generation.
+        active_requests = (
+            *((self._current,) if self._current is not None else ()),
+            *self._music,
         )
-        selected = [primary]
-        while older and len(selected) < 3:
-            weights = tuple(range(len(older), 0, -1))
-            choice = randomizer.choices(older, weights=weights, k=1)[0]
-            older.remove(choice)
-            selected.append(choice)
-        return tuple(selected)
+        active_references = tuple(
+            dict.fromkeys(
+                reference
+                for item in active_requests
+                if item.kind is AudioKind.MUSIC
+                and item.queue_lane is AudioQueueLane.REQUEST
+                and (reference := item.resolver_reference or item.page_url)
+            )
+        )
+        if active_references:
+            return active_references[-3:]
+        references = tuple(self._mix_seed_references)
+        return references[-3:] if references else ()
 
     def _select_radio_candidates(
         self,
@@ -1142,6 +1198,8 @@ class AudioSession:
             item = self._pop_ready_music(self._music)
             if item is not None:
                 return item
+            if self._manual_music_start_reservations:
+                return None
             return self._pop_ready_music(self._autoplay)
 
     def _pop_ready_music(self, queue: deque[AudioItem]) -> AudioItem | None:
