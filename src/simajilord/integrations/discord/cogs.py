@@ -5978,7 +5978,7 @@ _TRANSLATION_LANGUAGE_FLAGS = {
     "en-GB": "🇬🇧",
     "en-ZA": "🇿🇦",
     "en-AU": "🇦🇺",
-    "en": "🌐",
+    "en": "🇺🇸",
     "en-IE": "🇮🇪",
     "en-NZ": "🇳🇿",
     "fr-CA": "🇨🇦",
@@ -6041,9 +6041,8 @@ _TRANSLATION_LANGUAGE_REGIONS: dict[str, tuple[str, ...]] = {
         "tr",
         "uk",
     ),
-    "Americas": ("en-CA", "fr-CA", "es-MX", "es-US"),
+    "Americas": ("en", "en-CA", "fr-CA", "pt", "es-MX", "es-US"),
     "Middle East & Africa": ("ar-AE", "en-ZA"),
-    "Global": ("en", "pt"),
 }
 
 
@@ -6106,7 +6105,6 @@ class TranslationRegionSelect(discord.ui.Select["TranslationLanguagePickerView"]
                         "Europe": "🌍",
                         "Americas": "🌎",
                         "Middle East & Africa": "🌍",
-                        "Global": "🌐",
                     }[region],
                 )
                 for region, codes in _TRANSLATION_LANGUAGE_REGIONS.items()

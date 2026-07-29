@@ -430,12 +430,15 @@ def test_translation_context_menu_groups_every_language_by_region() -> None:
             "Europe",
             "Americas",
             "Middle East & Africa",
-            "Global",
         )
     )
     assert all(1 <= len(select.options) <= 25 for select in selects)
     assert {option.value for select in selects for option in select.options} == set(codes)
     assert all(option.emoji is not None for select in selects for option in select.options)
+    americas = next(select for select in selects if select.placeholder.endswith("Americas"))
+    assert {option.value for option in americas.options} >= {"en", "pt"}
+    assert next(option for option in americas.options if option.value == "en").emoji.name == "🇺🇸"
+    assert next(option for option in americas.options if option.value == "pt").emoji.name == "🇧🇷"
 
 
 def test_translation_region_picker_has_no_next_or_previous_controls() -> None:
