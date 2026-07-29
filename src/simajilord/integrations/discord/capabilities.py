@@ -829,6 +829,7 @@ class _DiscordAnimatedMedia:
 class DiscordSendMessageRequest:
     channel_id: str
     content: str
+    purpose: Literal["progress", "requested_action"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4476,7 +4477,12 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.send_message",
-                summary="Post one agent-authored progress update or follow-up to Discord.",
+                summary=(
+                    "Post one distinct agent-authored Discord message. Routine progress is "
+                    "already shown by the host UI; use purpose=progress only for a useful "
+                    "bespoke interim update, or purpose=requested_action when the person "
+                    "explicitly requested a separate post."
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=(

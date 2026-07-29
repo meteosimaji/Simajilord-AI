@@ -32,6 +32,7 @@ from simajilord.agent.providers.codex import (
     CodexAppServerProvider,
     _base_instructions,
     _batched_event_message_ids,
+    _blocking_write_capability,
     _event_trigger,
     _last_write_failure,
     _mark_authorization_message_read,
@@ -44,6 +45,7 @@ from simajilord.agent.providers.codex import (
     _user_error_reason,
     _web_search_mode,
     _with_opaque_authorization,
+    _write_readiness_failure_reason,
 )
 from simajilord.agent.service import AgentLimits, AgentService, _event_prompt
 from simajilord.agent.store import AgentConversationStore
@@ -79,6 +81,13 @@ class WriteRequest:
 @dataclass(frozen=True, slots=True)
 class WriteResponse:
     job_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProgressWriteRequest:
+    channel_id: str
+    content: str
+    purpose: Literal["progress", "requested_action"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +422,50 @@ def test_later_failed_write_is_not_hidden_by_an_earlier_success() -> None:
         output='{"truncated":true,"preview":"partial"}',
         required_message_id="4",
     )
+
+
+def test_optional_progress_failure_does_not_replace_the_final_answer() -> None:
+    assert (
+        _blocking_write_capability(
+            "discord.send_message",
+            {
+                "channel_id": "2",
+                "content": "Checking the requested PDF.",
+                "purpose": "progress",
+            },
+        )
+        is None
+    )
+    assert (
+        _blocking_write_capability(
+            "discord.send_message",
+            {
+                "channel_id": "2",
+                "content": "Post this separately.",
+                "purpose": "requested_action",
+            },
+        )
+        == "discord.send_message"
+    )
+
+
+def test_write_readiness_names_an_unread_concurrent_follow_up() -> None:
+    budget = _ToolTurnBudget(
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+        calls_remaining=2,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+        follow_up_message_ids={"follow-up"},
+        read_authorization_event_ids={"authorization"},
+        last_write_authorization_event_id="authorization",
+    )
+
+    reason = _write_readiness_failure_reason(budget)
+
+    assert reason is not None
+    assert "follow-up arrived while this turn was running" in reason
 
 
 @pytest.mark.asyncio
@@ -2870,6 +2923,98 @@ async def test_provider_rejects_write_before_exact_event_is_read(
 
 
 @pytest.mark.asyncio
+async def test_provider_keeps_unread_follow_up_progress_failure_nonblocking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: ProgressWriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.content)
+        return WriteResponse(job_id="posted")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.send_message",
+                "Post a typed progress or requested message.",
+                RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+            ),
+            ProgressWriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.send_message",),
+        required_grants={"discord.send_message": "write-scope"},
+        write_capabilities=("discord.send_message",),
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-progress-race",
+        timeout_seconds=10,
+        reasoning_effort="low",
+        tools=catalog,
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    context = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "event",
+        grants=frozenset({"write-scope"}),
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=4,
+        output_characters_remaining=4_000,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+        authorization_contexts={"auth": context},
+        authorization_message_ids={"auth": "original"},
+        read_authorization_event_ids={"auth"},
+        follow_up_message_ids={"concurrent-follow-up"},
+    )
+    provider._active_tool_budgets["thread"] = budget
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+
+    await provider._handle_dynamic_tool(
+        1,
+        {
+            "namespace": "simajilord",
+            "tool": "discord_send_message",
+            "arguments": {
+                "channel_id": "channel",
+                "content": "Checking the requested PDF.",
+                "purpose": "progress",
+                "authorization_event_id": "auth",
+            },
+            "threadId": "thread",
+        },
+    )
+
+    payload = json.loads(response.await_args.kwargs["text"])
+    assert invoked == []
+    assert response.await_args.kwargs["success"] is False
+    assert payload["error"]["code"] == "agent.event_message_not_read"
+    assert "follow-up arrived while this turn was running" in (
+        payload["error"]["reason"]
+    )
+    assert budget.write_failures == []
+
+
+@pytest.mark.asyncio
 async def test_provider_executes_write_with_authorizing_contributor_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3162,6 +3307,9 @@ async def test_provider_uses_escalation_model_only_for_verified_write_recovery(
     assert request.await_args_list[0].args[1]["model"] == "primary-model"
     assert request.await_args_list[1].args[0] == "turn/start"
     assert request.await_args_list[1].args[1]["model"] == "escalation-model"
+    correction_prompt = request.await_args_list[1].args[1]["input"][0]["text"]
+    assert "Preserve all verified informational content" in correction_prompt
+    assert "unverified success" in correction_prompt
     assert result.model == "escalation-model"
     assert result.content == "verified failure explanation"
 
@@ -3662,12 +3810,9 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "not minimizing substance" in normalized
     assert "one reactive sentence is usually insufficient" in normalized
     assert "address the concrete weakness and improve it" in instructions
-    assert "name the subject/evidence and next check" in instructions
-    assert "never generic status" in instructions
-    assert "update again after evidence or a real milestone" in instructions
-    assert "what is verified and uncertain" in normalized
-    assert "private reasoning" in instructions
-    assert "put the complete answer only in the assistant final" in normalized
+    assert "The host already shows routine progress" in instructions
+    assert "purpose=requested_action" in instructions
+    assert "Put the complete answer in the assistant final" in normalized
     assert "Codex web search" in instructions
     assert "primary sources" in instructions
     assert "reply_context" in instructions
