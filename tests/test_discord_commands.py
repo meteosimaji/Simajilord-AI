@@ -2400,15 +2400,19 @@ async def test_music_search_selection_updates_the_component_message(
 
 
 def test_agent_conversation_key_is_shared_per_channel() -> None:
-    assert discord_conversation_id(guild_id=1, channel_id=2) == ("discord:guild:1:channel:2")
-    assert discord_conversation_id(guild_id=None, channel_id=2) == ("discord:direct:channel:2")
+    assert discord_conversation_id(guild_id=1, channel_id=2) == (
+        "discord:v2:guild:1:channel:2"
+    )
+    assert discord_conversation_id(guild_id=None, channel_id=2) == (
+        "discord:v2:direct:channel:2"
+    )
     assert (
         discord_conversation_id(
             guild_id=1,
             channel_id=2,
             grants=frozenset({AGENT_WEB_GRANT}),
         )
-        == "discord:guild:1:channel:2:profile:web"
+        == "discord:v2:guild:1:channel:2:profile:web"
     )
 
 

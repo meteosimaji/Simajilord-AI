@@ -284,6 +284,27 @@ async def test_reduced_capability_profile_never_inherits_privileged_thread(
 
 
 @pytest.mark.asyncio
+async def test_new_conversation_compatibility_version_never_resumes_legacy_thread(
+    tmp_path,
+) -> None:
+    provider = FakeProvider()
+    service = AgentService(
+        provider=provider,
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+    legacy_id = "discord:guild:1:channel:2:profile:discord_message+web"
+    current_id = "discord:v2:guild:1:channel:2:profile:discord_message+web"
+
+    await service.respond(_request("legacy", conversation_id=legacy_id))
+    await service.respond(_request("current", conversation_id=current_id))
+
+    assert provider.calls[0][0] is None
+    assert provider.calls[1][0] is None
+
+
+@pytest.mark.asyncio
 async def test_agent_emits_only_structured_progress_stages(tmp_path) -> None:
     provider = FakeProvider()
     service = AgentService(
@@ -1303,6 +1324,8 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "send at least one more update" in instructions
     assert "what remains uncertain or to compare" in normalized
     assert "private reasoning" in instructions
+    assert "never put a complete answer" in normalized
+    assert "assistant final response" in instructions
     assert "Codex web search" in instructions
     assert "primary sources" in instructions
 

@@ -8115,6 +8115,9 @@ class QuoteComposerView(SafeView):
         self.stop()
 
 
+_AGENT_CONVERSATION_COMPATIBILITY_VERSION = 2
+
+
 def discord_conversation_id(
     *,
     guild_id: int | None,
@@ -8124,7 +8127,10 @@ def discord_conversation_id(
     """Map one Discord channel and capability profile to one agent conversation."""
 
     scope = f"guild:{guild_id}" if guild_id is not None else "direct"
-    base = f"discord:{scope}:channel:{channel_id}"
+    base = (
+        f"discord:v{_AGENT_CONVERSATION_COMPATIBILITY_VERSION}:"
+        f"{scope}:channel:{channel_id}"
+    )
     if not grants:
         return base
     profile = "+".join(sorted(grants))
