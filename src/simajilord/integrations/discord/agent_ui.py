@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import suppress
 
 import discord
 
@@ -120,7 +119,7 @@ def agent_progress_text(update: AgentProgressUpdate) -> str:
 
 
 class AgentProgressMessage:
-    """Coalesce real execution stages into one low-frequency Discord message."""
+    """Coalesce execution stages into one temporary Discord message."""
 
     def __init__(
         self,
@@ -139,6 +138,7 @@ class AgentProgressMessage:
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._closed = False
+        self._temporary_messages: dict[int, discord.Message] = {}
 
     async def update(self, update: AgentProgressUpdate) -> None:
         if self._closed:
@@ -153,29 +153,17 @@ class AgentProgressMessage:
     async def finish(self, content: str) -> None:
         self._closed = True
         await self._cancel_pending()
+        await self._delete_temporary_messages()
         if content.strip() == AGENT_NO_ACTION_CONTENT:
-            async with self._lock:
-                if self.message is not None:
-                    with suppress(discord.DiscordException):
-                        await self.message.delete()
-                    self.message = None
             return
         messages = agent_message_groups(content)
         if not messages:
             return
-        async with self._lock:
-            if self.message is None:
-                self.message = await self.source.reply(
-                    messages[0],
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await self.message.edit(
-                    content=messages[0],
-                    embed=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+        await self.source.reply(
+            messages[0],
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         for message in messages[1:]:
             await self.source.channel.send(
                 message,
@@ -185,19 +173,21 @@ class AgentProgressMessage:
     async def fail(self, content: str) -> None:
         self._closed = True
         await self._cancel_pending()
+        await self._delete_temporary_messages()
+        await self.source.reply(
+            content,
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def add_temporary_message(self, message: discord.Message) -> None:
+        """Delete a follow-up acknowledgement when this turn closes."""
+
         async with self._lock:
-            if self.message is None:
-                self.message = await self.source.reply(
-                    content,
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await self.message.edit(
-                    content=content,
-                    embed=None,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+            if not self._closed:
+                self._temporary_messages[message.id] = message
+                return
+        await self._delete_message(message, kind="follow-up")
 
     async def _flush_later(self) -> None:
         try:
@@ -258,3 +248,32 @@ class AgentProgressMessage:
             return
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    async def _delete_temporary_messages(self) -> None:
+        async with self._lock:
+            messages = list(self._temporary_messages.values())
+            self._temporary_messages.clear()
+            if self.message is not None:
+                messages.insert(0, self.message)
+            self.message = None
+        for message in messages:
+            await self._delete_message(message, kind="temporary")
+
+    async def _delete_message(
+        self,
+        message: discord.Message,
+        *,
+        kind: str,
+    ) -> None:
+        try:
+            await message.delete()
+        except discord.DiscordException:
+            # Final delivery remains a new post even when Discord refuses
+            # cleanup, so authored milestone updates keep their ordering.
+            log.exception(
+                "Failed to delete AI %s message source_message_id=%s "
+                "temporary_message_id=%s",
+                kind,
+                self.source.id,
+                message.id,
+            )

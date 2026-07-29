@@ -18,7 +18,6 @@ from simajilord.agent import (
     AGENT_MODERATION_GRANT,
     AGENT_QUOTE_GRANT,
     AGENT_REPOST_GRANT,
-    AGENT_WEB_GRANT,
 )
 from simajilord.agent.providers import CodexAppServerProvider
 from simajilord.agent.service import AgentLimits, AgentService
@@ -368,10 +367,6 @@ class SimajilordRuntime:
                 capability_name = "discord.analyze_attachment"
                 agent_capabilities.append(capability_name)
                 required_grants[capability_name] = AGENT_MODERATION_GRANT
-            if settings.agent_web_search_access is not AgentFeatureAccess.DISABLED:
-                for capability_name in ("web.search", "web.fetch", "web.find"):
-                    agent_capabilities.append(capability_name)
-                    required_grants[capability_name] = AGENT_WEB_GRANT
             if (
                 image.provider is not None
                 and settings.image_generation_access is not AgentFeatureAccess.DISABLED

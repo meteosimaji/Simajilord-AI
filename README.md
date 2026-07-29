@@ -105,6 +105,9 @@ with Discord's generic “interaction failed” banner.
   `Generate` and `Cancel` on the main screen
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
+- Agent research uses Codex first-party live web search through the host's existing ChatGPT OAuth
+  session when `AGENT_WEB_SEARCH_ACCESS` grants access. Local SearXNG remains available to
+  explicit `/web` and prefix commands, but is not exposed to autonomous Codex turns
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and
@@ -118,7 +121,12 @@ with Discord's generic “interaction failed” banner.
   Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
   as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
   remain attached so another user's read-only contribution is distinguishable. Queue and
-  execution progress uses short English status messages
+  host execution progress uses short English status messages. The temporary `Working` embed is
+  deleted before the final answer is posted as a new reply, preserving the order of visible
+  milestone updates. Accepted-follow-up acknowledgements are tied to the parent turn and removed
+  on either completion or failure. Multi-step work also posts task-specific progress in the
+  conversation language, naming checked evidence and the next step without exposing private
+  reasoning
 - Restart-safe local image generation with atomic user/server/pending admission and a resident
   exponential-backoff Discord delivery retry loop. A completed image is not considered
   delivered until Discord accepts it, without waiting for the next service restart
@@ -275,9 +283,9 @@ without attaching the check to CI or consuming Discord API rate limits:
 uv run python scripts/manual_agent_discord_qa.py
 ```
 
-This one-shot test gives the AI an exact-message task and verifies that it sends a recorded
-intermediate message before returning the final answer. It consumes one model turn and is
-intentionally not run on push.
+This one-shot test gives the AI an exact-message research task and verifies first-party Codex
+web search, multiple concrete intermediate messages, and the final sourced answer. It consumes
+one model turn and live search, and is intentionally not run on push.
 
 To inspect Discord embeds, adaptive buttons, local read-aloud, and music ducking without
 connecting a Discord client:

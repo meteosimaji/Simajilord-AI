@@ -15,6 +15,7 @@ from pathlib import Path
 
 from simajilord.agent import (
     AGENT_MESSAGE_GRANT,
+    AGENT_WEB_GRANT,
     AgentProgressUpdate,
     AgentRequest,
     AgentTrigger,
@@ -70,11 +71,10 @@ async def run() -> dict[str, object]:
     """Run one production-shaped turn and return an assertion-friendly summary."""
 
     source_message = (
-        "Simajilordの手動QAです。最終回答の前に、途中経過として"
-        "「考えを整理しています」という短いメッセージをこのチャンネルへ1件送って"
-        "ください。その後、幼少期に『ミッケ』や『ウォーリーをさがせ』のような"
-        "探し絵を読むことに意味はあるのか、結論・期待できる点・限界を理由つきで"
-        "自然な日本語で答えてください。短い相づちだけでは終えないでください。"
+        "Simajilordの手動QAです。Codexの組み込みWeb検索がChatGPT OAuthで"
+        "利用できるかを最新のOpenAI公式情報で確認し、検索モードと安全上の注意を"
+        "自然な日本語で詳しくまとめてください。途中経過では、確認対象と次の検証、"
+        "確認できた内容と残る作業が具体的に分かるようにしてください。"
     )
     sent_messages: list[str] = []
     progress: list[dict[str, object]] = []
@@ -188,7 +188,7 @@ async def run() -> dict[str, object]:
                     message_id="message-qa",
                     occurred_at=datetime.now(UTC),
                     resource_ids=("channel-qa",),
-                    grants=frozenset({AGENT_MESSAGE_GRANT}),
+                    grants=frozenset({AGENT_MESSAGE_GRANT, AGENT_WEB_GRANT}),
                     approvals=frozenset({"discord.send_message"}),
                 ),
                 on_progress=on_progress,
@@ -203,8 +203,11 @@ async def run() -> dict[str, object]:
         "final_response": response.content,
         "response_characters": len(response.content),
         "passed": (
-            sent_messages == ["考えを整理しています"]
-            and len(response.content) >= 120
+            len(sent_messages) >= 2
+            and all(len(message) >= 25 for message in sent_messages)
+            and any(item["stage"] == "searching_web" for item in progress)
+            and "https://" in response.content
+            and len(response.content) >= 200
         ),
     }
     return result

@@ -230,16 +230,16 @@ class AgentService:
     async def close(self) -> None:
         await self.provider.close()
 
-    async def try_follow_up(self, request: AgentRequest) -> bool:
-        """Steer an active same-channel turn using only a Discord event pointer."""
+    async def try_follow_up(self, request: AgentRequest) -> str | None:
+        """Steer a turn and return its original event ID when accepted."""
 
         if not isinstance(self.provider, SteerableAgentProvider):
-            return False
+            return None
         origin_key = (request.workspace_id, request.channel_id)
         async with self._admission_lock:
             active = self._active_origins.get(origin_key)
             if active is None:
-                return False
+                return None
             original, follow_up_count = active
             if follow_up_count >= self.limits.max_pending_turns:
                 raise AgentBusyError("The bounded agent follow-up queue is full.")
@@ -277,7 +277,7 @@ class AgentService:
                         "same_actor": request.actor_id == original.actor_id,
                     },
                 )
-            return accepted
+            return original.event_id if accepted else None
         finally:
             if not accepted:
                 async with self._admission_lock:

@@ -166,7 +166,9 @@ async def test_actor_member_fetches_exact_member_when_cache_is_empty() -> None:
 async def test_agent_no_action_sentinel_is_never_published() -> None:
     source = Mock(spec=discord.Message)
     source.id = 42
+    source.reply = AsyncMock()
     published = Mock(spec=discord.Message)
+    published.id = 43
     published.delete = AsyncMock()
     progress = _AgentProgressMessage(source)
     progress.message = published
@@ -174,7 +176,121 @@ async def test_agent_no_action_sentinel_is_never_published() -> None:
     await progress.finish("<simajilord:no-action>")
 
     published.delete.assert_awaited_once_with()
+    source.reply.assert_not_awaited()
     assert progress.message is None
+
+
+@pytest.mark.asyncio
+async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> None:
+    order: list[str] = []
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.channel = Mock()
+    source.channel.send = AsyncMock()
+
+    async def reply(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        order.append("final")
+        return Mock(spec=discord.Message)
+
+    source.reply = AsyncMock(side_effect=reply)
+    published = Mock(spec=discord.Message)
+    published.id = 43
+
+    async def delete() -> None:
+        order.append("delete-progress")
+
+    published.delete = AsyncMock(side_effect=delete)
+    published.edit = AsyncMock()
+    progress = _AgentProgressMessage(source)
+    progress.message = published
+
+    await progress.finish("Final answer")
+
+    assert order == ["delete-progress", "final"]
+    published.edit.assert_not_awaited()
+    source.reply.assert_awaited_once()
+    source.channel.send.assert_not_awaited()
+    assert progress.message is None
+
+
+@pytest.mark.asyncio
+async def test_agent_failure_replaces_working_with_a_new_reply() -> None:
+    order: list[str] = []
+    source = Mock(spec=discord.Message)
+    source.id = 42
+
+    async def reply(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        order.append("failure")
+        return Mock(spec=discord.Message)
+
+    source.reply = AsyncMock(side_effect=reply)
+    published = Mock(spec=discord.Message)
+    published.id = 43
+
+    async def delete() -> None:
+        order.append("delete-progress")
+
+    published.delete = AsyncMock(side_effect=delete)
+    published.edit = AsyncMock()
+    progress = _AgentProgressMessage(source)
+    progress.message = published
+
+    await progress.fail("Could not finish")
+
+    assert order == ["delete-progress", "failure"]
+    published.edit.assert_not_awaited()
+    source.reply.assert_awaited_once()
+    assert progress.message is None
+
+
+@pytest.mark.asyncio
+async def test_agent_finish_deletes_follow_up_acknowledgements_before_final() -> None:
+    order: list[str] = []
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.channel = Mock()
+    source.channel.send = AsyncMock()
+
+    async def reply(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        order.append("final")
+        return Mock(spec=discord.Message)
+
+    source.reply = AsyncMock(side_effect=reply)
+    acknowledgement = Mock(spec=discord.Message)
+    acknowledgement.id = 44
+
+    async def delete() -> None:
+        order.append("delete-follow-up")
+
+    acknowledgement.delete = AsyncMock(side_effect=delete)
+    progress = _AgentProgressMessage(source)
+    await progress.add_temporary_message(acknowledgement)
+
+    await progress.finish("Final answer")
+
+    assert order == ["delete-follow-up", "final"]
+    acknowledgement.delete.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_late_follow_up_acknowledgement_is_deleted_immediately() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.reply = AsyncMock(return_value=Mock(spec=discord.Message))
+    source.channel = Mock()
+    source.channel.send = AsyncMock()
+    acknowledgement = Mock(spec=discord.Message)
+    acknowledgement.id = 44
+    acknowledgement.delete = AsyncMock()
+    progress = _AgentProgressMessage(source)
+
+    await progress.finish("Final answer")
+    await progress.add_temporary_message(acknowledgement)
+
+    acknowledgement.delete.assert_awaited_once_with()
 
 
 def test_agent_queue_progress_shows_same_server_wait_position() -> None:

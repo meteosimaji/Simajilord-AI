@@ -30,6 +30,7 @@ from simajilord.agent.providers.codex import (
     _provider_turn_error,
     _tool_read_exact_event,
     _ToolTurnBudget,
+    _web_search_mode,
 )
 from simajilord.agent.service import AgentLimits, AgentService
 from simajilord.agent.store import AgentConversationStore
@@ -482,7 +483,7 @@ async def test_agent_steers_same_channel_follow_up_with_distinct_actor_identity(
         message_id="follow-up-message",
     )
 
-    assert await service.try_follow_up(follow_up) is True
+    assert await service.try_follow_up(follow_up) == original.event_id
     assert len(steered) == 1
     prompt, context = steered[0]
     assert "SIMAJILORD_FOLLOW_UP_V1" in prompt
@@ -1297,6 +1298,27 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "not minimizing substance" in instructions
     assert "one reactive sentence is usually insufficient" in instructions
     assert "address the concrete weakness and improve it" in instructions
+    assert "specific subject or source categories" in instructions
+    assert "generic working/searching line" in instructions
+    assert "send at least one more update" in instructions
+    assert "what remains uncertain or to compare" in normalized
+    assert "private reasoning" in instructions
+    assert "Codex web search" in instructions
+    assert "primary sources" in instructions
+
+
+def test_codex_live_search_requires_the_existing_web_grant() -> None:
+    denied = InvocationContext("actor", "workspace", "agent", "denied")
+    granted = InvocationContext(
+        "actor",
+        "workspace",
+        "agent",
+        "granted",
+        grants=frozenset({AGENT_WEB_GRANT}),
+    )
+
+    assert _web_search_mode(denied) == "disabled"
+    assert _web_search_mode(granted) == "live"
 
 
 def test_provider_usage_limit_has_a_stable_error_type() -> None:

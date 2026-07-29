@@ -8184,6 +8184,7 @@ class AgentCog(commands.Cog):
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
         self.runtime = runtime
+        self._active_progress: dict[str, AgentProgressMessage] = {}
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -8246,7 +8247,7 @@ class AgentCog(commands.Cog):
             approvals=approvals,
         )
         try:
-            follow_up_added = await agent.try_follow_up(request)
+            followed_event_id = await agent.try_follow_up(request)
         except AgentBusyError as exc:
             await message.reply(
                 _agent_error_text(exc),
@@ -8254,8 +8255,8 @@ class AgentCog(commands.Cog):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
-        if follow_up_added:
-            await message.reply(
+        if followed_event_id is not None:
+            acknowledgement = await message.reply(
                 embed=command_embed(
                     "Added to the active AI request",
                     description=(
@@ -8267,8 +8268,15 @@ class AgentCog(commands.Cog):
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            progress = self._active_progress.get(followed_event_id)
+            if progress is None:
+                with suppress(discord.DiscordException):
+                    await acknowledgement.delete()
+            else:
+                await progress.add_temporary_message(acknowledgement)
             return
         progress = _AgentProgressMessage(message)
+        self._active_progress[request.event_id] = progress
         try:
             async with message.channel.typing():
                 response = await agent.respond(
@@ -8279,6 +8287,9 @@ class AgentCog(commands.Cog):
         except Exception as exc:
             log.exception("Mention agent turn failed message=%s", message.id)
             await progress.fail(_agent_error_text(exc))
+        finally:
+            if self._active_progress.get(request.event_id) is progress:
+                self._active_progress.pop(request.event_id, None)
 
 
 class ObservationCog(commands.Cog):
