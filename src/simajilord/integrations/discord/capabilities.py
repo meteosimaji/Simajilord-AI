@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -59,8 +60,9 @@ from simajilord.capabilities.speech import (
     SpeechSpeakResponse,
 )
 from simajilord.capabilities.translation import (
-    TranslationTranslateRequest,
-    TranslationTranslateResponse,
+    TranslationBatchRequest,
+    TranslationBatchResponse,
+    TranslationSegmentItem,
 )
 from simajilord.core import (
     ApprovalMode,
@@ -86,6 +88,8 @@ from .presenter import (
     expanded_message_view,
     quote_message_view,
 )
+
+log = logging.getLogger(__name__)
 
 DiscordMessageChannel: TypeAlias = (
     discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel
@@ -473,6 +477,13 @@ class DiscordTranslateMessageRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordTranslatedSegmentRecord:
+    identifier: str
+    original: str
+    translation: str
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordTranslateMessageResponse:
     message_id: str
     channel_id: str
@@ -483,6 +494,8 @@ class DiscordTranslateMessageResponse:
     source_language: str
     target_language: str
     provider: str
+    segments: tuple[DiscordTranslatedSegmentRecord, ...] = ()
+    cached: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -822,31 +835,69 @@ def build_discord_endpoints(
             message_id=request.message_id,
             context=context,
         )
-        if not message.content.strip():
+        segments = discord_translation_segments(message)
+        if not segments:
             raise UserError("translation.message_text_required")
         translated = cast(
-            TranslationTranslateResponse,
+            TranslationBatchResponse,
             await runtime.registry.invoke(
-                "translation.translate",
-                TranslationTranslateRequest(
-                    text=message.content,
+                "translation.translate_batch",
+                TranslationBatchRequest(
+                    segments=segments,
                     target_language=request.target_language,
                     source_language=request.source_language,
                 ),
                 context,
             ),
         )
-        return DiscordTranslateMessageResponse(
+        response = DiscordTranslateMessageResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
             jump_url=message.jump_url,
             author_name=message.author.display_name,
-            original=translated.original,
-            translation=translated.translation,
+            original="\n".join(item.original for item in translated.segments),
+            translation="\n".join(item.translation for item in translated.segments),
             source_language=translated.source_language,
             target_language=translated.target_language,
             provider=translated.provider,
+            segments=tuple(
+                DiscordTranslatedSegmentRecord(
+                    identifier=item.identifier,
+                    original=item.original,
+                    translation=item.translation,
+                )
+                for item in translated.segments
+            ),
+            cached=translated.cached,
         )
+        await runtime.journal.append(
+            kind="translation.document",
+            actor_id=context.actor_id,
+            workspace_id=context.workspace_id,
+            transport=context.transport,
+            request_id=context.request_id,
+            payload={
+                "message_id": str(message.id),
+                "channel_id": str(channel.id),
+                "segment_count": len(response.segments),
+                "source_language": response.source_language,
+                "target_language": response.target_language,
+                "provider": response.provider,
+                "cached": response.cached,
+            },
+        )
+        log.info(
+            "Translated Discord message message=%s channel=%s segments=%s "
+            "source=%s target=%s provider=%s cached=%s",
+            response.message_id,
+            response.channel_id,
+            len(response.segments),
+            response.source_language,
+            response.target_language,
+            response.provider,
+            response.cached,
+        )
+        return response
 
     async def post_expanded_message(
         request: DiscordPostExpandedMessageRequest,
@@ -2979,6 +3030,75 @@ def _expanded_poll(poll: discord.Poll | None) -> DiscordExpandedPollRecord | Non
         question=poll.question,
         answers=tuple(answer.text for answer in poll.answers),
     )
+
+
+def discord_translation_segments(
+    message: discord.Message,
+) -> tuple[TranslationSegmentItem, ...]:
+    """Extract translatable text in Discord display order with stable paths."""
+
+    output: list[TranslationSegmentItem] = []
+
+    def append(identifier: str, text: str | None) -> None:
+        value = text.strip() if text is not None else ""
+        if value:
+            output.append(TranslationSegmentItem(identifier=identifier, text=value))
+
+    append("content", message.content)
+    for embed_index, item in enumerate(message.embeds[:10]):
+        append(f"embed.{embed_index}.author", item.author.name)
+        append(f"embed.{embed_index}.title", item.title)
+        append(f"embed.{embed_index}.description", item.description)
+        for field_index, field in enumerate(item.fields[:25]):
+            append(f"embed.{embed_index}.field.{field_index}.name", field.name)
+            append(f"embed.{embed_index}.field.{field_index}.value", field.value)
+        append(f"embed.{embed_index}.footer", item.footer.text)
+    if message.poll is not None:
+        append("poll.question", message.poll.question)
+        for answer_index, answer in enumerate(message.poll.answers):
+            append(f"poll.answer.{answer_index}", answer.text)
+    for component_index, component in enumerate(message.components):
+        _append_component_text(
+            component.to_dict(),
+            path=f"component.{component_index}",
+            append=append,
+        )
+    for attachment_index, attachment in enumerate(message.attachments[:10]):
+        append(
+            f"attachment.{attachment_index}.description",
+            attachment.description,
+        )
+    return tuple(output)
+
+
+def _append_component_text(
+    value: object,
+    *,
+    path: str,
+    append: Callable[[str, str | None], None],
+) -> None:
+    if isinstance(value, dict):
+        component_type = value.get("type")
+        content = value.get("content")
+        if component_type == 10 and isinstance(content, str):
+            append(f"{path}.content", content)
+        for key in ("components",):
+            children = value.get(key)
+            if isinstance(children, list):
+                for index, child in enumerate(children):
+                    _append_component_text(
+                        child,
+                        path=f"{path}.{index}",
+                        append=append,
+                    )
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            _append_component_text(
+                child,
+                path=f"{path}.{index}",
+                append=append,
+            )
 
 
 def _expanded_reply(message: discord.Message) -> tuple[str | None, str | None]:

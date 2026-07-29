@@ -38,6 +38,14 @@ struct TranslationHelper {
                     "translation.helper_unavailable",
                     "Direct on-device translation requires macOS 26 or newer."
                 )
+            case "translate_batch":
+                if #available(macOS 26.0, *) {
+                    return await translateBatch(request)
+                }
+                return failure(
+                    "translation.helper_unavailable",
+                    "Direct on-device translation requires macOS 26 or newer."
+                )
             default:
                 return failure("translation.request_invalid", "Unknown operation.")
             }
@@ -162,6 +170,119 @@ struct TranslationHelper {
                 "source_language": response.sourceLanguage.minimalIdentifier,
                 "target_language": response.targetLanguage.minimalIdentifier,
                 "translated_text": response.targetText,
+            ]
+        } catch {
+            return failure("translation.failed", String(describing: error))
+        }
+    }
+
+    @available(macOS 26.0, *)
+    private static func translateBatch(_ request: JSONObject) async -> JSONObject {
+        guard
+            let values = request["segments"] as? [JSONObject],
+            !values.isEmpty,
+            let targetIdentifier = request["target_language"] as? String,
+            !targetIdentifier.isEmpty
+        else {
+            return failure(
+                "translation.request_invalid",
+                "Segments and target language are required."
+            )
+        }
+        var requests: [TranslationSession.Request] = []
+        var sourceTextByIdentifier: [String: String] = [:]
+        for value in values {
+            guard
+                let identifier = value["identifier"] as? String,
+                !identifier.isEmpty,
+                let text = value["text"] as? String,
+                !text.isEmpty,
+                sourceTextByIdentifier[identifier] == nil
+            else {
+                return failure(
+                    "translation.request_invalid",
+                    "Every segment needs a unique identifier and non-empty text."
+                )
+            }
+            sourceTextByIdentifier[identifier] = text
+            requests.append(
+                TranslationSession.Request(
+                    sourceText: text,
+                    clientIdentifier: identifier
+                )
+            )
+        }
+        let sourceIdentifier: String
+        if let supplied = request["source_language"] as? String, !supplied.isEmpty {
+            sourceIdentifier = supplied
+        } else {
+            let detectionText = values.compactMap { $0["text"] as? String }.joined(
+                separator: "\n"
+            )
+            guard let detected = NLLanguageRecognizer.dominantLanguage(
+                for: detectionText
+            )?.rawValue else {
+                return failure(
+                    "translation.language_not_detected",
+                    "The source language could not be identified."
+                )
+            }
+            sourceIdentifier = detected
+        }
+        let source = Locale.Language(identifier: sourceIdentifier)
+        let target = Locale.Language(identifier: targetIdentifier)
+        let availability = LanguageAvailability()
+        let status = await availability.status(from: source, to: target)
+        switch status {
+        case .unsupported:
+            return failure(
+                "translation.language_pair_unsupported",
+                "The requested language pair is not supported by Apple Translation."
+            )
+        case .supported:
+            return failure(
+                "translation.language_pair_not_installed",
+                "Install this language pair in macOS before translating."
+            )
+        case .installed:
+            break
+        @unknown default:
+            return failure(
+                "translation.language_pair_unsupported",
+                "The language-pair status is unknown."
+            )
+        }
+        do {
+            let session = TranslationSession(installedSource: source, target: target)
+            let responses = try await session.translations(from: requests)
+            let byIdentifier = Dictionary(
+                uniqueKeysWithValues: responses.compactMap { response in
+                    response.clientIdentifier.map { ($0, response) }
+                }
+            )
+            var translated: [JSONObject] = []
+            for request in requests {
+                guard
+                    let identifier = request.clientIdentifier,
+                    let sourceText = sourceTextByIdentifier[identifier],
+                    let response = byIdentifier[identifier]
+                else {
+                    return failure(
+                        "translation.failed",
+                        "Apple Translation returned an incomplete batch."
+                    )
+                }
+                translated.append([
+                    "identifier": identifier,
+                    "source_text": sourceText,
+                    "translated_text": response.targetText,
+                ])
+            }
+            return [
+                "ok": true,
+                "source_language": source.minimalIdentifier,
+                "target_language": target.minimalIdentifier,
+                "segments": translated,
             ]
         } catch {
             return failure("translation.failed", String(describing: error))

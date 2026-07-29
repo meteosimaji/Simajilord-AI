@@ -25,13 +25,18 @@ from .read_aloud import (
 )
 from .speech import SpeechProvider, SpeechService
 from .translation import (
+    TranslatedSegment,
+    TranslationBatchResult,
     TranslationDetection,
     TranslationHypothesis,
     TranslationLanguage,
+    TranslationPreference,
     TranslationProvider,
     TranslationProviderError,
     TranslationResult,
+    TranslationSegment,
     TranslationService,
+    TranslationStore,
 )
 from .web import WebService
 
@@ -72,12 +77,17 @@ __all__ = [
     "SpeechService",
     "StoredAudioItem",
     "StoredAudioSession",
+    "TranslatedSegment",
+    "TranslationBatchResult",
     "TranslationDetection",
     "TranslationHypothesis",
     "TranslationLanguage",
+    "TranslationPreference",
     "TranslationProvider",
     "TranslationProviderError",
     "TranslationResult",
+    "TranslationSegment",
     "TranslationService",
+    "TranslationStore",
     "WebService",
 ]

@@ -69,6 +69,7 @@ from simajilord.services import (
     ServiceOperationMetric,
     SpeechService,
     TranslationService,
+    TranslationStore,
     WebService,
 )
 
@@ -286,6 +287,7 @@ class SimajilordRuntime:
             if settings.translation_enabled and sys.platform == "darwin"
             else (),
             max_characters=settings.translation_max_characters,
+            store=TranslationStore(settings.data_dir / "translations.sqlite3"),
         )
         files = (
             AgentFileSandbox(settings.data_dir / "agent_files")
@@ -330,6 +332,7 @@ class SimajilordRuntime:
                 "translation.detect",
                 "translation.languages",
                 "translation.translate",
+                "translation.translate_batch",
             ]
             required_grants: dict[str, str] = {
                 "audio.history": AGENT_AUDIO_GRANT,

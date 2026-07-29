@@ -54,6 +54,8 @@ from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
     DiscordServerResponse,
+    DiscordTranslatedSegmentRecord,
+    DiscordTranslateMessageResponse,
     DiscordUserResponse,
     DiscordViewCustomEmojiRequest,
     DiscordViewCustomEmojiResponse,
@@ -70,6 +72,7 @@ from simajilord.integrations.discord.capabilities import (
     _prepare_discord_animated_media,
     agent_readable_channel_ids,
     build_discord_endpoints,
+    discord_translation_segments,
     parse_discord_message_link,
 )
 from simajilord.integrations.discord.cogs import (
@@ -105,8 +108,10 @@ from simajilord.integrations.discord.cogs import (
     _agent_message_groups,
     _AgentProgressMessage,
     _discord_message_chunks,
+    _locale_target,
     _resolve_translation_target,
     _retry_after_text,
+    _translation_result_embeds,
     _translation_target_autocomplete_choices,
     _youtube_card_reference,
     audio_control_capability_call,
@@ -122,6 +127,7 @@ from simajilord.integrations.discord.help_catalog import (
     PublicCommandSpec,
 )
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.translation import TranslationPreference
 
 
 @pytest.mark.asyncio
@@ -407,6 +413,154 @@ def test_translation_slash_autocomplete_filters_all_languages_and_caps_results()
             "Native 36",
         )
     ] == ["x-36"]
+
+
+def test_translation_locale_resolution_supports_exact_base_and_chinese_script() -> None:
+    languages = (
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem(
+            "zh-Hans",
+            "Chinese, Simplified",
+            "简体中文",
+            "installed",
+        ),
+        TranslationLanguageItem(
+            "zh-Hant",
+            "Chinese, Traditional",
+            "繁體中文",
+            "installed",
+        ),
+        TranslationLanguageItem("pt-BR", "Portuguese", "Português", "installed"),
+    )
+
+    assert _locale_target(("pt-BR",), languages) == "pt-BR"
+    assert _locale_target(("en-US",), languages) == "en"
+    assert _locale_target(("zh-TW",), languages) == "zh-Hant"
+    assert _locale_target(("zh-CN",), languages) == "zh-Hans"
+
+
+@pytest.mark.asyncio
+async def test_translation_default_restores_target_and_original_preference() -> None:
+    languages = (
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem("fr", "French", "Français", "installed"),
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+    )
+    translation = SimpleNamespace(
+        preference=AsyncMock(
+            return_value=TranslationPreference(
+                target_language="fr",
+                show_original=True,
+            )
+        )
+    )
+    runtime = cast(
+        SimajilordRuntime,
+        SimpleNamespace(translation=translation),
+    )
+    cog = TranslationCog(runtime)
+    interaction = cast(
+        discord.Interaction,
+        SimpleNamespace(
+            user=SimpleNamespace(id=7),
+            guild_id=11,
+            locale=SimpleNamespace(value="ja"),
+            guild_locale=SimpleNamespace(value="en-US"),
+        ),
+    )
+
+    assert await cog._default_translation_settings(interaction, languages) == (
+        "fr",
+        True,
+    )
+    translation.preference.assert_awaited_once_with(
+        actor_id="7",
+        workspace_id="11",
+    )
+
+
+def test_structured_translation_extracts_and_rebuilds_discord_message() -> None:
+    embed = discord.Embed(
+        title="Title",
+        description="Description",
+        colour=discord.Colour.blurple(),
+    )
+    embed.set_author(name="Author")
+    embed.add_field(name="Name", value="Value", inline=True)
+    embed.set_footer(text="Footer")
+    embed.set_image(url="https://example.com/image.png")
+    component = SimpleNamespace(
+        to_dict=lambda: {
+            "type": 17,
+            "components": [
+                {"type": 10, "content": "Component text"},
+            ],
+        }
+    )
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            content="Content",
+            embeds=[embed],
+            poll=SimpleNamespace(
+                question="Question",
+                answers=[SimpleNamespace(text="Answer")],
+            ),
+            components=[component],
+            attachments=[SimpleNamespace(description="Alt text")],
+        ),
+    )
+    segments = discord_translation_segments(message)
+    response = DiscordTranslateMessageResponse(
+        message_id="1",
+        channel_id="2",
+        jump_url="https://discord.com/channels/1/2/3",
+        author_name="Meteo",
+        original="\n".join(item.text for item in segments),
+        translation="\n".join(f"T:{item.text}" for item in segments),
+        source_language="en",
+        target_language="ja",
+        provider="test",
+        segments=tuple(
+            DiscordTranslatedSegmentRecord(
+                identifier=item.identifier,
+                original=item.text,
+                translation=f"T:{item.text}",
+            )
+            for item in segments
+        ),
+    )
+
+    assert tuple(item.identifier for item in segments) == (
+        "content",
+        "embed.0.author",
+        "embed.0.title",
+        "embed.0.description",
+        "embed.0.field.0.name",
+        "embed.0.field.0.value",
+        "embed.0.footer",
+        "poll.question",
+        "poll.answer.0",
+        "component.0.0.content",
+        "attachment.0.description",
+    )
+    rendered = _translation_result_embeds(message, response, show_original=False)
+    translated_embed = rendered[1]
+    assert rendered[0].description == "T:Content"
+    assert translated_embed.title == "T:Title"
+    assert translated_embed.description == "T:Description"
+    assert translated_embed.author.name == "T:Author"
+    assert translated_embed.fields[0].name == "T:Name"
+    assert translated_embed.fields[0].value == "T:Value"
+    assert translated_embed.footer.text == "T:Footer"
+    assert translated_embed.colour == discord.Colour.blurple()
+    assert translated_embed.image.url == "https://example.com/image.png"
+    assert all(item.title != "Original" for item in rendered)
+    assert _translation_result_embeds(
+        message,
+        response,
+        show_original=True,
+    )[-1].title == "Original"
 
 
 def test_human_audio_controls_map_to_exact_agent_capabilities() -> None:

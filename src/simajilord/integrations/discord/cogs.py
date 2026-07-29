@@ -156,11 +156,13 @@ from .capabilities import (
     DiscordPostExpandedMessageResponse,
     DiscordServerRequest,
     DiscordServerResponse,
+    DiscordTranslatedSegmentRecord,
     DiscordTranslateMessageRequest,
     DiscordTranslateMessageResponse,
     DiscordUserRequest,
     DiscordUserResponse,
     agent_readable_channel_ids,
+    discord_translation_segments,
     parse_discord_message_link,
     quote_message_has_animation,
 )
@@ -2612,13 +2614,25 @@ async def edit_deferred_error(
     interaction: discord.Interaction,
     error: Exception,
 ) -> None:
-    await interaction.edit_original_response(
-        embed=command_embed(
-            "Could not complete the request",
-            description=error_message(error),
-            tone=EmbedTone.ERROR,
+    if not interaction.response.is_done():
+        await send_error(interaction, error)
+        return
+    try:
+        await interaction.edit_original_response(
+            embed=command_embed(
+                "Could not complete the request",
+                description=error_message(error),
+                tone=EmbedTone.ERROR,
+            )
         )
-    )
+    except discord.NotFound:
+        log.warning(
+            "Could not edit an expired Discord interaction response",
+            extra={
+                "interaction_id": interaction.id,
+                "error_type": type(error).__name__,
+            },
+        )
 
 
 class FocusTimerCancelView(discord.ui.View):
@@ -5694,16 +5708,16 @@ def translation_embed(
     target_language: str,
     provider: str,
     author_name: str | None = None,
+    show_original: bool = False,
 ) -> discord.Embed:
     title = (
         f"Translation · {source_language} → {target_language}"
         if source_language and target_language
         else "Translation"
     )
-    fields = [
-        EmbedField("Original", _translation_text(original), inline=False),
-        EmbedField("Translation", _translation_text(translation), inline=False),
-    ]
+    fields = [EmbedField("Translation", _translation_text(translation), inline=False)]
+    if show_original:
+        fields.append(EmbedField("Original", _translation_text(original), inline=False))
     if author_name:
         fields.append(EmbedField("Author", discord.utils.escape_markdown(author_name)))
     embed = command_embed(
@@ -5713,6 +5727,127 @@ def translation_embed(
     )
     embed.set_footer(text=f"On-device · {provider}")
     return embed
+
+
+def _translated_segment_map(
+    response: DiscordTranslateMessageResponse,
+) -> dict[str, DiscordTranslatedSegmentRecord]:
+    return {item.identifier: item for item in response.segments}
+
+
+def _translation_result_embeds(
+    message: discord.Message,
+    response: DiscordTranslateMessageResponse,
+    *,
+    show_original: bool,
+) -> list[discord.Embed]:
+    """Rebuild a translated message while retaining Discord embed presentation."""
+
+    translated = _translated_segment_map(response)
+
+    def value(identifier: str, fallback: str | None = None) -> str | None:
+        segment = translated.get(identifier)
+        return segment.translation if segment is not None else fallback
+
+    description = value("content")
+    summary = command_embed(
+        f"Translation · {response.source_language} → {response.target_language}",
+        description=_translation_text(description, maximum=4_000)
+        if description
+        else None,
+        fields=(
+            (EmbedField("Author", discord.utils.escape_markdown(response.author_name)),)
+            if response.author_name
+            else ()
+        ),
+        tone=EmbedTone.SUCCESS,
+    )
+    cache_label = " · cached" if response.cached else ""
+    summary.set_footer(text=f"On-device · {response.provider}{cache_label}")
+    embeds: list[discord.Embed] = [summary]
+
+    for embed_index, source_embed in enumerate(message.embeds[:8]):
+        clone = discord.Embed.from_dict(source_embed.to_dict())
+        clone.title = value(f"embed.{embed_index}.title", source_embed.title)
+        clone.description = value(
+            f"embed.{embed_index}.description",
+            source_embed.description,
+        )
+        author_name = value(
+            f"embed.{embed_index}.author",
+            source_embed.author.name,
+        )
+        if author_name:
+            clone.set_author(
+                name=author_name,
+                url=source_embed.author.url or None,
+                icon_url=source_embed.author.icon_url or None,
+            )
+        for field_index, field in enumerate(source_embed.fields[:25]):
+            clone.set_field_at(
+                field_index,
+                name=value(
+                    f"embed.{embed_index}.field.{field_index}.name",
+                    field.name,
+                )
+                or "\u200b",
+                value=value(
+                    f"embed.{embed_index}.field.{field_index}.value",
+                    field.value,
+                )
+                or "\u200b",
+                inline=field.inline,
+            )
+        footer_text = value(
+            f"embed.{embed_index}.footer",
+            source_embed.footer.text,
+        )
+        if footer_text:
+            clone.set_footer(
+                text=footer_text,
+                icon_url=source_embed.footer.icon_url or None,
+            )
+        embeds.append(clone)
+
+    supplemental = tuple(
+        item
+        for item in response.segments
+        if item.identifier.startswith(
+            ("poll.", "component.", "attachment.")
+        )
+    )
+    if supplemental and len(embeds) < 10:
+        fields: list[EmbedField] = []
+        for item in supplemental[:25]:
+            if item.identifier == "poll.question":
+                label = "Poll"
+            elif item.identifier.startswith("poll.answer."):
+                label = "Option"
+            elif item.identifier.startswith("attachment."):
+                label = "Attachment"
+            else:
+                label = "Text"
+            fields.append(
+                EmbedField(
+                    label,
+                    _translation_text(item.translation),
+                    inline=False,
+                )
+            )
+        embeds.append(
+            command_embed(
+                "Translated message details",
+                fields=tuple(fields),
+            )
+        )
+    if show_original and len(embeds) < 10:
+        embeds.append(
+            command_embed(
+                "Original",
+                description=_translation_text(response.original, maximum=4_000),
+            )
+        )
+    return embeds
 
 
 def _translation_jump_view(jump_url: str | None) -> discord.ui.View | None:
@@ -5760,6 +5895,57 @@ def _resolve_translation_target(
     ).code
 
 
+def _locale_target(
+    locales: tuple[str, ...],
+    languages: tuple[TranslationLanguageItem, ...],
+) -> str | None:
+    by_code = {item.code.casefold(): item.code for item in languages}
+    for locale in locales:
+        normalized = locale.strip().replace("_", "-").casefold()
+        if not normalized:
+            continue
+        if normalized in by_code:
+            return by_code[normalized]
+        base = normalized.split("-", 1)[0]
+        if base in by_code:
+            return by_code[base]
+        variants = tuple(
+            item.code
+            for item in languages
+            if item.code.casefold().split("-", 1)[0] == base
+        )
+        if len(variants) == 1:
+            return variants[0]
+        if base == "zh" and variants:
+            preferred_token = (
+                "hant"
+                if any(token in normalized for token in ("tw", "hk", "mo", "hant"))
+                else "hans"
+            )
+            matched = next(
+                (
+                    code
+                    for code in variants
+                    if preferred_token in code.casefold()
+                ),
+                None,
+            )
+            if matched is not None:
+                return matched
+    return None
+
+
+def _interaction_locales(interaction: discord.Interaction) -> tuple[str, ...]:
+    values: list[str] = []
+    for locale in (interaction.locale, interaction.guild_locale):
+        if locale is None:
+            continue
+        value = getattr(locale, "value", str(locale))
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
 def _translation_target_autocomplete_choices(
     languages: tuple[TranslationLanguageItem, ...],
     current: str,
@@ -5787,13 +5973,26 @@ def _translation_target_autocomplete_choices(
 class TranslationPostView(discord.ui.View):
     def __init__(
         self,
+        cog: TranslationCog,
         *,
         requester_id: int,
+        message: discord.Message,
         response: DiscordTranslateMessageResponse,
+        show_original: bool = False,
+        preference_saved: bool = False,
     ) -> None:
         super().__init__(timeout=5 * 60)
+        self.cog = cog
         self.requester_id = requester_id
+        self.message = message
         self.response = response
+        self.show_original = show_original
+        self.toggle_original.label = (
+            "Hide original" if show_original else "Show original"
+        )
+        if preference_saved:
+            self.use_by_default.disabled = True
+            self.use_by_default.label = "Default saved"
         self.add_item(
             discord.ui.Button(
                 label="Jump",
@@ -5811,6 +6010,83 @@ class TranslationPostView(discord.ui.View):
         )
         return False
 
+    @discord.ui.button(label="Show original", style=discord.ButtonStyle.secondary)
+    async def toggle_original(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button[TranslationPostView],
+    ) -> None:
+        self.show_original = not self.show_original
+        button.label = (
+            "Hide original" if self.show_original else "Show original"
+        )
+        await interaction.response.edit_message(
+            embeds=_translation_result_embeds(
+                self.message,
+                self.response,
+                show_original=self.show_original,
+            ),
+            view=self,
+        )
+
+    @discord.ui.button(label="Change language", style=discord.ButtonStyle.secondary)
+    async def change_language(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationPostView],
+    ) -> None:
+        languages = self.cog._ranked_languages(
+            await self.cog._languages(self.response.source_language),
+            recent=await self.cog.runtime.translation.recent_targets(
+                actor_id=str(interaction.user.id)
+            ),
+            source_language=self.response.source_language,
+        )
+        await interaction.response.edit_message(
+            embeds=[
+                command_embed(
+                    "Choose a language",
+                    description=(
+                        "Only you can see this selector. The message is translated "
+                        "again after one choice."
+                    ),
+                )
+            ],
+            view=TranslationTargetSelectView(
+                self.cog,
+                requester_id=self.requester_id,
+                message=self.message,
+                detected_language=self.response.source_language,
+                languages=languages,
+            ),
+        )
+
+    @discord.ui.button(label="Use by default", style=discord.ButtonStyle.secondary)
+    async def use_by_default(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationPostView],
+    ) -> None:
+        await interaction.response.edit_message(
+            embeds=[
+                command_embed(
+                    "Save as default",
+                    description=(
+                        f"Use **{self.response.target_language}** for translations "
+                        "in this server or everywhere. This preference is private."
+                    ),
+                )
+            ],
+            view=TranslationPreferenceScopeView(
+                self.cog,
+                requester_id=self.requester_id,
+                message=self.message,
+                response=self.response,
+                show_original=self.show_original,
+                guild_id=interaction.guild_id,
+            ),
+        )
+
     @discord.ui.button(label="Post", style=discord.ButtonStyle.primary)
     async def post(
         self,
@@ -5820,18 +6096,111 @@ class TranslationPostView(discord.ui.View):
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await interaction.followup.send(
-            embed=translation_embed(
-                original=self.response.original,
-                translation=self.response.translation,
-                source_language=self.response.source_language,
-                target_language=self.response.target_language,
-                provider=self.response.provider,
-                author_name=self.response.author_name,
+            embeds=_translation_result_embeds(
+                self.message,
+                self.response,
+                show_original=self.show_original,
             ),
             view=_translation_jump_view(self.response.jump_url)
             or discord.utils.MISSING,
             allowed_mentions=discord.AllowedMentions.none(),
             silent=True,
+        )
+
+
+class TranslationPreferenceScopeView(discord.ui.View):
+    def __init__(
+        self,
+        cog: TranslationCog,
+        *,
+        requester_id: int,
+        message: discord.Message,
+        response: DiscordTranslateMessageResponse,
+        show_original: bool,
+        guild_id: int | None,
+    ) -> None:
+        super().__init__(timeout=5 * 60)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.message = message
+        self.response = response
+        self.show_original = show_original
+        self.guild_id = guild_id
+        self.this_server.disabled = guild_id is None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Use Apps → Translate to manage your own translation preference.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _save(
+        self,
+        interaction: discord.Interaction,
+        *,
+        workspace_id: str | None,
+    ) -> None:
+        await self.cog.runtime.translation.set_preference(
+            actor_id=str(interaction.user.id),
+            workspace_id=workspace_id,
+            target_language=self.response.target_language,
+            show_original=self.show_original,
+        )
+        await interaction.response.edit_message(
+            embeds=_translation_result_embeds(
+                self.message,
+                self.response,
+                show_original=self.show_original,
+            ),
+            view=TranslationPostView(
+                self.cog,
+                requester_id=self.requester_id,
+                message=self.message,
+                response=self.response,
+                show_original=self.show_original,
+                preference_saved=True,
+            ),
+        )
+
+    @discord.ui.button(label="This server", style=discord.ButtonStyle.primary)
+    async def this_server(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationPreferenceScopeView],
+    ) -> None:
+        assert self.guild_id is not None
+        await self._save(interaction, workspace_id=str(self.guild_id))
+
+    @discord.ui.button(label="Everywhere", style=discord.ButtonStyle.secondary)
+    async def everywhere(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationPreferenceScopeView],
+    ) -> None:
+        await self._save(interaction, workspace_id=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[TranslationPreferenceScopeView],
+    ) -> None:
+        await interaction.response.edit_message(
+            embeds=_translation_result_embeds(
+                self.message,
+                self.response,
+                show_original=self.show_original,
+            ),
+            view=TranslationPostView(
+                self.cog,
+                requester_id=self.requester_id,
+                message=self.message,
+                response=self.response,
+                show_original=self.show_original,
+            ),
         )
 
 
@@ -5967,18 +6336,20 @@ class TranslationTargetSelectView(discord.ui.View):
                     invocation_context(interaction),
                 ),
             )
-            self.cog.record_recent_target(interaction.user.id, target_language)
+            await self.cog.runtime.translation.record_recent_target(
+                actor_id=str(interaction.user.id),
+                code=target_language,
+            )
             await interaction.edit_original_response(
-                embed=translation_embed(
-                    original=response.original,
-                    translation=response.translation,
-                    source_language=response.source_language,
-                    target_language=response.target_language,
-                    provider=response.provider,
-                    author_name=response.author_name,
+                embeds=_translation_result_embeds(
+                    self.message,
+                    response,
+                    show_original=False,
                 ),
                 view=TranslationPostView(
+                    self.cog,
                     requester_id=interaction.user.id,
+                    message=self.message,
                     response=response,
                 ),
             )
@@ -5991,15 +6362,7 @@ class TranslationCog(commands.Cog):
 
     def __init__(self, runtime: SimajilordRuntime) -> None:
         self.runtime = runtime
-        self._recent_targets: dict[int, list[str]] = {}
         self._language_cache: tuple[TranslationLanguageItem, ...] | None = None
-
-    def record_recent_target(self, user_id: int, code: str) -> None:
-        recent = self._recent_targets.setdefault(user_id, [])
-        with suppress(ValueError):
-            recent.remove(code)
-        recent.insert(0, code)
-        del recent[5:]
 
     async def _languages(
         self,
@@ -6028,10 +6391,9 @@ class TranslationCog(commands.Cog):
         self,
         languages: tuple[TranslationLanguageItem, ...],
         *,
-        user_id: int,
+        recent: tuple[str, ...],
         source_language: str | None,
     ) -> tuple[TranslationLanguageItem, ...]:
-        recent = self._recent_targets.get(user_id, [])
         recent_positions = {code: index for index, code in enumerate(recent)}
         common = {
             "en": 0,
@@ -6061,18 +6423,52 @@ class TranslationCog(commands.Cog):
             )
         )
 
+    async def _default_target(
+        self,
+        interaction: discord.Interaction,
+        languages: tuple[TranslationLanguageItem, ...],
+    ) -> str:
+        target, _ = await self._default_translation_settings(
+            interaction,
+            languages,
+        )
+        return target
+
+    async def _default_translation_settings(
+        self,
+        interaction: discord.Interaction,
+        languages: tuple[TranslationLanguageItem, ...],
+    ) -> tuple[str, bool]:
+        preference = await self.runtime.translation.preference(
+            actor_id=str(interaction.user.id),
+            workspace_id=(
+                str(interaction.guild_id)
+                if interaction.guild_id is not None
+                else None
+            ),
+        )
+        candidates = (
+            ((preference.target_language,) if preference is not None else ())
+            + _interaction_locales(interaction)
+            + ("en",)
+        )
+        resolved = _locale_target(candidates, languages)
+        if resolved is None:
+            raise UserError("translation.target_required")
+        return resolved, preference.show_original if preference is not None else False
+
     @app_commands.command(
         name="translate",
         description="Translate text locally with Apple's on-device language models.",
     )
     @app_commands.describe(
-        target="Target language name or BCP-47 code",
+        target="Target language; omit to follow your Discord language",
         text="Text to translate; omit to use the latest visible message",
     )
     async def translate_command(
         self,
         interaction: discord.Interaction,
-        target: str,
+        target: str | None = None,
         text: str | None = None,
     ) -> None:
         try:
@@ -6081,6 +6477,7 @@ class TranslationCog(commands.Cog):
                     interaction.client,
                     "Translating…",
                 ),
+                ephemeral=True,
                 silent=True,
             )
             source_message: discord.Message | None = None
@@ -6098,16 +6495,52 @@ class TranslationCog(commands.Cog):
                 ):
                     raise UserError("translation.text_required")
                 async for candidate in channel.history(limit=10):
-                    if candidate.content.strip() and not candidate.author.bot:
+                    if discord_translation_segments(candidate):
                         source_message = candidate
-                        source_text = candidate.content
                         break
-            if source_text is None:
+            if source_text is None and source_message is None:
                 raise UserError("translation.text_required")
-            target_code = _resolve_translation_target(
-                target,
-                await self._languages(),
-            )
+            languages = await self._languages()
+            if target is not None:
+                target_code = _resolve_translation_target(target, languages)
+                show_original = False
+            else:
+                target_code, show_original = (
+                    await self._default_translation_settings(interaction, languages)
+                )
+            if source_message is not None:
+                document_response = cast(
+                    DiscordTranslateMessageResponse,
+                    await self.runtime.registry.invoke(
+                        "discord.translate_message",
+                        DiscordTranslateMessageRequest(
+                            channel_id=str(source_message.channel.id),
+                            message_id=str(source_message.id),
+                            target_language=target_code,
+                        ),
+                        invocation_context(interaction),
+                    ),
+                )
+                await self.runtime.translation.record_recent_target(
+                    actor_id=str(interaction.user.id),
+                    code=target_code,
+                )
+                await interaction.edit_original_response(
+                    embeds=_translation_result_embeds(
+                        source_message,
+                        document_response,
+                        show_original=show_original,
+                    ),
+                    view=TranslationPostView(
+                        self,
+                        requester_id=interaction.user.id,
+                        message=source_message,
+                        response=document_response,
+                        show_original=show_original,
+                    ),
+                )
+                return
+            assert source_text is not None
             response = cast(
                 TranslationTranslateResponse,
                 await self.runtime.registry.invoke(
@@ -6119,7 +6552,10 @@ class TranslationCog(commands.Cog):
                     invocation_context(interaction),
                 ),
             )
-            self.record_recent_target(interaction.user.id, target_code)
+            await self.runtime.translation.record_recent_target(
+                actor_id=str(interaction.user.id),
+                code=target_code,
+            )
             await interaction.edit_original_response(
                 embed=translation_embed(
                     original=response.original,
@@ -6127,14 +6563,7 @@ class TranslationCog(commands.Cog):
                     source_language=response.source_language,
                     target_language=response.target_language,
                     provider=response.provider,
-                    author_name=(
-                        source_message.author.display_name
-                        if source_message is not None
-                        else None
-                    ),
-                ),
-                view=_translation_jump_view(
-                    source_message.jump_url if source_message is not None else None
+                    show_original=show_original,
                 ),
             )
         except Exception as exc:
@@ -6149,7 +6578,9 @@ class TranslationCog(commands.Cog):
         try:
             languages = self._ranked_languages(
                 await self._languages(),
-                user_id=interaction.user.id,
+                recent=await self.runtime.translation.recent_targets(
+                    actor_id=str(interaction.user.id)
+                ),
                 source_language=None,
             )
         except Exception:
@@ -6162,8 +6593,6 @@ class TranslationCog(commands.Cog):
         message: discord.Message,
     ) -> None:
         try:
-            if not message.content.strip():
-                raise UserError("translation.message_text_required")
             await interaction.response.send_message(
                 embed=async_progress_embed(
                     interaction.client,
@@ -6172,35 +6601,93 @@ class TranslationCog(commands.Cog):
                 ephemeral=True,
                 silent=True,
             )
+            segments = discord_translation_segments(message)
+            if not segments:
+                raise UserError("translation.message_text_required")
             detection = cast(
                 TranslationDetectResponse,
                 await self.runtime.registry.invoke(
                     "translation.detect",
-                    TranslationDetectRequest(text=message.content),
+                    TranslationDetectRequest(
+                        text="\n".join(item.text for item in segments)[:4_000]
+                    ),
                     invocation_context(interaction),
                 ),
             )
+            source_languages = await self._languages(detection.language)
             languages = self._ranked_languages(
-                await self._languages(detection.language),
-                user_id=interaction.user.id,
+                source_languages,
+                recent=await self.runtime.translation.recent_targets(
+                    actor_id=str(interaction.user.id)
+                ),
                 source_language=detection.language,
             )
             if not languages:
                 raise UserError("translation.language_pair_unsupported")
-            await interaction.edit_original_response(
-                embed=command_embed(
-                    "Translate message",
-                    description=(
-                        f"Detected **{detection.language}** "
-                        f"({detection.confidence:.0%}). Choose a target language."
-                    ),
+            target_language, show_original = await self._default_translation_settings(
+                interaction,
+                await self._languages(),
+            )
+            target_status = next(
+                (
+                    item.availability
+                    for item in source_languages
+                    if item.code.casefold() == target_language.casefold()
                 ),
-                view=TranslationTargetSelectView(
+                "unsupported",
+            )
+            if target_status in {"unsupported", "same_language"}:
+                description = (
+                    f"This message is already **{detection.language}**."
+                    if target_status == "same_language"
+                    else (
+                        "Your Discord language is unavailable for this source. "
+                        "Choose another language."
+                    )
+                )
+                await interaction.edit_original_response(
+                    embed=command_embed(
+                        "Choose a language",
+                        description=description,
+                    ),
+                    view=TranslationTargetSelectView(
+                        self,
+                        requester_id=interaction.user.id,
+                        message=message,
+                        detected_language=detection.language,
+                        languages=languages,
+                    ),
+                )
+                return
+            response = cast(
+                DiscordTranslateMessageResponse,
+                await self.runtime.registry.invoke(
+                    "discord.translate_message",
+                    DiscordTranslateMessageRequest(
+                        channel_id=str(message.channel.id),
+                        message_id=str(message.id),
+                        target_language=target_language,
+                        source_language=detection.language,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await self.runtime.translation.record_recent_target(
+                actor_id=str(interaction.user.id),
+                code=target_language,
+            )
+            await interaction.edit_original_response(
+                embeds=_translation_result_embeds(
+                    message,
+                    response,
+                    show_original=show_original,
+                ),
+                view=TranslationPostView(
                     self,
                     requester_id=interaction.user.id,
                     message=message,
-                    detected_language=detection.language,
-                    languages=languages,
+                    response=response,
+                    show_original=show_original,
                 ),
             )
         except Exception as exc:
