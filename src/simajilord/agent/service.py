@@ -558,12 +558,20 @@ class AgentService:
                         self.limits.per_workspace_window_seconds,
                     ),
                 )
-        usage = await self.store.token_usage_since(
+        usage, token_release_anchor = await self.store.token_budget_window(
             now - timedelta(hours=24),
+            limit=self.limits.max_tokens_per_24_hours,
             excluded_actor_ids=self.limits.rate_limit_exempt_actor_ids,
         )
         if usage >= self.limits.max_tokens_per_24_hours:
-            raise AgentRateLimitError("The rolling agent token budget is exhausted.")
+            raise AgentRateLimitError(
+                "The rolling agent token budget is exhausted.",
+                retry_after_seconds=_retry_after_seconds(
+                    now,
+                    token_release_anchor,
+                    24 * 60 * 60,
+                ),
+            )
 
     def _must_rotate(self, conversation: AgentConversationRecord) -> bool:
         if conversation.turn_count >= self.limits.max_conversation_turns:

@@ -1304,6 +1304,25 @@ async def test_agent_local_rate_limit_blocks_before_provider(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rolling_token_budget_reports_actual_expiry(tmp_path) -> None:
+    provider = FakeProvider()
+    service = AgentService(
+        provider=provider,
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(max_tokens_per_24_hours=100),
+    )
+    await service.respond(_request("token-event-1"))
+
+    with pytest.raises(AgentRateLimitError) as raised:
+        await service.respond(_request("token-event-2"))
+
+    assert raised.value.retry_after_seconds is not None
+    assert 86_300 <= raised.value.retry_after_seconds <= 86_400
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_rate_limited_turn_does_not_consume_global_admission(tmp_path) -> None:
     provider = FakeProvider()
     service = AgentService(
