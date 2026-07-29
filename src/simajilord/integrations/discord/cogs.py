@@ -6212,13 +6212,49 @@ class TranslationLanguagePickerView(discord.ui.View):
     ) -> None:
         source: str = language if self.mode == "source" else self.source_language
         target: str = language if self.mode == "target" else self.target_language
-        await self.cog._translate_message_from_language_override(
-            interaction,
-            message=self.message,
-            source_language=source,
-            target_language=target,
-            show_original=self.show_original,
-        )
+        if source.casefold() == target.casefold():
+            next_mode: Literal["source", "target"] = (
+                "source" if self.mode == "target" else "target"
+            )
+            title = (
+                "Choose the source language"
+                if next_mode == "source"
+                else "Choose a different target"
+            )
+            description = (
+                "The detected source and selected target are both "
+                f"**{_translation_language_name(source, self.languages)}**. "
+                + (
+                    "Choose the language actually used by the message so it can "
+                    "still be translated into your selected target."
+                    if next_mode == "source"
+                    else "The source is now confirmed; choose the language to translate into."
+                )
+            )
+            await interaction.response.edit_message(
+                embed=command_embed(title, description=description),
+                view=TranslationLanguagePickerView(
+                    self.cog,
+                    requester_id=self.requester_id,
+                    message=self.message,
+                    languages=self.languages,
+                    source_language=source,
+                    target_language=target,
+                    show_original=self.show_original,
+                    mode=next_mode,
+                ),
+            )
+            return
+        try:
+            await self.cog._translate_message_from_language_override(
+                interaction,
+                message=self.message,
+                source_language=source,
+                target_language=target,
+                show_original=self.show_original,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
 
     @discord.ui.button(label="Type language", style=discord.ButtonStyle.secondary, row=2)
     async def type_language(
@@ -7051,7 +7087,10 @@ class TranslationCog(commands.Cog):
                         channel_id=str(message.channel.id),
                         message_id=str(message.id),
                         target_language=target_language,
-                        source_language=detection.language,
+                        # Detection only explains the initial UI. Keep the
+                        # automatic request provider-driven unless the user
+                        # explicitly chooses a source language.
+                        source_language=None,
                     ),
                     invocation_context(interaction),
                 ),

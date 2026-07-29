@@ -59,6 +59,7 @@ from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
     DiscordServerResponse,
     DiscordTranslatedSegmentRecord,
+    DiscordTranslateMessageRequest,
     DiscordTranslateMessageResponse,
     DiscordUserResponse,
     DiscordViewCustomEmojiRequest,
@@ -461,6 +462,165 @@ def test_translation_region_picker_has_no_next_or_previous_controls() -> None:
     labels = {item.label for item in view.children if isinstance(item, discord.ui.Button)}
     assert "Next" not in labels
     assert "Previous" not in labels
+
+
+@pytest.mark.asyncio
+async def test_translation_target_matching_detection_requests_source_without_timeout() -> None:
+    languages = (
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+    )
+    cog = Mock(spec=TranslationCog)
+    cog._translate_message_from_language_override = AsyncMock()
+    message = Mock(spec=discord.Message)
+    message.jump_url = "https://discord.com/channels/1/2/3"
+    interaction = Mock(spec=discord.Interaction)
+    interaction.response.edit_message = AsyncMock()
+    view = TranslationLanguagePickerView(
+        cog,
+        requester_id=7,
+        message=message,
+        languages=languages,
+        source_language="ja",
+        target_language="en",
+        show_original=False,
+        mode="target",
+    )
+
+    await view.choose_language(interaction, "ja")
+
+    interaction.response.edit_message.assert_awaited_once()
+    response = interaction.response.edit_message.await_args.kwargs
+    assert response["embed"].title == "Choose the source language"
+    assert response["embed"].description
+    assert isinstance(response["view"], TranslationLanguagePickerView)
+    assert response["view"].mode == "source"
+    assert response["view"].target_language == "ja"
+    cog._translate_message_from_language_override.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_translation_language_picker_acknowledges_nonempty_errors() -> None:
+    languages = (
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+    )
+    cog = Mock(spec=TranslationCog)
+    cog._translate_message_from_language_override = AsyncMock(
+        side_effect=UserError("translation.language_pair_unsupported")
+    )
+    message = Mock(spec=discord.Message)
+    message.jump_url = "https://discord.com/channels/1/2/3"
+    interaction = Mock(spec=discord.Interaction)
+    interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
+    view = TranslationLanguagePickerView(
+        cog,
+        requester_id=7,
+        message=message,
+        languages=languages,
+        source_language="en",
+        target_language="en",
+        show_original=False,
+        mode="target",
+    )
+
+    await view.choose_language(interaction, "ja")
+
+    interaction.response.send_message.assert_awaited_once()
+    response = interaction.response.send_message.await_args.kwargs
+    assert response["ephemeral"] is True
+    assert response["embed"].title == "Could not complete the request"
+    assert response["embed"].description
+    assert "does not support" in response["embed"].description
+    assert response["embed"].description != "translation.language_pair_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_automatic_message_translation_does_not_fix_detected_source() -> None:
+    languages = (
+        TranslationLanguageItem("en", "English", "English", "installed"),
+        TranslationLanguageItem("ja", "Japanese", "日本語", "installed"),
+    )
+    registry = SimpleNamespace(
+        invoke=AsyncMock(
+            side_effect=(
+                TranslationDetectResponse(
+                    language="en",
+                    confidence=0.999,
+                    hypotheses=(("en", 0.999), ("nl", 0.001)),
+                ),
+                DiscordTranslateMessageResponse(
+                    message_id="3",
+                    channel_id="2",
+                    jump_url="https://discord.com/channels/1/2/3",
+                    author_name="Author",
+                    original="This is a sufficiently long and unambiguous English sentence.",
+                    translation="これは十分に長く、明確な英語の文です。",
+                    source_language="en",
+                    target_language="ja",
+                    provider="Apple Translation",
+                    segments=(
+                        DiscordTranslatedSegmentRecord(
+                            identifier="content",
+                            original=(
+                                "This is a sufficiently long and unambiguous English sentence."
+                            ),
+                            translation="これは十分に長く、明確な英語の文です。",
+                        ),
+                    ),
+                ),
+            )
+        )
+    )
+    runtime = cast(
+        SimajilordRuntime,
+        SimpleNamespace(
+            registry=registry,
+            translation=SimpleNamespace(
+                recent_targets=AsyncMock(return_value=()),
+                record_recent_target=AsyncMock(),
+            ),
+            journal=SimpleNamespace(append=AsyncMock()),
+        ),
+    )
+    cog = TranslationCog(runtime)
+    cog._languages = AsyncMock(side_effect=(languages, languages))
+    cog._default_translation_settings = AsyncMock(return_value=("ja", False))
+    interaction = cast(
+        discord.Interaction,
+        SimpleNamespace(
+            response=SimpleNamespace(send_message=AsyncMock()),
+            edit_original_response=AsyncMock(),
+            client=Mock(spec=discord.Client),
+            user=SimpleNamespace(id=7),
+            guild_id=1,
+            channel_id=2,
+            id=4,
+        ),
+    )
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=3,
+            channel=SimpleNamespace(id=2),
+            content="This is a sufficiently long and unambiguous English sentence.",
+            embeds=[],
+            poll=None,
+            components=[],
+            attachments=[],
+            jump_url="https://discord.com/channels/1/2/3",
+        ),
+    )
+
+    await cog.translate_message(interaction, message)
+
+    assert registry.invoke.await_count == 2
+    capability_name, request, _ = registry.invoke.await_args_list[1].args
+    assert capability_name == "discord.translate_message"
+    assert isinstance(request, DiscordTranslateMessageRequest)
+    assert request.source_language is None
+    assert request.target_language == "ja"
 
 
 def test_translation_slash_autocomplete_filters_all_languages_and_caps_results() -> None:
