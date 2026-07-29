@@ -829,7 +829,7 @@ class _DiscordAnimatedMedia:
 class DiscordSendMessageRequest:
     channel_id: str
     content: str
-    purpose: Literal["progress", "requested_action"]
+    purpose: Literal["progress", "requested_action"] = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
