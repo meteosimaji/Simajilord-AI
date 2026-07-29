@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock
@@ -18,6 +18,7 @@ from simajilord.agent import (
     AgentEvent,
     AgentProgressStage,
     AgentProgressUpdate,
+    AgentProviderError,
     AgentProviderLimitError,
     AgentRateLimitError,
     AgentRequest,
@@ -621,6 +622,41 @@ async def test_completed_mention_host_delivery_is_restart_safe_and_body_free(
 
 
 @pytest.mark.asyncio
+async def test_interrupted_mention_can_be_recovered_or_closed(
+    tmp_path: Path,
+) -> None:
+    store = AgentConversationStore(tmp_path / "agent.sqlite3")
+    request = _request("discord:message:44")
+    before_begin = datetime.now(UTC) - timedelta(seconds=1)
+    await store.begin(request, model="test-model")
+    after_begin = datetime.now(UTC) + timedelta(seconds=1)
+
+    interrupted = await store.interrupted_mentions(
+        started_after=before_begin,
+        started_before=after_begin,
+    )
+
+    assert len(interrupted) == 1
+    assert interrupted[0].event_id == request.event_id
+    assert interrupted[0].source_message_id == request.message_id
+    assert await store.fail_interrupted_mention(
+        request.event_id,
+        error_type="RecoverySourceUnavailable",
+    )
+    assert not await store.fail_interrupted_mention(
+        request.event_id,
+        error_type="RecoverySourceUnavailable",
+    )
+    assert (
+        await store.interrupted_mentions(
+            started_after=before_begin,
+            started_before=after_begin,
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
 async def test_autonomous_turn_is_not_claimed_by_mention_host_outbox(
     tmp_path: Path,
 ) -> None:
@@ -1000,6 +1036,62 @@ async def test_agent_steers_same_channel_follow_up_with_distinct_actor_identity(
     assert "message_id=follow-up-message" in prompt
     assert context.actor_id == "different-user"
     assert context.grants == original.grants
+
+    release.set()
+    await active
+
+
+@pytest.mark.asyncio
+async def test_agent_never_steers_explicit_mention_into_autonomous_turn(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    steered: list[InvocationContext] = []
+
+    class SteerableProvider(FakeProvider):
+        async def respond(
+            self,
+            *,
+            provider_thread_id: str | None,
+            event_prompt: str,
+            context: InvocationContext,
+            on_progress: object = None,
+        ) -> ProviderTurnResult:
+            entered.set()
+            await release.wait()
+            return await super().respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+            )
+
+        async def steer(
+            self,
+            *,
+            event_prompt: str,
+            context: InvocationContext,
+        ) -> bool:
+            del event_prompt
+            steered.append(context)
+            return True
+
+    service = AgentService(
+        provider=SteerableProvider(),
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+    autonomous = replace(
+        _request("autonomous"),
+        trigger=AgentTrigger.AUTONOMOUS,
+    )
+    active = asyncio.create_task(service.respond(autonomous))
+    await entered.wait()
+
+    assert await service.try_follow_up(_request("explicit-mention")) is None
+    assert steered == []
 
     release.set()
     await active
@@ -3220,6 +3312,101 @@ async def test_provider_reports_outer_deadline_as_dedicated_timeout(
 
     assert raised.value.timeout_seconds == 125
     assert "execution deadline" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_provider_accepts_autonomous_no_action_without_message_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-no-action",
+        timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(return_value={"turn": {"id": "turn"}}),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_await_turn",
+        AsyncMock(
+            return_value=(
+                "<simajilord:no-action>",
+                AgentTokenUsage(total_tokens=1),
+            )
+        ),
+    )
+
+    result = await provider.respond(
+        provider_thread_id=None,
+        event_prompt=(
+            "SIMAJILORD_EVENT_V1\n"
+            "trigger=autonomous\n"
+            "message_id=123\n"
+            'batched_event={"payload":{"message_id":"123"}}'
+        ),
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+    )
+
+    assert result.content == "<simajilord:no-action>"
+
+
+@pytest.mark.asyncio
+async def test_provider_still_requires_message_fetch_for_mention_no_action(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-mention-no-action",
+        timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(return_value={"turn": {"id": "turn"}}),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_await_turn",
+        AsyncMock(
+            return_value=(
+                "<simajilord:no-action>",
+                AgentTokenUsage(total_tokens=1),
+            )
+        ),
+    )
+
+    with pytest.raises(
+        AgentProviderError,
+        match="did not read the exact Discord event message",
+    ):
+        await provider.respond(
+            provider_thread_id=None,
+            event_prompt=(
+                "SIMAJILORD_EVENT_V1\n"
+                "trigger=mention\n"
+                "message_id=123"
+            ),
+            context=InvocationContext("actor", "workspace", "agent", "event"),
+        )
 
 
 @pytest.mark.asyncio

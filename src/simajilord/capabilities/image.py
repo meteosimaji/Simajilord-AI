@@ -1,4 +1,4 @@
-"""Transport-neutral local image-generation capabilities."""
+"""Transport-neutral image-generation capabilities."""
 
 from __future__ import annotations
 
@@ -229,8 +229,8 @@ def build_image_endpoints(
             CapabilityDescriptor(
                 name="image.generate",
                 summary=(
-                    "Generate one image locally from a production-ready visual "
-                    "brief and deliver it asynchronously."
+                    "Generate one image through Codex OAuth from a production-ready "
+                    "visual brief, import the file, and deliver it asynchronously."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -245,7 +245,8 @@ def build_image_endpoints(
                     "写真",
                 ),
                 side_effects=(
-                    "Starts local MLX image generation.",
+                    "Starts hosted GPT Image generation through the saved Codex login.",
+                    "Imports the generated file into Simajilord local storage.",
                     "Posts progress and the result to the approved channel.",
                 ),
                 requires_workspace=True,

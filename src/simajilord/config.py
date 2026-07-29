@@ -92,10 +92,7 @@ class Settings:
     hive_timeout_seconds: float
     hive_max_media_bytes: int
     hive_threshold: float
-    image_model_path: Path | None
-    image_mflux_source: str
     image_timeout_seconds: float
-    image_mlx_cache_limit_gb: int
     image_generation_access: AgentFeatureAccess
     image_per_user_requests: int
     image_per_user_window_seconds: int
@@ -700,20 +697,10 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             minimum=0.01,
             maximum=1.0,
         ),
-        image_model_path=_optional_directory("IMAGE_MODEL_PATH"),
-        image_mflux_source=_text(
-            "IMAGE_MFLUX_SOURCE",
-            "git+https://github.com/plz12345/mflux@ideogram-mlx-forge-loader-pr",
-        ),
         image_timeout_seconds=_positive_float(
             "IMAGE_TIMEOUT_SECONDS",
             600.0,
             maximum=1_800.0,
-        ),
-        image_mlx_cache_limit_gb=_positive_int(
-            "IMAGE_MLX_CACHE_LIMIT_GB",
-            6,
-            maximum=32,
         ),
         image_generation_access=image_generation_access,
         image_per_user_requests=_positive_int(

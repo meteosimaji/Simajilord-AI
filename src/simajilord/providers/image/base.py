@@ -1,4 +1,4 @@
-"""Provider boundary for local image generation."""
+"""Provider boundary for image generation that yields a local file."""
 
 from __future__ import annotations
 
@@ -14,16 +14,20 @@ ImageProgressCallback = Callable[[int, int], Awaitable[None]]
 class ImageProviderResult:
     generation_seconds: float
     model: str
+    width: int | None = None
+    height: int | None = None
 
 
 class ImageGenerationProvider(Protocol):
     async def generate(
         self,
         *,
-        caption_json: str,
+        brief_json: str,
         destination: Path,
         width: int,
         height: int,
         seed: int,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult: ...
+
+    async def close(self) -> None: ...

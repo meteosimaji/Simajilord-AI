@@ -236,7 +236,7 @@ def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
             lighting="Cool window light with a warm lamp rim",
             rendering=ImageRendering.PHOTO,
         ),
-        caption_json="{}",
+        brief_json="{}",
         status=ImageJobStatus.COMPLETED,
         output_path=None,
         width=768,
@@ -244,6 +244,7 @@ def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
         seed=42,
         created_at_iso="2026-07-27T00:00:00+00:00",
         generation_seconds=153.0,
+        provider_model="GPT Image 2・Codex OAuth",
     )
 
     embed = _image_result_embed(job, filename="image.png")
@@ -252,6 +253,8 @@ def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
     assert "rainy apartment window" in (embed.description or "")
     assert "Natural editorial pet photography" in (embed.description or "")
     assert "Cool window light" in (embed.description or "")
+    assert embed.fields[0].value == "GPT Image 2・Codex OAuth"
+    assert embed.fields[2].value == "768 x 512 · square"
 
 
 def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:

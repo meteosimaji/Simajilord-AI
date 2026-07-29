@@ -31,6 +31,7 @@ from simajilord.agent.autonomy import (
 )
 from simajilord.agent.store import (
     AgentHostDeliveryRecord,
+    AgentInterruptedMention,
     AgentPendingHostDelivery,
 )
 from simajilord.config import AgentFeatureAccess
@@ -1005,6 +1006,43 @@ async def test_agent_routes_edited_bot_mention_as_explicit_turn() -> None:
         current,
         event_id=f"discord:message-edit:40:{edited_at}",
         occurred_at=datetime.fromisoformat(edited_at),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_recovers_prior_process_mention_as_a_fresh_turn() -> None:
+    now = datetime.now(UTC)
+    interrupted = AgentInterruptedMention(
+        event_id="discord:message:40",
+        channel_id="20",
+        source_message_id="40",
+        occurred_at=now - timedelta(minutes=1),
+        started_at=now - timedelta(seconds=30),
+    )
+    source = Mock(spec=discord.Message)
+    store = SimpleNamespace(
+        interrupted_mentions=AsyncMock(return_value=(interrupted,)),
+        fail_interrupted_mention=AsyncMock(return_value=False),
+    )
+    bot = SimpleNamespace(wait_until_ready=AsyncMock())
+    cog = AgentCog(bot, SimpleNamespace(agent_store=store))
+    cog._started_at = now
+    cog._agent_host_channel = AsyncMock(return_value=object())  # type: ignore[method-assign]
+    cog._agent_source_message = AsyncMock(return_value=source)  # type: ignore[method-assign]
+    cog._handle_mention = AsyncMock()  # type: ignore[method-assign]
+
+    await cog._recover_interrupted_mentions()
+
+    bot.wait_until_ready.assert_awaited_once()
+    cog._handle_mention.assert_awaited_once_with(
+        source,
+        event_id=interrupted.event_id,
+        occurred_at=interrupted.occurred_at,
+        allow_follow_up=False,
+    )
+    store.fail_interrupted_mention.assert_awaited_once_with(
+        interrupted.event_id,
+        error_type="RecoverySkipped",
     )
 
 

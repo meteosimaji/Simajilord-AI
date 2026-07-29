@@ -18,6 +18,8 @@ from .contracts import (
     AgentTrigger,
 )
 
+_IN_PROGRESS_STATUS = "in_progress"
+
 
 @dataclass(frozen=True, slots=True)
 class AgentConversationRecord:
@@ -46,6 +48,17 @@ class AgentPendingHostDelivery:
     response_content: str
     occurred_at: datetime
     completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentInterruptedMention:
+    """One explicit mention left active when an earlier process stopped."""
+
+    event_id: str
+    channel_id: str
+    source_message_id: str
+    occurred_at: datetime
+    started_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +125,44 @@ class AgentConversationStore:
             return await asyncio.to_thread(
                 self._pending_host_delivery,
                 event_id,
+            )
+
+    async def interrupted_mentions(
+        self,
+        *,
+        started_after: datetime,
+        started_before: datetime,
+        limit: int = 100,
+    ) -> tuple[AgentInterruptedMention, ...]:
+        """Return prior-process mentions that never reached a terminal state."""
+
+        if started_after.tzinfo is None or started_before.tzinfo is None:
+            raise ValueError("interrupted mention cutoffs must be timezone-aware")
+        if started_after >= started_before:
+            raise ValueError("started_after must be earlier than started_before")
+        if limit < 1 or limit > 1_000:
+            raise ValueError("interrupted mention limit must be between 1 and 1000")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._interrupted_mentions,
+                started_after.astimezone(UTC).isoformat(),
+                started_before.astimezone(UTC).isoformat(),
+                limit,
+            )
+
+    async def fail_interrupted_mention(
+        self,
+        event_id: str,
+        *,
+        error_type: str,
+    ) -> bool:
+        """Close an unrecoverable interrupted mention without touching terminal rows."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._fail_interrupted_mention,
+                event_id,
+                error_type,
             )
 
     async def plan_host_delivery(
@@ -490,6 +541,40 @@ class AgentConversationStore:
                 if row is not None
                 else None
             )
+        finally:
+            connection.close()
+
+    def _interrupted_mentions(
+        self,
+        started_after: str,
+        started_before: str,
+        limit: int,
+    ) -> tuple[AgentInterruptedMention, ...]:
+        connection = _connection(self.path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT event_id, channel_id, message_id, occurred_at, started_at
+                FROM agent_requests
+                WHERE status = ?
+                  AND trigger = ?
+                  AND message_id IS NOT NULL
+                  AND event_id LIKE 'discord:message:%'
+                  AND event_id NOT LIKE 'discord:message-edit:%'
+                  AND started_at >= ?
+                  AND started_at < ?
+                ORDER BY started_at, event_id
+                LIMIT ?
+                """,
+                (
+                    _IN_PROGRESS_STATUS,
+                    AgentTrigger.MENTION.value,
+                    started_after,
+                    started_before,
+                    limit,
+                ),
+            ).fetchall()
+            return tuple(_interrupted_mention_from_row(row) for row in rows)
         finally:
             connection.close()
 
@@ -937,6 +1022,36 @@ class AgentConversationStore:
         finally:
             connection.close()
 
+    def _fail_interrupted_mention(
+        self,
+        event_id: str,
+        error_type: str,
+    ) -> bool:
+        now = datetime.now(UTC).isoformat()
+        connection = sqlite3.connect(self.path)
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE agent_requests
+                SET status = ?, error_type = ?, completed_at = ?
+                WHERE event_id = ?
+                  AND status = ?
+                  AND trigger = ?
+                """,
+                (
+                    AgentResponseStatus.FAILED.value,
+                    error_type[:200],
+                    now,
+                    event_id,
+                    _IN_PROGRESS_STATUS,
+                    AgentTrigger.MENTION.value,
+                ),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        finally:
+            connection.close()
+
     def _rotate(self, conversation_id: str, model: str) -> None:
         now = datetime.now(UTC).isoformat()
         connection = sqlite3.connect(self.path)
@@ -1054,6 +1169,20 @@ def _pending_host_delivery_from_row(
         response_content=str(row["response_content"] or ""),
         occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
         completed_at=datetime.fromisoformat(str(completed_at)),
+    )
+
+
+def _interrupted_mention_from_row(
+    row: sqlite3.Row,
+) -> AgentInterruptedMention:
+    message_id = row["message_id"]
+    assert message_id is not None
+    return AgentInterruptedMention(
+        event_id=str(row["event_id"]),
+        channel_id=str(row["channel_id"]),
+        source_message_id=str(message_id),
+        occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
+        started_at=datetime.fromisoformat(str(row["started_at"])),
     )
 
 

@@ -167,6 +167,9 @@ class ImageGenerationStore:
         *,
         output_path: Path,
         generation_seconds: float,
+        provider_model: str,
+        width: int,
+        height: int,
     ) -> ImageGenerationJob:
         now = datetime.now(UTC).isoformat()
         with self._connect() as connection:
@@ -174,8 +177,9 @@ class ImageGenerationStore:
                 """
                 UPDATE image_generation_jobs
                 SET status = ?, output_path = ?, completed_at = ?,
-                    generation_seconds = ?, progress_step = progress_total,
-                    error_code = NULL
+                    generation_seconds = ?, provider_model = ?,
+                    width = ?, height = ?,
+                    progress_step = progress_total, error_code = NULL
                 WHERE job_id = ?
                 """,
                 (
@@ -183,6 +187,9 @@ class ImageGenerationStore:
                     str(output_path),
                     now,
                     generation_seconds,
+                    provider_model,
+                    width,
+                    height,
                     job_id,
                 ),
             )
@@ -385,6 +392,7 @@ class ImageGenerationStore:
                     created_at TEXT NOT NULL,
                     completed_at TEXT,
                     generation_seconds REAL,
+                    provider_model TEXT,
                     error_code TEXT,
                     progress_step INTEGER NOT NULL DEFAULT 0,
                     progress_total INTEGER NOT NULL DEFAULT 12,
@@ -410,6 +418,22 @@ class ImageGenerationStore:
                     "ALTER TABLE image_generation_jobs "
                     "ADD COLUMN delivery_message_id TEXT"
                 )
+            if "provider_model" not in columns:
+                connection.execute(
+                    "ALTER TABLE image_generation_jobs "
+                    "ADD COLUMN provider_model TEXT"
+                )
+                connection.execute(
+                    """
+                    UPDATE image_generation_jobs
+                    SET provider_model = ?
+                    WHERE status = ? AND output_path IS NOT NULL
+                    """,
+                    (
+                        "Ideogram 4・ローカルMLX (旧経路)",
+                        ImageJobStatus.COMPLETED.value,
+                    ),
+                )
         self.path.chmod(0o600)
 
     def _connect(self) -> sqlite3.Connection:
@@ -430,9 +454,9 @@ class ImageGenerationStore:
                 job_id, actor_id, workspace_id, delivery_target_id,
                 reply_to_message_id, prompt_json, caption_json, status,
                 output_path, width, height, seed, created_at, completed_at,
-                generation_seconds, error_code, progress_step, progress_total,
-                delivery_message_id, delivered
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                generation_seconds, provider_model, error_code,
+                progress_step, progress_total, delivery_message_id, delivered
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _job_values(job),
         )
@@ -532,7 +556,7 @@ class ImageGenerationService:
             delivery_target_id=delivery_target_id,
             reply_to_message_id=reply_to_message_id,
             prompt=prompt,
-            caption_json=build_ideogram_caption(prompt),
+            brief_json=build_image_brief(prompt),
             status=ImageJobStatus.QUEUED,
             output_path=None,
             width=width,
@@ -613,6 +637,8 @@ class ImageGenerationService:
         self._delivery_retry_tasks.clear()
         self._delivery_retry_requested.clear()
         self._delivery_locks.clear()
+        if self.provider is not None:
+            await self.provider.close()
 
     def _ensure_worker(self) -> None:
         if self._closed or self.provider is None:
@@ -635,7 +661,7 @@ class ImageGenerationService:
             try:
                 assert self.provider is not None
                 result = await self.provider.generate(
-                    caption_json=job.caption_json,
+                    brief_json=job.brief_json,
                     destination=output,
                     width=job.width,
                     height=job.height,
@@ -647,6 +673,9 @@ class ImageGenerationService:
                     job.job_id,
                     output_path=output,
                     generation_seconds=result.generation_seconds,
+                    provider_model=result.model,
+                    width=result.width or job.width,
+                    height=result.height or job.height,
                 )
             except asyncio.CancelledError:
                 raise
@@ -836,51 +865,19 @@ class ImageGenerationService:
             )
 
 
-def build_ideogram_caption(prompt: ImageGenerationPrompt) -> str:
-    """Compile typed fields in the canonical key order required by Ideogram 4."""
+def build_image_brief(prompt: ImageGenerationPrompt) -> str:
+    """Compile typed fields into the provider-neutral GPT Image brief."""
 
-    if prompt.rendering is ImageRendering.PHOTO:
-        style_description: dict[str, object] = {
-            "aesthetics": "High-quality, coherent details, intentional visual hierarchy",
-            "lighting": prompt.lighting,
-            "photo": prompt.style,
-            "medium": "Digital photograph",
-        }
-    else:
-        # Ideogram 4 validates insertion order as part of its structured-caption
-        # schema. In particular, illustration captions require ``medium`` before
-        # ``art_style`` while photo captions require ``photo`` before ``medium``.
-        style_description = {
-            "aesthetics": "High-quality, coherent details, intentional visual hierarchy",
-            "lighting": prompt.lighting,
-            "medium": "Digital illustration",
-            "art_style": prompt.style,
-        }
-    details = prompt.details.strip() or (
-        "Preserve coherent anatomy, intentional materials, and clearly separated forms."
-    )
-    avoid = prompt.avoid.strip() or (
-        "watermarks, unintended text, duplicated subjects, malformed anatomy, "
-        "cropped essential features"
-    )
     payload = {
-        "high_level_description": (
-            f"{prompt.subject}. {prompt.scene.rstrip('.')}. "
-            f"{prompt.composition.rstrip('.')}. Required details: {details}"
-        ),
-        "style_description": style_description,
-        "compositional_deconstruction": {
-            "background": prompt.scene,
-            "elements": [
-                {
-                    "type": "obj",
-                    "desc": (
-                        f"{prompt.subject}. Composition: {prompt.composition}. "
-                        f"Required details: {details}. Avoid: {avoid}."
-                    ),
-                }
-            ],
-        },
+        "subject": prompt.subject,
+        "scene": prompt.scene,
+        "composition": prompt.composition,
+        "style": prompt.style,
+        "lighting": prompt.lighting,
+        "required_details": prompt.details.strip(),
+        "avoid": prompt.avoid.strip(),
+        "rendering": prompt.rendering.value,
+        "aspect_ratio": prompt.aspect_ratio.value,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -911,13 +908,15 @@ def _validate_prompt(prompt: ImageGenerationPrompt) -> None:
 
 
 def _image_error_code(exc: Exception) -> str:
+    if isinstance(exc, TimeoutError):
+        return "generation_timeout"
     if isinstance(exc, ProviderError):
         detail = str(exc).lower()
-        if "caption" in detail or "strict" in detail:
+        if "brief" in detail or "strict" in detail:
             return "caption_invalid"
         if "timed out" in detail:
             return "generation_timeout"
-        if "invalid png" in detail:
+        if "png" in detail or "image data" in detail:
             return "invalid_output"
         return "provider_failed"
     return type(exc).__name__
@@ -939,7 +938,7 @@ def _job_values(job: ImageGenerationJob) -> tuple[object, ...]:
         job.delivery_target_id,
         job.reply_to_message_id,
         prompt_json,
-        job.caption_json,
+        job.brief_json,
         job.status.value,
         str(job.output_path) if job.output_path else None,
         job.width,
@@ -948,6 +947,7 @@ def _job_values(job: ImageGenerationJob) -> tuple[object, ...]:
         job.created_at_iso,
         job.completed_at_iso,
         job.generation_seconds,
+        job.provider_model,
         job.error_code,
         job.progress_step,
         job.progress_total,
@@ -964,6 +964,8 @@ def _row_job(row: sqlite3.Row) -> ImageGenerationJob:
         composition=str(raw["composition"]),
         style=str(raw["style"]),
         lighting=str(raw["lighting"]),
+        details=str(raw.get("details", "")),
+        avoid=str(raw.get("avoid", "")),
         aspect_ratio=ImageAspectRatio(str(raw["aspect_ratio"])),
         rendering=ImageRendering(str(raw["rendering"])),
         seed=int(raw["seed"]) if raw.get("seed") is not None else None,
@@ -978,7 +980,7 @@ def _row_job(row: sqlite3.Row) -> ImageGenerationJob:
             str(row["reply_to_message_id"]) if row["reply_to_message_id"] else None
         ),
         prompt=prompt,
-        caption_json=str(row["caption_json"]),
+        brief_json=str(row["caption_json"]),
         status=ImageJobStatus(str(row["status"])),
         output_path=Path(str(output)) if output else None,
         width=int(row["width"]),
@@ -992,6 +994,9 @@ def _row_job(row: sqlite3.Row) -> ImageGenerationJob:
             float(row["generation_seconds"])
             if row["generation_seconds"] is not None
             else None
+        ),
+        provider_model=(
+            str(row["provider_model"]) if row["provider_model"] else None
         ),
         error_code=str(row["error_code"]) if row["error_code"] else None,
         progress_step=int(row["progress_step"]),

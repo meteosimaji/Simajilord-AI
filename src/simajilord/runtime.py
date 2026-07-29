@@ -69,7 +69,7 @@ from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
 from simajilord.observability import EventJournal
-from simajilord.providers.image import IdeogramMlxProvider
+from simajilord.providers.image import CodexImageProvider
 from simajilord.providers.moderation import HiveSyntheticMediaProvider
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.providers.translation import MacOSTranslationProvider
@@ -336,13 +336,13 @@ class SimajilordRuntime:
             threshold=settings.hive_threshold,
         )
         image_provider = (
-            IdeogramMlxProvider(
-                model_path=settings.image_model_path,
-                mflux_source=settings.image_mflux_source,
+            CodexImageProvider(
+                executable=settings.codex_executable,
+                model=settings.agent_model,
+                workspace_dir=settings.data_dir / "image_codex_workspace",
                 timeout_seconds=settings.image_timeout_seconds,
-                mlx_cache_limit_gb=settings.image_mlx_cache_limit_gb,
             )
-            if settings.image_model_path is not None
+            if settings.image_generation_access is not AgentFeatureAccess.DISABLED
             else None
         )
         image_store = ImageGenerationStore(

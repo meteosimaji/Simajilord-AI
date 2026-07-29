@@ -246,6 +246,10 @@ class AgentService:
             if active is None:
                 return None
             original, follow_up_count = active
+            if original.trigger is not AgentTrigger.MENTION:
+                # An explicit user request must never disappear into an
+                # autonomous observation that is allowed to return NO_ACTION.
+                return None
             if request.grants != original.grants or request.approvals != original.approvals:
                 # The active provider thread exposes the original capability
                 # profile. Queue a separate turn so a stronger or different

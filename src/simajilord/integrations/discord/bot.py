@@ -468,9 +468,17 @@ def _image_result_embed(
         colour=discord.Colour.green(),
         timestamp=datetime.now(UTC),
     )
-    embed.add_field(name="モデル", value="Ideogram 4・ローカルMLX", inline=True)
+    embed.add_field(
+        name="モデル",
+        value=job.provider_model or "画像生成プロバイダー",
+        inline=True,
+    )
     embed.add_field(name="生成時間", value=duration, inline=True)
-    embed.add_field(name="シード", value=str(job.seed), inline=True)
+    embed.add_field(
+        name="出力",
+        value=f"{job.width} x {job.height} · {job.prompt.aspect_ratio.value}",
+        inline=True,
+    )
     embed.set_image(url=f"attachment://{filename}")
     embed.set_footer(text=_image_job_marker(job.job_id))
     return embed

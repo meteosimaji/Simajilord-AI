@@ -1,10 +1,10 @@
 """Image-generation provider adapters."""
 
 from .base import ImageGenerationProvider, ImageProgressCallback, ImageProviderResult
-from .ideogram_mlx import IdeogramMlxProvider
+from .codex import CodexImageProvider
 
 __all__ = (
-    "IdeogramMlxProvider",
+    "CodexImageProvider",
     "ImageGenerationProvider",
     "ImageProgressCallback",
     "ImageProviderResult",

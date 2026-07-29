@@ -20,6 +20,7 @@ from simajilord.core.errors import (
     UserError,
     WebError,
 )
+from simajilord.providers.codex_features import codex_feature_arguments
 
 from ..contracts import (
     AGENT_MESSAGE_BREAK,
@@ -42,36 +43,6 @@ from .base import AgentProgressCallback, ProviderTurnResult
 
 log = logging.getLogger(__name__)
 
-_DISABLED_CODEX_FEATURES = (
-    "apps",
-    "auth_elicitation",
-    "browser_use",
-    "browser_use_external",
-    "browser_use_full_cdp_access",
-    "code_mode_host",
-    "computer_use",
-    "fast_mode",
-    "goals",
-    "guardian_approval",
-    "hooks",
-    "image_generation",
-    "in_app_browser",
-    "memories",
-    "multi_agent",
-    "multi_agent_v2",
-    "personality",
-    "plugin_sharing",
-    "plugins",
-    "remote_plugin",
-    "shell_snapshot",
-    "shell_tool",
-    "skill_mcp_dependency_install",
-    "skill_search",
-    "tool_call_mcp_elicitation",
-    "tool_suggest",
-    "unified_exec",
-    "workspace_dependencies",
-)
 _MAX_TOOL_RESULT_CHARACTERS = 8_000
 
 def _base_instructions(model: str) -> str:
@@ -340,8 +311,17 @@ class CodexAppServerProvider:
                     )
                     content, usage = await self._await_turn(thread_id, turn_id)
                     budget = self._active_tool_budgets.get(thread_id)
+                    autonomous_no_action = (
+                        budget is not None
+                        and _event_trigger(provider_prompt) == "autonomous"
+                        and content.strip() == AGENT_NO_ACTION_CONTENT
+                        and not budget.follow_up_message_ids
+                        and not budget.write_successes
+                        and not budget.write_failures
+                    )
                     if (
                         budget is not None
+                        and not autonomous_no_action
                         and (
                             (
                                 budget.required_message_id is not None
@@ -638,7 +618,7 @@ class CodexAppServerProvider:
                     "app-server",
                     "--listen",
                     "stdio://",
-                    *_disabled_feature_arguments(),
+                    *codex_feature_arguments(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -1966,14 +1946,6 @@ def _web_search_mode(context: InvocationContext) -> str:
     """Use first-party live search only for an explicitly granted agent profile."""
 
     return "live" if AGENT_WEB_GRANT in context.grants else "disabled"
-
-
-def _disabled_feature_arguments() -> tuple[str, ...]:
-    return tuple(
-        argument
-        for feature in _DISABLED_CODEX_FEATURES
-        for argument in ("--disable", feature)
-    )
 
 
 def _object(value: object, label: str) -> dict[str, object]:

@@ -27,7 +27,7 @@ class ImageJobStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ImageGenerationPrompt:
-    """Structured fields compiled into the Ideogram 4 JSON-caption schema."""
+    """Structured fields compiled into a provider-neutral production brief."""
 
     subject: str
     scene: str
@@ -49,7 +49,7 @@ class ImageGenerationJob:
     delivery_target_id: str
     reply_to_message_id: str | None
     prompt: ImageGenerationPrompt
-    caption_json: str
+    brief_json: str
     status: ImageJobStatus
     output_path: Path | None
     width: int
@@ -58,6 +58,7 @@ class ImageGenerationJob:
     created_at_iso: str
     completed_at_iso: str | None = None
     generation_seconds: float | None = None
+    provider_model: str | None = None
     error_code: str | None = None
     progress_step: int = 0
     progress_total: int = 12

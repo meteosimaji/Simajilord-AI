@@ -35,7 +35,7 @@ from simajilord.providers.image import ImageProviderResult
 from simajilord.services.image import (
     ImageGenerationService,
     ImageGenerationStore,
-    build_ideogram_caption,
+    build_image_brief,
 )
 
 
@@ -43,19 +43,27 @@ class FakeImageProvider:
     async def generate(
         self,
         *,
-        caption_json: str,
+        brief_json: str,
         destination: Path,
         width: int,
         height: int,
         seed: int,
         on_progress: object = None,
     ) -> ImageProviderResult:
-        del caption_json, width, height, seed
+        del brief_json, seed
         if callable(on_progress):
             await on_progress(6, 12)
             await on_progress(12, 12)
         destination.write_bytes(b"\x89PNG\r\n\x1a\nfake")
-        return ImageProviderResult(generation_seconds=0.01, model="fake")
+        return ImageProviderResult(
+            generation_seconds=0.01,
+            model="fake",
+            width=width,
+            height=height,
+        )
+
+    async def close(self) -> None:
+        pass
 
 
 def _service(
@@ -106,7 +114,7 @@ def _job(
         delivery_target_id="123",
         reply_to_message_id="456",
         prompt=_prompt(),
-        caption_json=build_ideogram_caption(_prompt()),
+        brief_json=build_image_brief(_prompt()),
         status=status,
         output_path=output if status is ImageJobStatus.COMPLETED else None,
         width=512,
@@ -122,36 +130,7 @@ def _job(
     )
 
 
-def test_ideogram_caption_uses_rendering_specific_canonical_key_order() -> None:
-    illustration = json.loads(build_ideogram_caption(_prompt()))
-    assert tuple(illustration["style_description"]) == (
-        "aesthetics",
-        "lighting",
-        "medium",
-        "art_style",
-    )
-
-    photo = json.loads(
-        build_ideogram_caption(
-            ImageGenerationPrompt(
-                subject="a cat",
-                scene="a studio",
-                composition="centered",
-                style="editorial photography",
-                lighting="softbox",
-                rendering=ImageRendering.PHOTO,
-            )
-        )
-    )
-    assert tuple(photo["style_description"]) == (
-        "aesthetics",
-        "lighting",
-        "photo",
-        "medium",
-    )
-
-
-def test_ideogram_caption_preserves_full_production_brief() -> None:
+def test_image_brief_preserves_full_production_brief() -> None:
     prompt = ImageGenerationPrompt(
         subject="Exactly one orange cat sitting upright with amber eyes",
         scene="A rainy apartment window with a low walnut table and city bokeh",
@@ -163,14 +142,19 @@ def test_ideogram_caption_preserves_full_production_brief() -> None:
         rendering=ImageRendering.PHOTO,
     )
 
-    caption = json.loads(build_ideogram_caption(prompt))
+    brief = json.loads(build_image_brief(prompt))
 
-    assert prompt.subject in caption["high_level_description"]
-    assert prompt.scene in caption["high_level_description"]
-    assert prompt.composition in caption["high_level_description"]
-    element = caption["compositional_deconstruction"]["elements"][0]["desc"]
-    assert prompt.details in element
-    assert prompt.avoid in element
+    assert brief == {
+        "subject": prompt.subject,
+        "scene": prompt.scene,
+        "composition": prompt.composition,
+        "style": prompt.style,
+        "lighting": prompt.lighting,
+        "required_details": prompt.details,
+        "avoid": prompt.avoid,
+        "rendering": "photo",
+        "aspect_ratio": "square",
+    }
 
 
 def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
@@ -184,7 +168,7 @@ def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
         delivery_target_id="channel",
         reply_to_message_id=None,
         prompt=_prompt(),
-        caption_json=build_ideogram_caption(_prompt()),
+        brief_json=build_image_brief(_prompt()),
         status=ImageJobStatus.FAILED,
         output_path=None,
         width=512,
@@ -202,7 +186,7 @@ def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
         delivery_target_id="channel",
         reply_to_message_id=None,
         prompt=_prompt(),
-        caption_json=build_ideogram_caption(_prompt()),
+        brief_json=build_image_brief(_prompt()),
         status=ImageJobStatus.FAILED,
         output_path=None,
         width=512,
@@ -263,6 +247,7 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
             )
         }
     assert "delivery_message_id" in columns
+    assert "provider_model" in columns
     job = _job(
         tmp_path,
         job_id="post-migration",
@@ -372,7 +357,7 @@ async def test_terminal_retry_is_not_lost_while_an_older_retry_is_in_flight(
         delivery_target_id="channel",
         reply_to_message_id="message",
         prompt=_prompt(),
-        caption_json=build_ideogram_caption(_prompt()),
+        brief_json=build_image_brief(_prompt()),
         status=ImageJobStatus.RUNNING,
         output_path=None,
         width=512,
@@ -390,6 +375,9 @@ async def test_terminal_retry_is_not_lost_while_an_older_retry_is_in_flight(
         job.job_id,
         output_path=output,
         generation_seconds=0.01,
+        provider_model="fake",
+        width=512,
+        height=512,
     )
     service._schedule_delivery_retry(job.job_id)
     release_first_delivery.set()
@@ -432,6 +420,9 @@ async def test_image_delivery_lock_serializes_and_reloads_terminal_state(
         running.job_id,
         output_path=output,
         generation_seconds=0.01,
+        provider_model="fake",
+        width=512,
+        height=512,
     )
     second = asyncio.create_task(service._notify(terminal))
     release_first.set()

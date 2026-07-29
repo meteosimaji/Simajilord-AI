@@ -8236,6 +8236,7 @@ _agent_error_text = agent_error_text
 _retry_after_text = retry_after_text
 _agent_progress_text = agent_progress_text
 _AgentProgressMessage = AgentProgressMessage
+_AGENT_INTERRUPTED_MENTION_MAX_AGE = timedelta(hours=24)
 
 
 def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
@@ -8288,10 +8289,12 @@ class AgentCog(commands.Cog):
     def __init__(self, bot: commands.Bot, runtime: SimajilordRuntime) -> None:
         self.bot = bot
         self.runtime = runtime
+        self._started_at = datetime.now(UTC)
         self._active_progress: dict[str, AgentProgressMessage] = {}
         self._host_delivery_locks: dict[str, asyncio.Lock] = {}
         self._host_delivery_wakeup = asyncio.Event()
         self._host_delivery_task: asyncio.Task[None] | None = None
+        self._interrupted_recovery_task: asyncio.Task[None] | None = None
 
     async def cog_load(self) -> None:
         if self._host_delivery_task is None or self._host_delivery_task.done():
@@ -8299,14 +8302,30 @@ class AgentCog(commands.Cog):
                 self._host_delivery_loop(),
                 name="simajilord-agent-host-delivery",
             )
+        if (
+            self._interrupted_recovery_task is None
+            or self._interrupted_recovery_task.done()
+        ):
+            self._interrupted_recovery_task = asyncio.create_task(
+                self._recover_interrupted_mentions(),
+                name="simajilord-agent-interrupted-recovery",
+            )
 
     async def cog_unload(self) -> None:
-        task = self._host_delivery_task
+        tasks = tuple(
+            task
+            for task in (
+                self._host_delivery_task,
+                self._interrupted_recovery_task,
+            )
+            if task is not None
+        )
         self._host_delivery_task = None
-        if task is None:
-            return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        self._interrupted_recovery_task = None
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -8342,6 +8361,7 @@ class AgentCog(commands.Cog):
         *,
         event_id: str,
         occurred_at: datetime,
+        allow_follow_up: bool = True,
     ) -> None:
         agent = self.runtime.agent
         bot_user = self.bot.user
@@ -8401,35 +8421,36 @@ class AgentCog(commands.Cog):
             grants=grants,
             approvals=approvals,
         )
-        try:
-            followed_event_id = await agent.try_follow_up(request)
-        except AgentBusyError as exc:
-            await message.reply(
-                _agent_error_text(exc),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        if followed_event_id is not None:
-            acknowledgement = await message.reply(
-                embed=command_embed(
-                    "Added to the active AI request",
-                    description=(
-                        "The AI will read this message before it finishes. "
-                        "Your Discord identity remains attached to the follow-up."
+        if allow_follow_up:
+            try:
+                followed_event_id = await agent.try_follow_up(request)
+            except AgentBusyError as exc:
+                await message.reply(
+                    _agent_error_text(exc),
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            if followed_event_id is not None:
+                acknowledgement = await message.reply(
+                    embed=command_embed(
+                        "Added to the active AI request",
+                        description=(
+                            "The AI will read this message before it finishes. "
+                            "Your Discord identity remains attached to the follow-up."
+                        ),
+                        tone=EmbedTone.INFO,
                     ),
-                    tone=EmbedTone.INFO,
-                ),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            progress = self._active_progress.get(followed_event_id)
-            if progress is None:
-                with suppress(discord.DiscordException):
-                    await acknowledgement.delete()
-            else:
-                await progress.add_temporary_message(acknowledgement)
-            return
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                progress = self._active_progress.get(followed_event_id)
+                if progress is None:
+                    with suppress(discord.DiscordException):
+                        await acknowledgement.delete()
+                else:
+                    await progress.add_temporary_message(acknowledgement)
+                return
         progress = _AgentProgressMessage(
             message,
             delivery_key=request.event_id,
@@ -8473,6 +8494,67 @@ class AgentCog(commands.Cog):
         finally:
             if self._active_progress.get(request.event_id) is progress:
                 self._active_progress.pop(request.event_id, None)
+
+    async def _recover_interrupted_mentions(self) -> None:
+        """Re-run recent explicit mentions interrupted by the prior process."""
+
+        await self.bot.wait_until_ready()
+        interrupted = await self.runtime.agent_store.interrupted_mentions(
+            started_after=self._started_at - _AGENT_INTERRUPTED_MENTION_MAX_AGE,
+            started_before=self._started_at,
+        )
+        for request in interrupted:
+            try:
+                channel = await self._agent_host_channel(request.channel_id)
+                source = await self._agent_source_message(
+                    channel,
+                    request.source_message_id,
+                )
+                if source is None:
+                    await self.runtime.agent_store.fail_interrupted_mention(
+                        request.event_id,
+                        error_type="RecoverySourceUnavailable",
+                    )
+                    log.warning(
+                        "Interrupted mention source is unavailable request=%s "
+                        "channel=%s message=%s",
+                        request.event_id,
+                        request.channel_id,
+                        request.source_message_id,
+                    )
+                    continue
+                log.info(
+                    "Recovering interrupted mention request=%s channel=%s message=%s",
+                    request.event_id,
+                    request.channel_id,
+                    request.source_message_id,
+                )
+                await self._handle_mention(
+                    source,
+                    event_id=request.event_id,
+                    occurred_at=request.occurred_at,
+                    allow_follow_up=False,
+                )
+                skipped = await self.runtime.agent_store.fail_interrupted_mention(
+                    request.event_id,
+                    error_type="RecoverySkipped",
+                )
+                if skipped:
+                    log.warning(
+                        "Interrupted mention no longer qualified for processing "
+                        "request=%s",
+                        request.event_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Leave the row in progress so a later restart can retry a
+                # transient Discord or store failure.
+                log.exception(
+                    "Interrupted mention recovery failed request=%s channel=%s",
+                    request.event_id,
+                    request.channel_id,
+                )
 
     async def _host_delivery_loop(self) -> None:
         """Reconcile completed mention responses without rerunning the model."""
