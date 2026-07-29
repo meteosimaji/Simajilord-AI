@@ -3044,7 +3044,13 @@ def discord_translation_segments(
         if value:
             output.append(TranslationSegmentItem(identifier=identifier, text=value))
 
-    append("content", message.content)
+    primary_text = message.content
+    if not primary_text.strip() and message.is_system():
+        # System messages such as member join notices render through
+        # ``system_content`` while their regular content remains empty.
+        # Retain the stable ``content`` path for the translated rendering.
+        primary_text = message.system_content
+    append("content", primary_text)
     for embed_index, item in enumerate(message.embeds[:10]):
         append(f"embed.{embed_index}.author", item.author.name)
         append(f"embed.{embed_index}.title", item.title)

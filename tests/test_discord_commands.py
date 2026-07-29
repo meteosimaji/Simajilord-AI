@@ -48,6 +48,7 @@ from simajilord.capabilities.read_aloud import (
 from simajilord.capabilities.translation import (
     TranslationDetectResponse,
     TranslationLanguageItem,
+    TranslationSegmentItem,
 )
 from simajilord.capabilities.web import WebFetchResponse
 from simajilord.config import AgentFeatureAccess
@@ -676,6 +677,28 @@ def test_structured_translation_extracts_and_rebuilds_discord_message() -> None:
             show_original=True,
         )[-1].title
         == "Original"
+    )
+
+
+def test_structured_translation_uses_rendered_system_message_content() -> None:
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            content="",
+            is_system=lambda: True,
+            system_content="Make it a Quote joined the server.",
+            embeds=[],
+            poll=None,
+            components=[],
+            attachments=[],
+        ),
+    )
+
+    assert discord_translation_segments(message) == (
+        TranslationSegmentItem(
+            identifier="content",
+            text="Make it a Quote joined the server.",
+        ),
     )
 
 
