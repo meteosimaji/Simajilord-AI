@@ -15,6 +15,7 @@ from simajilord.agent import (
     AgentBusyError,
     AgentProgressStage,
     AgentProgressUpdate,
+    AgentProviderLimitError,
     AgentRateLimitError,
     AgentRequest,
     AgentTokenUsage,
@@ -26,6 +27,7 @@ from simajilord.agent.providers.codex import (
     CodexAppServerProvider,
     _base_instructions,
     _last_write_failure,
+    _provider_turn_error,
     _tool_read_exact_event,
     _ToolTurnBudget,
 )
@@ -1280,9 +1282,25 @@ async def test_provider_does_not_require_a_rejected_follow_up_read(
 
 def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     instructions = _base_instructions("gpt-5.6-luna")
-    assert len(instructions) < 2_000
+    normalized = " ".join(instructions.split())
+    assert len(instructions) < 4_000
     assert "Simajilord AI" in instructions
     assert "gpt-5.6-luna" in instructions
     assert "generic Codex/OpenAI Assistant" in instructions
+    assert "thoughtful member of the current Discord conversation" in instructions
+    assert "Never pretend to be human" in instructions
     assert "capability_search" in instructions
-    assert "natural, concise Japanese by default" in instructions
+    assert "concrete action-and-object query" in instructions
+    assert "call capability_invoke with only fields defined by that schema" in instructions
+    assert "do not search merely to use a tool" in normalized
+    assert "Concise means" in instructions
+    assert "not minimizing substance" in instructions
+    assert "one reactive sentence is usually insufficient" in instructions
+    assert "address the concrete weakness and improve it" in instructions
+
+
+def test_provider_usage_limit_has_a_stable_error_type() -> None:
+    error = _provider_turn_error(
+        "You've hit your usage limit. Purchase more credits or try again later."
+    )
+    assert isinstance(error, AgentProviderLimitError)

@@ -71,8 +71,10 @@ async def run() -> dict[str, object]:
 
     source_message = (
         "Simajilordの手動QAです。最終回答の前に、途中経過として"
-        "「計算を確認しています」という短いメッセージをこのチャンネルへ1件送り、"
-        "その後17 x 19を計算して最終回答してください。"
+        "「考えを整理しています」という短いメッセージをこのチャンネルへ1件送って"
+        "ください。その後、幼少期に『ミッケ』や『ウォーリーをさがせ』のような"
+        "探し絵を読むことに意味はあるのか、結論・期待できる点・限界を理由つきで"
+        "自然な日本語で答えてください。短い相づちだけでは終えないでください。"
     )
     sent_messages: list[str] = []
     progress: list[dict[str, object]] = []
@@ -199,7 +201,11 @@ async def run() -> dict[str, object]:
         "progress": progress,
         "intermediate_messages": sent_messages,
         "final_response": response.content,
-        "passed": bool(sent_messages) and "323" in response.content,
+        "response_characters": len(response.content),
+        "passed": (
+            sent_messages == ["考えを整理しています"]
+            and len(response.content) >= 120
+        ),
     }
     return result
 

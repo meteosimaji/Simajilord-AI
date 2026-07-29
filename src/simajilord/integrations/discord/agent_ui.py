@@ -15,6 +15,7 @@ from simajilord.agent import (
     AgentBusyError,
     AgentProgressStage,
     AgentProgressUpdate,
+    AgentProviderLimitError,
     AgentRateLimitError,
     AgentUnavailableError,
 )
@@ -71,6 +72,11 @@ def agent_error_text(error: Exception) -> str:
         return "AIの利用間隔を調整しています。時間を空けてもう一度お試しください。"
     if isinstance(error, AgentUnavailableError):
         return "現在、このホストではSimajilord AIを利用できません。"
+    if isinstance(error, AgentProviderLimitError):
+        return (
+            "AIプロバイダーの利用上限に達しています。"
+            "上限がリセットされてから、もう一度お試しください。"
+        )
     return "AIの処理を完了できませんでした。"
 
 

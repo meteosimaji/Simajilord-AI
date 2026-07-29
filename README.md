@@ -35,6 +35,8 @@ Discord adapter / local agent / human commands / future transports
 Conversation text is not hard-coded into capabilities. Only the Discord presenter owns fixed
 operational feedback such as command success, validation, and permission errors. The agent
 generates conversational text and chooses `discord.send_message` separately.
+Agent replies match the depth of the request: concise wording removes filler, but substantive
+questions still receive a direct answer, reasoning, context, and important limitations.
 Explicit human commands use compact English embeds with useful result fields and a Discord
 timestamp; implementation labels and decorative footer text are intentionally omitted.
 Unexpected command errors show the same reference ID that is recorded in the host log, so a

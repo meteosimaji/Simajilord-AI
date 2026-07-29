@@ -24,6 +24,7 @@ from simajilord.agent import (
     AGENT_WEB_GRANT,
     AgentProgressStage,
     AgentProgressUpdate,
+    AgentProviderLimitError,
     AgentRateLimitError,
 )
 from simajilord.capabilities.audio import (
@@ -3113,6 +3114,12 @@ def test_agent_rate_limit_message_includes_exact_retry_time() -> None:
     )
     assert _agent_error_text(error).endswith("あと2分5秒ほどお待ちください。")
     assert _retry_after_text(3_661) == "1時間1分1秒"
+
+
+def test_agent_provider_limit_message_explains_the_actual_failure() -> None:
+    message = _agent_error_text(AgentProviderLimitError("usage limit"))
+    assert "AIプロバイダーの利用上限" in message
+    assert "もう一度お試しください" in message
 
 
 def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:

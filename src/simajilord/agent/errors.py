@@ -32,6 +32,10 @@ class AgentProviderError(AgentError):
     """The provider failed while creating or running a turn."""
 
 
+class AgentProviderLimitError(AgentProviderError):
+    """The upstream provider rejected a turn because its usage limit was reached."""
+
+
 class AgentThreadError(AgentProviderError):
     """A saved provider thread could not be resumed."""
 
