@@ -623,3 +623,73 @@ async def test_role_assignment_enforces_both_hierarchies() -> None:
         )
 
     target.add_roles.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_administrator_still_cannot_bypass_member_role_hierarchy() -> None:
+    class Rank:
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+        def __le__(self, other: object) -> bool:
+            return isinstance(other, Rank) and self.value <= other.value
+
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    guild.owner_id = 1
+    administrator = SimpleNamespace(
+        manage_roles=False,
+        administrator=True,
+    )
+    actor = SimpleNamespace(
+        id=7,
+        bot=False,
+        guild=guild,
+        guild_permissions=administrator,
+        top_role=Rank(5),
+    )
+    bot = SimpleNamespace(
+        id=99,
+        bot=True,
+        guild=guild,
+        guild_permissions=administrator,
+        top_role=Rank(10),
+    )
+    target = SimpleNamespace(
+        id=8,
+        bot=False,
+        guild=guild,
+        guild_permissions=SimpleNamespace(administrator=False),
+        top_role=Rank(6),
+        roles=[],
+        add_roles=AsyncMock(),
+    )
+    role = SimpleNamespace(
+        id=40,
+        managed=False,
+        is_default=lambda: False,
+    )
+    guild.me = bot
+    guild.get_member.side_effect = lambda member_id: {7: actor, 8: target}.get(member_id)
+    guild.get_role.return_value = role
+    client.get_guild.return_value = guild
+    endpoints = _endpoints(cast(discord.Client, client))
+
+    with pytest.raises(UserError, match=r"discord\.member_hierarchy_forbidden"):
+        await endpoints["discord.assign_role"].invoke(
+            DiscordRoleMemberRequest(
+                user_id="8",
+                role_id="40",
+                reason="Grant project access",
+                evidence_message_ids=("30",),
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="discord:message:30",
+            ),
+        )
+
+    target.add_roles.assert_not_awaited()

@@ -22,6 +22,7 @@ from simajilord.providers.codex_features import codex_feature_arguments
 from .base import ImageProgressCallback, ImageProviderResult
 
 _MAX_IMAGE_BYTES = 50_000_000
+_APP_SERVER_STDOUT_LIMIT_BYTES = 80_000_000
 _MODEL_LABEL = "GPT Image 2・Codex OAuth"
 log = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class CodexImageProvider:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self.workspace_dir,
                     env=environment,
-                    limit=64_000_000,
+                    limit=_APP_SERVER_STDOUT_LIMIT_BYTES,
                 )
             except OSError as exc:
                 raise ProviderError("Codex image app-server could not start.") from exc

@@ -94,6 +94,41 @@ _SEARCH_TERM_GROUPS = (
             "思い出す",
         }
     ),
+    frozenset(
+        {
+            "identity",
+            "me",
+            "my",
+            "profile",
+            "requester",
+            "user",
+            "プロフィール",
+            "ユーザー",
+            "本人",
+            "私",
+            "自己",
+        }
+    ),
+    frozenset(
+        {
+            "admin",
+            "administrator",
+            "author",
+            "built",
+            "creator",
+            "developer",
+            "manager",
+            "operator",
+            "owner",
+            "created",
+            "作成者",
+            "制作者",
+            "管理者",
+            "開発者",
+            "運営",
+            "責任者",
+        }
+    ),
 )
 _SEARCH_TERM_GROUP_BY_TOKEN = {
     token: f"concept:{index}"
@@ -1169,6 +1204,30 @@ class AgentMemoryService:
 
     def __init__(self, store: AgentMemoryStore) -> None:
         self.store = store
+
+    async def context_for_turn(
+        self,
+        context: InvocationContext,
+        *,
+        limit: int = 4,
+    ) -> tuple[AgentMemoryRecord, ...]:
+        """Return a tiny requester-private context without claiming it was used."""
+
+        if context.workspace_id is None:
+            return ()
+        if not 1 <= limit <= MAX_MEMORY_SEARCH_RESULTS:
+            raise ValueError("turn memory context limit is invalid")
+        return await self.store.search(
+            query="",
+            scopes=(AgentMemoryScope.USER,),
+            limit=limit,
+            min_confidence=MIN_MEMORY_CONFIDENCE,
+            workspace_id=context.workspace_id,
+            actor_id=context.actor_id,
+            channel_id=context.origin_resource_id,
+            now=datetime.now(UTC),
+            mark_used_limit=0,
+        )
 
     async def search(
         self,

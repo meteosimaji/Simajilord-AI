@@ -12,6 +12,15 @@ DiscordMessageChannel: TypeAlias = (
 DiscordReadableChannel: TypeAlias = DiscordMessageChannel | discord.ForumChannel
 
 
+def permission_enabled(permissions: object, permission: str) -> bool:
+    """Return only Discord's concrete boolean permission value."""
+
+    return getattr(permissions, permission, False) is True
+
+
+_permission_enabled = permission_enabled
+
+
 def agent_readable_channel_ids(
     guild: discord.Guild,
     actor: discord.Member | None,
@@ -125,9 +134,14 @@ def can_read_messages(
     member: discord.Member,
 ) -> bool:
     permissions = channel.permissions_for(member)
-    can_read = permissions.view_channel and permissions.read_message_history
+    if _permission_enabled(permissions, "administrator"):
+        return True
+    can_read = _permission_enabled(
+        permissions,
+        "view_channel",
+    ) and _permission_enabled(permissions, "read_message_history")
     if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
-        return can_read and permissions.connect
+        return can_read and _permission_enabled(permissions, "connect")
     return can_read
 
 
@@ -141,7 +155,10 @@ def can_read_private_thread(
     ):
         return True
     permissions = channel.permissions_for(member)
-    if permissions.administrator or permissions.manage_threads:
+    if _permission_enabled(
+        permissions,
+        "administrator",
+    ) or _permission_enabled(permissions, "manage_threads"):
         return True
     return any(thread_member.id == member.id for thread_member in channel.members)
 
@@ -151,17 +168,24 @@ def can_post_expanded_message(
     member: discord.Member,
 ) -> bool:
     permissions = channel.permissions_for(member)
+    if _permission_enabled(permissions, "administrator"):
+        return True
     can_send = (
-        permissions.send_messages_in_threads
+        _permission_enabled(permissions, "send_messages_in_threads")
         if isinstance(channel, discord.Thread)
-        else permissions.send_messages
+        else _permission_enabled(permissions, "send_messages")
     )
     can_connect = (
-        permissions.connect
+        _permission_enabled(permissions, "connect")
         if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
         else True
     )
-    return permissions.view_channel and can_send and permissions.embed_links and can_connect
+    return (
+        _permission_enabled(permissions, "view_channel")
+        and can_send
+        and _permission_enabled(permissions, "embed_links")
+        and can_connect
+    )
 
 
 def can_post_quote_image(
@@ -169,14 +193,21 @@ def can_post_quote_image(
     member: discord.Member,
 ) -> bool:
     permissions = channel.permissions_for(member)
+    if _permission_enabled(permissions, "administrator"):
+        return True
     can_send = (
-        permissions.send_messages_in_threads
+        _permission_enabled(permissions, "send_messages_in_threads")
         if isinstance(channel, discord.Thread)
-        else permissions.send_messages
+        else _permission_enabled(permissions, "send_messages")
     )
     can_connect = (
-        permissions.connect
+        _permission_enabled(permissions, "connect")
         if isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
         else True
     )
-    return permissions.view_channel and can_send and permissions.attach_files and can_connect
+    return (
+        _permission_enabled(permissions, "view_channel")
+        and can_send
+        and _permission_enabled(permissions, "attach_files")
+        and can_connect
+    )

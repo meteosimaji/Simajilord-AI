@@ -31,6 +31,9 @@ AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES = (
     "discord.bulk_delete_messages",
     "discord.kick_member",
     "discord.ban_member",
+    "discord.delete_guild_resource",
+    "discord.delete_platform_asset",
+    "discord.delete_automod_rule",
 )
 AGENT_DISCORD_MODERATION_CAPABILITIES = (
     "discord.set_timeout",
@@ -54,6 +57,18 @@ AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES = (
     "discord.remove_role",
     "discord.update_channel_settings",
     "discord.create_channel",
+    "discord.create_guild_resource",
+    "discord.update_guild_resource",
+    "discord.message_action",
+    "discord.set_channel_overwrite",
+    "discord.create_platform_asset",
+    "discord.update_platform_asset",
+    "discord.create_automod_rule",
+    "discord.update_automod_rule",
+    "discord.channel_operation",
+    "discord.forward_message",
+    "discord.send_direct_message",
+    "discord.set_bot_presence",
     *AGENT_DISCORD_MODERATION_CAPABILITIES,
 )
 AGENT_MEMORY_WRITE_CAPABILITIES = (

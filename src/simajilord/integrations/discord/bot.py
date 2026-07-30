@@ -16,6 +16,7 @@ from simajilord.config import CommandScope
 from simajilord.domain.image import ImageGenerationJob, ImageJobStatus
 from simajilord.runtime import SimajilordRuntime
 
+from .agent_ui import agent_delivery_nonce
 from .application_emojis import ApplicationEmojiCatalog
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import DiscordMessageChannel, build_discord_endpoints
@@ -23,7 +24,6 @@ from .cogs import error_message, handle_interaction_error, setup_cogs
 from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
-_IMAGE_JOB_FOOTER_PREFIX = "Simajilord image job · "
 _IMAGE_DELIVERY_RECOVERY_LIMIT = 1_000
 
 
@@ -40,12 +40,11 @@ class SimajilordCommandTree(app_commands.CommandTree[commands.Bot]):
 
 class SimajilordDiscordBot(commands.Bot):
     def __init__(self, runtime: SimajilordRuntime) -> None:
-        intents = discord.Intents.none()
-        intents.guilds = True
-        intents.voice_states = True
-        intents.messages = True
-        intents.reactions = True
-        intents.message_content = True
+        # This installation explicitly enables all three privileged intents in
+        # Discord's Developer Portal. Preserve the complete bot-visible state so
+        # bounded read capabilities can report members, presence, activities,
+        # voice state, and the standard guild event surface accurately.
+        intents = discord.Intents.all()
         super().__init__(
             # Mentions are agent events. Prefix commands remain an explicit direct API path.
             command_prefix=runtime.settings.command_prefix,
@@ -291,7 +290,6 @@ class SimajilordDiscordBot(commands.Bot):
             embed = _image_result_embed(job, filename=filename)
             if progress_message is None or not _image_result_already_present(
                 progress_message,
-                job=job,
                 filename=filename,
             ):
                 image_file = discord.File(job.output_path, filename=filename)
@@ -301,6 +299,7 @@ class SimajilordDiscordBot(commands.Bot):
                             embed=embed,
                             file=image_file,
                             allowed_mentions=discord.AllowedMentions.none(),
+                            nonce=_image_delivery_nonce(job.job_id),
                         )
                         await self.runtime.image.set_delivery_message(
                             job.job_id,
@@ -351,8 +350,9 @@ class SimajilordDiscordBot(commands.Bot):
         """Resolve the one durable Discord message used for every job state.
 
         Discord cannot commit a message send and our SQLite update atomically.
-        The bot-authored job marker reconciles the narrow send-before-persist
-        crash window without posting a second result.
+        A deterministic Discord nonce reconciles the narrow send-before-persist
+        crash window without exposing an implementation marker or posting a
+        second result.
         """
 
         if job.delivery_message_id is not None:
@@ -364,7 +364,7 @@ class SimajilordDiscordBot(commands.Bot):
         user = self.user
         if user is None:
             return None
-        marker = _image_job_marker(job.job_id)
+        nonce = _image_delivery_nonce(job.job_id)
         boundary_text = job.completed_at_iso or job.created_at_iso
         boundary = datetime.fromisoformat(boundary_text)
         if boundary.tzinfo is None:
@@ -376,7 +376,7 @@ class SimajilordDiscordBot(commands.Bot):
         ):
             if candidate.author.id != user.id:
                 continue
-            if any(embed.footer.text == marker for embed in candidate.embeds):
+            if str(candidate.nonce) == nonce:
                 await self.runtime.image.set_delivery_message(
                     job.job_id,
                     str(candidate.id),
@@ -405,10 +405,12 @@ async def _send_image_progress(
                 embed=embed,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
+                nonce=_image_delivery_nonce(job.job_id),
             )
     return await channel.send(
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none(),
+        nonce=_image_delivery_nonce(job.job_id),
     )
 
 
@@ -425,7 +427,6 @@ def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
         )
         if job.error_code:
             embed.add_field(name="エラーコード", value=f"`{job.error_code}`")
-        embed.set_footer(text=_image_job_marker(job.job_id))
         return embed
     complete = job.status is ImageJobStatus.COMPLETED
     step = job.progress_total if complete else job.progress_step
@@ -448,7 +449,6 @@ def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
         value=f"幅 {job.width}・高さ {job.height}",
         inline=True,
     )
-    embed.set_footer(text=_image_job_marker(job.job_id))
     return embed
 
 
@@ -468,11 +468,6 @@ def _image_result_embed(
         colour=discord.Colour.green(),
         timestamp=datetime.now(UTC),
     )
-    embed.add_field(
-        name="モデル",
-        value=job.provider_model or "画像生成プロバイダー",
-        inline=True,
-    )
     embed.add_field(name="生成時間", value=duration, inline=True)
     embed.add_field(
         name="出力",
@@ -480,7 +475,6 @@ def _image_result_embed(
         inline=True,
     )
     embed.set_image(url=f"attachment://{filename}")
-    embed.set_footer(text=_image_job_marker(job.job_id))
     return embed
 
 
@@ -495,24 +489,21 @@ def _image_prompt_preview(job: ImageGenerationJob) -> str:
     return "\n".join(part for part in parts if part)[:1_000]
 
 
-def _image_job_marker(job_id: str) -> str:
-    return f"{_IMAGE_JOB_FOOTER_PREFIX}{job_id}"
+def _image_delivery_nonce(job_id: str) -> str:
+    return agent_delivery_nonce(job_id, 0, purpose="image-job")
 
 
 def _image_result_already_present(
     message: discord.Message,
     *,
-    job: ImageGenerationJob,
     filename: str,
 ) -> bool:
-    marker = _image_job_marker(job.job_id)
     has_attachment = any(
         attachment.filename == filename
         for attachment in message.attachments
     )
     has_result_embed = any(
-        embed.footer.text == marker
-        and embed.image.url == f"attachment://{filename}"
+        embed.image.url == f"attachment://{filename}"
         for embed in message.embeds
     )
     return has_attachment and has_result_embed

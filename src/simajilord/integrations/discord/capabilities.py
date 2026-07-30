@@ -9,7 +9,7 @@ import io
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -107,7 +107,11 @@ from .permissions import channel_visibility as _channel_visibility
 from .permissions import (
     disclosure_audience_relation as _disclosure_audience_relation,
 )
+from .permissions import permission_enabled as _permission_enabled
 from .presenter import (
+    EmbedField,
+    EmbedTone,
+    agent_embed,
     expanded_message_embeds,
     expanded_message_view,
     quote_message_view,
@@ -199,6 +203,94 @@ class DiscordServerResponse:
 @dataclass(frozen=True, slots=True)
 class DiscordUserRequest:
     user_id: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordActivityRecord:
+    name: str
+    type: str
+    details: str | None = None
+    state: str | None = None
+    url: str | None = None
+    application_id: str | None = None
+    created_at_iso: str | None = None
+    start_iso: str | None = None
+    end_iso: str | None = None
+    emoji: str | None = None
+    platform: str | None = None
+    session_id: str | None = None
+    sync_id: str | None = None
+    details_url: str | None = None
+    state_url: str | None = None
+    large_image_url: str | None = None
+    large_image_text: str | None = None
+    small_image_url: str | None = None
+    small_image_text: str | None = None
+    buttons: tuple[str, ...] = ()
+    party: str | None = None
+    flags: str | None = None
+    status_display_type: str | None = None
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    track_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordVoiceStateRecord:
+    user_id: str
+    display_name: str
+    bot: bool
+    channel_id: str
+    channel_name: str
+    channel_kind: str
+    category_id: str | None
+    server_muted: bool
+    server_deafened: bool
+    self_muted: bool
+    self_deafened: bool
+    streaming: bool
+    video: bool
+    suppressed: bool
+    afk: bool
+    requested_to_speak_at_iso: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListVoiceStatesRequest:
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Guild ID returned by discord.list_servers. Omit for the origin guild."
+            )
+        },
+    )
+    offset: int = dataclass_field(
+        default=0,
+        metadata={"description": "Zero-based voice-state offset."},
+    )
+    limit: int = dataclass_field(
+        default=25,
+        metadata={"description": "Visible connected members returned, from 1 through 25."},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordListVoiceStatesResponse:
+    voice_states: tuple[DiscordVoiceStateRecord, ...]
+    source_guild_id: str
+    total_visible_connected: int
+    next_offset: int | None = None
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +312,36 @@ class DiscordUserResponse:
     timed_out_until_iso: str | None = None
     key_permissions: tuple[str, ...] = ()
     colour_value: int = 0
+    source_guild_id: str | None = None
+    member: bool = False
+    presence_available: bool = False
+    desktop_status: str | None = None
+    mobile_status: str | None = None
+    web_status: str | None = None
+    activities: tuple[DiscordActivityRecord, ...] = ()
+    voice_state: DiscordVoiceStateRecord | None = None
+    premium_since_iso: str | None = None
+    guild_avatar_url: str | None = None
+    guild_banner_url: str | None = None
+    public_flags: tuple[str, ...] = ()
+    member_flags: tuple[str, ...] = ()
+    role_ids: tuple[str, ...] = ()
+    enabled_guild_permissions: tuple[str, ...] = ()
+    raw_status: str | None = None
+    is_on_mobile: bool = False
+    discriminator: str = "0"
+    system: bool = False
+    global_avatar_url: str | None = None
+    banner_url: str | None = None
+    display_banner_url: str | None = None
+    accent_colour_value: int | None = None
+    avatar_decoration_url: str | None = None
+    avatar_decoration_sku_id: str | None = None
+    mutual_guild_ids: tuple[str, ...] = ()
+    primary_guild_id: str | None = None
+    primary_guild_tag: str | None = None
+    primary_guild_badge_url: str | None = None
+    primary_guild_identity_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,6 +951,42 @@ class _DiscordAnimatedMedia:
 class DiscordSendMessageRequest:
     channel_id: str
     content: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Target guild ID returned by discord.list_servers. Omit for the "
+                "origin guild. Cross-guild posting is re-authorized from live "
+                "requester and bot membership and channel permissions."
+            )
+        },
+    )
+    purpose: Literal["progress", "requested_action"] = "requested_action"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordEmbedFieldRequest:
+    name: str
+    value: str
+    inline: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendEmbedRequest:
+    channel_id: str
+    title: str
+    description: str = ""
+    fields: tuple[DiscordEmbedFieldRequest, ...] = ()
+    tone: Literal["info", "success", "warning", "error"] = "info"
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Target guild ID returned by discord.list_servers. Omit for the "
+                "origin guild."
+            )
+        },
+    )
     purpose: Literal["progress", "requested_action"] = "requested_action"
 
 
@@ -895,7 +1053,6 @@ class DiscordTranslateMessageResponse:
     translation: str
     source_language: str
     target_language: str
-    provider: str
     segments: tuple[DiscordTranslatedSegmentRecord, ...] = ()
     cached: bool = False
 
@@ -920,6 +1077,20 @@ class DiscordSendFileRequest:
     channel_id: str
     path: str
     caption: str = ""
+    description: str = ""
+    spoiler: bool = False
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Target guild ID returned by discord.list_servers. Omit for the "
+                "origin guild."
+            )
+        },
+    )
+    reply_to_message_id: str | None = None
+    silent: bool = False
+    purpose: Literal["progress", "requested_action"] = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -928,12 +1099,50 @@ class DiscordSendFileResponse:
     channel_id: str
     filename: str
     size_bytes: int
+    guild_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordFileAttachmentRequest:
+    path: str
+    description: str = ""
+    spoiler: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendFilesRequest:
+    channel_id: str
+    attachments: tuple[DiscordFileAttachmentRequest, ...]
+    caption: str = ""
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={
+            "description": (
+                "Target guild ID returned by discord.list_servers. Omit for the "
+                "origin guild."
+            )
+        },
+    )
+    reply_to_message_id: str | None = None
+    silent: bool = False
+    purpose: Literal["progress", "requested_action"] = "requested_action"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendFilesResponse:
+    message_id: str
+    channel_id: str
+    filenames: tuple[str, ...]
+    size_bytes: tuple[int, ...]
+    total_size_bytes: int
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DiscordSendMessageResponse:
     message_id: str
     channel_id: str
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1160,6 +1369,7 @@ class DiscordBulkDeleteResponse:
 class DiscordDeleteOwnMessageRequest:
     channel_id: str
     message_id: str
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1167,6 +1377,7 @@ class DiscordDeleteOwnMessageResponse:
     message_id: str
     channel_id: str
     deleted: bool
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1175,12 +1386,14 @@ class DiscordDeleteOwnMessagesRequest:
 
     channel_id: str
     message_ids: str
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class DiscordDeleteOwnMessagesResponse:
     channel_id: str
     deleted_message_ids: tuple[str, ...]
+    guild_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1336,12 +1549,24 @@ def build_discord_endpoints(
         request: DiscordUserRequest,
         context: InvocationContext,
     ) -> DiscordUserResponse:
-        guild = _guild(client, context)
+        guild = _requested_guild(client, context, request.guild_id)
+        if context.transport == "agent":
+            await _require_common_guild(guild, context)
         try:
             user_id = int(request.user_id)
         except ValueError as exc:
             raise UserError("discord.user_id_invalid") from exc
-        member = guild.get_member(user_id)
+        cached_member = guild.get_member(user_id)
+        member = cached_member
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                member = None
+            except discord.Forbidden as exc:
+                raise UserError("discord.member_lookup_failed") from exc
+            except discord.DiscordException as exc:
+                raise UserError("discord.member_lookup_failed") from exc
         user = member or client.get_user(user_id)
         if user is None:
             try:
@@ -1362,12 +1587,31 @@ def build_discord_endpoints(
             tuple(
                 label
                 for permission, label in key_permission_labels.items()
-                if getattr(member.guild_permissions, permission)
+                if _permission_enabled(member.guild_permissions, permission)
             )
             if member is not None
             else ()
         )
-        roles = tuple(role.name for role in member.roles[1:]) if member is not None else ()
+        member_roles = member.roles[1:] if member is not None else ()
+        roles = tuple(role.name for role in member_roles)
+        intents = getattr(client, "intents", None)
+        presence_available = (
+            cached_member is not None
+            and isinstance(intents, discord.Intents)
+            and intents.presences
+        )
+        presence_member = cached_member if presence_available else None
+        voice_state = (
+            _voice_state_record(cached_member)
+            if cached_member is not None and cached_member.voice is not None
+            else None
+        )
+        primary_guild = user.primary_guild
+        global_avatar = user.avatar
+        banner = user.banner
+        display_banner = member.display_banner if member is not None else banner
+        accent_colour = user.accent_colour
+        avatar_decoration = user.avatar_decoration
         return DiscordUserResponse(
             user_id=str(user.id),
             display_name=member.display_name if member else user.display_name,
@@ -1381,8 +1625,12 @@ def build_discord_endpoints(
             nickname=member.nick if member is not None else None,
             role_names=roles,
             role_count=len(roles),
-            status=str(member.status) if member is not None else None,
-            pending=member.pending if member is not None else False,
+            status=(
+                str(presence_member.status)
+                if presence_member is not None
+                else None
+            ),
+            pending=member.pending is True if member is not None else False,
             timed_out_until_iso=(
                 member.timed_out_until.isoformat()
                 if member is not None and member.timed_out_until is not None
@@ -1390,6 +1638,144 @@ def build_discord_endpoints(
             ),
             key_permissions=key_permissions,
             colour_value=member.colour.value if member is not None else 0,
+            source_guild_id=str(guild.id),
+            member=member is not None,
+            presence_available=presence_available,
+            desktop_status=(
+                str(presence_member.desktop_status)
+                if presence_member is not None
+                else None
+            ),
+            mobile_status=(
+                str(presence_member.mobile_status)
+                if presence_member is not None
+                else None
+            ),
+            web_status=(
+                str(presence_member.web_status)
+                if presence_member is not None
+                else None
+            ),
+            activities=(
+                tuple(_activity_record(activity) for activity in presence_member.activities)
+                if presence_member is not None
+                else ()
+            ),
+            voice_state=voice_state,
+            premium_since_iso=(
+                member.premium_since.isoformat()
+                if member is not None and member.premium_since is not None
+                else None
+            ),
+            guild_avatar_url=(
+                str(member.guild_avatar.url)
+                if member is not None and member.guild_avatar is not None
+                else None
+            ),
+            guild_banner_url=(
+                str(member.guild_banner.url)
+                if member is not None and member.guild_banner is not None
+                else None
+            ),
+            public_flags=_enabled_flag_names(user.public_flags),
+            member_flags=(
+                _enabled_flag_names(member.flags)
+                if member is not None
+                else ()
+            ),
+            role_ids=tuple(str(role.id) for role in member_roles),
+            enabled_guild_permissions=(
+                _enabled_flag_names(member.guild_permissions)
+                if member is not None
+                else ()
+            ),
+            raw_status=(
+                presence_member.raw_status
+                if presence_member is not None
+                else None
+            ),
+            is_on_mobile=(
+                presence_member.is_on_mobile()
+                if presence_member is not None
+                else False
+            ),
+            discriminator=user.discriminator,
+            system=user.system,
+            global_avatar_url=str(global_avatar.url) if global_avatar else None,
+            banner_url=str(banner.url) if banner else None,
+            display_banner_url=(
+                str(display_banner.url) if display_banner else None
+            ),
+            accent_colour_value=(
+                accent_colour.value if accent_colour is not None else None
+            ),
+            avatar_decoration_url=(
+                str(avatar_decoration.url)
+                if avatar_decoration is not None
+                else None
+            ),
+            avatar_decoration_sku_id=(
+                str(user.avatar_decoration_sku_id)
+                if user.avatar_decoration_sku_id is not None
+                else None
+            ),
+            mutual_guild_ids=tuple(
+                sorted(str(mutual_guild.id) for mutual_guild in user.mutual_guilds)
+            ),
+            primary_guild_id=(
+                str(primary_guild.id) if primary_guild.id is not None else None
+            ),
+            primary_guild_tag=primary_guild.tag,
+            primary_guild_badge_url=(
+                str(primary_guild.badge.url)
+                if primary_guild.badge is not None
+                else None
+            ),
+            primary_guild_identity_enabled=primary_guild.identity_enabled is True,
+        )
+
+    async def list_voice_states(
+        request: DiscordListVoiceStatesRequest,
+        context: InvocationContext,
+    ) -> DiscordListVoiceStatesResponse:
+        if request.offset < 0:
+            raise UserError("discord.voice_state_offset_invalid")
+        if not 1 <= request.limit <= 25:
+            raise UserError("discord.voice_state_limit_invalid")
+        guild = _requested_guild(client, context, request.guild_id)
+        actor = await _require_common_guild(guild, context)
+        bot = guild.me
+        if bot is None:
+            raise UserError("discord.guild_unavailable")
+        records: list[DiscordVoiceStateRecord] = []
+        channels = (*guild.voice_channels, *guild.stage_channels)
+        for channel in channels:
+            if not _can_view_channel(channel, actor) or not _can_view_channel(
+                channel,
+                bot,
+            ):
+                continue
+            records.extend(
+                _voice_state_record(member)
+                for member in channel.members
+                if member.voice is not None
+            )
+        records.sort(
+            key=lambda item: (
+                item.channel_name.casefold(),
+                item.display_name.casefold(),
+                item.user_id,
+            )
+        )
+        page = tuple(records[request.offset : request.offset + request.limit])
+        page_end = request.offset + len(page)
+        next_offset = page_end if page_end < len(records) else None
+        return DiscordListVoiceStatesResponse(
+            voice_states=page,
+            source_guild_id=str(guild.id),
+            total_visible_connected=len(records),
+            next_offset=next_offset,
+            complete=next_offset is None,
         )
 
     async def list_roles(
@@ -2122,7 +2508,6 @@ def build_discord_endpoints(
             translation="\n".join(item.translation for item in translated.segments),
             source_language=translated.source_language,
             target_language=translated.target_language,
-            provider=translated.provider,
             segments=tuple(
                 DiscordTranslatedSegmentRecord(
                     identifier=item.identifier,
@@ -2145,19 +2530,17 @@ def build_discord_endpoints(
                 "segment_count": len(response.segments),
                 "source_language": response.source_language,
                 "target_language": response.target_language,
-                "provider": response.provider,
                 "cached": response.cached,
             },
         )
         log.info(
             "Translated Discord message message=%s channel=%s segments=%s "
-            "source=%s target=%s provider=%s cached=%s",
+            "source=%s target=%s cached=%s",
             response.message_id,
             response.channel_id,
             len(response.segments),
             response.source_language,
             response.target_language,
-            response.provider,
             response.cached,
         )
         return response
@@ -2516,8 +2899,11 @@ def build_discord_endpoints(
         request: DiscordSendMessageRequest,
         context: InvocationContext,
     ) -> DiscordSendMessageResponse:
-        _guild_value, channel, actor, bot = await _write_message_channel(
-            client, context, request.channel_id
+        guild, channel, actor, bot = await _write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
         )
         for member in (actor, bot):
             _require_channel_permissions(channel, member, "send_messages")
@@ -2525,12 +2911,66 @@ def build_discord_endpoints(
             raise UserError("discord.message_length_invalid")
         message = await channel.send(
             request.content,
+            nonce=_discord_write_nonce(context, "message"),
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
         )
         return DiscordSendMessageResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
+            guild_id=str(guild.id),
+        )
+
+    async def send_embed(
+        request: DiscordSendEmbedRequest,
+        context: InvocationContext,
+    ) -> DiscordSendMessageResponse:
+        guild, channel, actor, bot = await _write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+        )
+        for member in (actor, bot):
+            _require_channel_permissions(channel, member, "send_messages")
+            _require_channel_permissions(channel, member, "embed_links")
+        title = request.title.strip()
+        description = request.description.strip()
+        if not 1 <= len(title) <= 256:
+            raise UserError("discord.embed_title_invalid")
+        if len(description) > 4_096:
+            raise UserError("discord.embed_description_invalid")
+        if len(request.fields) > 10:
+            raise UserError("discord.embed_fields_invalid")
+        fields: list[EmbedField] = []
+        total_characters = len(title) + len(description)
+        for field in request.fields:
+            name = field.name.strip()
+            value = field.value.strip()
+            if not 1 <= len(name) <= 256 or not 1 <= len(value) <= 1_024:
+                raise UserError("discord.embed_field_invalid")
+            total_characters += len(name) + len(value)
+            fields.append(EmbedField(name=name, value=value, inline=field.inline))
+        if total_characters > 6_000:
+            raise UserError("discord.embed_length_invalid")
+        try:
+            tone = EmbedTone(request.tone)
+        except ValueError as exc:
+            raise UserError("discord.embed_tone_invalid") from exc
+        message = await channel.send(
+            embed=agent_embed(
+                title,
+                description=description or None,
+                fields=tuple(fields),
+                tone=tone,
+            ),
+            nonce=_discord_write_nonce(context, "embed"),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return DiscordSendMessageResponse(
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            guild_id=str(guild.id),
         )
 
     async def reply_message(
@@ -3121,7 +3561,7 @@ def build_discord_endpoints(
         request: DiscordDeleteOwnMessageRequest,
         context: InvocationContext,
     ) -> DiscordDeleteOwnMessageResponse:
-        guild = _guild(client, context)
+        guild = _requested_guild(client, context, request.guild_id)
         channel = _message_channel(guild, request.channel_id)
         bot_member = guild.me
         if bot_member is None:
@@ -3146,6 +3586,7 @@ def build_discord_endpoints(
                 message_id=request.message_id,
                 channel_id=request.channel_id,
                 deleted=True,
+                guild_id=str(guild.id),
             )
         except discord.Forbidden as exc:
             raise UserError("discord.message_delete_forbidden") from exc
@@ -3165,13 +3606,14 @@ def build_discord_endpoints(
             message_id=str(message.id),
             channel_id=str(channel.id),
             deleted=True,
+            guild_id=str(guild.id),
         )
 
     async def delete_own_messages(
         request: DiscordDeleteOwnMessagesRequest,
         context: InvocationContext,
     ) -> DiscordDeleteOwnMessagesResponse:
-        guild = _guild(client, context)
+        guild = _requested_guild(client, context, request.guild_id)
         channel = _message_channel(guild, request.channel_id)
         bot_member = guild.me
         if bot_member is None:
@@ -3223,6 +3665,7 @@ def build_discord_endpoints(
         return DiscordDeleteOwnMessagesResponse(
             channel_id=str(channel.id),
             deleted_message_ids=message_ids,
+            guild_id=str(guild.id),
         )
 
     async def add_reaction(
@@ -3290,46 +3733,125 @@ def build_discord_endpoints(
             changed=already_reacted,
         )
 
-    async def send_file(
-        request: DiscordSendFileRequest,
+    async def send_files(
+        request: DiscordSendFilesRequest,
         context: InvocationContext,
-    ) -> DiscordSendFileResponse:
+        *,
+        _single_file: bool = False,
+    ) -> DiscordSendFilesResponse:
         if runtime.files is None:
             raise UserError("files.disabled")
         if context.workspace_id is None:
             raise UserError("files.workspace_required")
+        if not 1 <= len(request.attachments) <= 10:
+            raise UserError("discord.file_count_invalid")
         if len(request.caption) > 2_000:
             raise UserError("discord.file_caption_too_long")
-        guild, channel, actor, bot = await _write_message_channel(
-            client, context, request.channel_id
+        if any(len(item.description) > 1_024 for item in request.attachments):
+            raise UserError("discord.file_description_too_long")
+        guild, channel, _actor, _bot = await _write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages", "attach_files"),
         )
-        for member in (actor, bot):
-            _require_channel_permissions(channel, member, "send_messages")
-            _require_channel_permissions(channel, member, "attach_files")
-        filename, content = await asyncio.to_thread(
-            runtime.files.snapshot_for_delivery,
-            context.workspace_id,
-            request.path,
+        snapshots = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    runtime.files.snapshot_for_delivery,
+                    context.workspace_id,
+                    item.path,
+                )
+                for item in request.attachments
+            )
         )
-        size_bytes = len(content)
-        if size_bytes > guild.filesize_limit:
+        sizes = tuple(len(content) for _filename, content in snapshots)
+        if any(size > guild.filesize_limit for size in sizes):
             raise UserError("discord.file_too_large")
+        files = [
+            discord.File(
+                io.BytesIO(content),
+                filename=filename,
+                spoiler=item.spoiler,
+                description=item.description or None,
+            )
+            for item, (filename, content) in zip(
+                request.attachments,
+                snapshots,
+                strict=True,
+            )
+        ]
+        filenames = tuple(file.filename for file in files)
+        reply = (
+            await _fetch_message_for_write(channel, request.reply_to_message_id)
+            if request.reply_to_message_id is not None
+            else None
+        )
         try:
+            send_arguments: dict[str, Any] = {
+                "allowed_mentions": discord.AllowedMentions.none(),
+                "nonce": _discord_write_nonce(context, "attachments"),
+                "suppress_embeds": True,
+            }
+            if _single_file:
+                send_arguments["file"] = files[0]
+            else:
+                send_arguments["files"] = files
+            if reply is not None:
+                send_arguments["reference"] = reply
+                send_arguments["mention_author"] = False
+            if request.silent:
+                send_arguments["silent"] = True
             message = await channel.send(
                 request.caption or None,
-                file=discord.File(io.BytesIO(content), filename=filename),
-                allowed_mentions=discord.AllowedMentions.none(),
-                suppress_embeds=True,
+                **send_arguments,
             )
         except discord.Forbidden as exc:
             raise UserError("discord.file_send_forbidden") from exc
         except discord.DiscordException as exc:
             raise UserError("discord.file_send_failed") from exc
-        return DiscordSendFileResponse(
+        finally:
+            for file in files:
+                file.close()
+        return DiscordSendFilesResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
-            filename=filename,
-            size_bytes=size_bytes,
+            filenames=filenames,
+            size_bytes=sizes,
+            total_size_bytes=sum(sizes),
+            guild_id=str(guild.id),
+        )
+
+    async def send_file(
+        request: DiscordSendFileRequest,
+        context: InvocationContext,
+    ) -> DiscordSendFileResponse:
+        response = await send_files(
+            DiscordSendFilesRequest(
+                channel_id=request.channel_id,
+                attachments=(
+                    DiscordFileAttachmentRequest(
+                        path=request.path,
+                        description=request.description,
+                        spoiler=request.spoiler,
+                    ),
+                ),
+                caption=request.caption,
+                guild_id=request.guild_id,
+                reply_to_message_id=request.reply_to_message_id,
+                silent=request.silent,
+                purpose=request.purpose,
+            ),
+            context,
+            _single_file=True,
+        )
+        return DiscordSendFileResponse(
+            message_id=response.message_id,
+            channel_id=response.channel_id,
+            filename=response.filenames[0],
+            size_bytes=response.size_bytes[0],
+            guild_id=response.guild_id,
         )
 
     async def create_poll(
@@ -3348,13 +3870,23 @@ def build_discord_endpoints(
             else None
         )
         if (
-            not actor_permissions.view_channel
-            or not actor_permissions.send_messages
-            or not actor_permissions.create_polls
-            or bot_permissions is None
-            or not bot_permissions.view_channel
-            or not bot_permissions.send_messages
-            or not bot_permissions.create_polls
+            bot_permissions is None
+            or (
+                not _permission_enabled(actor_permissions, "administrator")
+                and (
+                    not _permission_enabled(actor_permissions, "view_channel")
+                    or not _permission_enabled(actor_permissions, "send_messages")
+                    or not _permission_enabled(actor_permissions, "create_polls")
+                )
+            )
+            or (
+                not _permission_enabled(bot_permissions, "administrator")
+                and (
+                    not _permission_enabled(bot_permissions, "view_channel")
+                    or not _permission_enabled(bot_permissions, "send_messages")
+                    or not _permission_enabled(bot_permissions, "create_polls")
+                )
+            )
         ):
             raise UserError("discord.poll_forbidden")
         question = request.question.strip()
@@ -3636,7 +4168,11 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         member = await _actor_member(guild, context)
         mutating = request.action is not ReadAloudAction.STATUS
-        if mutating and not member.guild_permissions.manage_guild:
+        can_manage_guild = _permission_enabled(
+            member.guild_permissions,
+            "administrator",
+        ) or _permission_enabled(member.guild_permissions, "manage_guild")
+        if mutating and not can_manage_guild:
             member_voice = _member_voice_channel(member)
             if request.action is ReadAloudAction.ADD_SOURCES:
                 current_route = runtime.read_aloud.get(str(guild.id))
@@ -3880,7 +4416,7 @@ def build_discord_endpoints(
         )
         return cast(ReadAloudPolicyResponse, response)
 
-    return (
+    endpoints = (
         endpoint(
             CapabilityDescriptor(
                 name="discord.list_servers",
@@ -3958,6 +4494,39 @@ def build_discord_endpoints(
             DiscordUserRequest,
             DiscordUserResponse,
             inspect_user,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.list_voice_states",
+                summary=(
+                    "List every currently connected member in voice or stage channels "
+                    "visible to both the requester and bot, including mute, stream, "
+                    "video, and speaker state."
+                ),
+                risk=RiskLevel.READ,
+                keywords=(
+                    "discord",
+                    "voice",
+                    "stage",
+                    "connected",
+                    "presence",
+                    "VC",
+                    "ボイス",
+                    "参加",
+                    "通話",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.guild_unavailable",
+                    "discord.member_required",
+                    "discord.voice_state_offset_invalid",
+                    "discord.voice_state_limit_invalid",
+                ),
+                timeout_seconds=10,
+            ),
+            DiscordListVoiceStatesRequest,
+            DiscordListVoiceStatesResponse,
+            list_voice_states,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -4335,8 +4904,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.analyze_attachment",
                 summary=(
-                    "Analyze an authorized Discord attachment with HIVE without exposing "
-                    "its bytes or signed URL to the model."
+                    "Analyze an authorized Discord attachment for synthetic-media "
+                    "signals without exposing its bytes or signed URL to the model."
                 ),
                 risk=RiskLevel.EXTERNAL,
                 keywords=(
@@ -4350,7 +4919,7 @@ def build_discord_endpoints(
                 ),
                 side_effects=(
                     "Retrieves one authorized Discord attachment.",
-                    "Uses one HIVE API request when no cached result is available.",
+                    "Uses one external analysis request when no cached result is available.",
                 ),
                 requires_workspace=True,
                 idempotency="non_idempotent_write",
@@ -4507,6 +5076,48 @@ def build_discord_endpoints(
             DiscordSendMessageRequest,
             DiscordSendMessageResponse,
             send_message,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.send_embed",
+                summary=(
+                    "Post one clean AI-authored Discord embed when a compact structured "
+                    "card materially improves a requested result or useful interim update. "
+                    "Supports a title, description, up to 10 fields, and a restrained tone; "
+                    "it adds no timestamp, footer, provider label, image URL, or mentions."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "embed",
+                    "card",
+                    "structured",
+                    "status",
+                    "summary",
+                    "埋め込み",
+                    "カード",
+                    "ステータス",
+                ),
+                side_effects=("Creates a user-visible embed in a Discord channel.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "discord.agent_write_channel_forbidden",
+                    "discord.embed_links_required",
+                    "discord.embed_title_invalid",
+                    "discord.embed_description_invalid",
+                    "discord.embed_fields_invalid",
+                    "discord.embed_field_invalid",
+                    "discord.embed_length_invalid",
+                    "discord.embed_tone_invalid",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Posts a clean structured card visible to channel members.",
+            ),
+            DiscordSendEmbedRequest,
+            DiscordSendMessageResponse,
+            send_embed,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -5041,8 +5652,54 @@ def build_discord_endpoints(
         ),
         endpoint(
             CapabilityDescriptor(
+                name="discord.send_files",
+                summary=(
+                    "Send 1-10 workspace files as real Discord attachments, with "
+                    "optional descriptions, spoiler treatment, reply target, and "
+                    "silent delivery."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "files",
+                    "attachments",
+                    "send",
+                    "deliver",
+                    "export",
+                    "複数ファイル",
+                    "添付",
+                    "送る",
+                    "届ける",
+                ),
+                side_effects=(
+                    "Creates one Discord message containing 1-10 attachments.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.workspace_required",
+                    "discord.file_count_invalid",
+                    "discord.file_too_large",
+                    "discord.file_send_forbidden",
+                ),
+                timeout_seconds=30,
+                user_visible_effect=(
+                    "Posts one Discord message containing the selected attachments."
+                ),
+            ),
+            DiscordSendFilesRequest,
+            DiscordSendFilesResponse,
+            send_files,
+        ),
+        endpoint(
+            CapabilityDescriptor(
                 name="discord.send_file",
-                summary="Send a file from the isolated workspace to the current channel.",
+                summary=(
+                    "Send one workspace file as a real Discord attachment, with "
+                    "optional description, spoiler treatment, reply target, and "
+                    "silent delivery."
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
@@ -5638,6 +6295,22 @@ def build_discord_endpoints(
             manage_read_aloud,
         ),
     )
+    # Import lazily so the low-frequency platform module can reuse the
+    # authorization helpers above without creating an import-time cycle.
+    from .platform_actions import build_discord_platform_action_endpoints
+    from .platform_assets import build_discord_platform_asset_endpoints
+    from .platform_automod import build_discord_automod_endpoints
+    from .platform_capabilities import build_discord_platform_endpoints
+    from .platform_operations import build_discord_platform_operation_endpoints
+
+    return (
+        *endpoints,
+        *build_discord_platform_endpoints(client, runtime),
+        *build_discord_platform_action_endpoints(client),
+        *build_discord_platform_asset_endpoints(client, runtime),
+        *build_discord_automod_endpoints(client),
+        *build_discord_platform_operation_endpoints(client),
+    )
 
 
 def _guild(client: discord.Client, context: InvocationContext) -> discord.Guild:
@@ -5824,6 +6497,119 @@ def _member_voice_channel(
     return state.channel
 
 
+def _voice_state_record(member: discord.Member) -> DiscordVoiceStateRecord:
+    state = member.voice
+    if state is None or not isinstance(
+        state.channel,
+        (discord.VoiceChannel, discord.StageChannel),
+    ):
+        raise ValueError("member is not connected to a visible voice channel")
+    channel = state.channel
+    return DiscordVoiceStateRecord(
+        user_id=str(member.id),
+        display_name=member.display_name,
+        bot=member.bot,
+        channel_id=str(channel.id),
+        channel_name=channel.name,
+        channel_kind=str(channel.type),
+        category_id=(
+            str(channel.category_id)
+            if channel.category_id is not None
+            else None
+        ),
+        server_muted=state.mute,
+        server_deafened=state.deaf,
+        self_muted=state.self_mute,
+        self_deafened=state.self_deaf,
+        streaming=state.self_stream,
+        video=state.self_video,
+        suppressed=state.suppress,
+        afk=state.afk,
+        requested_to_speak_at_iso=(
+            state.requested_to_speak_at.isoformat()
+            if state.requested_to_speak_at is not None
+            else None
+        ),
+    )
+
+
+def _activity_record(activity: object) -> DiscordActivityRecord:
+    def optional_text(value: object) -> str | None:
+        return str(value) if value is not None and str(value) else None
+
+    def optional_timestamp(value: object) -> str | None:
+        return value.isoformat() if isinstance(value, datetime) else None
+
+    activity_type = getattr(activity, "type", None)
+    activity_type_name = getattr(activity_type, "name", None)
+    return DiscordActivityRecord(
+        name=optional_text(getattr(activity, "name", None)) or "Unknown activity",
+        type=(
+            activity_type_name
+            if isinstance(activity_type_name, str) and activity_type_name
+            else optional_text(activity_type) or type(activity).__name__
+        ),
+        details=optional_text(getattr(activity, "details", None)),
+        state=optional_text(getattr(activity, "state", None)),
+        url=optional_text(getattr(activity, "url", None)),
+        application_id=optional_text(getattr(activity, "application_id", None)),
+        created_at_iso=optional_timestamp(getattr(activity, "created_at", None)),
+        start_iso=optional_timestamp(getattr(activity, "start", None)),
+        end_iso=optional_timestamp(getattr(activity, "end", None)),
+        emoji=optional_text(getattr(activity, "emoji", None)),
+        platform=optional_text(getattr(activity, "platform", None)),
+        session_id=optional_text(getattr(activity, "session_id", None)),
+        sync_id=optional_text(getattr(activity, "sync_id", None)),
+        details_url=optional_text(getattr(activity, "details_url", None)),
+        state_url=optional_text(getattr(activity, "state_url", None)),
+        large_image_url=optional_text(getattr(activity, "large_image_url", None)),
+        large_image_text=optional_text(getattr(activity, "large_image_text", None)),
+        small_image_url=optional_text(getattr(activity, "small_image_url", None)),
+        small_image_text=optional_text(getattr(activity, "small_image_text", None)),
+        buttons=tuple(
+            str(button)
+            for button in (getattr(activity, "buttons", None) or ())
+        ),
+        party=optional_text(getattr(activity, "party", None)),
+        flags=optional_text(getattr(activity, "flags", None)),
+        status_display_type=optional_text(
+            getattr(activity, "status_display_type", None)
+        ),
+        title=optional_text(getattr(activity, "title", None)),
+        artist=optional_text(getattr(activity, "artist", None)),
+        album=optional_text(getattr(activity, "album", None)),
+        track_url=optional_text(getattr(activity, "track_url", None)),
+    )
+
+
+def _enabled_flag_names(flags: object) -> tuple[str, ...]:
+    try:
+        values: tuple[object, ...] = tuple(cast(Iterable[object], flags))
+    except TypeError:
+        return ()
+    return tuple(
+        str(name)
+        for value in values
+        if (
+            isinstance(value, tuple)
+            and len(value) == 2
+            and isinstance((name := value[0]), str)
+            and value[1] is True
+        )
+    )
+
+
+def _can_view_channel(
+    channel: discord.abc.GuildChannel | discord.Thread,
+    member: discord.Member,
+) -> bool:
+    permissions = channel.permissions_for(member)
+    return _permission_enabled(permissions, "administrator") or _permission_enabled(
+        permissions,
+        "view_channel",
+    )
+
+
 def _assert_same_voice(
     destination_id: str | None,
     channel: discord.VoiceChannel | discord.StageChannel | None,
@@ -5833,7 +6619,11 @@ def _assert_same_voice(
 
 
 def _require_manage_guild(member: discord.Member) -> None:
-    if not member.guild_permissions.manage_guild:
+    permissions = member.guild_permissions
+    if not _permission_enabled(
+        permissions,
+        "administrator",
+    ) and not _permission_enabled(permissions, "manage_guild"):
         raise UserError("discord.manage_guild_required")
 
 
@@ -6047,7 +6837,10 @@ def _search_result_source(
         if actor is None:
             return None
         permissions = parent.permissions_for(actor)
-        if not (permissions.administrator or permissions.manage_threads):
+        if not (
+            _permission_enabled(permissions, "administrator")
+            or _permission_enabled(permissions, "manage_threads")
+        ):
             return None
     return parent
 
@@ -6075,10 +6868,13 @@ async def _write_message_channel(
     client: discord.Client,
     context: InvocationContext,
     channel_id: str,
+    *,
+    guild_id: str | None = None,
+    required_permissions: tuple[str, ...] = (),
 ) -> tuple[discord.Guild, DiscordMessageChannel, discord.Member, discord.Member]:
-    guild = _guild(client, context)
-    _assert_origin_guild(context, guild)
-    _assert_agent_update_scope(context, channel_id)
+    guild = _requested_guild(client, context, guild_id)
+    if str(guild.id) == context.workspace_id:
+        _assert_agent_update_scope(context, channel_id)
     channel = _message_channel(guild, channel_id)
     actor, bot = await _write_members(guild, context)
     for member in (actor, bot):
@@ -6086,6 +6882,8 @@ async def _write_message_channel(
             channel, member
         ):
             raise UserError("discord.agent_write_channel_forbidden")
+        for permission in required_permissions:
+            _require_channel_permissions(channel, member, permission)
     return guild, channel, actor, bot
 
 
@@ -6103,25 +6901,49 @@ async def _guild_member(guild: discord.Guild, user_id: str) -> discord.Member:
 
 
 def _require_channel_permissions(
-    channel: DiscordMessageChannel | discord.ForumChannel,
+    channel: (
+        DiscordMessageChannel
+        | discord.ForumChannel
+        | discord.CategoryChannel
+    ),
     member: discord.Member,
     permission: str,
 ) -> None:
     permissions = channel.permissions_for(member)
+    if _permission_enabled(permissions, "administrator"):
+        return
     effective = permission
     if permission == "send_messages" and isinstance(channel, discord.Thread):
         effective = "send_messages_in_threads"
-    if not permissions.view_channel or not bool(getattr(permissions, effective, False)):
+    if not _permission_enabled(
+        permissions,
+        "view_channel",
+    ) or not _permission_enabled(permissions, effective):
         raise UserError(f"discord.{permission}_required")
 
 
 def _require_guild_permission(member: discord.Member, permission: str) -> None:
-    if not bool(getattr(member.guild_permissions, permission, False)):
+    permissions = member.guild_permissions
+    if not _permission_enabled(
+        permissions,
+        "administrator",
+    ) and not _permission_enabled(permissions, permission):
         raise UserError(f"discord.{permission}_required")
 
 
+def _discord_write_nonce(context: InvocationContext, purpose: str) -> str:
+    """Deduplicate one exact model tool call without merging intentional calls."""
+
+    digest = hashlib.sha256(
+        f"{purpose}\0{context.request_id}".encode()
+    ).hexdigest()
+    return f"sla{digest[:22]}"
+
+
 def _require_role_above(member: discord.Member, role: discord.Role) -> None:
-    if member.guild.owner_id == member.id or member.guild_permissions.administrator:
+    # Administrator bypasses channel overwrites, but Discord role hierarchy
+    # still prevents every non-owner from managing an equal or higher role.
+    if member.guild.owner_id == member.id:
         return
     if member.top_role <= role:
         raise UserError("discord.role_hierarchy_forbidden")
@@ -6131,9 +6953,13 @@ def _role_assignable_by(member: discord.Member, role: discord.Role) -> bool:
     if role.is_default() or role.managed:
         return False
     permissions = member.guild_permissions
-    if member.guild.owner_id == member.id or permissions.administrator:
+    if member.guild.owner_id == member.id:
         return True
-    return permissions.manage_roles and member.top_role > role
+    can_manage = _permission_enabled(
+        permissions,
+        "administrator",
+    ) or _permission_enabled(permissions, "manage_roles")
+    return can_manage and member.top_role > role
 
 
 def _require_member_below(
@@ -6143,7 +6969,7 @@ def _require_member_below(
 ) -> None:
     if target.id == guild.owner_id or target.id == member.id:
         raise UserError("discord.member_hierarchy_forbidden")
-    if member.id == guild.owner_id or member.guild_permissions.administrator:
+    if member.id == guild.owner_id:
         return
     if member.top_role <= target.top_role:
         raise UserError("discord.member_hierarchy_forbidden")

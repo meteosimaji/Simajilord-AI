@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 from dataclasses import dataclass, field
+
+from PIL import Image
 
 from simajilord.core import (
     ApprovalMode,
@@ -25,10 +28,15 @@ from simajilord.domain.image import (
 from simajilord.services.files import AgentFileSandbox
 from simajilord.services.image import ImageGenerationService
 
+_MAX_MODEL_IMAGE_PREVIEW_BYTES = 512_000
+_MODEL_IMAGE_PREVIEW_DIMENSIONS = (1_024, 896, 768, 640, 512, 384)
+_MODEL_IMAGE_PREVIEW_QUALITIES = (86, 78, 70, 62, 54, 46)
+
 
 @dataclass(frozen=True, slots=True)
 class ImageGenerateRequest:
     """A structured prompt for one turn-owned generated image."""
+
     subject: str = field(
         metadata={
             "description": (
@@ -105,9 +113,11 @@ class ImageGenerateResponse:
     sha256: str
     kind: str
     image_data_url: str
+    preview_size_bytes: int
+    preview_width: int
+    preview_height: int
     width: int
     height: int
-    provider_model: str
     generation_seconds: float
     next_action: str
 
@@ -221,9 +231,7 @@ def build_image_endpoints(
             progress_total=job.progress_total,
             auto_delivery_enabled=job.auto_deliver,
             runtime_delivery_completed=job.delivered,
-            workspace_handoff_completed=(
-                job.handoff_completed or workspace_path is not None
-            ),
+            workspace_handoff_completed=(job.handoff_completed or workspace_path is not None),
             workspace_path=workspace_path,
             error_code=job.error_code,
             terminal=terminal,
@@ -236,9 +244,9 @@ def build_image_endpoints(
             CapabilityDescriptor(
                 name="image.generate",
                 summary=(
-                    "Generate one image through Codex OAuth from a production-ready "
-                    "visual brief, wait for completion in this turn, and return both "
-                    "the visible image and a workspace file."
+                    "Generate one image from a production-ready visual brief, wait "
+                    "for completion in this turn, and return both a bounded visual "
+                    "preview and the original workspace file."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -253,10 +261,10 @@ def build_image_endpoints(
                     "写真",
                 ),
                 side_effects=(
-                    "Starts hosted GPT Image generation through the saved Codex login.",
+                    "Starts one image generation job.",
                     "Imports the generated file into Simajilord local storage.",
-                    "Does not post by itself; the active agent turn must follow with "
-                    "discord.send_file.",
+                    "Does not post by itself; publication is a separate model decision "
+                    "based on the user's request.",
                 ),
                 requires_workspace=True,
                 idempotency="idempotent_write",
@@ -307,6 +315,10 @@ async def _agent_image_result(
         content,
     )
     await service.mark_handed_off(job.job_id)
+    preview, preview_media_type, preview_width, preview_height = await asyncio.to_thread(
+        _model_image_preview,
+        content,
+    )
     return ImageGenerateResponse(
         job_id=job.job_id,
         status=job.status,
@@ -314,18 +326,70 @@ async def _agent_image_result(
         size_bytes=record.size_bytes,
         sha256=record.sha256,
         kind=record.kind,
-        image_data_url="data:image/png;base64," + base64.b64encode(content).decode(),
+        image_data_url=(f"data:{preview_media_type};base64," + base64.b64encode(preview).decode()),
+        preview_size_bytes=len(preview),
+        preview_width=preview_width,
+        preview_height=preview_height,
         width=job.width,
         height=job.height,
-        provider_model=job.provider_model or "GPT Image 2・Codex OAuth",
         generation_seconds=job.generation_seconds or 0.0,
         next_action=(
-            "Inspect the image attached to this tool result. If it fulfills the request, "
-            "call discord.send_file with path and the authorized current channel. If it "
-            "does not, revise the brief deliberately. Never claim Discord delivery until "
-            "discord.send_file succeeds."
+            "Inspect the lightweight preview attached to this tool result. The path is "
+            "the full-resolution original. Respect the user's publication intent: send "
+            "the original with discord.send_file or discord.send_files only when they "
+            "asked to show/post/deliver it; otherwise keep it unpublished for comparison, "
+            "description, or iteration. Never claim Discord delivery until the attachment "
+            "send succeeds."
         ),
     )
+
+
+def _model_image_preview(content: bytes) -> tuple[bytes, str, int, int]:
+    """Return a bounded model preview while preserving the full workspace artifact."""
+
+    with Image.open(io.BytesIO(content)) as source:
+        source.load()
+        source_format = source.format
+        source_width, source_height = source.size
+        image = source.convert("RGB")
+    if (
+        source_format == "PNG"
+        and source_width <= 1_024
+        and source_height <= 1_024
+        and len(content) <= _MAX_MODEL_IMAGE_PREVIEW_BYTES
+    ):
+        return content, "image/png", source_width, source_height
+
+    smallest: tuple[bytes, int, int] | None = None
+    for maximum_dimension in _MODEL_IMAGE_PREVIEW_DIMENSIONS:
+        candidate = image.copy()
+        candidate.thumbnail(
+            (maximum_dimension, maximum_dimension),
+            Image.Resampling.LANCZOS,
+        )
+        for quality in _MODEL_IMAGE_PREVIEW_QUALITIES:
+            output = io.BytesIO()
+            candidate.save(
+                output,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+            jpeg = output.getvalue()
+            smallest = (jpeg, candidate.width, candidate.height)
+            if len(jpeg) <= _MAX_MODEL_IMAGE_PREVIEW_BYTES:
+                return jpeg, "image/jpeg", candidate.width, candidate.height
+
+    assert smallest is not None
+    jpeg, width, height = smallest
+    if len(jpeg) > _MAX_MODEL_IMAGE_PREVIEW_BYTES:
+        raise UserError(
+            "image.preview_too_large",
+            preview_size_bytes=len(jpeg),
+            maximum_size_bytes=_MAX_MODEL_IMAGE_PREVIEW_BYTES,
+        )
+    return jpeg, "image/jpeg", width, height
 
 
 def _agent_image_path(job_id: str) -> str:

@@ -203,6 +203,46 @@ async def test_curated_workflow_catalog_contains_no_host_execution_steps() -> No
     )
 
 
+@pytest.mark.asyncio
+async def test_curated_discord_api_workflow_is_discovered_lazily() -> None:
+    capabilities = frozenset(
+        {
+            "discord.list_servers",
+            "discord.list_members",
+            "discord.inspect_user",
+            "discord.inspect_channel",
+            "discord.list_platform_resources",
+        }
+    )
+    endpoint = build_curated_workflow_endpoint(capabilities)
+
+    response = await endpoint.invoke(
+        CuratedWorkflowSearchRequest(
+            query="DiscordのstatusとVCと実効権限をAPIで確認",
+            limit=1,
+        ),
+        InvocationContext(
+            actor_id="7",
+            workspace_id="1",
+            transport="agent",
+            request_id="event",
+        ),
+    )
+
+    assert tuple(item.workflow_id for item in response.workflows) == (
+        "discord.platform_inspection",
+    )
+    assert tuple(
+        step.capability for step in response.workflows[0].steps
+    ) == (
+        "discord.list_servers",
+        "discord.list_members",
+        "discord.inspect_user",
+        "discord.inspect_channel",
+        "discord.list_platform_resources",
+    )
+
+
 async def test_curated_memory_workflow_connects_search_update_and_forget() -> None:
     endpoint = build_curated_workflow_endpoint(
         frozenset(
@@ -360,12 +400,16 @@ def test_runtime_curated_workflow_switch_controls_registry_and_agent_tool(
         specs = provider.tools.dynamic_specs(
             InvocationContext("actor", "workspace", "agent", "event")
         )
-        aliases = {
-            str(tool["name"])
-            for namespace in specs
-            for tool in namespace["tools"]
-            if isinstance(tool, dict)
-        }
+        aliases: set[str] = set()
+        for namespace in specs:
+            tools = namespace.get("tools")
+            if not isinstance(tools, list):
+                continue
+            aliases.update(
+                str(tool["name"])
+                for tool in tools
+                if isinstance(tool, dict) and "name" in tool
+            )
         assert ("workflow_search" in aliases) is enabled
         assert "capability_search" in aliases
     finally:

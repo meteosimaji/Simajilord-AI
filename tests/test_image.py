@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sqlite3
 from collections.abc import AsyncIterator
@@ -12,10 +13,13 @@ from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
+from PIL import Image
 
 from simajilord.capabilities.image import (
+    _MAX_MODEL_IMAGE_PREVIEW_BYTES,
     ImageGenerateRequest,
     ImageGenerateResponse,
+    _model_image_preview,
     build_image_endpoints,
 )
 from simajilord.core import CapabilityRegistry, InvocationContext
@@ -28,6 +32,7 @@ from simajilord.domain.image import (
 )
 from simajilord.integrations.discord.bot import (
     SimajilordDiscordBot,
+    _image_delivery_nonce,
     _image_progress_embed,
 )
 from simajilord.observability import EventJournal
@@ -59,7 +64,7 @@ class FakeImageProvider:
         if callable(on_progress):
             await on_progress(6, 12)
             await on_progress(12, 12)
-        destination.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        Image.new("RGB", (width, height), "#e98b42").save(destination)
         return ImageProviderResult(
             generation_seconds=0.01,
             model="fake",
@@ -162,6 +167,20 @@ def test_image_brief_preserves_full_production_brief() -> None:
     }
 
 
+def test_model_image_preview_has_a_hard_binary_size_limit() -> None:
+    source = Image.effect_noise((2_048, 2_048), 100).convert("RGB")
+    encoded = io.BytesIO()
+    source.save(encoded, format="PNG")
+    assert len(encoded.getvalue()) > _MAX_MODEL_IMAGE_PREVIEW_BYTES
+
+    preview, media_type, width, height = _model_image_preview(encoded.getvalue())
+
+    assert media_type == "image/jpeg"
+    assert len(preview) <= _MAX_MODEL_IMAGE_PREVIEW_BYTES
+    assert 0 < width <= 1_024
+    assert 0 < height <= 1_024
+
+
 def test_image_pressure_pruning_distinguishes_fileless_job_from_empty_store(
     tmp_path: Path,
 ) -> None:
@@ -246,10 +265,7 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
     store = ImageGenerationStore(database)
     with sqlite3.connect(database) as connection:
         columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info(image_generation_jobs)"
-            )
+            str(row[1]) for row in connection.execute("PRAGMA table_info(image_generation_jobs)")
         }
     assert "delivery_message_id" in columns
     assert "provider_model" in columns
@@ -525,9 +541,7 @@ async def test_completed_image_edits_persistent_message_across_mark_failure(
     progress_message.embeds = [_image_progress_embed(job)]
 
     async def edit_progress(**kwargs: object) -> None:
-        progress_message.attachments = [
-            SimpleNamespace(filename="simajilord-edit-aft.png")
-        ]
+        progress_message.attachments = [SimpleNamespace(filename="simajilord-edit-aft.png")]
         progress_message.embeds = [kwargs["embed"]]
 
     progress_message.edit = AsyncMock(side_effect=edit_progress)
@@ -536,17 +550,13 @@ async def test_completed_image_edits_persistent_message_across_mark_failure(
     channel.send = AsyncMock()
     image_service = SimpleNamespace(
         set_delivery_message=AsyncMock(),
-        mark_delivered=AsyncMock(
-            side_effect=[OSError("database unavailable"), None]
-        ),
+        mark_delivered=AsyncMock(side_effect=[OSError("database unavailable"), None]),
     )
     bot = Mock(spec=SimajilordDiscordBot)
     bot.get_channel.return_value = channel
     bot.runtime = SimpleNamespace(image=image_service)
     bot.user = SimpleNamespace(id=999)
-    bot._image_delivery_message = (
-        SimajilordDiscordBot._image_delivery_message.__get__(bot)
-    )
+    bot._image_delivery_message = SimajilordDiscordBot._image_delivery_message.__get__(bot)
 
     with pytest.raises(OSError, match="database unavailable"):
         await SimajilordDiscordBot._deliver_image_job(bot, job)
@@ -573,6 +583,7 @@ async def test_completed_image_recovers_unpersisted_progress_message(
     progress_message = Mock(spec=discord.Message)
     progress_message.id = 987
     progress_message.author = SimpleNamespace(id=999)
+    progress_message.nonce = _image_delivery_nonce(job.job_id)
     progress_message.attachments = []
     progress_message.embeds = [_image_progress_embed(job)]
     progress_message.edit = AsyncMock()
@@ -599,9 +610,7 @@ async def test_completed_image_recovers_unpersisted_progress_message(
     bot.get_channel.return_value = channel
     bot.runtime = SimpleNamespace(image=image_service)
     bot.user = SimpleNamespace(id=999)
-    bot._image_delivery_message = (
-        SimajilordDiscordBot._image_delivery_message.__get__(bot)
-    )
+    bot._image_delivery_message = SimajilordDiscordBot._image_delivery_message.__get__(bot)
 
     await SimajilordDiscordBot._deliver_image_job(bot, job)
 
@@ -641,9 +650,7 @@ async def test_transient_progress_fetch_failure_does_not_send_duplicate(
     bot.get_channel.return_value = channel
     bot.runtime = SimpleNamespace(image=image_service)
     bot.user = SimpleNamespace(id=999)
-    bot._image_delivery_message = (
-        SimajilordDiscordBot._image_delivery_message.__get__(bot)
-    )
+    bot._image_delivery_message = SimajilordDiscordBot._image_delivery_message.__get__(bot)
 
     with pytest.raises(discord.HTTPException, match="temporary outage"):
         await SimajilordDiscordBot._deliver_image_job(bot, job)
@@ -675,11 +682,14 @@ async def test_image_rate_limit_check_and_insert_are_atomic(tmp_path: Path) -> N
     assert len(accepted) == 1
     assert len(rejected) == 7
     assert {error.code for error in rejected} == {"image.user_limit_reached"}
-    assert service.store.recent_count(
-        actor_id="same-user",
-        workspace_id=None,
-        since=datetime.now(UTC) - timedelta(minutes=1),
-    ) == 1
+    assert (
+        service.store.recent_count(
+            actor_id="same-user",
+            workspace_id=None,
+            since=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        == 1
+    )
     await service.close()
 
 
@@ -749,7 +759,9 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
     provider = cast(FakeImageProvider, service.provider)
     assert provider.generate_calls == 1
     assert response.status is ImageJobStatus.COMPLETED
-    assert response.image_data_url.startswith("data:image/png;base64,")
+    assert response.image_data_url.startswith("data:image/")
+    assert response.preview_size_bytes <= response.size_bytes
+    assert (response.preview_width, response.preview_height) == (512, 512)
     assert files.path_for_delivery("guild", response.path).is_file()
     assert job.auto_deliver is False
     assert job.delivery_message_id is None

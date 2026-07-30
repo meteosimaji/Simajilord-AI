@@ -204,7 +204,7 @@ from .help_catalog import (
     PublicCommandSpec,
 )
 from .local_media import attachment_can_play, import_discord_attachment
-from .permissions import agent_readable_channel_ids
+from .permissions import agent_readable_channel_ids, permission_enabled
 from .presenter import (
     EmbedField,
     EmbedTone,
@@ -318,7 +318,7 @@ _ERROR_MESSAGES = {
     "translation.language_not_detected": "The source language could not be detected.",
     "translation.same_language": "The source and target languages are the same.",
     "translation.language_pair_unsupported": (
-        "Apple Translation does not support that language pair."
+        "The translation service does not support that language pair."
     ),
     "translation.language_pair_not_installed": (
         "Install that language pair in macOS Translation settings, then try again."
@@ -327,14 +327,14 @@ _ERROR_MESSAGES = {
     "translation.helper_unavailable": "The local macOS translation helper is unavailable.",
     "translation.helper_failed": "The local macOS translation helper could not complete.",
     "translation.timeout": "The local translation took too long.",
-    "translation.failed": "The on-device translation could not be completed.",
-    "translation.unavailable": "On-device translation is unavailable on this host.",
-    "moderation.daily_limit_reached": "HIVE's daily request limit has been reached.",
+    "translation.failed": "The translation could not be completed.",
+    "translation.unavailable": "Translation is unavailable right now.",
+    "moderation.daily_limit_reached": "The daily analysis limit has been reached.",
     "moderation.filename_invalid": "Could not read the attachment filename.",
     "moderation.media_empty": "The attachment is empty.",
-    "moderation.media_too_large": "The attachment is too large for HIVE.",
-    "moderation.media_type_unsupported": "HIVE accepts common image and video files.",
-    "moderation.not_configured": "HIVE Moderation is not configured.",
+    "moderation.media_too_large": "The attachment is too large to analyze.",
+    "moderation.media_type_unsupported": "Use a common image or video file.",
+    "moderation.not_configured": "Synthetic-media analysis is not configured.",
     "discord.message_limit_invalid": "History limit must be between 1 and 100.",
     "discord.message_not_found": "The Discord message could not be found.",
     "discord.message_fetch_failed": "The Discord message could not be retrieved.",
@@ -461,13 +461,13 @@ _WEB_ERROR_MESSAGES = {
 }
 
 _MODERATION_ERROR_MESSAGES = {
-    "authentication_failed": "HIVE authentication failed. Check the host API key.",
-    "invalid_response": "HIVE returned an invalid analysis response.",
-    "media_rejected": "HIVE could not analyse this attachment.",
-    "provider_unavailable": "HIVE is temporarily unavailable.",
-    "rate_limited": "HIVE is rate-limiting requests.",
-    "response_too_large": "HIVE's analysis response exceeded the safe limit.",
-    "timeout": "HIVE analysis timed out.",
+    "authentication_failed": "Media analysis authentication failed.",
+    "invalid_response": "The analysis service returned an invalid response.",
+    "media_rejected": "The attachment could not be analyzed.",
+    "provider_unavailable": "Media analysis is temporarily unavailable.",
+    "rate_limited": "Media analysis is temporarily rate-limited.",
+    "response_too_large": "The analysis response exceeded the safe limit.",
+    "timeout": "Media analysis timed out.",
 }
 
 _AUDIO_ACTION_MESSAGES = {
@@ -2765,7 +2765,7 @@ def error_message(
     if isinstance(error, ModerationError):
         return _MODERATION_ERROR_MESSAGES.get(
             error.category,
-            "Could not complete the HIVE analysis.",
+            "Could not complete the media analysis.",
         )
     if isinstance(error, UserError):
         return _ERROR_MESSAGES.get(error.code, error.code)
@@ -4412,7 +4412,10 @@ class ReadAloudCog(commands.Cog):
     ) -> None:
         try:
             member = interaction.user
-            if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
+            if not isinstance(member, discord.Member) or not (
+                permission_enabled(member.guild_permissions, "administrator")
+                or permission_enabled(member.guild_permissions, "manage_guild")
+            ):
                 raise UserError("discord.manage_guild_required")
             selected_text = text_channel
             if selected_text is None and isinstance(
@@ -4937,7 +4940,10 @@ class ReadAloudCog(commands.Cog):
     ) -> None:
         try:
             member = interaction.user
-            if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
+            if not isinstance(member, discord.Member) or not (
+                permission_enabled(member.guild_permissions, "administrator")
+                or permission_enabled(member.guild_permissions, "manage_guild")
+            ):
                 raise UserError("discord.manage_guild_required")
             policy = cast(
                 ReadAloudPolicyResponse,
@@ -5068,7 +5074,10 @@ class ReadAloudCog(commands.Cog):
     async def disable(self, interaction: discord.Interaction) -> None:
         try:
             member = interaction.user
-            if not isinstance(member, discord.Member) or not member.guild_permissions.manage_guild:
+            if not isinstance(member, discord.Member) or not (
+                permission_enabled(member.guild_permissions, "administrator")
+                or permission_enabled(member.guild_permissions, "manage_guild")
+            ):
                 raise UserError("discord.manage_guild_required")
             await self.runtime.registry.invoke(
                 "discord.manage_read_aloud",
@@ -5756,7 +5765,9 @@ def synthetic_media_embed(
             )
         )
     cache_line = (
-        "Cached result · no additional HIVE request" if response.cached else "New HIVE analysis"
+        "Cached result · no additional request"
+        if response.cached
+        else "New analysis"
     )
     sample_name = {
         "image": " image",
@@ -5770,15 +5781,13 @@ def synthetic_media_embed(
         )
     )
     embed = command_embed(
-        "HIVE AI content analysis",
+        "AI content analysis",
         description=conclusion,
         fields=tuple(fields),
         tone=tone,
     )
     if attachment_url is not None and response.content_type.startswith("image/"):
         embed.set_thumbnail(url=attachment_url)
-    model_label = response.model.removeprefix("hive/")
-    embed.set_footer(text=f"Analysed by HIVE Moderation · {model_label}")
     return embed
 
 
@@ -6901,7 +6910,7 @@ class TranslationCog(commands.Cog):
 
     @app_commands.command(
         name="translate",
-        description="Translate text locally with Apple's on-device language models.",
+        description="Translate text into another language.",
     )
     @app_commands.describe(
         source="Source language; omit to detect it automatically",
@@ -7220,9 +7229,9 @@ class MediaCog(commands.Cog):
 
     @media.command(
         name="detect-ai",
-        description="Estimate AI-generation and deepfake likelihood with HIVE.",
+        description="Estimate AI-generation and deepfake likelihood.",
     )
-    @app_commands.describe(media="Image or video attachment to analyse with HIVE")
+    @app_commands.describe(media="Image or video attachment to analyze")
     async def detectai(
         self,
         interaction: discord.Interaction,
@@ -7231,7 +7240,7 @@ class MediaCog(commands.Cog):
         await interaction.response.send_message(
             embed=async_progress_embed(
                 interaction.client,
-                "Analysing with HIVE…",
+                "Analyzing the attachment…",
             ),
             silent=True,
         )
@@ -8089,21 +8098,22 @@ class QuoteComposerView(SafeView):
         self.stop()
 
 
-_AGENT_CONVERSATION_COMPATIBILITY_VERSION = 2
+_AGENT_CONVERSATION_COMPATIBILITY_VERSION = 3
 
 
 def discord_conversation_id(
     *,
     guild_id: int | None,
     channel_id: int,
+    actor_id: int | str,
     grants: frozenset[str] = frozenset(),
 ) -> str:
-    """Map one Discord channel and capability profile to one agent conversation."""
+    """Map one actor, channel, and capability profile to one private conversation."""
 
     scope = f"guild:{guild_id}" if guild_id is not None else "direct"
     base = (
         f"discord:v{_AGENT_CONVERSATION_COMPATIBILITY_VERSION}:"
-        f"{scope}:channel:{channel_id}"
+        f"{scope}:channel:{channel_id}:actor:{actor_id}"
     )
     if not grants:
         return base
@@ -8437,6 +8447,7 @@ class AgentCog(commands.Cog):
             conversation_id=discord_conversation_id(
                 guild_id=message.guild.id if message.guild else None,
                 channel_id=message.channel.id,
+                actor_id=actor_id,
                 grants=grants,
             ),
             event_id=event_id,
@@ -8487,11 +8498,10 @@ class AgentCog(commands.Cog):
         )
         self._active_progress[request.event_id] = progress
         try:
-            async with message.channel.typing():
-                response = await agent.respond(
-                    request,
-                    on_progress=progress.update,
-                )
+            response = await agent.respond(
+                request,
+                on_progress=progress.update,
+            )
         except Exception as exc:
             log.exception("Mention agent turn failed message=%s", message.id)
             await progress.fail(_agent_error_text(exc))
@@ -9851,22 +9861,24 @@ class AgentAutonomyCog(commands.Cog):
             raise RuntimeError("Discord bot member is temporarily unavailable")
         permissions = channel.permissions_for(bot_member)
         can_send = (
-            permissions.send_messages_in_threads
+            permission_enabled(permissions, "send_messages_in_threads")
             if isinstance(channel, discord.Thread)
-            else permissions.send_messages
+            else permission_enabled(permissions, "send_messages")
         )
         if (
-            not permissions.view_channel
-            or not permissions.read_message_history
-            or not can_send
-            or (
-                isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
-                and not permissions.connect
+            not permission_enabled(permissions, "administrator")
+            and (
+                not permission_enabled(permissions, "view_channel")
+                or not permission_enabled(permissions, "read_message_history")
+                or not can_send
+                or (
+                    isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+                    and not permission_enabled(permissions, "connect")
+                )
             )
-            or (
-                isinstance(channel, discord.Thread)
-                and (channel.archived or channel.locked)
-            )
+        ) or (
+            isinstance(channel, discord.Thread)
+            and (channel.archived or channel.locked)
         ):
             raise _AutonomyTerminalDrop("channel_not_postable")
         bot_user = self.bot.user
@@ -9899,6 +9911,7 @@ class AgentAutonomyCog(commands.Cog):
             conversation_id=discord_conversation_id(
                 guild_id=int(workspace_id) if workspace_id else None,
                 channel_id=int(channel_id),
+                actor_id=autonomy_actor_id,
                 grants=grants,
             ),
             event_id=batch.batch_id,

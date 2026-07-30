@@ -253,8 +253,9 @@ def test_generated_image_embed_shows_the_actual_creative_brief() -> None:
     assert "rainy apartment window" in (embed.description or "")
     assert "Natural editorial pet photography" in (embed.description or "")
     assert "Cool window light" in (embed.description or "")
-    assert embed.fields[0].value == "GPT Image 2・Codex OAuth"
-    assert embed.fields[2].value == "768 x 512 · square"
+    assert all(field.name != "モデル" for field in embed.fields)
+    assert embed.fields[1].value == "768 x 512 · square"
+    assert embed.footer.text is None
 
 
 def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
@@ -284,7 +285,7 @@ def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
         attachment_url="https://cdn.example.com/sample.png",
     )
 
-    assert embed.title == "HIVE AI content analysis"
+    assert embed.title == "AI content analysis"
     assert embed.description == "**AI-generated image likelihood: High**"
     assert "Deepfake" not in (embed.description or "")
     fields = {field.name: field.value for field in embed.fields}
@@ -292,7 +293,7 @@ def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
     assert fields["Deepfake"] == "**0.0%** · Low"
     assert fields["Likely generation source"] == "**Stable Diffusion XL** · 99.2%"
     assert "HIVE API quota" not in fields
-    assert "HIVE Moderation" in embed.footer.text
+    assert embed.footer.text is None
     assert embed.thumbnail.url == "https://cdn.example.com/sample.png"
 
 

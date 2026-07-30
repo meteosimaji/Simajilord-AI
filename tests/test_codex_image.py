@@ -4,10 +4,18 @@ import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
 
+from simajilord.agent.providers.codex import (
+    CodexAppServerProvider,
+    _import_generated_image,
+    _TurnWatchdog,
+)
+from simajilord.agent.tools import AgentToolCatalog
+from simajilord.core import CapabilityRegistry
 from simajilord.core.errors import ProviderError
 from simajilord.providers.codex_features import codex_feature_arguments
 from simajilord.providers.image.codex import (
@@ -22,6 +30,21 @@ def _provider(tmp_path: Path) -> CodexImageProvider:
         model="gpt-5.6-sol",
         workspace_dir=tmp_path / "workspace",
         timeout_seconds=60,
+    )
+
+
+def _primary_provider(tmp_path: Path) -> CodexAppServerProvider:
+    return CodexAppServerProvider(
+        executable="codex",
+        model="gpt-5.6-sol",
+        workspace_dir=tmp_path / "agent-workspace",
+        idle_timeout_seconds=60,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=1,
+        max_tool_output_characters=1_000,
+        allow_image_generation=True,
+        image_timeout_seconds=60,
     )
 
 
@@ -124,6 +147,25 @@ def test_codex_image_imports_base64_fallback_and_validates_png(
         assert image.format == "PNG"
 
 
+def test_primary_codex_provider_imports_image_without_a_second_runtime(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "shared.png"
+    dimensions = _import_generated_image(
+        {
+            "type": "imageGeneration",
+            "status": "completed",
+            "result": base64.b64encode(
+                _png_bytes(width=11, height=6),
+            ).decode(),
+        },
+        destination,
+    )
+
+    assert dimensions == (11, 6)
+    assert destination.is_file()
+
+
 @pytest.mark.asyncio
 async def test_codex_image_waits_for_completed_turn_after_image_notification(
     tmp_path: Path,
@@ -158,6 +200,90 @@ async def test_codex_image_waits_for_completed_turn_after_image_notification(
     )
 
     assert received is image_item
+
+
+@pytest.mark.asyncio
+async def test_primary_provider_routes_image_completion_on_its_shared_server(
+    tmp_path: Path,
+) -> None:
+    provider = _primary_provider(tmp_path)
+    provider._notification_queues["thread"] = asyncio.Queue()
+    provider._thread_by_turn["turn"] = "thread"
+    provider._turn_watchdogs["turn"] = _TurnWatchdog(60)
+    image_item = {
+        "type": "imageGeneration",
+        "id": "image-1",
+        "status": "completed",
+        "result": "encoded",
+    }
+    await provider._notification_queues["thread"].put(
+        (
+            "item/completed",
+            {"threadId": "thread", "turnId": "turn", "item": image_item},
+        )
+    )
+    await provider._notification_queues["thread"].put(
+        (
+            "turn/completed",
+            {
+                "threadId": "thread",
+                "turnId": "turn",
+                "turn": {"id": "turn", "status": "completed", "items": []},
+            },
+        )
+    )
+
+    received = await asyncio.wait_for(
+        provider._await_generated_image(
+            "thread",
+            "turn",
+            on_progress=None,
+        ),
+        timeout=1,
+    )
+
+    assert received is image_item
+
+
+@pytest.mark.asyncio
+async def test_primary_image_inactivity_resets_shared_runtime_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _primary_provider(tmp_path)
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    request = AsyncMock(
+        side_effect=[
+            {"thread": {"id": "image-thread"}},
+            {"turn": {"id": "image-turn"}},
+        ]
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(
+        provider,
+        "_await_generated_image",
+        AsyncMock(side_effect=TimeoutError),
+    )
+    interrupt = AsyncMock()
+    reset = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider, "_interrupt_quietly", interrupt)
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", reset)
+
+    with pytest.raises(TimeoutError):
+        await provider.generate_image(
+            brief_json='{"subject":"one dog"}',
+            destination=tmp_path / "image.png",
+            width=512,
+            height=512,
+            seed=1,
+        )
+
+    assert request.await_count == 2
+    interrupt.assert_awaited_once_with("image-thread", "image-turn")
+    reset.assert_awaited_once_with(None)
+    assert provider._thread_by_turn == {}
+    assert provider._turn_watchdogs == {}
+    assert provider._notification_queues == {}
 
 
 @pytest.mark.asyncio

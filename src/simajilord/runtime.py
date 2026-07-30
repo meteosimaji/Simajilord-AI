@@ -69,7 +69,10 @@ from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
 from simajilord.observability import EventJournal
-from simajilord.providers.image import CodexImageProvider
+from simajilord.providers.image import (
+    CodexImageProvider,
+    SharedCodexImageProvider,
+)
 from simajilord.providers.moderation import HiveSyntheticMediaProvider
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
 from simajilord.providers.translation import MacOSTranslationProvider
@@ -335,15 +338,28 @@ class SimajilordRuntime:
             max_media_bytes=settings.hive_max_media_bytes,
             threshold=settings.hive_threshold,
         )
-        image_provider = (
-            CodexImageProvider(
-                executable=settings.codex_executable,
-                model=settings.agent_model,
-                workspace_dir=settings.data_dir / "image_codex_workspace",
-                timeout_seconds=settings.image_timeout_seconds,
+        shared_image_provider = (
+            SharedCodexImageProvider()
+            if (
+                settings.agent_enabled
+                and settings.image_generation_access
+                is not AgentFeatureAccess.DISABLED
             )
-            if settings.image_generation_access is not AgentFeatureAccess.DISABLED
             else None
+        )
+        image_provider = (
+            shared_image_provider
+            or (
+                CodexImageProvider(
+                    executable=settings.codex_executable,
+                    model=settings.agent_model,
+                    workspace_dir=settings.data_dir / "image_codex_workspace",
+                    timeout_seconds=settings.image_timeout_seconds,
+                )
+                if settings.image_generation_access
+                is not AgentFeatureAccess.DISABLED
+                else None
+            )
         )
         image_store = ImageGenerationStore(
             settings.data_dir / "image_generation.sqlite3"
@@ -405,6 +421,12 @@ class SimajilordRuntime:
         agent: AgentService | None = None
         curated_workflow_endpoint = None
         if settings.agent_enabled:
+            discord_requested_write_capabilities = tuple(
+                name
+                for name in AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES
+                if files is not None
+                or name != "discord.create_platform_asset"
+            )
             action_receipts = ActionReceiptService(
                 store=ActionReceiptStore(
                     settings.data_dir / "agent_actions.sqlite3"
@@ -420,6 +442,15 @@ class SimajilordRuntime:
                 "discord.list_servers",
                 "discord.inspect_server",
                 "discord.inspect_user",
+                "discord.inspect_application",
+                "discord.inspect_channel",
+                "discord.list_members",
+                "discord.list_voice_states",
+                "discord.list_pins",
+                "discord.list_reaction_users",
+                "discord.list_poll_voters",
+                "discord.list_thread_members",
+                "discord.list_platform_resources",
                 "discord.get_message",
                 "discord.list_channels",
                 "discord.list_archived_threads",
@@ -442,10 +473,11 @@ class SimajilordRuntime:
                 *AGENT_AUDIO_CONTROL_CAPABILITIES,
                 "discord.read_messages",
                 "discord.add_reaction",
-                *AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
+                *discord_requested_write_capabilities,
                 "discord.delete_own_message",
                 "discord.remove_own_reaction",
                 "discord.send_message",
+                "discord.send_embed",
                 "discord.speak",
                 "discord.translate_message",
                 "discord.post_expanded_message",
@@ -503,6 +535,7 @@ class SimajilordRuntime:
                 "discord.read_aloud_content_mode_set": AGENT_AUDIO_GRANT,
                 "discord.speak": AGENT_AUDIO_GRANT,
                 "discord.send_message": AGENT_MESSAGE_GRANT,
+                "discord.send_embed": AGENT_MESSAGE_GRANT,
                 **{
                     name: (
                         AGENT_AUDIO_GRANT
@@ -513,7 +546,7 @@ class SimajilordRuntime:
                             else AGENT_MESSAGE_GRANT
                         )
                     )
-                    for name in AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES
+                    for name in discord_requested_write_capabilities
                 },
                 "discord.add_reaction": AGENT_REACTION_GRANT,
                 "discord.delete_own_message": AGENT_MESSAGE_GRANT,
@@ -534,6 +567,7 @@ class SimajilordRuntime:
                 required_grants[capability_name] = AGENT_HIVE_GRANT
             if (
                 image.provider is not None
+                and files is not None
                 and settings.image_generation_access is not AgentFeatureAccess.DISABLED
             ):
                 for capability_name in ("image.generate", "image.status"):
@@ -547,11 +581,13 @@ class SimajilordRuntime:
                     "files.replace_text",
                     "discord.import_attachment",
                     "discord.send_file",
+                    "discord.send_files",
                 )
                 agent_capabilities.extend(file_capabilities)
                 required_grants.update(
                     {name: AGENT_FILE_GRANT for name in file_capabilities}
                 )
+                required_grants["discord.create_platform_asset"] = AGENT_FILE_GRANT
                 agent_capabilities.append("media.save")
                 required_grants["media.save"] = AGENT_MEDIA_GRANT
             if compute is not None:
@@ -572,7 +608,7 @@ class SimajilordRuntime:
                     capability_grants=required_grants,
                     approval_capabilities=frozenset(
                         AGENT_REQUESTED_WRITE_CAPABILITIES
-                    ),
+                    ).intersection(agent_capabilities),
                 )
                 agent_capabilities.append(
                     curated_workflow_endpoint.descriptor.name
@@ -587,6 +623,15 @@ class SimajilordRuntime:
                     "discord.list_channels",
                     "discord.list_archived_threads",
                     "discord.list_roles",
+                    "discord.list_members",
+                    "discord.inspect_user",
+                    "discord.inspect_channel",
+                    "discord.list_voice_states",
+                    "discord.list_pins",
+                    "discord.list_reaction_users",
+                    "discord.list_poll_voters",
+                    "discord.list_thread_members",
+                    "discord.list_platform_resources",
                     "discord.get_message",
                     "discord.read_messages",
                     "discord.search_messages",
@@ -594,6 +639,7 @@ class SimajilordRuntime:
                     "discord.delete_own_message",
                     "discord.remove_own_reaction",
                     "discord.send_message",
+                    "discord.send_embed",
                     "discord.view_image_attachment",
                     "memory.search",
                     "memory.remember",
@@ -617,6 +663,7 @@ class SimajilordRuntime:
                             "files.read",
                             "discord.import_attachment",
                             "discord.send_file",
+                            "discord.send_files",
                         )
                         if files is not None
                         else ()
@@ -631,6 +678,7 @@ class SimajilordRuntime:
                     (
                         "action.undo",
                         "discord.send_message",
+                        "discord.send_embed",
                         "discord.add_reaction",
                         "discord.delete_own_message",
                         "discord.remove_own_reaction",
@@ -638,7 +686,7 @@ class SimajilordRuntime:
                         "discord.create_quote_image",
                         "timer.create",
                         "timer.cancel",
-                        *AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
+                        *discord_requested_write_capabilities,
                         *AGENT_MEMORY_WRITE_CAPABILITIES,
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                     )
@@ -658,6 +706,7 @@ class SimajilordRuntime:
                             "files.replace_text",
                             "discord.import_attachment",
                             "discord.send_file",
+                            "discord.send_files",
                             "media.save",
                         )
                         if files is not None
@@ -682,18 +731,23 @@ class SimajilordRuntime:
                 ),
                 action_receipts=action_receipts,
             )
+            codex_provider = CodexAppServerProvider(
+                executable=settings.codex_executable,
+                model=settings.agent_model,
+                workspace_dir=settings.data_dir / "agent_workspace",
+                idle_timeout_seconds=settings.agent_idle_timeout_seconds,
+                reasoning_effort=settings.agent_reasoning_effort,
+                tools=agent_tools,
+                max_tool_calls=settings.agent_max_tool_calls,
+                max_tool_output_characters=settings.agent_max_tool_output_characters,
+                escalation_model=settings.agent_escalation_model,
+                allow_image_generation=shared_image_provider is not None,
+                image_timeout_seconds=settings.image_timeout_seconds,
+            )
+            if shared_image_provider is not None:
+                shared_image_provider.bind(codex_provider)
             agent = AgentService(
-                provider=CodexAppServerProvider(
-                    executable=settings.codex_executable,
-                    model=settings.agent_model,
-                    workspace_dir=settings.data_dir / "agent_workspace",
-                    idle_timeout_seconds=settings.agent_idle_timeout_seconds,
-                    reasoning_effort=settings.agent_reasoning_effort,
-                    tools=agent_tools,
-                    max_tool_calls=settings.agent_max_tool_calls,
-                    max_tool_output_characters=settings.agent_max_tool_output_characters,
-                    escalation_model=settings.agent_escalation_model,
-                ),
+                provider=codex_provider,
                 store=agent_store,
                 journal=journal,
                 limits=AgentLimits(
@@ -712,6 +766,7 @@ class SimajilordRuntime:
                         settings.agent_rate_limit_exempt_user_ids
                     ),
                 ),
+                memory=memory,
             )
         maintenance = DataMaintenanceService(
             data_dir=settings.data_dir,
@@ -808,9 +863,9 @@ class SimajilordRuntime:
         return runtime
 
     async def close(self) -> None:
+        await self.image.close()
         if self.agent is not None:
             await self.agent.close()
-        await self.image.close()
         await self.moderation.close()
         await self.web.close()
         await self.translation.close()

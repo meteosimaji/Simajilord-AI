@@ -536,4 +536,117 @@ _WORKFLOWS = (
             }
         ),
     ),
+    _WorkflowDefinition(
+        workflow=CuratedWorkflow(
+            workflow_id="discord.platform_inspection",
+            summary=(
+                "Inspect a Discord server's members, effective permissions, presence, "
+                "voice participation, channels, and low-frequency platform resources "
+                "without loading unrelated resource families."
+            ),
+            required_grants=(),
+            steps=(
+                _step(
+                    1,
+                    "discord.list_servers",
+                    "Resolve a mutually joined server and keep its exact server ID.",
+                ),
+                _step(
+                    2,
+                    "discord.list_members",
+                    "Search or page members only when the question concerns people.",
+                ),
+                _step(
+                    3,
+                    "discord.inspect_user",
+                    "Inspect the exact member for full Presence, activities, roles, and VC state.",
+                ),
+                _step(
+                    4,
+                    "discord.inspect_channel",
+                    "Inspect settings, overwrites, and requester/Bot effective permissions.",
+                ),
+                _step(
+                    5,
+                    "discord.list_platform_resources",
+                    "Request only the named resource family, such as events or audit logs.",
+                ),
+            ),
+            stop_conditions=(
+                "The requested live state is returned with complete=true.",
+                "Presence intent or Discord cache completeness is false; state the limit.",
+                "Either requester or Bot lacks visibility; do not infer hidden state.",
+            ),
+        ),
+        keywords=(
+            "discord platform api inspect",
+            "presence voice permissions status",
+            "member channel audit event",
+            "Discord API",
+            "ステータス",
+            "オンライン",
+            "VC",
+            "権限",
+            "管理者",
+            "メンバー",
+            "チャンネル",
+            "監査ログ",
+        ),
+        required_capabilities=frozenset(
+            {
+                "discord.list_servers",
+                "discord.list_members",
+                "discord.inspect_user",
+                "discord.inspect_channel",
+                "discord.list_platform_resources",
+            }
+        ),
+    ),
+    _WorkflowDefinition(
+        workflow=CuratedWorkflow(
+            workflow_id="image.generate_review_publish",
+            summary=(
+                "Generate an image as a restart-safe job, inspect its bounded preview, "
+                "and independently decide whether to publish the full original."
+            ),
+            required_grants=("image", "files"),
+            steps=(
+                _step(
+                    1,
+                    "image.generate",
+                    "Submit a complete brief and wait for the terminal workspace handoff.",
+                ),
+                _step(
+                    2,
+                    "image.status",
+                    "Use only when resuming a known job or confirming terminal state.",
+                ),
+                _step(
+                    3,
+                    "discord.send_file",
+                    "Publish the full original only when the user asked to show or post it.",
+                ),
+            ),
+            stop_conditions=(
+                "The terminal result and model-visible preview are available.",
+                "The user asked to hide, compare, describe, or iterate; do not publish.",
+                "Discord attachment delivery succeeds or returns an exact permission error.",
+            ),
+        ),
+        keywords=(
+            "image generate review publish",
+            "image job preview attachment",
+            "画像生成",
+            "画像",
+            "描く",
+            "添付",
+            "投稿",
+            "隠す",
+            "見せない",
+            "段階",
+        ),
+        required_capabilities=frozenset(
+            {"image.generate", "image.status", "discord.send_file"}
+        ),
+    ),
 )

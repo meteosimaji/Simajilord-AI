@@ -31,6 +31,15 @@ class AgentRateLimitError(AgentError):
 class AgentProviderError(AgentError):
     """The provider failed while creating or running a turn."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = dict(diagnostic or {})
+
 
 class AgentProviderLimitError(AgentProviderError):
     """The upstream provider rejected a turn because its usage limit was reached."""
@@ -47,12 +56,14 @@ class AgentTimeoutError(AgentProviderError):
         auto_retry_attempted: bool = False,
         runtime_restarted: bool = False,
         write_attempted: bool = False,
+        diagnostic: dict[str, object] | None = None,
     ) -> None:
         super().__init__(message)
         self.timeout_seconds = timeout_seconds
         self.auto_retry_attempted = auto_retry_attempted
         self.runtime_restarted = runtime_restarted
         self.write_attempted = write_attempted
+        self.diagnostic = dict(diagnostic or {})
 
 
 class AgentThreadError(AgentProviderError):

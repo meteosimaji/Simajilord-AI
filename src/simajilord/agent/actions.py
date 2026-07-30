@@ -176,11 +176,19 @@ def _same_reaction(
 
 
 def _created_message(_request: object, response: object) -> Mapping[str, object]:
-    return _selected_values(response, ("channel_id", "message_id"))
+    selected = dict(_selected_values(response, ("channel_id", "message_id")))
+    guild_id = getattr(response, "guild_id", None)
+    if isinstance(guild_id, str):
+        selected["guild_id"] = guild_id
+    return selected
 
 
 def _created_messages(_request: object, response: object) -> Mapping[str, object]:
-    return _selected_values(response, ("channel_id", "message_ids"))
+    selected = dict(_selected_values(response, ("channel_id", "message_ids")))
+    guild_id = getattr(response, "guild_id", None)
+    if isinstance(guild_id, str):
+        selected["guild_id"] = guild_id
+    return selected
 
 
 def _created_timer(_request: object, response: object) -> Mapping[str, object]:
@@ -501,9 +509,11 @@ _REVERSIBLE_POLICIES = (
             undo_arguments=_created_message,
         )
         for capability in (
+            "discord.send_embed",
             "discord.send_message",
             "discord.reply_message",
             "discord.send_file",
+            "discord.send_files",
             "discord.post_expanded_message",
             "discord.create_quote_image",
             "discord.create_poll",
@@ -714,6 +724,21 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "discord.delete_own_message",
         "discord.delete_own_messages",
         "discord.edit_own_message",
+        "discord.create_guild_resource",
+        "discord.update_guild_resource",
+        "discord.delete_guild_resource",
+        "discord.message_action",
+        "discord.set_channel_overwrite",
+        "discord.create_platform_asset",
+        "discord.update_platform_asset",
+        "discord.delete_platform_asset",
+        "discord.create_automod_rule",
+        "discord.update_automod_rule",
+        "discord.delete_automod_rule",
+        "discord.channel_operation",
+        "discord.forward_message",
+        "discord.send_direct_message",
+        "discord.set_bot_presence",
         "discord.delete_created_role",
         "discord.delete_created_channel",
         "discord.delete_message",

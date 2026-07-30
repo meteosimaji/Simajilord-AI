@@ -13,6 +13,7 @@ from simajilord.core import InvocationContext
 from simajilord.observability import EventJournal
 
 from .contracts import (
+    AGENT_MEMORY_GRANT,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentRequest,
@@ -22,9 +23,12 @@ from .contracts import (
 )
 from .errors import (
     AgentBusyError,
+    AgentProviderError,
     AgentRateLimitError,
     AgentThreadError,
+    AgentTimeoutError,
 )
+from .memory import AgentMemoryRecord, AgentMemoryService
 from .providers import (
     AgentProgressCallback,
     AgentProvider,
@@ -59,11 +63,13 @@ class AgentService:
         store: AgentConversationStore,
         journal: EventJournal,
         limits: AgentLimits,
+        memory: AgentMemoryService | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
         self.journal = journal
         self.limits = limits
+        self.memory = memory
         self._admission_lock = asyncio.Lock()
         self._admission_condition = asyncio.Condition(self._admission_lock)
         self._budget_lock = asyncio.Lock()
@@ -122,6 +128,19 @@ class AgentService:
                     origin_resource_id=request.channel_id,
                     approvals=request.approvals,
                 )
+                memory_context: tuple[AgentMemoryRecord, ...] = ()
+                if self.memory is not None and AGENT_MEMORY_GRANT in request.grants:
+                    try:
+                        memory_context = await self.memory.context_for_turn(context)
+                    except Exception as exc:
+                        await self.journal.append(
+                            kind="agent.memory.context_failed",
+                            actor_id=request.actor_id,
+                            workspace_id=request.workspace_id,
+                            transport="agent",
+                            request_id=request.event_id,
+                            payload={"error_type": type(exc).__name__},
+                        )
                 if on_progress is not None:
                     await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
                 origin_key = (request.workspace_id, request.channel_id)
@@ -133,6 +152,7 @@ class AgentService:
                         event_prompt=_event_prompt(
                             request,
                             continuity_reset_reason=continuity_reset_reason,
+                            memory_context=memory_context,
                         ),
                         context=context,
                         on_progress=on_progress,
@@ -144,6 +164,7 @@ class AgentService:
                         event_prompt=_event_prompt(
                             request,
                             continuity_reset_reason="saved_thread_unavailable",
+                            memory_context=memory_context,
                         ),
                         context=context,
                         on_progress=on_progress,
@@ -193,6 +214,22 @@ class AgentService:
                 )
                 return response
         except Exception as exc:
+            failure_payload: dict[str, object] = {
+                "conversation_id": request.conversation_id,
+                "trigger": request.trigger.value,
+                "model": self.model,
+                "error_type": type(exc).__name__,
+            }
+            if isinstance(exc, AgentTimeoutError):
+                failure_payload["inactivity_timeout"] = {
+                    "seconds": exc.timeout_seconds,
+                    "automatic_retry_attempted": exc.auto_retry_attempted,
+                    "runtime_restarted": exc.runtime_restarted,
+                    "non_idempotent_write_attempted": exc.write_attempted,
+                    "diagnostic": exc.diagnostic,
+                }
+            elif isinstance(exc, AgentProviderError) and exc.diagnostic:
+                failure_payload["provider_diagnostic"] = exc.diagnostic
             await self.store.fail(
                 request,
                 model=self.model,
@@ -204,12 +241,7 @@ class AgentService:
                 workspace_id=request.workspace_id,
                 transport="agent",
                 request_id=request.event_id,
-                payload={
-                    "conversation_id": request.conversation_id,
-                    "trigger": request.trigger.value,
-                    "model": self.model,
-                    "error_type": type(exc).__name__,
-                },
+                payload=failure_payload,
             )
             raise
         finally:
@@ -556,6 +588,7 @@ class AgentService:
                 ),
             )
 
+
 async def _finish_cleanup(awaitable: Awaitable[None]) -> None:
     """Finish mandatory cleanup before preserving an arriving cancellation."""
 
@@ -575,6 +608,7 @@ def _event_prompt(
     request: AgentRequest,
     *,
     continuity_reset_reason: str | None = None,
+    memory_context: tuple[AgentMemoryRecord, ...] = (),
 ) -> str:
     message_id = request.message_id or "none"
     workspace_id = request.workspace_id or "direct-message"
@@ -594,6 +628,30 @@ def _event_prompt(
         )
         for event in request.events
     )
+    memory_pointers = tuple(
+        json.dumps(
+            {
+                "basis": memory.basis.value,
+                "confidence": memory.confidence,
+                "key": memory.key,
+                "memory_id": memory.memory_id,
+                "source_message_locators": [
+                    {
+                        "channel_id": locator.channel_id,
+                        "guild_id": locator.guild_id,
+                        "message_id": locator.message_id,
+                    }
+                    for locator in memory.source_message_locators
+                ],
+                "summary": memory.summary,
+                "updated_at": memory.updated_at.isoformat(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        for memory in memory_context
+    )
     return "\n".join(
         (
             "SIMAJILORD_EVENT_V1",
@@ -608,6 +666,21 @@ def _event_prompt(
             f"occurred_at={request.occurred_at.isoformat()}",
             f"batched_event_count={len(event_pointers)}",
             *(f"batched_event={pointer}" for pointer in event_pointers),
+            f"requester_memory_count={len(memory_pointers)}",
+            *(f"requester_memory={pointer}" for pointer in memory_pointers),
+            *(
+                (
+                    (
+                        "Requester memories are host-scoped durable context for this "
+                        "actor only. Use a memory only when relevant. Its basis and "
+                        "source locators are provenance, not current authorization; "
+                        "describe user_stated evidence honestly and verify facts that "
+                        "may have changed."
+                    ),
+                )
+                if memory_pointers
+                else ()
+            ),
             (
                 "No message body is included. Inspect only what you need through bounded "
                 "Simajilord tools, then produce one user-facing response."

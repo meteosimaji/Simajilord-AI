@@ -159,8 +159,8 @@ _PROGRESS_MESSAGES = {
     AgentProgressStage.READING_DISCORD: "Reading the relevant Discord conversation…",
     AgentProgressStage.SEARCHING_WEB: "Searching the web…",
     AgentProgressStage.COMPUTING: "Running the calculation…",
-    AgentProgressStage.ANALYZING_MEDIA: "Analyzing the attachment with HIVE…",
-    AgentProgressStage.GENERATING_IMAGE: "Generating image with GPT Image 2…",
+    AgentProgressStage.ANALYZING_MEDIA: "Analyzing the attachment…",
+    AgentProgressStage.GENERATING_IMAGE: "Generating image…",
     AgentProgressStage.USING_AUDIO: "Preparing the server audio controls…",
     AgentProgressStage.PREPARING_RESPONSE: "Preparing the response…",
 }
@@ -187,12 +187,16 @@ class AgentProgressMessage:
         *,
         initial_delay_seconds: float = 1.0,
         minimum_update_seconds: float = 2.5,
+        typing_interval_seconds: float = 7.5,
+        typing_lease_seconds: float = 12.0,
         on_posted: Callable[[discord.Message], Awaitable[None]] | None = None,
         delivery_key: str | None = None,
     ) -> None:
         self.source = source
         self.initial_delay_seconds = initial_delay_seconds
         self.minimum_update_seconds = minimum_update_seconds
+        self.typing_interval_seconds = typing_interval_seconds
+        self.typing_lease_seconds = typing_lease_seconds
         self.on_posted = on_posted
         self.delivery_key = delivery_key or f"discord:message:{source.id}"
         self.message: discord.Message | None = None
@@ -200,6 +204,9 @@ class AgentProgressMessage:
         self._published: AgentProgressUpdate | None = None
         self._last_update = 0.0
         self._task: asyncio.Task[None] | None = None
+        self._typing_task: asyncio.Task[None] | None = None
+        self._typing_deadline = 0.0
+        self._stage_started_at_epoch: int | None = None
         self._lock = asyncio.Lock()
         self._closed = False
         self._temporary_messages: dict[int, discord.Message] = {}
@@ -207,7 +214,16 @@ class AgentProgressMessage:
     async def update(self, update: AgentProgressUpdate) -> None:
         if self._closed:
             return
+        if update.stage is not AgentProgressStage.QUEUED:
+            self._typing_deadline = time.monotonic() + self.typing_lease_seconds
+            if self._typing_task is None or self._typing_task.done():
+                self._typing_task = asyncio.create_task(
+                    self._typing_while_active(),
+                    name=f"simajilord-agent-typing-{self.source.id}",
+                )
         self._latest = update
+        if update == self._published:
+            return
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(
                 self._flush_later(),
@@ -282,9 +298,19 @@ class AgentProgressMessage:
             if self._closed or self._latest is None or self._latest == self._published:
                 return
             update = self._latest
+            if self._published is None or self._published.stage is not update.stage:
+                self._stage_started_at_epoch = int(time.time())
+            description = agent_progress_text(update)
+            if (
+                self._stage_started_at_epoch is not None
+                and update.stage is not AgentProgressStage.QUEUED
+            ):
+                description += (
+                    f"\n-# Active since <t:{self._stage_started_at_epoch}:R>"
+                )
             embed = command_embed(
                 "Working",
-                description=agent_progress_text(update),
+                description=description,
                 tone=EmbedTone.INFO,
             )
             async with self._lock:
@@ -328,12 +354,41 @@ class AgentProgressMessage:
                 )
 
     async def _cancel_pending(self) -> None:
-        task = self._task
+        tasks = tuple(
+            task
+            for task in (self._task, self._typing_task)
+            if task is not None and not task.done()
+        )
         self._task = None
-        if task is None or task.done():
+        self._typing_task = None
+        if not tasks:
             return
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _typing_while_active(self) -> None:
+        """Pulse typing only while the harness keeps renewing activity."""
+
+        try:
+            while not self._closed:
+                remaining = self._typing_deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    await self.source.channel.typing()
+                except discord.DiscordException:
+                    log.exception(
+                        "Failed to publish AI typing activity source_message_id=%s",
+                        self.source.id,
+                    )
+                    return
+                await asyncio.sleep(min(self.typing_interval_seconds, remaining))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._typing_task is asyncio.current_task():
+                self._typing_task = None
 
     async def _delete_temporary_messages(self) -> None:
         async with self._lock:

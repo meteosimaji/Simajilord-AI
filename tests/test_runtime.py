@@ -26,6 +26,7 @@ from simajilord.agent.providers import CodexAppServerProvider
 from simajilord.config import load_settings
 from simajilord.core import InvocationContext, RiskLevel
 from simajilord.integrations.discord.capabilities import build_discord_endpoints
+from simajilord.providers.image import SharedCodexImageProvider
 from simajilord.runtime import SimajilordRuntime
 
 
@@ -60,6 +61,32 @@ def test_runtime_composes_before_discord_starts_the_event_loop(
         "memory.forget",
     } <= set(capability_names)
     asyncio.run(runtime.close())
+
+
+def test_agent_and_image_queue_share_the_primary_codex_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("IMAGE_GENERATION_ACCESS", "everyone")
+
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+
+    try:
+        assert runtime.agent is not None
+        assert isinstance(runtime.agent.provider, CodexAppServerProvider)
+        assert isinstance(runtime.image.provider, SharedCodexImageProvider)
+        assert runtime.image.provider._provider is runtime.agent.provider
+        assert runtime.agent.provider.allow_image_generation is True
+        assert runtime.agent.provider.image_timeout_seconds == (
+            settings.image_timeout_seconds
+        )
+    finally:
+        asyncio.run(runtime.close())
 
 
 def test_complete_core_capability_catalog_uses_english_surface(

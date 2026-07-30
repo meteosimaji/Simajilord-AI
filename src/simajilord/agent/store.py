@@ -311,7 +311,7 @@ class AgentConversationStore:
         limit: int,
         excluded_actor_ids: frozenset[str] = frozenset(),
     ) -> tuple[int, datetime | None]:
-        """Return current usage and the oldest expiry that drops it below limit."""
+        """Return non-cached usage and the oldest expiry that drops it below limit."""
 
         if since.tzinfo is None:
             raise ValueError("token budget cutoff must be timezone-aware")
@@ -1132,21 +1132,26 @@ class AgentConversationStore:
             exclusion_sql, exclusion_values = _actor_exclusion(excluded_actor_ids)
             rows = connection.execute(
                 (
-                    "SELECT COALESCE(total_tokens, 0), completed_at "
+                    "SELECT COALESCE(total_tokens, 0), "
+                    "COALESCE(cached_input_tokens, 0), completed_at "
                     "FROM agent_requests "
                     f"WHERE completed_at >= ?{exclusion_sql} "
                     "ORDER BY completed_at, event_id"
                 ),
                 (since.isoformat(), *exclusion_values),
             ).fetchall()
-            usage = sum(int(row[0]) for row in rows)
+            contributions = tuple(
+                max(0, int(row[0]) - int(row[1]))
+                for row in rows
+            )
+            usage = sum(contributions)
             if usage < limit:
                 return usage, None
             remaining = usage
             release_anchor: datetime | None = None
-            for row in rows:
-                remaining -= int(row[0])
-                release_anchor = datetime.fromisoformat(str(row[1]))
+            for row, contribution in zip(rows, contributions, strict=True):
+                remaining -= contribution
+                release_anchor = datetime.fromisoformat(str(row[2]))
                 if remaining < limit:
                     break
             return usage, release_anchor

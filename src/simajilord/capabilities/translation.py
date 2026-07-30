@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from simajilord.core import (
@@ -12,6 +13,8 @@ from simajilord.core import (
     endpoint,
 )
 from simajilord.services.translation import TranslationSegment, TranslationService
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +60,6 @@ class TranslationTranslateResponse:
     translation: str
     source_language: str
     target_language: str
-    provider: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +87,6 @@ class TranslationBatchResponse:
     segments: tuple[TranslatedSegmentItem, ...]
     source_language: str
     target_language: str
-    provider: str
     cached: bool
 
 
@@ -132,12 +133,18 @@ def build_translation_endpoints(
             source_language=request.source_language,
             target_language=request.target_language,
         )
+        log.info(
+            "Translation completed provider=%s source=%s target=%s characters=%d",
+            result.provider,
+            result.source_language,
+            result.target_language,
+            len(result.source_text),
+        )
         return TranslationTranslateResponse(
             original=result.source_text,
             translation=result.translated_text,
             source_language=result.source_language,
             target_language=result.target_language,
-            provider=result.provider,
         )
 
     async def translate_batch(
@@ -155,6 +162,15 @@ def build_translation_endpoints(
             source_language=request.source_language,
             target_language=request.target_language,
         )
+        log.info(
+            "Translation batch completed provider=%s source=%s target=%s "
+            "segments=%d cached=%s",
+            result.provider,
+            result.source_language,
+            result.target_language,
+            len(result.segments),
+            result.cached,
+        )
         return TranslationBatchResponse(
             segments=tuple(
                 TranslatedSegmentItem(
@@ -166,7 +182,6 @@ def build_translation_endpoints(
             ),
             source_language=result.source_language,
             target_language=result.target_language,
-            provider=result.provider,
             cached=result.cached,
         )
 
@@ -205,7 +220,7 @@ def build_translation_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="translation.translate",
-                summary="Translate supplied text with an offline on-device provider.",
+                summary="Translate supplied text into the requested language.",
                 risk=RiskLevel.READ,
                 keywords=("translate", "translation", "language", "local"),
                 expected_errors=(
@@ -225,7 +240,7 @@ def build_translation_endpoints(
             CapabilityDescriptor(
                 name="translation.translate_batch",
                 summary=(
-                    "Translate identified document segments in one offline on-device batch."
+                    "Translate identified document segments in one structured batch."
                 ),
                 risk=RiskLevel.READ,
                 keywords=(

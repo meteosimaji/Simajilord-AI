@@ -344,7 +344,7 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
     _entry(
         "translate",
         "Web & media",
-        "Translate supplied or recent message text with local on-device models.",
+        "Translate supplied or recent message text into another language.",
         "/translate target:<language> [text] [source:<language>]",
         "/translate target:English text:おはようございます",
         "/translate target:ja source:English text:Good morning",
@@ -366,7 +366,7 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
     _entry(
         "media detect-ai",
         "Web & media",
-        "Ask HIVE to estimate AI-generated and deepfake likelihood for an image or video.",
+        "Estimate AI-generated and deepfake likelihood for an image or video.",
         "/media detect-ai media:<attachment>",
         "/media detect-ai media:photo.png",
         notes=("Results are estimates, not proof.", "Audio-only detection is not enabled."),

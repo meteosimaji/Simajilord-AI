@@ -55,6 +55,25 @@ def command_embed(
     return embed
 
 
+def agent_embed(
+    title: str,
+    *,
+    description: str | None = None,
+    fields: tuple[EmbedField, ...] = (),
+    tone: EmbedTone = EmbedTone.INFO,
+) -> discord.Embed:
+    """Build a clean AI-authored card without command-only metadata."""
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        colour=_COLOURS[tone],
+    )
+    for field in fields:
+        embed.add_field(name=field.name, value=field.value, inline=field.inline)
+    return embed
+
+
 def expanded_message_embeds(
     response: DiscordExpandMessageResponse,
 ) -> tuple[discord.Embed, ...]:

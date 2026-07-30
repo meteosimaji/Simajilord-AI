@@ -208,6 +208,7 @@ async def test_memory_migrates_and_records_verified_failure_procedure(
         ("前に成功したやり方", "procedure.pdf_review"),
         ("私の好みを思い出す", "response.style"),
         ("メモリー", "memory.behavior"),
+        ("このAIの管理者は誰", "assistant.creator"),
     ),
 )
 async def test_memory_search_handles_japanese_english_and_spelling_variants(
@@ -242,6 +243,14 @@ async def test_memory_search_handles_japanese_english_and_spelling_variants(
         summary="必要な時だけメモリを検索する。",
         source_id="113",
     )
+    await _remember(
+        service,
+        context=context,
+        scope=AgentMemoryScope.USER,
+        key="assistant.creator",
+        summary="The requester created this assistant.",
+        source_id="114",
+    )
 
     result = await service.search(
         AgentMemorySearchRequest(query=query, limit=1),
@@ -249,6 +258,52 @@ async def test_memory_search_handles_japanese_english_and_spelling_variants(
     )
 
     assert [memory.key for memory in result.memories] == [expected_key]
+
+
+@pytest.mark.asyncio
+async def test_turn_context_is_bounded_requester_private_and_not_counted_as_used(
+    tmp_path,
+) -> None:
+    path = tmp_path / "memory.sqlite3"
+    service = AgentMemoryService(AgentMemoryStore(path))
+    owner = _context(actor_id="100", workspace_id="200", channel_id="300")
+    other_user = _context(actor_id="101", workspace_id="200", channel_id="300")
+    owner_memory = await _remember(
+        service,
+        context=owner,
+        scope=AgentMemoryScope.USER,
+        key="assistant.creator",
+        summary="The requester created this assistant.",
+        source_id="111",
+    )
+    await _remember(
+        service,
+        context=owner,
+        scope=AgentMemoryScope.WORKSPACE,
+        key="workspace.public",
+        summary="Visible to the workspace.",
+        source_id="112",
+    )
+    before = owner_memory.memory.last_used_at
+
+    owner_context = await service.context_for_turn(owner, limit=1)
+    other_context = await service.context_for_turn(other_user, limit=1)
+    after = (
+        await service.search(
+            AgentMemorySearchRequest(
+                query="creator",
+                scopes=(AgentMemoryScope.USER,),
+                limit=1,
+            ),
+            owner,
+        )
+    ).memories[0]
+
+    assert tuple(item.key for item in owner_context) == ("assistant.creator",)
+    assert other_context == ()
+    assert owner_context[0].scope is AgentMemoryScope.USER
+    assert owner_context[0].last_used_at == before
+    assert after.last_used_at >= before
 
 
 @pytest.mark.asyncio

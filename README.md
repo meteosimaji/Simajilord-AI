@@ -101,8 +101,16 @@ with Discord's generic “interaction failed” banner.
   where applicable). Each result includes a time-local source-visibility/disclosure advisory.
   `broader` flags a currently known audience expansion and `uncertain` means the member cache
   cannot prove the complete audience; neither is a mechanical disclosure block or a source of
-  write authority. Writes remain in the originating server and require live requester and BOT
-  permissions
+  write authority. A write to any explicitly selected shared server still requires fresh
+  requester and BOT permissions there; historical reads never grant write authority
+- The agent has bounded typed access to the bot-visible Discord platform surface: member
+  presence/activity/voice state, channel details and overwrites, pins, reactions, thread
+  membership, roles, audit logs, bans, invites, scheduled events, emojis, stickers, soundboard,
+  AutoMod, integrations, templates, stage/onboarding/widget/application metadata, and
+  owner-authorized commerce metadata. Low-frequency typed operations cover guild resources,
+  messages, permission overwrites, application assets, AutoMod, thread/forum/channel actions,
+  forwarding, direct messages, and bot presence. Credential/token disclosure, bot lifecycle,
+  private OAuth data, and test-commerce mutation are intentionally not exposed as agent tools
 - A bare Discord message link expands in place only after actor and BOT permission checks;
   the replacement preserves a Jump link and the original link post is deleted only after the
   replacement succeeds. The complete Embed text budget, including author, footer, title,
@@ -151,6 +159,14 @@ with Discord's generic “interaction failed” banner.
   This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
   and locally fetch a public URL that first-party search could not open. The same grant policy
   applies to autonomous turns; explicit `/web` and prefix commands remain available independently
+- A 106-endpoint typed Discord surface spanning server/member/user Presence and activities,
+  live VC state, channels/threads/pins/reactions/poll voters, effective permissions and
+  overwrites, audit/bans/invites/events/AutoMod, emojis/stickers/soundboard, token-free
+  webhooks, templates/integrations/onboarding/widget/application metadata, message/file/embed
+  delivery, moderation, resource mutation, and audio. Active threads and guild preview data
+  are fetched from REST rather than assumed from cache. Bot credentials, OAuth-only private
+  user data, bot lifecycle/logout, webhook execution tokens, and test-commerce mutation are
+  intentionally not model capabilities
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and
@@ -232,12 +248,12 @@ with Discord's generic “interaction failed” banner.
   Timer/audio system events do not consume the human-source cap. No built-in GitHub or RSS
   adapter is connected yet; a future adapter can publish through the same typed
   `AutonomyEventQueue` without adding a second scheduler
-- Restart-safe GPT Image 2 generation through the saved Codex OAuth login, with atomic
-  user/server/pending admission. Agent requests wait in the same turn, receive the generated
-  image as model-visible media plus a server-scoped workspace file, and post it with
-  `discord.send_file`. If the primary turn omits that send, one bounded same-thread correction
-  retries the delivery without regenerating the image; the legacy delivery worker remains only
-  for jobs that were explicitly submitted with automatic delivery enabled
+- Restart-safe image generation through the saved Codex login, with atomic user/server/pending
+  admission. Agent requests wait in the same turn and receive a bounded model-visible preview
+  plus the full server-scoped workspace file. Generation and publication stay independent: the
+  model may inspect, compare, describe, or iterate privately, and uses `discord.send_file` only
+  when the user asks to publish. Legacy automatic-delivery jobs reuse one durable Discord
+  message and a hidden deterministic nonce for crash-safe reconciliation
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls

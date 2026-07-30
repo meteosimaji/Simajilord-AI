@@ -329,6 +329,13 @@ async def test_forum_and_archived_posts_are_discoverable_and_searchable() -> Non
 
 @pytest.mark.asyncio
 async def test_list_roles_resolves_existing_role_ids_and_assignability() -> None:
+    class TopRole:
+        def __init__(self, position: int) -> None:
+            self.position = position
+
+        def __gt__(self, other: object) -> bool:
+            return self.position > getattr(other, "position", -1)
+
     client = Mock(spec=discord.Client)
     guild = Mock(spec=discord.Guild)
     guild.id = 10
@@ -341,6 +348,7 @@ async def test_list_roles_resolves_existing_role_ids_and_assignability() -> None
             administrator=True,
             manage_roles=True,
         ),
+        top_role=TopRole(10),
     )
     bot = SimpleNamespace(
         id=99,
@@ -350,6 +358,7 @@ async def test_list_roles_resolves_existing_role_ids_and_assignability() -> None
             administrator=False,
             manage_roles=False,
         ),
+        top_role=TopRole(1),
     )
     role = Mock(spec=discord.Role)
     role.id = 40

@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -30,10 +30,14 @@ from simajilord.agent import (
 )
 from simajilord.agent.providers import AgentProgressCallback, ProviderTurnResult
 from simajilord.agent.providers.codex import (
+    _APP_SERVER_INPUT_LINE_LIMIT_BYTES,
+    _APP_SERVER_STDOUT_LIMIT_BYTES,
     CodexAppServerProvider,
+    _AppServerTransportError,
     _base_instructions,
     _batched_event_message_ids,
     _blocking_write_capability,
+    _encode_app_server_message,
     _event_trigger,
     _last_write_failure,
     _mark_authorization_message_read,
@@ -43,6 +47,7 @@ from simajilord.agent.providers.codex import (
     _record_exact_message_reads,
     _tool_read_exact_event,
     _ToolTurnBudget,
+    _TurnAttemptState,
     _TurnWatchdog,
     _user_error_reason,
     _web_search_mode,
@@ -78,6 +83,27 @@ class ReadResponse:
 @dataclass(frozen=True, slots=True)
 class WriteRequest:
     subject: str
+
+
+class _FakeCodexProcess:
+    def __init__(self, stdout: asyncio.StreamReader) -> None:
+        self.pid = 4242
+        self.stdout = stdout
+        self.stdin = None
+        self.returncode: int | None = None
+        self.terminated = False
+        self.killed = False
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        return self.returncode or 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,10 +219,7 @@ async def _wait_for_turn_counts(
 ) -> None:
     deadline = asyncio.get_running_loop().time() + 2
     while asyncio.get_running_loop().time() < deadline:
-        if (
-            service._active_turns == active
-            and service._pending_turns == pending
-        ):
+        if service._active_turns == active and service._pending_turns == pending:
             return
         await asyncio.sleep(0.005)
     pytest.fail(
@@ -318,9 +341,7 @@ def test_memory_evidence_requires_a_complete_read_and_matching_locator() -> None
         capability_name="memory.remember",
         arguments={
             "source_message_ids": ["4"],
-            "source_message_locators": [
-                {"message_id": "4", "guild_id": "1", "channel_id": "999"}
-            ],
+            "source_message_locators": [{"message_id": "4", "guild_id": "1", "channel_id": "999"}],
         },
         budget=budget,
         context=context,
@@ -960,9 +981,7 @@ async def test_agent_keeps_turns_from_one_server_in_fifo_order(tmp_path) -> None
     )
     await asyncio.wait_for(queued_notified.wait(), timeout=1)
     assert not second.done()
-    assert queued_stages == [
-        AgentProgressUpdate(AgentProgressStage.QUEUED, queue_position=1)
-    ]
+    assert queued_stages == [AgentProgressUpdate(AgentProgressStage.QUEUED, queue_position=1)]
 
     release.set()
     await asyncio.gather(first, second)
@@ -1204,19 +1223,13 @@ async def test_agent_bounds_steered_follow_ups_per_contributor(tmp_path) -> None
     await entered.wait()
 
     assert (
-        await service.try_follow_up(
-            _request("first-follow-up", actor_id="contributor")
-        )
+        await service.try_follow_up(_request("first-follow-up", actor_id="contributor"))
         == original.event_id
     )
     with pytest.raises(AgentBusyError):
-        await service.try_follow_up(
-            _request("second-follow-up", actor_id="contributor")
-        )
+        await service.try_follow_up(_request("second-follow-up", actor_id="contributor"))
     assert (
-        await service.try_follow_up(
-            _request("other-follow-up", actor_id="other-contributor")
-        )
+        await service.try_follow_up(_request("other-follow-up", actor_id="other-contributor"))
         == original.event_id
     )
 
@@ -1303,13 +1316,17 @@ async def test_agent_local_rate_limit_blocks_before_provider(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rolling_token_budget_reports_actual_expiry(tmp_path) -> None:
+async def test_rolling_token_budget_counts_non_cached_tokens_and_reports_expiry(
+    tmp_path,
+) -> None:
     provider = FakeProvider()
     service = AgentService(
         provider=provider,
         store=AgentConversationStore(tmp_path / "agent.sqlite3"),
         journal=EventJournal(tmp_path / "events.sqlite3"),
-        limits=_limits(max_tokens_per_24_hours=100),
+        # FakeProvider reports 110 total with 50 cached, so the effective
+        # contribution is 60 rather than charging retained context twice.
+        limits=_limits(max_tokens_per_24_hours=60),
     )
     await service.respond(_request("token-event-1"))
 
@@ -1380,9 +1397,7 @@ async def test_agent_active_turns_are_globally_bounded_across_workspaces(tmp_pat
         journal=EventJournal(tmp_path / "events.sqlite3"),
         limits=_limits(max_active_turns=1),
     )
-    first = asyncio.create_task(
-        service.respond(_request("one", actor_id="actor-one"))
-    )
+    first = asyncio.create_task(service.respond(_request("one", actor_id="actor-one")))
     await first_entered.wait()
     second = asyncio.create_task(
         service.respond(
@@ -1456,10 +1471,7 @@ async def test_agent_accepts_max_active_plus_max_waiting_turns(tmp_path) -> None
             channel_id=str(index + 100),
         )
 
-    accepted = [
-        asyncio.create_task(service.respond(request(index)))
-        for index in range(1, 6)
-    ]
+    accepted = [asyncio.create_task(service.respond(request(index))) for index in range(1, 6)]
     await asyncio.wait_for(two_entered.wait(), timeout=1)
     await _wait_for_turn_counts(service, active=2, pending=3)
 
@@ -2223,12 +2235,8 @@ def test_workspace_capability_is_hidden_without_workspace_context() -> None:
     )
     catalog = AgentToolCatalog(registry, ("discord.read",))
 
-    assert catalog.dynamic_specs(
-        InvocationContext("actor", None, "agent", "request")
-    ) == ()
-    assert catalog.dynamic_specs(
-        InvocationContext("actor", "workspace", "agent", "request")
-    )
+    assert catalog.dynamic_specs(InvocationContext("actor", None, "agent", "request")) == ()
+    assert catalog.dynamic_specs(InvocationContext("actor", "workspace", "agent", "request"))
 
 
 @pytest.mark.asyncio
@@ -2394,26 +2402,41 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
             "authorization_event_id": "discord:message:123",
         },
     }
-    assert catalog.authorization_event_id_for_call(
-        tool_name="capability_invoke",
-        arguments=nested_authorization,
-    ) == "discord:message:123"
-    assert catalog.capability_for_call(
-        tool_name="capability_invoke",
-        arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
-    ) == "image.generate"
-    assert catalog.canonical_tool_name_for_call(
-        tool_name="capability_invoke",
-        arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
-    ) == "image_generate"
-    assert catalog.capability_arguments_for_call(
-        tool_name="capability_invoke",
-        arguments=nested_authorization,
-    ) == nested_authorization["arguments"]
-    assert catalog.capability_for_call(
-        tool_name="test_read",
-        arguments={"offset": 0},
-    ) == "test.read"
+    assert (
+        catalog.authorization_event_id_for_call(
+            tool_name="capability_invoke",
+            arguments=nested_authorization,
+        )
+        == "discord:message:123"
+    )
+    assert (
+        catalog.capability_for_call(
+            tool_name="capability_invoke",
+            arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
+        )
+        == "image.generate"
+    )
+    assert (
+        catalog.canonical_tool_name_for_call(
+            tool_name="capability_invoke",
+            arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
+        )
+        == "image_generate"
+    )
+    assert (
+        catalog.capability_arguments_for_call(
+            tool_name="capability_invoke",
+            arguments=nested_authorization,
+        )
+        == nested_authorization["arguments"]
+    )
+    assert (
+        catalog.capability_for_call(
+            tool_name="test_read",
+            arguments={"offset": 0},
+        )
+        == "test.read"
+    )
     granted = InvocationContext(
         "actor",
         "workspace",
@@ -2662,12 +2685,8 @@ async def test_capability_search_never_leaks_missing_grant_or_approval() -> None
     assert "test.secret_destroy" not in denied_output
     assert "test.secret_destroy" not in grant_only_output
     assert "test.secret_destroy" in approved_output
-    assert json.loads(denied_output)["unavailable_reason_counts"] == {
-        "missing_grant": 1
-    }
-    assert json.loads(grant_only_output)["unavailable_reason_counts"] == {
-        "approval_required": 1
-    }
+    assert json.loads(denied_output)["unavailable_reason_counts"] == {"missing_grant": 1}
+    assert json.loads(grant_only_output)["unavailable_reason_counts"] == {"approval_required": 1}
     assert json.loads(approved_output)["unavailable_reason_counts"] == {}
 
 
@@ -2729,10 +2748,7 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
     assert second["has_more"] is False
     assert general["matches"] == first["matches"]
     assert len(wide["matches"]) == 3
-    assert all(
-        item["invoke_with"] == "capability_invoke"
-        for item in wide["matches"]
-    )
+    assert all(item["invoke_with"] == "capability_invoke" for item in wide["matches"])
 
 
 @pytest.mark.asyncio
@@ -3076,9 +3092,7 @@ async def test_provider_rejects_write_before_exact_event_is_read(
     first_response = response.await_args
     assert first_response is not None
     assert first_response.kwargs["success"] is False
-    assert budget.write_failures == [
-        ("test.write", "agent.event_message_not_read")
-    ]
+    assert budget.write_failures == [("test.write", "agent.event_message_not_read")]
     budget.event_message_read = True
     budget.read_authorization_event_ids.add("event")
     await provider._handle_dynamic_tool(2, request)
@@ -3184,9 +3198,7 @@ async def test_provider_keeps_unread_follow_up_progress_failure_nonblocking(
     assert invoked == []
     assert response.await_args.kwargs["success"] is False
     assert payload["error"]["code"] == "agent.event_message_not_read"
-    assert "follow-up arrived while this turn was running" in (
-        payload["error"]["reason"]
-    )
+    assert "follow-up arrived while this turn was running" in (payload["error"]["reason"])
     assert budget.write_failures == []
 
 
@@ -3387,7 +3399,7 @@ async def test_provider_reports_idle_watchdog_as_dedicated_timeout(
         AsyncMock(side_effect=TimeoutError),
     )
     reset = AsyncMock(return_value=True)
-    monkeypatch.setattr(provider, "_reset_after_timeout", reset)
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", reset)
 
     with pytest.raises(AgentTimeoutError) as raised:
         await provider.respond(
@@ -3429,7 +3441,7 @@ async def test_provider_does_not_replay_timeout_after_write_attempt(
     respond = AsyncMock(side_effect=timeout_after_write)
     reset = AsyncMock(return_value=True)
     monkeypatch.setattr(provider, "_respond_with_idle_watchdog", respond)
-    monkeypatch.setattr(provider, "_reset_after_timeout", reset)
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", reset)
 
     with pytest.raises(AgentTimeoutError) as raised:
         await provider.respond(
@@ -3464,11 +3476,11 @@ async def test_timeout_reset_never_interrupts_another_active_turn(
     monkeypatch.setattr(provider, "_close_unlocked", close)
     provider._thread_by_turn["other-turn"] = "other-thread"
 
-    assert await provider._reset_after_timeout(None) is False
+    assert await provider._reset_after_runtime_failure(None) is False
     close.assert_not_awaited()
 
     provider._thread_by_turn.clear()
-    assert await provider._reset_after_timeout(None) is True
+    assert await provider._reset_after_runtime_failure(None) is True
     close.assert_awaited_once()
 
 
@@ -3558,11 +3570,7 @@ async def test_provider_still_requires_message_fetch_for_mention_no_action(
     ):
         await provider.respond(
             provider_thread_id=None,
-            event_prompt=(
-                "SIMAJILORD_EVENT_V1\n"
-                "trigger=mention\n"
-                "message_id=123"
-            ),
+            event_prompt=("SIMAJILORD_EVENT_V1\ntrigger=mention\nmessage_id=123"),
             context=InvocationContext("actor", "workspace", "agent", "event"),
         )
 
@@ -3623,6 +3631,7 @@ async def test_provider_uses_escalation_model_only_for_verified_write_recovery(
     async def await_turn(
         _thread_id: str,
         _turn_id: str,
+        **_kwargs: object,
     ) -> tuple[str, AgentTokenUsage]:
         nonlocal await_count
         await_count += 1
@@ -3660,22 +3669,9 @@ async def test_provider_uses_escalation_model_only_for_verified_write_recovery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("delivery_succeeds", "expected_content"),
-    (
-        (True, "画像を投稿しました。"),
-        (
-            False,
-            "画像生成は完了しましたが、Discordへの投稿は完了していません "
-            "(理由コード: discord.file_not_sent)。",
-        ),
-    ),
-)
-async def test_provider_enforces_delivery_after_successful_image_generation(
+async def test_provider_does_not_force_publish_after_successful_image_generation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    delivery_succeeds: bool,
-    expected_content: str,
 ) -> None:
     registry = CapabilityRegistry()
 
@@ -3719,31 +3715,19 @@ async def test_provider_enforces_delivery_after_successful_image_generation(
     )
     monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
     monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
-    request = AsyncMock(
-        side_effect=[
-            {"turn": {"id": "turn-primary"}},
-            {"turn": {"id": "turn-image-delivery"}},
-        ]
-    )
+    request = AsyncMock(return_value={"turn": {"id": "turn-primary"}})
     monkeypatch.setattr(provider, "_request", request)
-    await_count = 0
 
     async def await_turn(
         _thread_id: str,
         _turn_id: str,
+        **_kwargs: object,
     ) -> tuple[str, AgentTokenUsage]:
-        nonlocal await_count
-        await_count += 1
         budget = provider._active_tool_budgets["thread"]
-        if await_count == 1:
-            authorization_event_id = next(iter(budget.authorization_contexts))
-            budget.last_write_authorization_event_id = authorization_event_id
-            budget.write_successes.add("image.generate")
-            return "画像を生成しました。", AgentTokenUsage(total_tokens=1)
-        assert budget.calls_remaining == 2
-        if delivery_succeeds:
-            budget.write_successes.add("discord.send_file")
-        return "画像を投稿しました。", AgentTokenUsage(total_tokens=2)
+        authorization_event_id = next(iter(budget.authorization_contexts))
+        budget.last_write_authorization_event_id = authorization_event_id
+        budget.write_successes.add("image.generate")
+        return "画像は生成し、まだ非公開で保持しています。", AgentTokenUsage(total_tokens=1)
 
     monkeypatch.setattr(provider, "_await_turn", await_turn)
 
@@ -3759,14 +3743,10 @@ async def test_provider_enforces_delivery_after_successful_image_generation(
         ),
     )
 
-    assert request.await_count == 2
-    delivery_prompt = request.await_args_list[1].args[1]["input"][0]["text"]
-    assert "did not successfully call discord.send_file" in delivery_prompt
-    assert "Do not regenerate the image" in delivery_prompt
-    assert "authorization_event_id=auth_" in delivery_prompt
-    assert result.model == "escalation-model"
-    assert result.content == expected_content
-    assert result.usage.total_tokens == 3
+    assert request.await_count == 1
+    assert result.model == "primary-model"
+    assert result.content == "画像は生成し、まだ非公開で保持しています。"
+    assert result.usage.total_tokens == 1
 
 
 @pytest.mark.asyncio
@@ -3827,6 +3807,7 @@ async def test_provider_does_not_retry_idempotent_stale_undo(
     async def await_turn(
         _thread_id: str,
         _turn_id: str,
+        **_kwargs: object,
     ) -> tuple[str, AgentTokenUsage]:
         nonlocal await_count, correction_calls_remaining
         await_count += 1
@@ -3835,9 +3816,7 @@ async def test_provider_does_not_retry_idempotent_stale_undo(
                 ("test.write", "action.undo_conflict")
             )
             return "undo succeeded", AgentTokenUsage(total_tokens=1)
-        correction_calls_remaining = provider._active_tool_budgets[
-            "thread"
-        ].calls_remaining
+        correction_calls_remaining = provider._active_tool_budgets["thread"].calls_remaining
         return (
             "The target changed, so I did not overwrite it.",
             AgentTokenUsage(total_tokens=2),
@@ -4037,11 +4016,126 @@ def test_discord_visibility_observation_is_advisory_not_authority() -> None:
         ),
     )
 
-    assert budget.discord_disclosure_observations == [
-        ("other-guild", "private-channel", "broader")
-    ]
+    assert budget.discord_disclosure_observations == [("other-guild", "private-channel", "broader")]
     assert set(budget.authorization_contexts) == {"auth_trigger"}
     assert budget.read_authorization_event_ids == {"auth_trigger"}
+
+
+def test_app_server_jsonl_encoder_rejects_an_unbounded_tool_result() -> None:
+    with pytest.raises(_AppServerTransportError) as raised:
+        _encode_app_server_message(
+            {
+                "id": 1,
+                "result": {
+                    "contentItems": [
+                        {
+                            "type": "inputImage",
+                            "imageUrl": (
+                                "data:image/png;base64," + "A" * _APP_SERVER_INPUT_LINE_LIMIT_BYTES
+                            ),
+                        }
+                    ]
+                },
+            }
+        )
+
+    assert raised.value.diagnostic == {
+        "direction": "host_to_app_server",
+        "encoded_bytes": raised.value.diagnostic["encoded_bytes"],
+        "maximum_bytes": _APP_SERVER_INPUT_LINE_LIMIT_BYTES,
+        "message_kind": "response",
+    }
+    assert cast(int, raised.value.diagnostic["encoded_bytes"]) > _APP_SERVER_INPUT_LINE_LIMIT_BYTES
+
+
+@pytest.mark.asyncio
+async def test_provider_reader_accepts_historical_three_megabyte_image_echo(
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-large-jsonl",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    stdout = asyncio.StreamReader(limit=_APP_SERVER_STDOUT_LIMIT_BYTES)
+    process = _FakeCodexProcess(stdout)
+    provider._process = cast(asyncio.subprocess.Process, process)
+    notifications: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    provider._notification_queues["thread"] = notifications
+    payload = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread",
+            "turnId": "turn",
+            "item": {
+                "type": "dynamicToolCall",
+                "contentItems": [
+                    {
+                        "type": "inputImage",
+                        # The 2026-07-30 incident emitted 3,168,758 bytes.
+                        "imageUrl": "data:image/png;base64," + "A" * 3_165_478,
+                    }
+                ],
+            },
+        },
+    }
+    encoded = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    assert 3_000_000 < len(encoded) < _APP_SERVER_STDOUT_LIMIT_BYTES
+
+    reader = asyncio.create_task(provider._reader_loop(process))  # type: ignore[arg-type]
+    stdout.feed_data(encoded)
+    method, params = await asyncio.wait_for(notifications.get(), timeout=1)
+
+    assert method == "item/completed"
+    assert params["turnId"] == "turn"
+    assert not reader.done()
+
+    provider._expected_process_exits.add(id(process))
+    stdout.feed_eof()
+    await asyncio.wait_for(reader, timeout=1)
+    assert process.killed is False
+
+
+@pytest.mark.asyncio
+async def test_provider_reader_failure_reaches_active_turn_immediately(
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-broken-jsonl",
+        idle_timeout_seconds=30,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    stdout = asyncio.StreamReader(limit=_APP_SERVER_STDOUT_LIMIT_BYTES)
+    process = _FakeCodexProcess(stdout)
+    provider._process = cast(asyncio.subprocess.Process, process)
+    provider._thread_by_turn["turn"] = "thread"
+    attempt = _TurnAttemptState()
+    turn = asyncio.create_task(provider._await_turn("thread", "turn", attempt_state=attempt))
+    await asyncio.sleep(0)
+    reader = asyncio.create_task(provider._reader_loop(process))  # type: ignore[arg-type]
+
+    stdout.feed_data(
+        b"{" + b"x" * (_APP_SERVER_STDOUT_LIMIT_BYTES + 1) + b"\n"
+    )
+    stdout.feed_eof()
+
+    with pytest.raises(_AppServerTransportError):
+        await asyncio.wait_for(turn, timeout=1)
+    await asyncio.wait_for(reader, timeout=1)
+
+    assert process.terminated is True
+    assert attempt.diagnostic["reader_error_type"] == "ValueError"
+    assert attempt.diagnostic["stdout_limit_bytes"] == _APP_SERVER_STDOUT_LIMIT_BYTES
 
 
 @pytest.mark.asyncio
@@ -4295,11 +4389,7 @@ async def test_provider_steers_active_turn_and_requires_follow_up_read(
     )
 
     accepted = await provider.steer(
-        event_prompt=(
-            "SIMAJILORD_FOLLOW_UP_V1\n"
-            "message_id=follow-up\n"
-            "actor_id=follow-up-user"
-        ),
+        event_prompt=("SIMAJILORD_FOLLOW_UP_V1\nmessage_id=follow-up\nactor_id=follow-up-user"),
         context=context,
     )
 
@@ -4329,9 +4419,7 @@ async def test_provider_steers_active_turn_and_requires_follow_up_read(
     assert budget.follow_up_message_ids == {"follow-up"}
     assert budget.read_follow_up_message_ids == set()
     assert budget.authorization_contexts["auth_follow-up-token"] == context
-    assert budget.authorization_message_ids["auth_follow-up-token"] == (
-        "follow-up"
-    )
+    assert budget.authorization_message_ids["auth_follow-up-token"] == ("follow-up")
 
 
 @pytest.mark.asyncio
@@ -4426,7 +4514,7 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "Search before saving" in instructions
     assert "Forget only when explicitly asked" in normalized
     assert "secrets" in instructions
-    assert "profiles, and guesses" in instructions
+    assert "profiles, and guesses" in normalized
     assert "it is final" in instructions
     assert "image.generate waits for a terminal result" in normalized
     assert "call discord.send_file" in instructions
@@ -4446,9 +4534,7 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
 
 def test_user_error_reason_explains_stale_undo_and_preserves_unknown_code() -> None:
     assert "target changed" in _user_error_reason("action.undo_conflict")
-    assert "discord.permission_denied" in _user_error_reason(
-        "discord.permission_denied"
-    )
+    assert "discord.permission_denied" in _user_error_reason("discord.permission_denied")
 
 
 def test_codex_live_search_requires_the_existing_web_grant() -> None:
@@ -4544,9 +4630,7 @@ def test_bounded_json_preserves_discord_search_continuation_metadata() -> None:
     assert decoded["truncated"] is True
     visible_ids = [item["message_id"] for item in decoded["messages"]]
     assert visible_ids
-    assert visible_ids == [
-        item["message_id"] for item in messages[: len(visible_ids)]
-    ]
+    assert visible_ids == [item["message_id"] for item in messages[: len(visible_ids)]]
     assert decoded["next_before_message_id"] == visible_ids[-1]
     assert decoded["next_after_message_id"] is None
     assert decoded["has_more"] is True

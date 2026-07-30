@@ -279,13 +279,11 @@ async def test_agent_file_delivery_uses_the_guild_upload_limit(
     guild.filesize_limit = 4
     channel = Mock(spec=discord.TextChannel)
     channel.send = AsyncMock()
+    actor = Mock(spec=discord.Member)
+    bot = Mock(spec=discord.Member)
     monkeypatch.setattr(
-        "simajilord.integrations.discord.capabilities._guild",
-        lambda client, context: guild,
-    )
-    monkeypatch.setattr(
-        "simajilord.integrations.discord.capabilities._message_channel",
-        lambda selected_guild, channel_id: channel,
+        "simajilord.integrations.discord.capabilities._write_message_channel",
+        AsyncMock(return_value=(guild, channel, actor, bot)),
     )
     endpoints = {
         item.descriptor.name: item
@@ -331,11 +329,14 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
         content: str | None,
         *,
         file: discord.File,
+        nonce: str,
         allowed_mentions: discord.AllowedMentions,
         suppress_embeds: bool,
     ) -> discord.Message:
         del content, allowed_mentions
         assert suppress_embeds is True
+        assert nonce.startswith("sla")
+        assert len(nonce) == 25
         runtime.files.import_bytes("guild", "result.bin", b"newer")
         assert file.fp.read() == b"authorized"
         return sent
@@ -1115,7 +1116,6 @@ async def test_automatic_message_translation_does_not_fix_detected_source() -> N
                     translation="これは十分に長く、明確な英語の文です。",
                     source_language="en",
                     target_language="ja",
-                    provider="Apple Translation",
                     segments=(
                         DiscordTranslatedSegmentRecord(
                             identifier="content",
@@ -1353,7 +1353,6 @@ def test_structured_translation_extracts_and_rebuilds_discord_message() -> None:
         translation="\n".join(f"T:{item.text}" for item in segments),
         source_language="en",
         target_language="ja",
-        provider="test",
         segments=tuple(
             DiscordTranslatedSegmentRecord(
                 identifier=item.identifier,
@@ -1768,6 +1767,55 @@ async def test_agent_read_aloud_mutation_requires_manage_server(
 
 
 @pytest.mark.asyncio
+async def test_administrator_bypasses_individual_manage_server_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = ReadAloudResponse(
+        action=ReadAloudAction.DISABLE.value,
+        enabled=False,
+        text_channel_id=None,
+        text_channel_ids=(),
+        audio_destination_id=None,
+        mode=None,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(return_value=response)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    member = Mock(spec=discord.Member)
+    member.guild_permissions = discord.Permissions(administrator=True)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    result = await endpoint_by_name["discord.manage_read_aloud"].invoke(
+        ReadAloudRequest(action=ReadAloudAction.DISABLE),
+        InvocationContext(
+            actor_id="7",
+            workspace_id="1",
+            transport="agent",
+            request_id="event",
+        ),
+    )
+
+    assert result == response
+    runtime.registry.invoke.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_read_aloud_self_mute_is_allowed_but_other_user_requires_admin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1902,6 +1950,12 @@ async def test_join_self_service_is_limited_to_current_channel_and_voice(
     guild.get_channel.return_value = voice
     member = Mock(spec=discord.Member)
     member.guild_permissions.manage_guild = False
+    bot = Mock(spec=discord.Member)
+    guild.me = bot
+    source.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._guild",
         lambda client, context: guild,
@@ -2788,20 +2842,24 @@ async def test_music_search_selection_updates_the_component_message(
     assert final_edit.kwargs["view"] is None
 
 
-def test_agent_conversation_key_is_shared_per_channel() -> None:
-    assert discord_conversation_id(guild_id=1, channel_id=2) == (
-        "discord:v2:guild:1:channel:2"
+def test_agent_conversation_key_is_private_per_actor_and_channel() -> None:
+    assert discord_conversation_id(guild_id=1, channel_id=2, actor_id=3) == (
+        "discord:v3:guild:1:channel:2:actor:3"
     )
-    assert discord_conversation_id(guild_id=None, channel_id=2) == (
-        "discord:v2:direct:channel:2"
+    assert discord_conversation_id(guild_id=None, channel_id=2, actor_id=3) == (
+        "discord:v3:direct:channel:2:actor:3"
     )
     assert (
         discord_conversation_id(
             guild_id=1,
             channel_id=2,
+            actor_id=3,
             grants=frozenset({AGENT_WEB_GRANT}),
         )
-        == "discord:v2:guild:1:channel:2:profile:web"
+        == "discord:v3:guild:1:channel:2:actor:3:profile:web"
+    )
+    assert discord_conversation_id(guild_id=1, channel_id=2, actor_id=4) != (
+        discord_conversation_id(guild_id=1, channel_id=2, actor_id=3)
     )
 
 
@@ -3273,7 +3331,7 @@ def test_hive_analysis_is_one_direct_attachment_command() -> None:
     }
     assert set(commands) == {"detect-ai", "download"}
     assert commands["detect-ai"].description == (
-        "Estimate AI-generation and deepfake likelihood with HIVE."
+        "Estimate AI-generation and deepfake likelihood."
     )
 
 
