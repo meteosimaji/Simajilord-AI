@@ -618,61 +618,10 @@ class SimajilordRuntime:
                 tuple(agent_capabilities),
                 required_grants=required_grants,
                 eager_capabilities=(
-                    "action.undo",
-                    "discord.list_servers",
-                    "discord.list_channels",
-                    "discord.list_archived_threads",
-                    "discord.list_roles",
-                    "discord.list_members",
-                    "discord.inspect_user",
-                    "discord.inspect_channel",
-                    "discord.list_voice_states",
-                    "discord.list_pins",
-                    "discord.list_reaction_users",
-                    "discord.list_poll_voters",
-                    "discord.list_thread_members",
-                    "discord.list_platform_resources",
                     "discord.get_message",
                     "discord.read_messages",
-                    "discord.search_messages",
-                    "discord.add_reaction",
-                    "discord.delete_own_message",
-                    "discord.remove_own_reaction",
-                    "discord.send_message",
-                    "discord.send_embed",
-                    "discord.view_image_attachment",
                     "memory.search",
-                    "memory.remember",
-                    "memory.update",
                     "web.search",
-                    "web.fetch",
-                    "web.find",
-                    *(
-                        ("image.generate", "image.status")
-                        if "image.generate" in agent_capabilities
-                        else ()
-                    ),
-                    *(
-                        ("workflow.search",)
-                        if curated_workflow_endpoint is not None
-                        else ()
-                    ),
-                    *(
-                        (
-                            "files.list",
-                            "files.read",
-                            "discord.import_attachment",
-                            "discord.send_file",
-                            "discord.send_files",
-                        )
-                        if files is not None
-                        else ()
-                    ),
-                    *(
-                        ("compute.run", "files.download_url")
-                        if compute is not None
-                        else ()
-                    ),
                 ),
                 write_capabilities=(
                     (
@@ -872,3 +821,4 @@ class SimajilordRuntime:
         await self.audio.close()
         await self.media.close()
         await self.speech.close()
+        await self.journal.close()

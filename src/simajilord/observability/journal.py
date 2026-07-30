@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -22,6 +23,10 @@ _SENSITIVE_PARTS = (
     "authorization",
     "data_url",
 )
+_AUDIT_QUEUE_MAX_EVENTS = 4_096
+_AUDIT_BATCH_MAX_EVENTS = 64
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,13 +50,39 @@ class OperationDiagnostics:
     dashboard_429_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingEvent:
+    occurred_at: str
+    kind: str
+    payload: dict[str, object]
+    actor_id: str | None
+    workspace_id: str | None
+    transport: str | None
+    request_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _FlushAuditQueue:
+    completed: asyncio.Future[None]
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseAuditQueue:
+    completed: asyncio.Future[None]
+
+
 class EventJournal:
     """Store capability and transport events for audit and agent reconciliation."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._audit_queue: asyncio.Queue[
+            _PendingEvent | _FlushAuditQueue | _CloseAuditQueue
+        ] = asyncio.Queue(maxsize=_AUDIT_QUEUE_MAX_EVENTS)
+        self._audit_writer_task: asyncio.Task[None] | None = None
+        self._closed = False
         self._initialize()
 
     async def record_invocation(
@@ -75,13 +106,19 @@ class EventJournal:
         else:
             payload["error_type"] = type(error).__name__
             payload["error_message"] = _bounded(str(error), 1_000)
-        await self.append(
-            kind="capability.invocation",
-            payload=payload,
-            actor_id=context.actor_id,
-            workspace_id=context.workspace_id,
-            transport=context.transport,
-            request_id=context.request_id,
+        if self._closed:
+            raise RuntimeError("Event journal is closed.")
+        self._ensure_audit_writer()
+        await self._audit_queue.put(
+            _PendingEvent(
+                occurred_at=datetime.now(UTC).isoformat(),
+                kind="capability.invocation",
+                payload=cast_payload(_safe_value(payload)),
+                actor_id=context.actor_id,
+                workspace_id=context.workspace_id,
+                transport=context.transport,
+                request_id=context.request_id,
+            )
         )
 
     async def append(
@@ -94,17 +131,21 @@ class EventJournal:
         transport: str | None = None,
         request_id: str | None = None,
     ) -> int:
-        safe_payload = cast_payload(_safe_value(payload))
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._insert,
-                kind,
-                safe_payload,
-                actor_id,
-                workspace_id,
-                transport,
-                request_id,
-            )
+        """Durably append an explicit event before returning its sequence."""
+
+        if self._closed:
+            raise RuntimeError("Event journal is closed.")
+        pending = _PendingEvent(
+            occurred_at=datetime.now(UTC).isoformat(),
+            kind=kind,
+            payload=cast_payload(_safe_value(payload)),
+            actor_id=actor_id,
+            workspace_id=workspace_id,
+            transport=transport,
+            request_id=request_id,
+        )
+        async with self._write_lock:
+            return await asyncio.to_thread(self._insert, pending)
 
     async def recent(
         self,
@@ -114,30 +155,132 @@ class EventJournal:
         limit: int = 100,
     ) -> tuple[EventRecord, ...]:
         bounded_limit = min(max(limit, 1), 1_000)
-        async with self._lock:
-            return await asyncio.to_thread(
-                self._select,
-                after_sequence,
-                workspace_id,
-                bounded_limit,
-            )
+        await self._flush_audit_queue()
+        return await asyncio.to_thread(
+            self._select,
+            after_sequence,
+            workspace_id,
+            bounded_limit,
+        )
 
     async def latest_sequence(self) -> int:
-        async with self._lock:
-            return await asyncio.to_thread(self._latest_sequence)
+        """Return the latest committed cursor without waiting for queued audits."""
+
+        return await asyncio.to_thread(self._latest_sequence)
 
     async def prune(self, *, before: datetime) -> int:
         """Delete retained events older than an explicit UTC cutoff."""
 
         cutoff = _utc_iso(before)
-        async with self._lock:
+        await self._flush_audit_queue()
+        async with self._write_lock:
             return await asyncio.to_thread(self._prune, cutoff)
 
     async def operation_diagnostics(self) -> OperationDiagnostics:
-        """Summarise the failure signals surfaced by ``/status``."""
+        """Read the committed O(1) status projection without waiting for audits."""
 
-        async with self._lock:
-            return await asyncio.to_thread(self._operation_diagnostics)
+        return await asyncio.to_thread(self._operation_diagnostics)
+
+    async def close(self) -> None:
+        """Flush capability audits and stop the lazy writer."""
+
+        if self._closed:
+            return
+        self._closed = True
+        await self._flush_audit_queue()
+        task = self._audit_writer_task
+        if task is None or task.done():
+            if task is not None:
+                self._consume_writer_result(task)
+            self._audit_writer_task = None
+            return
+        loop = asyncio.get_running_loop()
+        completed = loop.create_future()
+        await self._audit_queue.put(_CloseAuditQueue(completed))
+        await completed
+        await task
+        self._audit_writer_task = None
+
+    def _ensure_audit_writer(self) -> None:
+        task = self._audit_writer_task
+        if task is not None and task.done():
+            self._consume_writer_result(task)
+            task = None
+            self._audit_writer_task = None
+        if task is None:
+            self._audit_writer_task = asyncio.create_task(
+                self._audit_writer(),
+                name="simajilord-event-journal-audit-writer",
+            )
+
+    @staticmethod
+    def _consume_writer_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            log.warning("Capability audit writer was cancelled.")
+        except Exception:
+            log.exception("Capability audit writer stopped unexpectedly.")
+
+    async def _flush_audit_queue(self) -> None:
+        task = self._audit_writer_task
+        if self._audit_queue.empty() and (task is None or task.done()):
+            if task is not None:
+                self._consume_writer_result(task)
+                self._audit_writer_task = None
+            return
+        self._ensure_audit_writer()
+        loop = asyncio.get_running_loop()
+        completed = loop.create_future()
+        await self._audit_queue.put(_FlushAuditQueue(completed))
+        await completed
+
+    async def _audit_writer(self) -> None:
+        while True:
+            item = await self._audit_queue.get()
+            if isinstance(item, _PendingEvent):
+                batch = [item]
+                control: _FlushAuditQueue | _CloseAuditQueue | None = None
+                while len(batch) < _AUDIT_BATCH_MAX_EVENTS:
+                    try:
+                        queued = self._audit_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if isinstance(queued, _PendingEvent):
+                        batch.append(queued)
+                    else:
+                        control = queued
+                        break
+                await self._write_audit_batch_safely(tuple(batch))
+                for _ in batch:
+                    self._audit_queue.task_done()
+                if control is not None:
+                    should_close = isinstance(control, _CloseAuditQueue)
+                    if not control.completed.done():
+                        control.completed.set_result(None)
+                    self._audit_queue.task_done()
+                    if should_close:
+                        return
+                continue
+            should_close = isinstance(item, _CloseAuditQueue)
+            if not item.completed.done():
+                item.completed.set_result(None)
+            self._audit_queue.task_done()
+            if should_close:
+                return
+
+    async def _write_audit_batch_safely(
+        self,
+        batch: tuple[_PendingEvent, ...],
+    ) -> None:
+        try:
+            async with self._write_lock:
+                await asyncio.to_thread(self._insert_batch, batch)
+        except Exception:
+            log.exception(
+                "Capability audit batch persistence failed events=%s",
+                len(batch),
+            )
 
     def _initialize(self) -> None:
         connection = sqlite3.connect(self.path)
@@ -161,45 +304,135 @@ class EventJournal:
                 "CREATE INDEX IF NOT EXISTS events_workspace_sequence "
                 "ON events(workspace_id, sequence)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS events_kind_sequence "
+                "ON events(kind, sequence)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS operation_diagnostics (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    last_radio_failure_at TEXT,
+                    overlay_failure_count INTEGER NOT NULL,
+                    dashboard_429_count INTEGER NOT NULL,
+                    projected_through_sequence INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO operation_diagnostics(
+                    singleton,
+                    last_radio_failure_at,
+                    overlay_failure_count,
+                    dashboard_429_count,
+                    projected_through_sequence
+                ) VALUES (1, NULL, 0, 0, 0)
+                """
+            )
+            projected = connection.execute(
+                """
+                SELECT projected_through_sequence
+                FROM operation_diagnostics
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            retained = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0)
+                FROM events
+                WHERE kind = 'service.operation'
+                """
+            ).fetchone()
+            if (
+                projected is None
+                or retained is None
+                or int(projected[0]) != int(retained[0])
+            ):
+                self._rebuild_operation_projection(connection)
             connection.commit()
         finally:
             connection.close()
         os.chmod(self.path, 0o600)
 
-    def _insert(
-        self,
-        kind: str,
-        payload: dict[str, object],
-        actor_id: str | None,
-        workspace_id: str | None,
-        transport: str | None,
-        request_id: str | None,
-    ) -> int:
+    def _insert(self, event: _PendingEvent) -> int:
         connection = sqlite3.connect(self.path)
         try:
-            cursor = connection.execute(
-                """
-                INSERT INTO events(
-                    occurred_at, kind, actor_id, workspace_id, transport,
-                    request_id, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    datetime.now(UTC).isoformat(),
-                    kind,
-                    actor_id,
-                    workspace_id,
-                    transport,
-                    request_id,
-                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                ),
-            )
+            sequence = self._insert_one(connection, event)
             connection.commit()
-            if cursor.lastrowid is None:
-                raise RuntimeError("SQLite did not return an event sequence.")
-            return cursor.lastrowid
+            return sequence
         finally:
             connection.close()
+
+    def _insert_batch(self, events: tuple[_PendingEvent, ...]) -> None:
+        connection = sqlite3.connect(self.path)
+        try:
+            for event in events:
+                self._insert_one(connection, event)
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _insert_one(
+        self,
+        connection: sqlite3.Connection,
+        event: _PendingEvent,
+    ) -> int:
+        cursor = connection.execute(
+            """
+            INSERT INTO events(
+                occurred_at, kind, actor_id, workspace_id, transport,
+                request_id, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.occurred_at,
+                event.kind,
+                event.actor_id,
+                event.workspace_id,
+                event.transport,
+                event.request_id,
+                json.dumps(event.payload, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return an event sequence.")
+        sequence = int(cursor.lastrowid)
+        self._project_operation_event(connection, sequence, event)
+        return sequence
+
+    @staticmethod
+    def _project_operation_event(
+        connection: sqlite3.Connection,
+        sequence: int,
+        event: _PendingEvent,
+    ) -> None:
+        if event.kind != "service.operation":
+            return
+        operation = event.payload.get("operation")
+        outcome = event.payload.get("outcome")
+        radio_failed = operation == "audio.autoplay_refill" and outcome == "failed"
+        connection.execute(
+            """
+            UPDATE operation_diagnostics
+            SET
+                last_radio_failure_at = CASE
+                    WHEN ? THEN ?
+                    ELSE last_radio_failure_at
+                END,
+                overlay_failure_count = overlay_failure_count + ?,
+                dashboard_429_count = dashboard_429_count + ?,
+                projected_through_sequence = MAX(projected_through_sequence, ?)
+            WHERE singleton = 1
+            """,
+            (
+                radio_failed,
+                event.occurred_at,
+                int(operation == "audio.overlay_failed"),
+                int(operation == "discord.dashboard_429"),
+                sequence,
+            ),
+        )
 
     def _select(
         self,
@@ -247,6 +480,7 @@ class EventJournal:
                 "DELETE FROM events WHERE occurred_at < ?",
                 (cutoff,),
             )
+            self._rebuild_operation_projection(connection)
             connection.commit()
             return cursor.rowcount
         finally:
@@ -256,40 +490,83 @@ class EventJournal:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         try:
-            rows = connection.execute(
+            row = connection.execute(
                 """
-                SELECT occurred_at, payload_json
-                FROM events
-                WHERE kind = 'service.operation'
-                ORDER BY sequence
+                SELECT
+                    last_radio_failure_at,
+                    overlay_failure_count,
+                    dashboard_429_count
+                FROM operation_diagnostics
+                WHERE singleton = 1
                 """
-            ).fetchall()
+            ).fetchone()
         finally:
             connection.close()
-        last_radio_failure_at: datetime | None = None
-        overlay_failure_count = 0
-        dashboard_429_count = 0
-        for row in rows:
-            try:
-                payload = json.loads(str(row["payload_json"]))
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            operation = payload.get("operation")
-            outcome = payload.get("outcome")
-            if operation == "audio.autoplay_refill" and outcome == "failed":
-                last_radio_failure_at = datetime.fromisoformat(
-                    str(row["occurred_at"])
-                )
-            elif operation == "audio.overlay_failed":
-                overlay_failure_count += 1
-            elif operation == "discord.dashboard_429":
-                dashboard_429_count += 1
+        if row is None:
+            return OperationDiagnostics(None, 0, 0)
+        raw_radio_failure = row["last_radio_failure_at"]
         return OperationDiagnostics(
-            last_radio_failure_at=last_radio_failure_at,
-            overlay_failure_count=overlay_failure_count,
-            dashboard_429_count=dashboard_429_count,
+            last_radio_failure_at=(
+                datetime.fromisoformat(str(raw_radio_failure))
+                if raw_radio_failure is not None
+                else None
+            ),
+            overlay_failure_count=int(row["overlay_failure_count"]),
+            dashboard_429_count=int(row["dashboard_429_count"]),
+        )
+
+    @staticmethod
+    def _rebuild_operation_projection(connection: sqlite3.Connection) -> None:
+        """Rebuild the retained-event projection during migration or pruning."""
+
+        summary = connection.execute(
+            """
+            WITH service_events AS (
+                SELECT
+                    sequence,
+                    CASE
+                        WHEN json_valid(payload_json)
+                        THEN json_extract(payload_json, '$.operation')
+                    END AS operation
+                FROM events
+                WHERE kind = 'service.operation'
+            )
+            SELECT
+                COALESCE(SUM(operation = 'audio.overlay_failed'), 0),
+                COALESCE(SUM(operation = 'discord.dashboard_429'), 0),
+                COALESCE(MAX(sequence), 0)
+            FROM service_events
+            """
+        ).fetchone()
+        radio = connection.execute(
+            """
+            SELECT occurred_at
+            FROM events
+            WHERE kind = 'service.operation'
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.operation') = 'audio.autoplay_refill'
+              AND json_extract(payload_json, '$.outcome') = 'failed'
+            ORDER BY sequence DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        assert summary is not None
+        connection.execute(
+            """
+            UPDATE operation_diagnostics
+            SET
+                last_radio_failure_at = ?,
+                overlay_failure_count = ?,
+                dashboard_429_count = ?,
+                projected_through_sequence = ?
+            WHERE singleton = 1
+            """,
+            (
+                str(radio[0]) if radio is not None else None,
+                int(summary[0]),
+                int(summary[1]),
+                int(summary[2]),
+            ),
         )
 
     def _latest_sequence(self) -> int:

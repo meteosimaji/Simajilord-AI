@@ -38,6 +38,7 @@ from simajilord.agent.providers.codex import (
     _base_instructions,
     _batched_event_message_ids,
     _blocking_write_capability,
+    _continuation_tool_budget,
     _encode_app_server_message,
     _event_trigger,
     _is_final_delivery,
@@ -509,6 +510,93 @@ def test_later_failed_write_is_not_hidden_by_an_earlier_success() -> None:
         output='{"truncated":true,"preview":"partial"}',
         required_message_id="4",
     )
+
+
+def test_continuation_budget_preserves_cumulative_write_and_delivery_state() -> None:
+    context = InvocationContext("actor", "workspace", "agent", "event")
+    source = _ToolTurnBudget(
+        context=context,
+        calls_remaining=1,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id="trigger",
+        authorization_contexts={"authorization": context},
+        authorization_message_ids={"authorization": "trigger"},
+        read_authorization_event_ids={"authorization"},
+        event_message_read=True,
+        follow_up_message_ids={"follow-up"},
+        read_follow_up_message_ids={"follow-up"},
+        write_successes={"discord.send_message"},
+        write_failures=[("discord.speak", "audio.not_connected")],
+        write_attempts={"discord.send_message", "discord.speak"},
+        final_delivery_successes={"discord.send_message"},
+        last_write_authorization_event_id="authorization",
+        discord_disclosure_observations=[("guild", "channel", "full")],
+    )
+
+    continued = _continuation_tool_budget(
+        source,
+        fallback_context=context,
+        calls_remaining=0,
+        output_characters_remaining=400,
+        fallback_progress=None,
+    )
+
+    assert continued.required_message_id is None
+    assert continued.calls_remaining == 0
+    assert continued.event_message_read is True
+    assert continued.follow_up_message_ids == {"follow-up"}
+    assert continued.read_follow_up_message_ids == {"follow-up"}
+    assert continued.write_successes == {"discord.send_message"}
+    assert continued.write_failures == [("discord.speak", "audio.not_connected")]
+    assert continued.write_attempts == {"discord.send_message", "discord.speak"}
+    assert continued.final_delivery_successes == {"discord.send_message"}
+    assert continued.last_write_authorization_event_id == "authorization"
+    assert continued.discord_disclosure_observations == [
+        ("guild", "channel", "full")
+    ]
+    continued.write_attempts.add("discord.send_embed")
+    assert "discord.send_embed" not in source.write_attempts
+
+
+@pytest.mark.asyncio
+async def test_provider_thread_lock_is_removed_only_after_the_last_waiter(
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-lock",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def first() -> None:
+        async with provider._thread_lock("request:event"):
+            first_entered.set()
+            await release_first.wait()
+
+    async def second() -> None:
+        await first_entered.wait()
+        async with provider._thread_lock("request:event"):
+            second_entered.set()
+
+    first_task = asyncio.create_task(first())
+    second_task = asyncio.create_task(second())
+    await first_entered.wait()
+    await asyncio.sleep(0)
+    assert provider._thread_locks["request:event"].users == 2
+    release_first.set()
+    await second_entered.wait()
+    await asyncio.gather(first_task, second_task)
+
+    assert provider._thread_locks == {}
 
 
 def test_optional_progress_failure_does_not_replace_the_final_answer() -> None:
@@ -2530,6 +2618,7 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
     assert isinstance(tools, list)
     assert [tool["name"] for tool in tools] == [
         "test_read",
+        "capability_list",
         "capability_search",
         "capability_invoke",
     ]
@@ -2637,6 +2726,8 @@ def test_agent_tool_catalog_rejects_duplicate_allowlist_entries() -> None:
         AgentToolCatalog(registry, ("test.a-b", "test.a_b"))
     with pytest.raises(AgentToolError, match="reserved"):
         AgentToolCatalog(registry, ("capability.search",))
+    with pytest.raises(AgentToolError, match="reserved"):
+        AgentToolCatalog(registry, ("capability.list",))
 
 
 def test_agent_tool_schema_cannot_shadow_broker_authorization_field() -> None:
@@ -2812,7 +2903,17 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
 
     first = await browse({"limit": 2})
     second = await browse({"query": "", "offset": first["next_offset"], "limit": 2})
-    general = await browse({"query": "何ができますか?", "limit": 2})
+    general_queries = (
+        "何ができますか?",
+        "どんなことができる?",
+        "何ができるの?",
+        "利用可能な操作を全部見せて",
+        "show every available operation",
+    )
+    general_pages = [
+        await browse({"query": query, "limit": 2})
+        for query in general_queries
+    ]
     wide = await browse({"query": "", "limit": 6})
 
     assert first["browse"] is True
@@ -2828,9 +2929,86 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
     assert [item["name"] for item in second["matches"]] == ["test.gamma"]
     assert second["next_offset"] is None
     assert second["has_more"] is False
-    assert general["matches"] == first["matches"]
+    assert all(page["browse"] is True for page in general_pages)
+    assert all(page["matches"] == first["matches"] for page in general_pages)
     assert len(wide["matches"]) == 3
     assert all(item["invoke_with"] == "capability_invoke" for item in wide["matches"])
+
+
+@pytest.mark.asyncio
+async def test_capability_list_uses_compact_opaque_cursor_pages() -> None:
+    registry = CapabilityRegistry()
+
+    async def read(
+        request: ReadRequest,
+        _: InvocationContext,
+    ) -> ReadResponse:
+        return ReadResponse(str(request.offset), None)
+
+    for name in ("test.alpha", "test.beta", "test.gamma"):
+        registry.register(
+            endpoint(
+                CapabilityDescriptor(name, f"Read {name}.", RiskLevel.READ),
+                ReadRequest,
+                ReadResponse,
+                read,
+            )
+        )
+    catalog = AgentToolCatalog(
+        registry,
+        ("test.alpha", "test.beta", "test.gamma"),
+        eager_capabilities=(),
+    )
+    context = InvocationContext("actor", "workspace", "agent", "list")
+    charged = 0
+
+    def charge() -> None:
+        nonlocal charged
+        charged += 1
+
+    first_output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_list",
+        arguments={"limit": 2},
+        context=context,
+        max_output_characters=8_000,
+        before_invoke=charge,
+    )
+    first = json.loads(first_output.text)
+    assert [item["name"] for item in first["tools"]] == [
+        "test.alpha",
+        "test.beta",
+    ]
+    assert all("input_schema" not in item for item in first["tools"])
+    assert isinstance(first["next_cursor"], str)
+    assert first["next_cursor"] != "2"
+    assert first["has_more"] is True
+    assert charged == 1
+
+    second_output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_list",
+        arguments={"cursor": first["next_cursor"], "limit": 2},
+        context=context,
+        max_output_characters=8_000,
+        before_invoke=charge,
+    )
+    second = json.loads(second_output.text)
+    assert [item["name"] for item in second["tools"]] == ["test.gamma"]
+    assert second["next_cursor"] is None
+    assert second["has_more"] is False
+    assert charged == 2
+
+    with pytest.raises(AgentToolError, match="cursor is invalid"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="capability_list",
+            arguments={"cursor": "not-a-valid-cursor"},
+            context=context,
+            max_output_characters=8_000,
+            before_invoke=charge,
+        )
+    assert charged == 2
 
 
 @pytest.mark.asyncio
@@ -2937,6 +3115,7 @@ async def test_capability_browse_reports_only_coarse_unavailable_counts() -> Non
     tools = specs[0]["tools"]
     assert [tool["name"] for tool in tools] == [
         "test_open",
+        "capability_list",
         "capability_search",
     ]
     output = await catalog.invoke(
@@ -3171,14 +3350,24 @@ async def test_provider_rejects_write_before_exact_event_is_read(
     await provider._handle_dynamic_tool(1, request)
 
     assert invoked == []
+    assert budget.calls_remaining == 4
     first_response = response.await_args
     assert first_response is not None
     assert first_response.kwargs["success"] is False
     assert budget.write_failures == [("test.write", "agent.event_message_not_read")]
     budget.event_message_read = True
     budget.read_authorization_event_ids.add("event")
-    await provider._handle_dynamic_tool(2, request)
+    invalid_request = {
+        **request,
+        "arguments": {"authorization_event_id": "event"},
+    }
+    await provider._handle_dynamic_tool(2, invalid_request)
+    assert invoked == []
+    assert budget.calls_remaining == 4
+    await provider._handle_dynamic_tool(3, request)
     assert invoked == ["requested"]
+    assert budget.calls_remaining == 3
+    assert budget.write_attempts == {"test.write"}
     second_response = response.await_args
     assert second_response is not None
     assert second_response.kwargs["success"] is True
@@ -3886,6 +4075,104 @@ async def test_provider_uses_escalation_model_only_for_verified_write_recovery(
     assert "unverified success" in correction_prompt
     assert result.model == "escalation-model"
     assert result.content == "verified failure explanation"
+
+
+@pytest.mark.asyncio
+async def test_correction_timeout_keeps_prior_write_and_final_delivery_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        return WriteResponse(job_id=request.subject)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.send_message",
+                "Perform one non-idempotent final delivery.",
+                RiskLevel.WRITE,
+            ),
+            WriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="primary-model",
+        escalation_model="escalation-model",
+        workspace_dir=tmp_path / "agent-correction-timeout",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(
+            registry,
+            ("discord.send_message",),
+            required_grants={"discord.send_message": "write-scope"},
+            write_capabilities=("discord.send_message",),
+        ),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(
+            side_effect=[
+                {"turn": {"id": "turn-primary"}},
+                {"turn": {"id": "turn-correction"}},
+            ]
+        ),
+    )
+    monkeypatch.setattr(provider, "_interrupt_quietly", AsyncMock())
+    await_count = 0
+
+    async def await_turn(
+        _thread_id: str,
+        _turn_id: str,
+        **_kwargs: object,
+    ) -> tuple[str, AgentTokenUsage]:
+        nonlocal await_count
+        await_count += 1
+        if await_count == 1:
+            budget = provider._active_tool_budgets["thread"]
+            budget.write_attempts.add("discord.send_message")
+            budget.write_successes.add("discord.send_message")
+            budget.final_delivery_successes.add("discord.send_message")
+            budget.write_failures.append(
+                ("discord.send_message", "discord.forbidden")
+            )
+            return "draft", AgentTokenUsage(total_tokens=1)
+        raise TimeoutError
+
+    monkeypatch.setattr(provider, "_await_turn", await_turn)
+    attempt_state = _TurnAttemptState()
+
+    with pytest.raises(TimeoutError):
+        await provider._respond_with_idle_watchdog(
+            provider_thread_id=None,
+            event_prompt="SIMAJILORD_EVENT_V1\ntrigger=autonomous\nmessage_id=none",
+            context=InvocationContext(
+                "actor",
+                "workspace",
+                "agent",
+                "event",
+                grants=frozenset({"write-scope"}),
+            ),
+            attempt_state=attempt_state,
+        )
+
+    assert attempt_state.write_attempted is True
+    assert attempt_state.final_delivery_successes == frozenset(
+        {"discord.send_message"}
+    )
+    assert provider._thread_locks == {}
 
 
 @pytest.mark.asyncio
@@ -4703,9 +4990,10 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "thoughtful member of the current Discord conversation" in instructions
     assert "Never pretend to be human" in instructions
     assert "capability_search" in instructions
-    assert "concrete action-and-object query" in instructions
-    assert "refine once" in instructions
-    assert "call capability_invoke with only fields defined by that schema" in instructions
+    assert "capability_list" in instructions
+    assert "one verb-object query" in instructions
+    assert "retry once with a synonym" in instructions
+    assert "capability_invoke only defined fields" in normalized
     assert "do not search merely to use a tool" in normalized
     assert "Concise means" in instructions
     assert "not minimizing substance" in normalized

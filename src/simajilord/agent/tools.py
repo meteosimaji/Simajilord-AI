@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
 import json
 import logging
 import math
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -27,11 +29,13 @@ from .actions import ActionReceipt, ActionReceiptService
 from .errors import AgentToolError
 
 _TOOL_NAMESPACE = "simajilord"
+_LIST_TOOL = "capability_list"
 _SEARCH_TOOL = "capability_search"
 _INVOKE_TOOL = "capability_invoke"
 _AUTHORIZATION_EVENT_ID = "authorization_event_id"
 _MAX_CAPABILITY_SEARCH_OFFSET = 10_000
 _MAX_CAPABILITY_SEARCH_LIMIT = 25
+_CAPABILITY_LIST_CURSOR_PREFIX = "simajilord-tools-v1:"
 _CAPABILITY_BROWSE_QUERIES = frozenset(
     {
         "abilities",
@@ -203,7 +207,7 @@ class AgentToolCatalog:
         aliases: dict[str, str] = {}
         for capability_name in self._allowed_capabilities:
             alias = _tool_alias(capability_name)
-            if alias in {_SEARCH_TOOL, _INVOKE_TOOL}:
+            if alias in {_LIST_TOOL, _SEARCH_TOOL, _INVOKE_TOOL}:
                 raise AgentToolError(
                     f"Dynamic tool alias is reserved by the capability broker: {alias}"
                 )
@@ -371,6 +375,7 @@ class AgentToolCatalog:
                 }
             )
         if hidden_configured:
+            tools.append(_list_spec())
             tools.append(_search_spec())
         if hidden_available:
             tools.append(_invoke_spec())
@@ -381,8 +386,8 @@ class AgentToolCatalog:
                 "type": "namespace",
                 "name": self.namespace,
                 "description": (
-                    "Typed Simajilord capabilities. Search only when a requested action "
-                    "needs a capability that is not already shown."
+                    "Typed Simajilord capabilities. List compact summaries for general "
+                    "ability questions; search only for a concrete requested action."
                 ),
                 "tools": tools,
             },
@@ -396,15 +401,26 @@ class AgentToolCatalog:
         arguments: object,
         context: InvocationContext,
         max_output_characters: int,
+        before_invoke: Callable[[], None] | None = None,
     ) -> AgentToolOutput:
         if namespace != self.namespace:
             raise AgentToolError("The dynamic tool namespace is not allowed.")
+        if tool_name == _LIST_TOOL:
+            return AgentToolOutput(
+                self._list(
+                    arguments,
+                    context=context,
+                    max_output_characters=max_output_characters,
+                    before_invoke=before_invoke,
+                )
+            )
         if tool_name == _SEARCH_TOOL:
             return AgentToolOutput(
                 self._search(
                     arguments,
                     context=context,
                     max_output_characters=max_output_characters,
+                    before_invoke=before_invoke,
                 )
             )
         if tool_name == _INVOKE_TOOL:
@@ -412,6 +428,7 @@ class AgentToolCatalog:
                 arguments,
                 context=context,
                 max_output_characters=max_output_characters,
+                before_invoke=before_invoke,
             )
         try:
             capability_name = self._aliases[tool_name]
@@ -424,6 +441,89 @@ class AgentToolCatalog:
             _without_authorization_event_id(arguments),
             context=context,
             max_output_characters=max_output_characters,
+            before_invoke=before_invoke,
+        )
+
+    def _list(
+        self,
+        arguments: object,
+        *,
+        context: InvocationContext,
+        max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
+    ) -> str:
+        """List compact available tools without injecting every input schema."""
+
+        if not isinstance(arguments, dict):
+            raise AgentToolError("Capability list arguments must be an object.")
+        unknown = set(arguments) - {"cursor", "limit"}
+        if unknown:
+            raise AgentToolError(
+                f"Unknown capability list fields: {', '.join(sorted(unknown))}"
+            )
+        raw_cursor = arguments.get("cursor")
+        limit = arguments.get("limit", _MAX_CAPABILITY_SEARCH_LIMIT)
+        offset = _decode_capability_list_cursor(raw_cursor)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= _MAX_CAPABILITY_SEARCH_LIMIT
+        ):
+            raise AgentToolError(
+                "Capability list limit must be between 1 and "
+                f"{_MAX_CAPABILITY_SEARCH_LIMIT}."
+            )
+        if before_invoke is not None:
+            before_invoke()
+
+        registered = {
+            item.descriptor.name: item
+            for item in self._registry.all()
+            if item.descriptor.name in self._allowed_capabilities
+        }
+        available: list[Any] = []
+        unavailable_reason_counts: dict[str, int] = {}
+        for capability_name in sorted(self._allowed_capabilities):
+            reason = self._unavailable_reason(capability_name, context)
+            if reason is not None:
+                unavailable_reason_counts[reason] = (
+                    unavailable_reason_counts.get(reason, 0) + 1
+                )
+                continue
+            item = registered.get(capability_name)
+            if item is None:
+                # _unavailable_reason reports this as endpoint_unregistered.
+                continue
+            self._validated_endpoint(capability_name, context)
+            available.append(item)
+
+        page = available[offset : offset + limit]
+        next_offset = offset + len(page)
+        has_more = next_offset < len(available)
+        payload = {
+            "tools": [
+                {
+                    "name": item.descriptor.name,
+                    "summary": item.descriptor.summary,
+                    "risk": item.descriptor.risk.value,
+                    "invoke_with": _INVOKE_TOOL,
+                    "authorization_event_id_required": (
+                        item.descriptor.name in self._write_capabilities
+                    ),
+                }
+                for item in page
+            ],
+            "next_cursor": (
+                _encode_capability_list_cursor(next_offset) if has_more else None
+            ),
+            "has_more": has_more,
+            "total_results": len(available),
+            "unavailable_reason_counts": unavailable_reason_counts,
+        }
+        return _bounded_json(
+            payload,
+            max_output_characters=max_output_characters,
+            request={"cursor": raw_cursor},
         )
 
     def _search(
@@ -432,6 +532,7 @@ class AgentToolCatalog:
         *,
         context: InvocationContext,
         max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
     ) -> str:
         if not isinstance(arguments, dict):
             raise AgentToolError("Capability search arguments must be an object.")
@@ -463,6 +564,8 @@ class AgentToolCatalog:
                 "Capability search limit must be between 1 and "
                 f"{_MAX_CAPABILITY_SEARCH_LIMIT}."
             )
+        if before_invoke is not None:
+            before_invoke()
         browse = _is_capability_browse_query(query)
         registered = self._registry.all()
         candidates = (
@@ -541,6 +644,7 @@ class AgentToolCatalog:
         *,
         context: InvocationContext,
         max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
     ) -> AgentToolOutput:
         if not isinstance(arguments, dict):
             raise AgentToolError("Capability invocation arguments must be an object.")
@@ -564,6 +668,7 @@ class AgentToolCatalog:
             _without_authorization_event_id(capability_arguments),
             context=context,
             max_output_characters=max_output_characters,
+            before_invoke=before_invoke,
         )
 
     async def _invoke_capability(
@@ -573,11 +678,14 @@ class AgentToolCatalog:
         *,
         context: InvocationContext,
         max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
     ) -> AgentToolOutput:
         if not self._is_available(capability_name, context):
             raise AgentToolError("The dynamic tool grant is not present for this turn.")
         endpoint = self._validated_endpoint(capability_name, context)
         request = _build_dataclass(endpoint.request_type, arguments)
+        if before_invoke is not None:
+            before_invoke()
         result = await self._registry.invoke(capability_name, request, context)
         receipt: ActionReceipt | None = None
         if (
@@ -759,6 +867,35 @@ def _descriptor_description(descriptor: CapabilityDescriptor) -> str:
     return f"{descriptor.summary} Operational metadata: {'; '.join(constraints)}."
 
 
+def _list_spec() -> Mapping[str, object]:
+    return {
+        "type": "function",
+        "name": _LIST_TOOL,
+        "description": (
+            "List available Simajilord capabilities as compact summaries without loading "
+            "their input schemas. Use this for general ability questions. Copy next_cursor "
+            "unchanged into cursor until has_more is false, then use capability_search for "
+            "one concrete action and capability_invoke to execute it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cursor": {
+                    "type": "string",
+                    "description": "Copy next_cursor exactly; omit it for the first page.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _MAX_CAPABILITY_SEARCH_LIMIT,
+                    "default": _MAX_CAPABILITY_SEARCH_LIMIT,
+                },
+            },
+            "additionalProperties": False,
+        },
+    }
+
+
 def _search_spec() -> Mapping[str, object]:
     return {
         "type": "function",
@@ -806,7 +943,72 @@ def _search_spec() -> Mapping[str, object]:
 
 def _is_capability_browse_query(query: str) -> bool:
     normalized = normalize_search_text(query)
-    return not normalized or normalized in _CAPABILITY_BROWSE_QUERIES
+    if not normalized or normalized in _CAPABILITY_BROWSE_QUERIES:
+        return True
+
+    compact = normalized.replace(" ", "")
+    if (
+        compact.startswith(("何ができる", "なにができる"))
+        or "どんなことができる" in compact
+        or "できることを教え" in compact
+    ):
+        return True
+    japanese_subject = any(
+        marker in compact
+        for marker in ("機能", "能力", "ツール", "操作", "できること")
+    )
+    japanese_list = any(
+        marker in compact
+        for marker in ("一覧", "全部", "全て", "すべて", "利用可能", "見せて", "教えて")
+    )
+    if japanese_subject and japanese_list:
+        return True
+
+    tokens = set(normalized.split())
+    english_subject = bool(
+        tokens
+        & {
+            "ability",
+            "abilities",
+            "capability",
+            "capabilities",
+            "feature",
+            "features",
+            "operation",
+            "operations",
+            "tool",
+            "tools",
+        }
+    )
+    english_list = bool(tokens & {"all", "available", "every", "list", "show"})
+    english_have_question = "what" in tokens and "have" in tokens
+    return english_subject and (english_list or english_have_question)
+
+
+def _encode_capability_list_cursor(offset: int) -> str:
+    raw = f"{_CAPABILITY_LIST_CURSOR_PREFIX}{offset}".encode("ascii")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_capability_list_cursor(cursor: object) -> int:
+    if cursor is None:
+        return 0
+    if not isinstance(cursor, str) or not cursor or len(cursor) > 200:
+        raise AgentToolError("Capability list cursor is invalid.")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        decoded = base64.urlsafe_b64decode(cursor + padding).decode("ascii")
+        if not decoded.startswith(_CAPABILITY_LIST_CURSOR_PREFIX):
+            raise ValueError
+        raw_offset = decoded.removeprefix(_CAPABILITY_LIST_CURSOR_PREFIX)
+        if not raw_offset.isdigit():
+            raise ValueError
+        offset = int(raw_offset)
+    except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
+        raise AgentToolError("Capability list cursor is invalid.") from exc
+    if not 0 <= offset <= _MAX_CAPABILITY_SEARCH_OFFSET:
+        raise AgentToolError("Capability list cursor is out of range.")
+    return offset
 
 
 def _invoke_spec() -> Mapping[str, object]:

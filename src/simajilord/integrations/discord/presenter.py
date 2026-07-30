@@ -147,7 +147,15 @@ def expanded_message_embeds(
         )
     if response.poll is not None:
         answers = "\n".join(
-            f"{index}. {discord.utils.escape_markdown(answer)}"
+            (
+                f"{index}. {discord.utils.escape_markdown(answer.text)}"
+                f" · {answer.vote_count}票"
+                + (
+                    f" ({answer.vote_count / response.poll.total_vote_count:.0%})"
+                    if response.poll.total_vote_count
+                    else ""
+                )
+            )
             for index, answer in enumerate(response.poll.answers[:10], start=1)
         )
         _add_bounded_field(

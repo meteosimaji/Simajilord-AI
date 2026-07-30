@@ -410,7 +410,19 @@ def test_runtime_curated_workflow_switch_controls_registry_and_agent_tool(
                 for tool in tools
                 if isinstance(tool, dict) and "name" in tool
             )
-        assert ("workflow_search" in aliases) is enabled
+        assert "workflow_search" not in aliases
         assert "capability_search" in aliases
+
+        async def discover() -> str:
+            output = await provider.tools.invoke(
+                namespace="simajilord",
+                tool_name="capability_search",
+                arguments={"query": "workflow research recipe", "limit": 5},
+                context=InvocationContext("actor", "workspace", "agent", "event"),
+                max_output_characters=8_000,
+            )
+            return output.text
+
+        assert ("workflow.search" in asyncio.run(discover())) is enabled
     finally:
         asyncio.run(runtime.close())

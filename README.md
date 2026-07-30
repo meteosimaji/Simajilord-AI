@@ -152,11 +152,13 @@ with Discord's generic “interaction failed” banner.
   generic media saving, selective memory, and Action Receipt/Undo flows. These are typed
   Simajilord-tool recipes, not Codex user/global skills: no plugin, MCP, shell, or host path
   is loaded, and workflows requiring unavailable capabilities or grants are omitted
-- A small eager tool surface makes Discord/Web/file/memory/workflow discovery available at the
-  start of a turn. For everything else, the model searches the typed capability registry by a
-  concrete goal and object, reads the returned risk and input schema, then invokes the selected
-  capability. Natural-language command strings and per-platform URL trigger tables are not the
-  capability router
+- At most four full eager schemas are shown at turn start: exact-message read, bounded nearby
+  message read, selective memory search, and (when granted) local web search. General ability
+  questions use compact cursor-paged `capability_list`, modeled after MCP `tools/list`; concrete
+  goals use `capability_search` to load only matching schemas and `capability_invoke` to execute
+  one. File, workflow, image, audio, Discord mutation, and the rest stay deferred regardless of
+  how many grants the caller has. Natural-language command strings and per-platform URL trigger
+  tables are not the capability router
 - `AGENT_WEB_SEARCH_ACCESS` exposes both Codex first-party live search through the host's existing
   ChatGPT OAuth session and Simajilord's local `web.search`, `web.fetch`, and `web.find` tools.
   This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
@@ -213,15 +215,20 @@ with Discord's generic “interaction failed” banner.
   DM, VC speech, or deliberate silence. A successful tool-owned final delivery suppresses the
   host fallback exactly once; a rejected or failed delivery leaves the normal durable host reply
   available, so an attempted alternative cannot lose the answer
-- Every successful agent write returns an Action Receipt. Reactions, pin state, role membership,
+- Every successful agent write returns an Action Receipt whose `tracked` field states whether
+  the local ledger commit also succeeded. A ledger failure returns `tracked=false`,
+  `action_id=null`, and no Undo claim instead of inventing an ID; the external write remains
+  succeeded and is never blindly repeated. Reactions, pin state, role membership,
   timeout state, thread membership/settings, channel topic/slowmode, audio volume, selected
   read-aloud settings, and Focus Timer create/cancel operations have restart-safe inverse or
   compensating actions; newly created BOT messages can be deleted. `action.undo` accepts a
   receipt ID or resolves the same actor's most recent undoable action; repeating the same Undo
   does not execute the inverse twice. Destructive operations or writes that would require
   retaining deleted content/file bodies are explicitly receipted as non-undoable.
-  Final replies and autonomous host posts are also receipted immediately after each Discord
-  send using only channel/message IDs, even though they bypass the model tool catalog. A
+  Final replies and autonomous host posts are also receipted after each Discord send using only
+  channel/message IDs, even though they bypass the model tool catalog. If ledger persistence
+  fails, their already-sent delivery evidence stays pending and only receipt persistence is
+  retried; the Discord message is not posted again. A
   single-source autonomous reply is attributed to that source actor for natural same-actor
   Undo; a mixed-source batch remains BOT-owned instead of arbitrarily granting one member
   control over the post. If a final confirmation follows a substantive write in the same turn,
@@ -317,11 +324,15 @@ ignored by Git.
 
 For private development, `COMMAND_SCOPE=guild` synchronizes commands to each connected server.
 It also removes stale global commands for the same application so users do not see old and new
-commands together. Use `global` only when global publication is intended. Automatic read-aloud
-requires the Discord Message Content intent. Full member, Presence/activity, VC, and message
-inspection requires enabling the Message Content, Presence, and Server Members privileged
-intents for this installation; the adapter requests `discord.Intents.all()` so missing portal
-intents are visible as incomplete data rather than silently described as supported.
+commands together. Use `global` only when global publication is intended. Message Content is the
+documented minimum and is always requested because mentions, prefix commands, message inspection,
+and automatic read-aloud need bodies. Server Members and Presence are opt-in with
+`DISCORD_MEMBERS_INTENT_ENABLED` and `DISCORD_PRESENCE_INTENT_ENABLED`; enable each matching
+Developer Portal toggle before setting it true. The adapter does not request disabled privileged
+intents, because Discord closes a Gateway connection with code 4014 when a requested privileged
+intent is not enabled or approved. Presence/activity and complete cached member inspection require
+the corresponding opt-ins; normal non-privileged guild, channel, message, reaction, and VC events
+remain enabled.
 
 Set `TTS_PROVIDER=voicevox`, `VOICEVOX_SPEAKER_ID` to a VOICEVOX style ID, and
 `VOICEVOX_ENGINE_PATH` to the local engine executable. The provider only accepts a loopback
@@ -391,7 +402,13 @@ commands call the same capability APIs.
 `.data/events.sqlite3` records Discord command receipt, capability outcomes, and Discord/agent
 events. Each row has a monotonic sequence, actor, workspace, transport, request ID, and
 structured payload. Sensitive field names such as token, password, secret, authorization, and
-cookie are redacted before storage. Autonomous delivery state is separate in
+cookie are redacted before storage. Capability outcomes enter a bounded audit queue and a
+background writer commits them in batches, so unrelated capability results do not wait for one
+SQLite commit or a process-wide read lock. Explicit transport events remain durable before their
+call returns; history reads, retention, and clean shutdown flush queued audits. `/status` reads a
+single-row operation projection and the committed cursor without scanning or decoding the event
+history; the `(kind, sequence)` index and projection are created/backfilled during migration and
+rebuilt after retention pruning. Autonomous delivery state is separate in
 `.data/agent_autonomy.sqlite3`, so advancing an observability cursor cannot discard candidates.
 Undo state is separately bounded in `.data/agent_actions.sqlite3`; inverse behavior remains a
 static code policy, so the database does not retain source file or message content.

@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from simajilord.activity import ActivityServer
-from simajilord.config import CommandScope
+from simajilord.config import CommandScope, Settings
 from simajilord.domain.image import ImageGenerationJob, ImageJobStatus
 from simajilord.runtime import SimajilordRuntime
 
@@ -25,6 +25,18 @@ from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
 _IMAGE_DELIVERY_RECOVERY_LIMIT = 1_000
+
+
+def _gateway_intents(settings: Settings) -> discord.Intents:
+    """Request only the privileged intents enabled for this installation."""
+
+    intents = discord.Intents.default()
+    # Message bodies drive prefix commands, mention events, and read-aloud. This
+    # intent remains part of the Bot's documented minimum configuration.
+    intents.message_content = True
+    intents.members = settings.discord_members_intent_enabled
+    intents.presences = settings.discord_presence_intent_enabled
+    return intents
 
 
 class SimajilordCommandTree(app_commands.CommandTree[commands.Bot]):
@@ -40,11 +52,7 @@ class SimajilordCommandTree(app_commands.CommandTree[commands.Bot]):
 
 class SimajilordDiscordBot(commands.Bot):
     def __init__(self, runtime: SimajilordRuntime) -> None:
-        # This installation explicitly enables all three privileged intents in
-        # Discord's Developer Portal. Preserve the complete bot-visible state so
-        # bounded read capabilities can report members, presence, activities,
-        # voice state, and the standard guild event surface accurately.
-        intents = discord.Intents.all()
+        intents = _gateway_intents(runtime.settings)
         super().__init__(
             # Mentions are agent events. Prefix commands remain an explicit direct API path.
             command_prefix=runtime.settings.command_prefix,

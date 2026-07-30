@@ -37,6 +37,8 @@ class Settings:
 
     token: str = field(repr=False)
     application_id: int
+    discord_members_intent_enabled: bool
+    discord_presence_intent_enabled: bool
     discord_emoji_loading_id: int | None
     discord_emoji_success_id: int | None
     discord_emoji_warning_id: int | None
@@ -569,6 +571,14 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     return Settings(
         token=_required("DISCORD_TOKEN"),
         application_id=application_id,
+        discord_members_intent_enabled=_boolean(
+            "DISCORD_MEMBERS_INTENT_ENABLED",
+            False,
+        ),
+        discord_presence_intent_enabled=_boolean(
+            "DISCORD_PRESENCE_INTENT_ENABLED",
+            False,
+        ),
         discord_emoji_loading_id=_optional_snowflake(
             "DISCORD_EMOJI_LOADING_ID"
         ),

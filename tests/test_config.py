@@ -8,6 +8,7 @@ from dotenv import dotenv_values
 from simajilord.agent import AgentAutonomyMode
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core.errors import ConfigurationError
+from simajilord.integrations.discord.bot import _gateway_intents
 
 _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_ENABLED",
@@ -72,6 +73,8 @@ _AGENT_ENVIRONMENT_NAMES = (
     "DISCORD_EMOJI_WARNING_ID",
     "DISCORD_EMOJI_AUDIO_WAVE_ID",
     "DISCORD_EMOJI_RADIO_ID",
+    "DISCORD_MEMBERS_INTENT_ENABLED",
+    "DISCORD_PRESENCE_INTENT_ENABLED",
     "DISCORD_ACTIVITY_ENABLED",
     "DISCORD_CLIENT_SECRET",
     "DISCORD_ACTIVITY_HOST",
@@ -123,6 +126,30 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_autonomy_batch_seconds == 10
     assert settings.agent_autonomy_max_runs == 0
     assert settings.agent_autonomy_max_pending_events_per_actor == 50
+    assert settings.discord_members_intent_enabled is False
+    assert settings.discord_presence_intent_enabled is False
+
+
+def test_gateway_privileged_intents_are_explicit_opt_ins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    defaults = load_settings(dotenv_path=dotenv_path)
+    default_intents = _gateway_intents(defaults)
+
+    assert default_intents.message_content is True
+    assert default_intents.members is False
+    assert default_intents.presences is False
+    assert default_intents.guilds is True
+    assert default_intents.voice_states is True
+
+    monkeypatch.setenv("DISCORD_MEMBERS_INTENT_ENABLED", "true")
+    monkeypatch.setenv("DISCORD_PRESENCE_INTENT_ENABLED", "true")
+    opted_in = _gateway_intents(load_settings(dotenv_path=dotenv_path))
+    assert opted_in.message_content is True
+    assert opted_in.members is True
+    assert opted_in.presences is True
 
 
 def test_agent_idle_watchdog_prefers_explicit_name_and_accepts_legacy_fallback(

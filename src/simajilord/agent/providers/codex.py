@@ -10,7 +10,8 @@ import re
 import secrets
 import shutil
 from collections import deque
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
@@ -104,12 +105,12 @@ After reading the trigger, choose the next step without stalling:
    and cite URLs. Local web tools can continue long/PDF text; follow next_offset and use
    files.download_url/files.read for truncated sources when available.
 3. For Discord state, files, or actions, use a matching shown Simajilord tool.
-4. If no shown tool fits, capability_search a concrete action-and-object query; read its schema and
-   call capability_invoke with only fields defined by that schema. For general abilities, browse
-   compact pages, limit 25; otherwise refine once with a synonym.
+4. General abilities: capability_list; copy next_cursor exactly. Missing concrete action:
+   capability_search one verb-object query, read its schema, then capability_invoke only defined
+   fields; retry once with a synonym.
 5. If no match or a tool rejects the request, use its availability/error reason to explain the
    real limit; never guess or claim success.
-Describe abilities only from tools or capability_search.
+Describe abilities only from shown tools, capability_list, or capability_search.
 Memory is selective, not a turn log. Search two to four likely terms only when a preference, rule,
 or procedure could materially change the answer; try one broader or empty recent lookup if needed.
 Before finishing substantive work, consider at most one durable memory: an explicitly stated
@@ -204,6 +205,14 @@ class _ToolTurnBudget:
     discord_disclosure_observations: list[tuple[str, str, str]] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _ThreadLockState:
+    """One per-thread lock plus callers already using or waiting for it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 def _continuation_tool_budget(
     source: _ToolTurnBudget | None,
     *,
@@ -229,6 +238,29 @@ def _continuation_tool_budget(
         ),
         exact_message_reads=(
             _copy_exact_message_reads(source.exact_message_reads) if source is not None else {}
+        ),
+        event_message_read=(source.event_message_read if source is not None else False),
+        follow_up_message_ids=(
+            set(source.follow_up_message_ids) if source is not None else set()
+        ),
+        read_follow_up_message_ids=(
+            set(source.read_follow_up_message_ids) if source is not None else set()
+        ),
+        last_progress=(source.last_progress if source is not None else None),
+        last_progress_activity_at=(
+            source.last_progress_activity_at if source is not None else 0.0
+        ),
+        write_successes=(set(source.write_successes) if source is not None else set()),
+        write_failures=(list(source.write_failures) if source is not None else []),
+        write_attempts=(set(source.write_attempts) if source is not None else set()),
+        final_delivery_successes=(
+            set(source.final_delivery_successes) if source is not None else set()
+        ),
+        last_write_authorization_event_id=(
+            source.last_write_authorization_event_id if source is not None else None
+        ),
+        discord_disclosure_observations=(
+            list(source.discord_disclosure_observations) if source is not None else []
         ),
     )
 
@@ -338,7 +370,7 @@ class CodexAppServerProvider:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._image_generation_lock = asyncio.Lock()
-        self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._thread_locks: dict[str, _ThreadLockState] = {}
         self._notification_queues: dict[
             str,
             asyncio.Queue[tuple[str, dict[str, object]]],
@@ -685,8 +717,7 @@ class CodexAppServerProvider:
         attempt_state: _TurnAttemptState | None = None,
     ) -> ProviderTurnResult:
         lock_key = provider_thread_id or f"request:{context.request_id}"
-        thread_lock = self._thread_locks.setdefault(lock_key, asyncio.Lock())
-        async with thread_lock:
+        async with self._thread_lock(lock_key):
             # The turn has no wall-clock deadline. Protocol requests and the active
             # turn are stopped only after their own inactivity windows expire.
             async with asyncio.timeout(None):
@@ -949,6 +980,23 @@ class CodexAppServerProvider:
                         if active_thread_id == thread_id:
                             self._thread_by_turn.pop(active_turn_id, None)
                             self._turn_watchdogs.pop(active_turn_id, None)
+
+    @asynccontextmanager
+    async def _thread_lock(self, lock_key: str) -> AsyncIterator[None]:
+        """Serialize one conversation and discard the lock after its last waiter."""
+
+        state = self._thread_locks.get(lock_key)
+        if state is None:
+            state = _ThreadLockState()
+            self._thread_locks[lock_key] = state
+        state.users += 1
+        try:
+            async with state.lock:
+                yield
+        finally:
+            state.users -= 1
+            if state.users == 0 and self._thread_locks.get(lock_key) is state:
+                self._thread_locks.pop(lock_key, None)
 
     async def steer(
         self,
@@ -1756,7 +1804,6 @@ class CodexAppServerProvider:
             tool_name,
             capability_name=capability_name,
         )
-        budget.calls_remaining -= 1
         # This matches the app-server's roughly 2k-token tool-output ceiling closely
         # enough to keep a normal Discord search or file page intact. The independent
         # per-turn character budget still bounds total retrieved context.
@@ -1880,6 +1927,18 @@ class CodexAppServerProvider:
                 ),
             )
             return
+
+        def consume_validated_call() -> None:
+            """Charge only a call whose complete request will reach its handler."""
+
+            if budget.calls_remaining <= 0:
+                raise AgentToolError(
+                    "The per-turn capability call limit was reached before invocation."
+                )
+            budget.calls_remaining -= 1
+            if write_capability is not None:
+                budget.write_attempts.add(write_capability)
+
         watchdog: _TurnWatchdog | None = None
         activity_task: asyncio.Task[None] | None = None
         call_id = str(request_id)
@@ -1914,8 +1973,6 @@ class CodexAppServerProvider:
                     self._tool_progress_heartbeat(budget),
                     name=f"simajilord-agent-tool-activity-{call_id}",
                 )
-            if write_capability is not None:
-                budget.write_attempts.add(write_capability)
             if capability_name in {
                 "discord.send_embed",
                 "discord.send_file",
@@ -1932,6 +1989,7 @@ class CodexAppServerProvider:
                 arguments=raw_params.get("arguments"),
                 context=tool_context,
                 max_output_characters=per_call_budget,
+                before_invoke=consume_validated_call,
             )
             _record_discord_disclosure_observations(
                 budget,

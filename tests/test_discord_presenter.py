@@ -27,6 +27,7 @@ from simajilord.integrations.discord.bot import _image_result_embed
 from simajilord.integrations.discord.capabilities import (
     DiscordExpandedAttachmentRecord,
     DiscordExpandedEmbedRecord,
+    DiscordExpandedPollAnswerRecord,
     DiscordExpandedPollRecord,
     DiscordExpandMessageResponse,
 )
@@ -207,7 +208,25 @@ def test_expanded_message_never_exceeds_discord_aggregate_character_limit() -> N
         sticker_names=tuple("スタンプ" * 100 for _ in range(10)),
         poll=DiscordExpandedPollRecord(
             question="質問" * 100,
-            answers=tuple("選択肢" * 100 for _ in range(10)),
+            answers=tuple(
+                DiscordExpandedPollAnswerRecord(
+                    answer_id=str(index),
+                    text="選択肢" * 100,
+                    emoji=None,
+                    vote_count=index,
+                    bot_voted=False,
+                    victor=False,
+                )
+                for index in range(1, 11)
+            ),
+            total_vote_count=55,
+            multiple=False,
+            expires_at_iso="2026-07-28T00:00:00+00:00",
+            duration_seconds=3_600,
+            finalized=False,
+            counts_are_exact=False,
+            victor_answer_id=None,
+            layout_type="default",
         ),
         reply_author_name="Bob " + ("b" * 200),
         reply_content_preview="返信" * 400,
@@ -219,6 +238,9 @@ def test_expanded_message_never_exceeds_discord_aggregate_character_limit() -> N
     assert len(embed.description or "") <= 4_096
     assert all(len(field.name) <= 256 for field in embed.fields)
     assert all(len(field.value) <= 1_024 for field in embed.fields)
+    poll_field = next(field for field in embed.fields if "質問" in field.name)
+    assert "1票" in poll_field.value
+    assert "%" in poll_field.value
 
 
 def test_generated_image_embed_shows_the_actual_creative_brief() -> None:

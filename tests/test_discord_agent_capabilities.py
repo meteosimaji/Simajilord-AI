@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock
@@ -156,6 +156,10 @@ def test_discord_research_capabilities_are_found_from_natural_japanese() -> None
         item.descriptor.name
         for item in registry.search("既存ロールを名前で検索", limit=3)
     }
+    poll_results = {
+        item.descriptor.name
+        for item in registry.search("この投票結果と票数を確認", limit=3)
+    }
 
     assert "discord.search_messages" in past
     assert {
@@ -164,6 +168,7 @@ def test_discord_research_capabilities_are_found_from_natural_japanese() -> None
     } <= popularity
     assert "discord.list_archived_threads" in archived
     assert "discord.list_roles" in roles
+    assert "discord.get_message" in poll_results
 
 
 @pytest.mark.asyncio
@@ -625,6 +630,64 @@ def _fetched_message(
         reference=None,
         is_system=lambda: False,
     )
+
+
+@pytest.mark.asyncio
+async def test_get_message_exposes_poll_result_counts_and_answer_ids() -> None:
+    client = Mock(spec=discord.Client)
+    guild, channel, _, _ = _visibility_guild(10, 20)
+    expires_at = datetime(2026, 7, 29, 10, 31, tzinfo=UTC)
+    yes = SimpleNamespace(
+        id=1,
+        text="Yes",
+        emoji=None,
+        vote_count=1,
+        self_voted=False,
+        victor=False,
+    )
+    no = SimpleNamespace(
+        id=2,
+        text="No",
+        emoji=None,
+        vote_count=0,
+        self_voted=False,
+        victor=False,
+    )
+    poll = SimpleNamespace(
+        question="Did the audit reach Discord?",
+        answers=[yes, no],
+        total_votes=1,
+        multiple=False,
+        expires_at=expires_at,
+        duration=timedelta(hours=1),
+        is_finalized=lambda: False,
+        victor_answer_id=None,
+        layout_type=SimpleNamespace(name="default"),
+    )
+    message = _fetched_message(channel)
+    message.poll = poll
+    channel.fetch_message = AsyncMock(return_value=message)
+    client.get_guild.return_value = guild
+    endpoints = _endpoint_map(cast(discord.Client, client))
+
+    response = await endpoints["discord.get_message"].invoke(
+        DiscordGetMessageRequest(
+            channel_id="20",
+            message_id="31",
+            include_reply_context=False,
+        ),
+        _agent_context(),
+    )
+
+    assert response.poll is not None
+    assert response.poll.question == "Did the audit reach Discord?"
+    assert response.poll.total_vote_count == 1
+    assert response.poll.expires_at_iso == expires_at.isoformat()
+    assert response.poll.counts_are_exact is False
+    assert [
+        (answer.answer_id, answer.text, answer.vote_count)
+        for answer in response.poll.answers
+    ] == [("1", "Yes", 1), ("2", "No", 0)]
 
 
 @pytest.mark.asyncio

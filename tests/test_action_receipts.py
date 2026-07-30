@@ -264,6 +264,7 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
         "capability": "discord.add_reaction",
         "classification": "fully_reversible",
         "status": "succeeded",
+        "tracked": True,
         "undo_available": True,
         "undo_capability": "discord.remove_own_reaction",
     }
@@ -278,6 +279,65 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
         )
     ]
     assert journal.entries[0][0] == "agent.action.recorded"
+
+
+async def test_receipt_persistence_failure_returns_untracked_without_fake_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ReactionRequest]] = []
+    registry = _reaction_registry(calls)
+    journal = RecordingJournal()
+    store = ActionReceiptStore(tmp_path / "actions.sqlite3")
+    service = ActionReceiptService(
+        store=store,
+        registry=registry,
+        journal=journal,
+    )
+
+    async def fail_add(**_values: object) -> None:
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(store, "add", fail_add)
+    response = await registry.invoke(
+        "discord.add_reaction",
+        ReactionRequest("channel", "message", "✅"),
+        _context(),
+    )
+    receipt = await service.record(
+        capability="discord.add_reaction",
+        request=ReactionRequest("channel", "message", "✅"),
+        response=response,
+        context=_context(),
+    )
+
+    assert receipt is not None
+    assert receipt.status == "succeeded"
+    assert receipt.action_id is None
+    assert receipt.tracked is False
+    assert receipt.undo_available is False
+    assert receipt.undo_capability is None
+    assert journal.entries == [
+        (
+            "agent.action.recorded",
+            {
+                "action_id": None,
+                "capability": "discord.add_reaction",
+                "status": "succeeded",
+                "result": "succeeded",
+                "classification": "fully_reversible",
+                "undo_available": False,
+                "undo_capability": None,
+                "target_ids": {
+                    "channel_id": "channel",
+                    "message_id": "message",
+                },
+                "evidence_event_ids": ["event"],
+                "tracked": False,
+                "host_delivery": False,
+            },
+        )
+    ]
 
 
 async def test_host_post_receipt_keeps_only_ids_and_deletes_the_bot_post(

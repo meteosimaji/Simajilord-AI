@@ -43,6 +43,7 @@ import discord
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core import CapabilityEndpoint, InvocationContext
 from simajilord.core.errors import UserError
+from simajilord.integrations.discord.bot import _gateway_intents
 from simajilord.integrations.discord.capabilities import build_discord_endpoints
 from simajilord.integrations.discord.platform_capabilities import (
     DiscordPlatformResourceKind,
@@ -510,6 +511,40 @@ class _AuditSession:
                         True,
                     )
                 )
+            if poll_message_id is not None:
+                poll_response = await self.invoke(
+                    "discord.get_message",
+                    case="poll-results-live-read",
+                    phase="live_read",
+                    context=context(),
+                    overrides={
+                        "channel_id": channel_id,
+                        "message_id": poll_message_id,
+                    },
+                    required=True,
+                )
+                poll_summary = getattr(poll_response, "poll", None)
+                answer_ids = {
+                    getattr(answer, "answer_id", None)
+                    for answer in getattr(poll_summary, "answers", ())
+                }
+                if (
+                    poll_summary is None
+                    or not answer_ids
+                    or (
+                        poll_answer_id is not None
+                        and poll_answer_id not in answer_ids
+                    )
+                ):
+                    selected = self.endpoints["discord.get_message"]
+                    self._append_failure(
+                        selected,
+                        case="poll-results-shape",
+                        phase="live_read",
+                        duration_ms=0.0,
+                        exc=RuntimeError("poll result summary is incomplete"),
+                    )
+                    self._required_failed = True
             if poll_message_id is not None and poll_answer_id is not None:
                 message_cases.append(
                     (
@@ -1073,6 +1108,25 @@ def _response_evidence(response: object) -> dict[str, object] | None:
         value = getattr(response, name, None)
         if isinstance(value, (tuple, list)):
             evidence[f"{name}_count"] = len(value)
+    poll = getattr(response, "poll", None)
+    poll_answers = getattr(poll, "answers", ())
+    if poll is not None and isinstance(poll_answers, (tuple, list)):
+        evidence["poll_answer_ids"] = [
+            str(answer.answer_id)
+            for answer in poll_answers
+            if getattr(answer, "answer_id", None) is not None
+        ]
+        evidence["poll_vote_counts"] = [
+            int(answer.vote_count)
+            for answer in poll_answers
+            if isinstance(getattr(answer, "vote_count", None), int)
+        ]
+        evidence["poll_total_vote_count"] = getattr(
+            poll,
+            "total_vote_count",
+            None,
+        )
+        evidence["poll_finalized"] = getattr(poll, "finalized", None)
     return evidence or None
 
 
@@ -1104,7 +1158,7 @@ async def run_live_audit(
             hive_api_key=None,
         )
         runtime = SimajilordRuntime.build(isolated_settings)
-        client = discord.Client(intents=discord.Intents.all())
+        client = discord.Client(intents=_gateway_intents(settings))
         await client.login(settings.token)
         client_task = asyncio.create_task(
             client.connect(reconnect=True),

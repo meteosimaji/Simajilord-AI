@@ -56,9 +56,10 @@ class ActionStatus(StrEnum):
 class ActionReceipt:
     """Small model-facing proof that a write succeeded."""
 
-    action_id: str
+    action_id: str | None
     capability: str
     status: str
+    tracked: bool
     undo_available: bool
     undo_capability: str | None
     classification: ActionClassification
@@ -1375,9 +1376,10 @@ class ActionReceiptService:
                 context.request_id,
             )
         receipt = ActionReceipt(
-            action_id=action_id,
+            action_id=action_id if tracked else None,
             capability=capability,
             status="succeeded",
+            tracked=tracked,
             undo_available=tracked and undo_capability is not None,
             undo_capability=undo_capability,
             classification=policy.classification,
@@ -1386,7 +1388,7 @@ class ActionReceiptService:
             kind="agent.action.recorded",
             context=context,
             payload={
-                "action_id": action_id,
+                "action_id": receipt.action_id,
                 "capability": capability,
                 "status": receipt.status,
                 "result": "succeeded",
@@ -1395,7 +1397,7 @@ class ActionReceiptService:
                 "undo_capability": receipt.undo_capability,
                 "target_ids": dict(target_ids),
                 "evidence_event_ids": [context.request_id],
-                "tracked": tracked,
+                "tracked": receipt.tracked,
                 "host_delivery": host_delivery,
             },
         )

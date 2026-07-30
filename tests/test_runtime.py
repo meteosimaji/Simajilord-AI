@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from typing import cast
@@ -14,7 +15,9 @@ from simajilord.agent import (
     AGENT_COMPUTE_GRANT,
     AGENT_FILE_GRANT,
     AGENT_HIVE_GRANT,
+    AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
+    AGENT_MEMORY_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_REQUESTED_WRITE_CAPABILITIES,
@@ -28,6 +31,32 @@ from simajilord.core import InvocationContext, RiskLevel
 from simajilord.integrations.discord.capabilities import build_discord_endpoints
 from simajilord.providers.image import SharedCodexImageProvider
 from simajilord.runtime import SimajilordRuntime
+
+
+async def _listed_capability_names(
+    provider: CodexAppServerProvider,
+    context: InvocationContext,
+) -> set[str]:
+    """Traverse the model-facing compact list exactly as the broker documents."""
+
+    names: set[str] = set()
+    cursor: str | None = None
+    while True:
+        arguments: dict[str, object] = {"limit": 25}
+        if cursor is not None:
+            arguments["cursor"] = cursor
+        output = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_list",
+            arguments=arguments,
+            context=context,
+            max_output_characters=20_000,
+        )
+        payload = json.loads(output.text)
+        names.update(str(item["name"]) for item in payload["tools"])
+        cursor = payload["next_cursor"]
+        if cursor is None:
+            return names
 
 
 def test_runtime_composes_before_discord_starts_the_event_loop(
@@ -87,6 +116,69 @@ def test_agent_and_image_queue_share_the_primary_codex_provider(
         )
     finally:
         asyncio.run(runtime.close())
+
+
+def test_max_feature_runtime_keeps_only_four_full_eager_schemas(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "true")
+    monkeypatch.setenv("AGENT_SAFE_COMPUTE_ACCESS", "everyone")
+    monkeypatch.setenv("AGENT_WEB_SEARCH_ACCESS", "everyone")
+    monkeypatch.setenv("IMAGE_GENERATION_ACCESS", "everyone")
+    monkeypatch.setenv("AGENT_CURATED_SKILLS_ENABLED", "true")
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+    for item in build_discord_endpoints(
+        cast(discord.Client, object()),
+        runtime,
+    ):
+        runtime.registry.register(item)
+    assert runtime.agent is not None
+    provider = cast(CodexAppServerProvider, runtime.agent.provider)
+    context = InvocationContext(
+        "7",
+        "1",
+        "agent",
+        "max-feature",
+        grants=frozenset(
+            {
+                AGENT_AUDIO_GRANT,
+                AGENT_COMPUTE_GRANT,
+                AGENT_FILE_GRANT,
+                AGENT_IMAGE_GRANT,
+                AGENT_MEDIA_GRANT,
+                AGENT_MEMORY_GRANT,
+                AGENT_MESSAGE_GRANT,
+                AGENT_MODERATION_GRANT,
+                AGENT_WEB_GRANT,
+            }
+        ),
+        approvals=frozenset(AGENT_REQUESTED_WRITE_CAPABILITIES),
+    )
+    names = {
+        str(tool["name"])
+        for namespace in provider.tools.dynamic_specs(context)
+        for tool in cast(list[dict[str, object]], namespace["tools"])
+    }
+    broker_names = {
+        "capability_list",
+        "capability_search",
+        "capability_invoke",
+    }
+
+    assert names - broker_names == {
+        "discord_get_message",
+        "discord_read_messages",
+        "memory_search",
+        "web_search",
+    }
+    assert len(names - broker_names) == 4
+    asyncio.run(runtime.close())
 
 
 def test_complete_core_capability_catalog_uses_english_surface(
@@ -291,19 +383,27 @@ def test_agent_web_grant_exposes_local_search_fetch_and_find(
         grants=frozenset({AGENT_WEB_GRANT}),
     )
 
-    denied_names = {
+    denied_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(denied)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    granted_names = {
+    granted_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
+    denied_names, granted_names = asyncio.run(
+        _listed_capability_names(provider, denied)
+    ), asyncio.run(_listed_capability_names(provider, granted))
 
-    assert {"web_search", "web_fetch", "web_find"}.isdisjoint(denied_names)
-    assert {"web_search", "web_fetch", "web_find"} <= granted_names
+    assert {"web_search", "web_fetch", "web_find"}.isdisjoint(
+        denied_eager_names
+    )
+    assert "web_search" in granted_eager_names
+    assert {"web_fetch", "web_find"}.isdisjoint(granted_eager_names)
+    assert {"web.search", "web.fetch", "web.find"}.isdisjoint(denied_names)
+    assert {"web.search", "web.fetch", "web.find"} <= granted_names
     asyncio.run(runtime.close())
 
 
@@ -336,29 +436,38 @@ def test_agent_file_grant_exposes_complete_attachment_read_and_delivery_path(
         grants=frozenset({AGENT_FILE_GRANT}),
     )
 
-    denied_names = {
+    denied_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(denied)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    granted_names = {
+    granted_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
+    denied_names, granted_names = asyncio.run(
+        _listed_capability_names(provider, denied)
+    ), asyncio.run(_listed_capability_names(provider, granted))
 
     assert {
-        "files_list",
-        "files_read",
-        "discord_import_attachment",
-        "discord_send_file",
+        "files.list",
+        "files.read",
+        "discord.import_attachment",
+        "discord.send_file",
     }.isdisjoint(denied_names)
+    assert {
+        "files.list",
+        "files.read",
+        "discord.import_attachment",
+        "discord.send_file",
+    } <= granted_names
     assert {
         "files_list",
         "files_read",
         "discord_import_attachment",
         "discord_send_file",
-    } <= granted_names
+    }.isdisjoint(denied_eager_names | granted_eager_names)
     asyncio.run(runtime.close())
 
 
@@ -399,21 +508,27 @@ def test_agent_safe_compute_access_exposes_only_isolated_workspace_tools(
         ),
     )
 
-    denied_names = {
+    denied_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(denied)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    granted_names = {
+    granted_eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
+    denied_names, granted_names = asyncio.run(
+        _listed_capability_names(provider, denied)
+    ), asyncio.run(_listed_capability_names(provider, granted))
 
-    assert {"compute_run", "files_download_url"}.isdisjoint(denied_names)
-    assert {"compute_run", "files_download_url"} <= granted_names
-    assert "shell_run" not in granted_names
-    assert "host_files_read" not in granted_names
+    assert {"compute.run", "files.download_url"}.isdisjoint(denied_names)
+    assert {"compute.run", "files.download_url"} <= granted_names
+    assert {"compute_run", "files_download_url"}.isdisjoint(
+        denied_eager_names | granted_eager_names
+    )
+    assert "shell.run" not in granted_names
+    assert "host_files.read" not in granted_names
     asyncio.run(runtime.close())
 
 
@@ -444,15 +559,17 @@ def test_agent_can_view_an_image_attachment_without_enabling_file_persistence(
         "image",
         grants=frozenset({AGENT_MESSAGE_GRANT}),
     )
-    names = {
+    eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(context)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
+    names = asyncio.run(_listed_capability_names(provider, context))
 
-    assert "discord_view_image_attachment" in names
-    assert "discord_import_attachment" not in names
-    assert "files_read" not in names
+    assert "discord.view_image_attachment" in names
+    assert "discord.import_attachment" not in names
+    assert "files.read" not in names
+    assert "discord_view_image_attachment" not in eager_names
     asyncio.run(runtime.close())
 
 
@@ -483,13 +600,15 @@ def test_agent_message_grant_exposes_restart_safe_undo_and_own_message_delete(
         "undo",
         grants=frozenset({AGENT_MESSAGE_GRANT}),
     )
-    names = {
+    eager_names = {
         str(tool["name"])
         for namespace in provider.tools.dynamic_specs(context)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
+    names = asyncio.run(_listed_capability_names(provider, context))
 
-    assert {"action_undo", "discord_delete_own_message"} <= names
+    assert {"action.undo", "discord.delete_own_message"} <= names
+    assert {"action_undo", "discord_delete_own_message"}.isdisjoint(eager_names)
     assert runtime.registry.endpoint("timer.restore").descriptor.approval.value == "always"
     asyncio.run(runtime.close())
 

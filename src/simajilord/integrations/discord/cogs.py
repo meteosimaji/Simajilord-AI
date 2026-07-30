@@ -8308,12 +8308,12 @@ async def _record_agent_host_posts(
     if receipts is None:
         return True
     try:
-        await receipts.record_posted_messages(
+        receipt = await receipts.record_posted_messages(
             channel_id=channel_id,
             message_ids=message_ids,
             context=context,
         )
-        return True
+        return receipt is not None and receipt.tracked
     except Exception:
         log.exception(
             "Could not receipt agent host response channel=%s messages=%s request=%s",

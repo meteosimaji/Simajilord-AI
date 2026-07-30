@@ -566,6 +566,30 @@ class DiscordReactionSummaryRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordExpandedPollAnswerRecord:
+    answer_id: str
+    text: str
+    emoji: str | None
+    vote_count: int
+    bot_voted: bool
+    victor: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordExpandedPollRecord:
+    question: str
+    answers: tuple[DiscordExpandedPollAnswerRecord, ...]
+    total_vote_count: int
+    multiple: bool
+    expires_at_iso: str | None
+    duration_seconds: int | None
+    finalized: bool
+    counts_are_exact: bool
+    victor_answer_id: str | None
+    layout_type: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordMessageRecord:
     message_id: str
     channel_id: str
@@ -586,6 +610,7 @@ class DiscordMessageRecord:
     reaction_count: int = 0
     reaction_summary: tuple[DiscordReactionSummaryRecord, ...] = ()
     thread_id: str | None = None
+    poll: DiscordExpandedPollRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -763,6 +788,7 @@ class DiscordReplyContextRecord:
     created_at_iso: str
     attachments: tuple[DiscordAttachmentRecord, ...]
     reference_message_id: str | None
+    poll: DiscordExpandedPollRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -792,6 +818,7 @@ class DiscordGetMessageResponse:
     reaction_summary: tuple[DiscordReactionSummaryRecord, ...] = ()
     thread_id: str | None = None
     content_format: Literal["discord_display_segments"] = "discord_display_segments"
+    poll: DiscordExpandedPollRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -825,12 +852,6 @@ class DiscordExpandedEmbedRecord:
     url: str | None
     image_url: str | None
     thumbnail_url: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class DiscordExpandedPollRecord:
-    question: str
-    answers: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2436,6 +2457,7 @@ def build_discord_endpoints(
                 for reaction in getattr(message, "reactions", ())[:10]
             ),
             thread_id=_message_thread_id(message),
+            poll=_expanded_poll(message.poll),
         )
 
     async def expand_message(
@@ -4742,7 +4764,9 @@ def build_discord_endpoints(
                 name="discord.get_message",
                 summary=(
                     "Read a Discord message by ID in bounded chunks, optionally including "
-                    "the message it replies to in the same channel."
+                    "the message it replies to in the same channel. Native polls include "
+                    "answer IDs, vote counts, expiry, finalization, and winner state so "
+                    "discord.list_poll_voters can be called without guessing."
                 ),
                 risk=RiskLevel.READ,
                 keywords=(
@@ -4757,6 +4781,10 @@ def build_discord_endpoints(
                     "本文",
                     "原文",
                     "メンション",
+                    "poll results",
+                    "vote count",
+                    "投票結果",
+                    "票数",
                 ),
                 requires_workspace=True,
                 expected_errors=(
@@ -7516,6 +7544,7 @@ def _message_record(
             for reaction in getattr(message, "reactions", ())[:10]
         ),
         thread_id=_message_thread_id(message),
+        poll=_expanded_poll(message.poll),
     )
 
 
@@ -7815,9 +7844,39 @@ def _expanded_embed(item: discord.Embed) -> DiscordExpandedEmbedRecord:
 def _expanded_poll(poll: discord.Poll | None) -> DiscordExpandedPollRecord | None:
     if poll is None:
         return None
+    answers = tuple(
+        DiscordExpandedPollAnswerRecord(
+            answer_id=str(answer.id),
+            text=answer.text,
+            emoji=str(answer.emoji) if answer.emoji is not None else None,
+            vote_count=answer.vote_count,
+            bot_voted=answer.self_voted,
+            victor=answer.victor,
+        )
+        for answer in poll.answers
+    )
+    finalized_value = poll.is_finalized()
+    expires_at = poll.expires_at
+    layout_name = getattr(poll.layout_type, "name", None)
     return DiscordExpandedPollRecord(
         question=poll.question,
-        answers=tuple(answer.text for answer in poll.answers),
+        answers=answers,
+        total_vote_count=poll.total_votes,
+        multiple=poll.multiple,
+        expires_at_iso=expires_at.isoformat() if expires_at is not None else None,
+        duration_seconds=int(poll.duration.total_seconds()),
+        finalized=finalized_value,
+        counts_are_exact=finalized_value,
+        victor_answer_id=(
+            str(poll.victor_answer_id)
+            if poll.victor_answer_id is not None
+            else None
+        ),
+        layout_type=(
+            str(layout_name)
+            if layout_name is not None
+            else str(poll.layout_type)
+        ),
     )
 
 
@@ -8013,6 +8072,7 @@ async def _reply_context(
                     if parent.reference and parent.reference.message_id
                     else None
                 ),
+                poll=_expanded_poll(parent.poll),
             )
         )
         current = parent
