@@ -218,6 +218,12 @@ class AgentToolCatalog:
     def namespace(self) -> str:
         return _TOOL_NAMESPACE
 
+    @property
+    def allowed_capabilities(self) -> tuple[str, ...]:
+        """Return the immutable model allowlist for diagnostics and coverage checks."""
+
+        return self._allowed_capabilities
+
     def write_capability_for_call(
         self,
         *,

@@ -103,14 +103,14 @@ with Discord's generic “interaction failed” banner.
   cannot prove the complete audience; neither is a mechanical disclosure block or a source of
   write authority. A write to any explicitly selected shared server still requires fresh
   requester and BOT permissions there; historical reads never grant write authority
-- The agent has bounded typed access to the bot-visible Discord platform surface: member
-  presence/activity/voice state, channel details and overwrites, pins, reactions, thread
-  membership, roles, audit logs, bans, invites, scheduled events, emojis, stickers, soundboard,
-  AutoMod, integrations, templates, stage/onboarding/widget/application metadata, and
-  owner-authorized commerce metadata. Low-frequency typed operations cover guild resources,
-  messages, permission overwrites, application assets, AutoMod, thread/forum/channel actions,
-  forwarding, direct messages, and bot presence. Credential/token disclosure, bot lifecycle,
-  private OAuth data, and test-commerce mutation are intentionally not exposed as agent tools
+- The Discord adapter currently registers 106 typed capability endpoints covering the bot-visible
+  conversation, moderation, audio, and common server-management areas listed below. This is a
+  broad capability catalog, not a one-to-one implementation of every route in Discord's official
+  REST API: six endpoints are internal compatibility/Undo helpers, and file or synthetic-media
+  capabilities are exposed only when their provider is configured. Application-command
+  deployment, bot identity/lifecycle changes, credential or token disclosure, OAuth-only private
+  user data, webhook-token execution, member pruning, integration deletion, incident mutation,
+  and test-commerce mutation remain host-managed or intentionally unavailable to the model
 - A bare Discord message link expands in place only after actor and BOT permission checks;
   the replacement preserves a Jump link and the original link post is deleted only after the
   replacement succeeds. The complete Embed text budget, including author, footer, title,
@@ -159,14 +159,14 @@ with Discord's generic “interaction failed” banner.
   This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
   and locally fetch a public URL that first-party search could not open. The same grant policy
   applies to autonomous turns; explicit `/web` and prefix commands remain available independently
-- A 106-endpoint typed Discord surface spanning server/member/user Presence and activities,
-  live VC state, channels/threads/pins/reactions/poll voters, effective permissions and
-  overwrites, audit/bans/invites/events/AutoMod, emojis/stickers/soundboard, token-free
-  webhooks, templates/integrations/onboarding/widget/application metadata, message/file/embed
-  delivery, moderation, resource mutation, and audio. Active threads and guild preview data
-  are fetched from REST rather than assumed from cache. Bot credentials, OAuth-only private
-  user data, bot lifecycle/logout, webhook execution tokens, and test-commerce mutation are
-  intentionally not model capabilities
+- The 106 registered Discord endpoints span server/member Presence and activities, live VC state,
+  channels/threads/pins/reactions/poll voters, effective permissions and overwrites,
+  audit/bans/invites/events/AutoMod, emojis/stickers/soundboard, token-free webhooks,
+  templates/integrations/onboarding/widget/application metadata, message/file/embed delivery,
+  moderation, resource mutation, and audio. Active threads and guild preview data are fetched
+  from REST rather than assumed from cache. The count describes Simajilord's typed abstractions,
+  some of which intentionally group several Discord routes; it does not claim complete official
+  Discord API coverage
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and

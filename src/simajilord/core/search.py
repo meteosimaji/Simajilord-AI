@@ -45,7 +45,7 @@ def search_overlap_score(query: str, candidate: str) -> int:
 
 
 def phrase_match_score(query: str, phrases: tuple[str, ...]) -> int:
-    """Reward descriptor-owned phrases contained in a natural-language query."""
+    """Reward descriptor-owned phrases, preferring specific multi-part intents."""
 
     normalized_query = normalize_search_text(query)
     if not normalized_query:
@@ -62,10 +62,10 @@ def phrase_match_score(query: str, phrases: tuple[str, ...]) -> int:
         ):
             continue
         if normalized_phrase in normalized_query:
-            score += 2
+            score += 2 + _phrase_specificity_bonus(normalized_phrase)
         elif len(normalized_query) >= 2 and normalized_query in normalized_phrase:
-            score += 1
-    return min(score, 12)
+            score += 1 + (_phrase_specificity_bonus(normalized_phrase) // 2)
+    return min(score, 24)
 
 
 def normalized_substring(query: str, candidate: str, *, minimum: int = 3) -> bool:
@@ -105,6 +105,20 @@ def _feature_weight(feature: str) -> int:
             return 2
         return 3
     return 2 if len(feature) >= 4 else 1
+
+
+def _phrase_specificity_bonus(normalized_phrase: str) -> int:
+    """Give a concrete action phrase more evidence than several generic nouns."""
+
+    tokens = normalized_phrase.split()
+    if len(tokens) > 1:
+        return min(4, len(tokens))
+    if any(_is_cjk(character) for character in normalized_phrase) and any(
+        marker in normalized_phrase
+        for marker in ("を", "に", "へ", "で", "から", "して", "する", "って", "一覧", "よう")
+    ):
+        return 3 if len(normalized_phrase) >= 8 else 2
+    return 0
 
 
 def _is_cjk(character: str) -> bool:
