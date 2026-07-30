@@ -20,6 +20,9 @@ dependencies = [
   "yt-dlp-ejs==0.8.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/meteosimaji/Simajilord-AI"
+
 [project.scripts]
 simajilord-discord = "simajilord.integrations.discord.__main__:main"
 simajilord-audio-doctor = "simajilord.diagnostics.audio:main"

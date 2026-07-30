@@ -197,6 +197,9 @@ async def test_provider_starts_new_threads_with_stable_history_mode(
     assert method == "thread/start"
     assert params["ephemeral"] is False
     assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
+    base_instructions = str(params["baseInstructions"])
+    assert "https://github.com/meteosimaji/Simajilord-AI" in base_instructions
+    assert "your own implementation and source code" in " ".join(base_instructions.split())
 
 
 @pytest.mark.asyncio
@@ -232,6 +235,9 @@ async def test_provider_does_not_rotate_an_existing_thread_for_history_mode(
     assert method == "thread/resume"
     assert params["threadId"] == "thread-existing"
     assert "historyMode" not in params
+    assert "https://github.com/meteosimaji/Simajilord-AI" in str(
+        params["baseInstructions"]
+    )
 
 
 def _request(
@@ -4983,10 +4989,16 @@ async def test_provider_does_not_require_a_rejected_follow_up_read(
 def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     instructions = _base_instructions("gpt-5.6-luna")
     normalized = " ".join(instructions.split())
-    assert len(instructions) < 6_500
+    assert len(instructions) < 7_200
     assert "Simajilord AI" in instructions
     assert "gpt-5.6-luna" in instructions
     assert "generic Codex/OpenAI Assistant" in instructions
+    assert "https://github.com/meteosimaji/Simajilord-AI" in instructions
+    assert "your own implementation and source code" in normalized
+    assert "not a separate reference project" in normalized
+    assert "Discord is its current deployment transport" in normalized
+    assert "inspect your repository" in normalized
+    assert "GitHub HEAD may differ from the running commit" in normalized
     assert "thoughtful member of the current Discord conversation" in instructions
     assert "Never pretend to be human" in instructions
     assert "capability_search" in instructions
