@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 
 AGENT_NO_ACTION_CONTENT = "<simajilord:no-action>"
+AGENT_FINAL_DELIVERED_CONTENT = "<simajilord:final-delivered>"
 AGENT_MESSAGE_BREAK = "<simajilord:message-break>"
 AGENT_AUTONOMY_ACTOR_ID = "simajilord:autonomy"
 AGENT_AUDIO_GRANT = "audio"

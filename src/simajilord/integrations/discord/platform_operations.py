@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 import discord
+from discord.http import Route
 
 from simajilord.core import (
     ApprovalMode,
@@ -18,6 +19,7 @@ from simajilord.core import (
 from simajilord.core.errors import UserError
 
 from .capabilities import (
+    DiscordDeliveryPurpose,
     _audit_reason,
     _bounded_name,
     _can_view_channel,
@@ -42,6 +44,7 @@ DiscordChannelOperation = Literal[
     "remove_thread_tags",
     "create_forum_tag",
     "send_soundboard",
+    "set_voice_status",
 ]
 DiscordPresenceStatus = Literal["online", "idle", "dnd", "invisible"]
 DiscordPresenceActivity = Literal[
@@ -110,7 +113,7 @@ class DiscordSendDirectMessageRequest:
     user_id: str
     content: str
     guild_id: str | None = None
-    purpose: Literal["progress", "requested_action"] = "requested_action"
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +250,50 @@ def build_discord_platform_operation_endpoints(
                 channel_id=channel.id,
                 resource_id=sound.id,
                 name=sound.name,
+            )
+
+        if request.operation == "set_voice_status":
+            if not isinstance(
+                channel,
+                (discord.VoiceChannel, discord.StageChannel),
+            ):
+                raise UserError("discord.voice_channel_invalid")
+            status = " ".join(request.name.split())
+            if len(status) > 500:
+                raise UserError("discord.voice_status_invalid")
+            for member in (actor, bot):
+                _require_channel_permissions(
+                    channel,
+                    member,
+                    "set_voice_channel_status",
+                )
+            bot_voice = bot.voice
+            if bot_voice is None or bot_voice.channel != channel:
+                for member in (actor, bot):
+                    _require_channel_permissions(
+                        channel,
+                        member,
+                        "manage_channels",
+                    )
+            try:
+                await client.http.request(
+                    Route(
+                        "PUT",
+                        "/channels/{channel_id}/voice-status",
+                        channel_id=channel.id,
+                    ),
+                    json={"status": status or None},
+                    reason=reason,
+                )
+            except discord.Forbidden as exc:
+                raise UserError("discord.voice_status_forbidden") from exc
+            except discord.DiscordException as exc:
+                raise UserError("discord.voice_status_update_failed") from exc
+            return _channel_operation_response(
+                guild,
+                request.operation,
+                channel_id=channel.id,
+                name=status or None,
             )
 
         if not isinstance(channel, discord.Thread):
@@ -395,8 +442,8 @@ def build_discord_platform_operation_endpoints(
                 name="discord.channel_operation",
                 summary=(
                     "Clone/follow a channel, join/leave/tag a thread, create a forum "
-                    "tag, or play a soundboard sound with live requester and bot "
-                    "permission checks."
+                    "tag, play a soundboard sound, or set/clear a voice-channel status "
+                    "with live requester and bot permission checks."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -411,6 +458,7 @@ def build_discord_platform_operation_endpoints(
                     "remove thread tag",
                     "create forum tag",
                     "play soundboard sound",
+                    "set voice channel status",
                     "チャンネルを複製",
                     "チャンネルをクローン",
                     "アナウンスチャンネルをフォロー",
@@ -420,6 +468,8 @@ def build_discord_platform_operation_endpoints(
                     "タグ解除",
                     "フォーラムタグを作る",
                     "サウンドボードを鳴らす",
+                    "VCのステータスを変更",
+                    "ボイスチャンネルの状態を変更",
                 ),
                 side_effects=("Mutates the selected Discord channel or thread.",),
                 requires_workspace=True,
@@ -454,7 +504,8 @@ def build_discord_platform_operation_endpoints(
                 name="discord.send_direct_message",
                 summary=(
                     "Send a link-preview-suppressed DM to the requester, or to a shared "
-                    "server member when the requester is an Administrator."
+                    "server member when the requester is an Administrator. Use purpose=final "
+                    "when the DM is the complete answer."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,

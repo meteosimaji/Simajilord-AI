@@ -23,7 +23,10 @@ from simajilord.core.errors import (
     UserError,
     WebError,
 )
-from simajilord.providers.codex_features import codex_feature_arguments
+from simajilord.providers.codex_features import (
+    CODEX_THREAD_HISTORY_MODE,
+    codex_feature_arguments,
+)
 from simajilord.providers.image.base import (
     ImageProgressCallback,
     ImageProviderResult,
@@ -41,6 +44,7 @@ from simajilord.providers.image.codex import (
 )
 
 from ..contracts import (
+    AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
     AGENT_WEB_GRANT,
@@ -67,6 +71,17 @@ _APP_SERVER_INPUT_LINE_LIMIT_BYTES = 4_000_000
 _APP_SERVER_STDOUT_LIMIT_BYTES = 80_000_000
 _APP_SERVER_LARGE_LINE_LOG_BYTES = 500_000
 _APP_SERVER_FAILURE_NOTIFICATION = "__simajilord_app_server_failed__"
+_FINAL_DELIVERY_CAPABILITIES = frozenset(
+    {
+        "discord.reply_message",
+        "discord.send_direct_message",
+        "discord.send_embed",
+        "discord.send_file",
+        "discord.send_files",
+        "discord.send_message",
+        "discord.speak",
+    }
+)
 
 
 def _base_instructions(model: str) -> str:
@@ -140,10 +155,13 @@ Reactions are optional conversational actions, not read receipts. React only whe
 never mark every message. Remove only the bot's own reaction. For Undo, trust action_receipt and
 call action.undo; omit action_id only for the requester's latest undoable action. Never overwrite a
 newer-state conflict.
-The host already shows routine progress. Do not call discord.send_message merely to announce that
-work started. Use purpose=progress only for a useful bespoke interim finding; use
-purpose=requested_action for a requested separate post. Put the complete answer in the assistant
-final without duplication. Split distinct final posts with {AGENT_MESSAGE_BREAK} alone.
+The host already shows routine progress; never post only that work started. Normally put the
+complete answer in the final and the host replies to the trigger. To finish instead by plain post,
+embed, file, message reply, DM, or VC speech, call it with purpose=final; after success return
+exactly {AGENT_FINAL_DELIVERED_CONTENT} to prevent duplication. purpose=progress is interim;
+purpose=requested_action is a separate post. For deliberate silence return
+{AGENT_NO_ACTION_CONTENT}; completion is journaled. Split host posts with
+{AGENT_MESSAGE_BREAK} alone.
 Claim work started only after a queued/running result; runtime status is authoritative.
 Long capabilities may use their declared timeout; wait for terminal status.
 For an autonomous event with nothing useful to say, return exactly {AGENT_NO_ACTION_CONTENT}.
@@ -181,6 +199,7 @@ class _ToolTurnBudget:
     write_successes: set[str] = field(default_factory=set)
     write_failures: list[tuple[str, str]] = field(default_factory=list)
     write_attempts: set[str] = field(default_factory=set)
+    final_delivery_successes: set[str] = field(default_factory=set)
     last_write_authorization_event_id: str | None = None
     discord_disclosure_observations: list[tuple[str, str, str]] = field(default_factory=list)
 
@@ -227,7 +246,9 @@ class _AppServerTransportError(AgentProviderError):
 @dataclass(slots=True)
 class _TurnAttemptState:
     process: asyncio.subprocess.Process | None = None
+    thread_id: str | None = None
     write_attempted: bool = False
+    final_delivery_successes: frozenset[str] = frozenset()
     diagnostic: dict[str, object] = field(default_factory=dict)
 
 
@@ -389,7 +410,7 @@ class CodexAppServerProvider:
                                 "tool_output_token_limit": 1_000,
                             },
                             "ephemeral": True,
-                            "historyMode": "paginated",
+                            "historyMode": CODEX_THREAD_HISTORY_MODE,
                             "sessionStartSource": "startup",
                         },
                     ),
@@ -562,6 +583,25 @@ class CodexAppServerProvider:
             if isinstance(first_failure, _AppServerTransportError):
                 first_attempt.diagnostic = first_failure.diagnostic
             runtime_restarted = await self._reset_after_runtime_failure(first_attempt.process)
+            if (
+                first_attempt.thread_id is not None
+                and first_attempt.final_delivery_successes
+            ):
+                log.warning(
+                    "Agent runtime failed after tool-owned final delivery; "
+                    "preserving delivered result request=%s capabilities=%s "
+                    "failure_type=%s runtime_restarted=%s",
+                    context.request_id,
+                    ",".join(sorted(first_attempt.final_delivery_successes)),
+                    type(first_failure).__name__,
+                    runtime_restarted,
+                )
+                return ProviderTurnResult(
+                    thread_id=first_attempt.thread_id,
+                    model=self.model,
+                    content=AGENT_FINAL_DELIVERED_CONTENT,
+                    usage=AgentTokenUsage(),
+                )
             if not first_attempt.write_attempted:
                 log.warning(
                     "Retrying safely replayable agent attempt on a fresh app-server "
@@ -584,6 +624,27 @@ class CodexAppServerProvider:
                     retry_runtime_restarted = await self._reset_after_runtime_failure(
                         retry_attempt.process
                     )
+                    if (
+                        retry_attempt.thread_id is not None
+                        and retry_attempt.final_delivery_successes
+                    ):
+                        log.warning(
+                            "Fresh agent retry runtime failed after tool-owned final "
+                            "delivery; preserving delivered result request=%s "
+                            "capabilities=%s failure_type=%s runtime_restarted=%s",
+                            context.request_id,
+                            ",".join(
+                                sorted(retry_attempt.final_delivery_successes)
+                            ),
+                            type(retry_failure).__name__,
+                            retry_runtime_restarted,
+                        )
+                        return ProviderTurnResult(
+                            thread_id=retry_attempt.thread_id,
+                            model=self.model,
+                            content=AGENT_FINAL_DELIVERED_CONTENT,
+                            usage=AgentTokenUsage(),
+                        )
                     diagnostic: dict[str, object] = {
                         "first_attempt": first_attempt.diagnostic,
                         "retry_attempt": retry_attempt.diagnostic,
@@ -633,6 +694,8 @@ class CodexAppServerProvider:
                 if attempt_state is not None:
                     attempt_state.process = self._process
                 thread_id = await self._ensure_thread(provider_thread_id, context)
+                if attempt_state is not None:
+                    attempt_state.thread_id = thread_id
                 self._notification_queues.setdefault(thread_id, asyncio.Queue())
                 authorization_event_id, provider_prompt = _with_opaque_authorization(event_prompt)
                 required_message_id = _event_message_id(provider_prompt)
@@ -840,6 +903,20 @@ class CodexAppServerProvider:
                             )
                         content = correction_content
                         usage = _combined_usage(usage, correction_usage)
+                    final_budget = self._active_tool_budgets.get(thread_id)
+                    if (
+                        final_budget is not None
+                        and final_budget.final_delivery_successes
+                    ):
+                        log.info(
+                            "Agent selected tool-owned final delivery request=%s "
+                            "capabilities=%s",
+                            context.request_id,
+                            ",".join(
+                                sorted(final_budget.final_delivery_successes)
+                            ),
+                        )
+                        content = AGENT_FINAL_DELIVERED_CONTENT
                     return ProviderTurnResult(
                         thread_id=thread_id,
                         model=result_model,
@@ -864,6 +941,9 @@ class CodexAppServerProvider:
                         attempt_state.write_attempted = any(
                             not self.tools.write_is_safe_to_retry(capability)
                             for capability in finished_budget.write_attempts
+                        )
+                        attempt_state.final_delivery_successes = frozenset(
+                            finished_budget.final_delivery_successes
                         )
                     for active_turn_id, active_thread_id in tuple(self._thread_by_turn.items()):
                         if active_thread_id == thread_id:
@@ -1118,7 +1198,7 @@ class CodexAppServerProvider:
             {
                 **common,
                 "ephemeral": False,
-                "historyMode": "paginated",
+                "historyMode": CODEX_THREAD_HISTORY_MODE,
                 "sessionStartSource": "startup",
             },
         )
@@ -1892,6 +1972,14 @@ class CodexAppServerProvider:
                 budget.write_failures = [
                     failure for failure in budget.write_failures if failure[0] != write_capability
                 ]
+            if (
+                _is_final_delivery(
+                    capability_name,
+                    capability_arguments,
+                )
+            ):
+                assert capability_name is not None
+                budget.final_delivery_successes.add(capability_name)
             await self._tool_response(
                 request_id,
                 success=True,
@@ -2293,6 +2381,19 @@ def _blocking_write_capability(
     ):
         return None
     return capability_name
+
+
+def _is_final_delivery(
+    capability_name: str | None,
+    arguments: object,
+) -> bool:
+    """Recognize an explicit model choice to replace the host's default reply."""
+
+    return (
+        capability_name in _FINAL_DELIVERY_CAPABILITIES
+        and isinstance(arguments, dict)
+        and arguments.get("purpose") == "final"
+    )
 
 
 def _write_readiness_failure_reason(

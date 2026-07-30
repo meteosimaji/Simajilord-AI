@@ -17,7 +17,10 @@ from typing import Any
 from PIL import Image
 
 from simajilord.core.errors import ProviderError
-from simajilord.providers.codex_features import codex_feature_arguments
+from simajilord.providers.codex_features import (
+    CODEX_THREAD_HISTORY_MODE,
+    codex_feature_arguments,
+)
 
 from .base import ImageProgressCallback, ImageProviderResult
 
@@ -207,7 +210,7 @@ class CodexImageProvider:
                         "tool_output_token_limit": 1_000,
                     },
                     "ephemeral": True,
-                    "historyMode": "paginated",
+                    "historyMode": CODEX_THREAD_HISTORY_MODE,
                     "sessionStartSource": "startup",
                 },
             ),

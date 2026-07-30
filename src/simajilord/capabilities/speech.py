@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from simajilord.core import (
     CapabilityDescriptor,
@@ -22,6 +23,7 @@ class SpeechSpeakRequest:
     title: str | None = None
     segments: tuple[SpeechSegment, ...] = ()
     voice_preset: str | None = None
+    purpose: Literal["progress", "requested_action", "final"] = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)

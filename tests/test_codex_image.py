@@ -17,7 +17,10 @@ from simajilord.agent.providers.codex import (
 from simajilord.agent.tools import AgentToolCatalog
 from simajilord.core import CapabilityRegistry
 from simajilord.core.errors import ProviderError
-from simajilord.providers.codex_features import codex_feature_arguments
+from simajilord.providers.codex_features import (
+    CODEX_THREAD_HISTORY_MODE,
+    codex_feature_arguments,
+)
 from simajilord.providers.image.codex import (
     CodexImageProvider,
     _image_prompt,
@@ -78,6 +81,24 @@ def test_codex_image_prompt_preserves_brief_and_requested_shape() -> None:
     assert "landscape (768:512 target ratio)" in prompt
     assert '"subject":"one cat"' in prompt
     assert '"avoid":"text"' in prompt
+
+
+@pytest.mark.asyncio
+async def test_fallback_image_thread_uses_stable_history_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _provider(tmp_path)
+    request = AsyncMock(return_value={"thread": {"id": "image-thread"}})
+    monkeypatch.setattr(provider, "_request", request)
+
+    thread_id = await provider._start_thread()
+
+    assert thread_id == "image-thread"
+    method, params = request.await_args.args
+    assert method == "thread/start"
+    assert params["ephemeral"] is True
+    assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
 
 
 def test_codex_image_imports_only_from_generated_directory(
@@ -279,6 +300,10 @@ async def test_primary_image_inactivity_resets_shared_runtime_without_retry(
         )
 
     assert request.await_count == 2
+    method, params = request.await_args_list[0].args
+    assert method == "thread/start"
+    assert params["ephemeral"] is True
+    assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
     interrupt.assert_awaited_once_with("image-thread", "image-turn")
     reset.assert_awaited_once_with(None)
     assert provider._thread_by_turn == {}

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from simajilord.agent import (
+    AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_IMAGE_GRANT,
     AGENT_WEB_GRANT,
     AgentBusyError,
@@ -39,6 +40,7 @@ from simajilord.agent.providers.codex import (
     _blocking_write_capability,
     _encode_app_server_message,
     _event_trigger,
+    _is_final_delivery,
     _last_write_failure,
     _mark_authorization_message_read,
     _memory_evidence_failure,
@@ -67,6 +69,7 @@ from simajilord.core import (
 )
 from simajilord.core.errors import MediaError
 from simajilord.observability import EventJournal
+from simajilord.providers.codex_features import CODEX_THREAD_HISTORY_MODE
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +118,7 @@ class WriteResponse:
 class ProgressWriteRequest:
     channel_id: str
     content: str
-    purpose: Literal["progress", "requested_action"]
+    purpose: Literal["progress", "requested_action", "final"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +168,69 @@ class FakeProvider:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_provider_starts_new_threads_with_stable_history_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    request = AsyncMock(return_value={"thread": {"id": "thread-new"}})
+    monkeypatch.setattr(provider, "_request", request)
+    context = InvocationContext("actor", "workspace", "agent", "event")
+
+    thread_id = await provider._ensure_thread(None, context)
+
+    assert thread_id == "thread-new"
+    method, params = request.await_args.args
+    assert method == "thread/start"
+    assert params["ephemeral"] is False
+    assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_rotate_an_existing_thread_for_history_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    request = AsyncMock(
+        return_value={
+            "thread": {
+                "id": "thread-existing",
+                "historyMode": "paginated",
+            }
+        }
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    context = InvocationContext("actor", "workspace", "agent", "event")
+
+    thread_id = await provider._ensure_thread("thread-existing", context)
+
+    assert thread_id == "thread-existing"
+    method, params = request.await_args.args
+    assert method == "thread/resume"
+    assert params["threadId"] == "thread-existing"
+    assert "historyMode" not in params
 
 
 def _request(
@@ -467,6 +533,22 @@ def test_optional_progress_failure_does_not_replace_the_final_answer() -> None:
             },
         )
         == "discord.send_message"
+    )
+    assert _is_final_delivery(
+        "discord.send_embed",
+        {"purpose": "final"},
+    )
+    assert _is_final_delivery(
+        "discord.reply_message",
+        {"purpose": "final"},
+    )
+    assert _is_final_delivery(
+        "discord.speak",
+        {"purpose": "final"},
+    )
+    assert not _is_final_delivery(
+        "discord.send_message",
+        {"purpose": "progress"},
     )
 
 
@@ -3458,6 +3540,98 @@ async def test_provider_does_not_replay_timeout_after_write_attempt(
 
 
 @pytest.mark.asyncio
+async def test_provider_preserves_successful_final_delivery_after_runtime_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-final-delivery-timeout",
+        idle_timeout_seconds=125,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+
+    async def timeout_after_final_delivery(**kwargs: object) -> ProviderTurnResult:
+        attempt_state = kwargs["attempt_state"]
+        assert isinstance(attempt_state, _TurnAttemptState)
+        attempt_state.thread_id = "durable-thread"
+        attempt_state.write_attempted = True
+        attempt_state.final_delivery_successes = frozenset(
+            {"discord.send_embed"}
+        )
+        raise TimeoutError
+
+    respond = AsyncMock(side_effect=timeout_after_final_delivery)
+    reset = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider, "_respond_with_idle_watchdog", respond)
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", reset)
+
+    result = await provider.respond(
+        provider_thread_id="saved-thread",
+        event_prompt="SIMAJILORD_EVENT_V1",
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+    )
+
+    assert result.thread_id == "durable-thread"
+    assert result.content == AGENT_FINAL_DELIVERED_CONTENT
+    assert result.usage == AgentTokenUsage()
+    assert respond.await_count == 1
+    reset.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_provider_preserves_retry_final_delivery_after_runtime_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-retry-final-delivery-timeout",
+        idle_timeout_seconds=125,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    attempts = 0
+
+    async def timeout_then_retry_final(**kwargs: object) -> ProviderTurnResult:
+        nonlocal attempts
+        attempts += 1
+        attempt_state = kwargs["attempt_state"]
+        assert isinstance(attempt_state, _TurnAttemptState)
+        if attempts == 2:
+            attempt_state.thread_id = "fresh-durable-thread"
+            attempt_state.write_attempted = True
+            attempt_state.final_delivery_successes = frozenset(
+                {"discord.reply_message"}
+            )
+        raise TimeoutError
+
+    respond = AsyncMock(side_effect=timeout_then_retry_final)
+    reset = AsyncMock(side_effect=(True, True))
+    monkeypatch.setattr(provider, "_respond_with_idle_watchdog", respond)
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", reset)
+
+    result = await provider.respond(
+        provider_thread_id="stale-thread",
+        event_prompt="SIMAJILORD_EVENT_V1",
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+    )
+
+    assert result.thread_id == "fresh-durable-thread"
+    assert result.content == AGENT_FINAL_DELIVERED_CONTENT
+    assert result.usage == AgentTokenUsage()
+    assert respond.await_count == 2
+    assert reset.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_timeout_reset_never_interrupts_another_active_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3573,6 +3747,52 @@ async def test_provider_still_requires_message_fetch_for_mention_no_action(
             event_prompt=("SIMAJILORD_EVENT_V1\ntrigger=mention\nmessage_id=123"),
             context=InvocationContext("actor", "workspace", "agent", "event"),
         )
+
+
+@pytest.mark.asyncio
+async def test_successful_tool_owned_final_suppresses_host_reply(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-tool-final",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(return_value={"turn": {"id": "turn"}}),
+    )
+
+    async def complete_turn(
+        thread_id: str,
+        turn_id: str,
+        *,
+        attempt_state: _TurnAttemptState | None = None,
+    ) -> tuple[str, AgentTokenUsage]:
+        del turn_id, attempt_state
+        budget = provider._active_tool_budgets[thread_id]
+        budget.event_message_read = True
+        budget.final_delivery_successes.add("discord.send_embed")
+        return "This text would duplicate the embed.", AgentTokenUsage(total_tokens=1)
+
+    monkeypatch.setattr(provider, "_await_turn", complete_turn)
+
+    result = await provider.respond(
+        provider_thread_id=None,
+        event_prompt=("SIMAJILORD_EVENT_V1\ntrigger=mention\nmessage_id=123"),
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+    )
+
+    assert result.content == AGENT_FINAL_DELIVERED_CONTENT
 
 
 @pytest.mark.asyncio
@@ -4493,7 +4713,10 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "address the concrete weakness and improve it" in instructions
     assert "The host already shows routine progress" in instructions
     assert "purpose=requested_action" in instructions
-    assert "Put the complete answer in the assistant final" in normalized
+    assert "purpose=final" in instructions
+    assert "the host replies to the trigger" in normalized
+    assert AGENT_FINAL_DELIVERED_CONTENT in instructions
+    assert "<simajilord:no-action>" in instructions
     assert "Codex web search" in instructions
     assert "primary sources" in instructions
     assert "reply_context" in instructions

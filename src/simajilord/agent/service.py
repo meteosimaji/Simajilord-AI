@@ -13,7 +13,9 @@ from simajilord.core import InvocationContext
 from simajilord.observability import EventJournal
 
 from .contracts import (
+    AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_MEMORY_GRANT,
+    AGENT_NO_ACTION_CONTENT,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentRequest,
@@ -202,6 +204,15 @@ class AgentService:
                         "trigger": request.trigger.value,
                         "model": result.model,
                         "response_characters": len(content),
+                        "delivery_disposition": (
+                            "agent_tool"
+                            if content == AGENT_FINAL_DELIVERED_CONTENT
+                            else (
+                                "intentional_silence"
+                                if content == AGENT_NO_ACTION_CONTENT
+                                else "host_reply"
+                            )
+                        ),
                         "usage": {
                             "input_tokens": result.usage.input_tokens,
                             "cached_input_tokens": result.usage.cached_input_tokens,

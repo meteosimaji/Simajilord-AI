@@ -29,6 +29,7 @@ from simajilord.agent import (
     AGENT_AUDIO_GRANT,
     AGENT_COMPUTE_GRANT,
     AGENT_FILE_GRANT,
+    AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
@@ -8648,7 +8649,10 @@ class AgentCog(commands.Cog):
         )
         async with lock:
             chunks = agent_message_groups(pending.response_content)
-            if pending.response_content.strip() == AGENT_NO_ACTION_CONTENT:
+            if pending.response_content.strip() in {
+                AGENT_FINAL_DELIVERED_CONTENT,
+                AGENT_NO_ACTION_CONTENT,
+            }:
                 chunks = ()
             if expected_chunks is not None and chunks != expected_chunks:
                 raise RuntimeError("prepared Discord chunks changed before delivery")
@@ -9928,7 +9932,10 @@ class AgentAutonomyCog(commands.Cog):
             events=event_pointers,
         )
         response = await agent.respond(request)
-        if response.content.strip() == AGENT_NO_ACTION_CONTENT:
+        if response.content.strip() in {
+            AGENT_FINAL_DELIVERED_CONTENT,
+            AGENT_NO_ACTION_CONTENT,
+        }:
             return True
         messages = _agent_message_groups(response.content)
         if not messages:

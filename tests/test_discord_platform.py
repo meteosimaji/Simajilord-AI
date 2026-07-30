@@ -31,6 +31,7 @@ from simajilord.integrations.discord.platform_capabilities import (
     DiscordListPollVotersRequest,
 )
 from simajilord.integrations.discord.platform_operations import (
+    DiscordChannelOperationRequest,
     DiscordSendDirectMessageRequest,
 )
 from simajilord.runtime import SimajilordRuntime
@@ -421,6 +422,350 @@ async def test_active_threads_and_guild_preview_are_fetched_live(
 
 
 @pytest.mark.asyncio
+async def test_disabled_widget_returns_settings_instead_of_public_widget_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock()
+    client.http.request = AsyncMock(
+        return_value={"enabled": False, "channel_id": None},
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(administrator=True)
+    bot = _member_with_permissions(administrator=True)
+    guild.me = bot
+    guild.widget = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._require_common_guild",
+        AsyncMock(return_value=actor),
+    )
+    endpoint_by_name = _endpoints(
+        cast(discord.Client, client),
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    response = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(kind="widget"),
+        _context(),
+    )
+
+    fields = {field.key: field.value for field in response.resources[0].fields}
+    assert fields["enabled"] == "false"
+    assert fields["public_widget_available"] == "false"
+    assert fields["image_url"] == "https://discord.com/api/guilds/1/widget.png"
+    guild.widget.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_welcome_screen_and_unavailable_vanity_are_state_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = cast(discord.Client, Mock(spec=discord.Client))
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.features = ["COMMUNITY"]
+    guild.vanity_url_code = None
+    guild.welcome_screen = AsyncMock(side_effect=discord.NotFound(Mock(), "missing"))
+    guild.vanity_invite = AsyncMock()
+    actor = _member_with_permissions(administrator=True)
+    bot = _member_with_permissions(administrator=True)
+    guild.me = bot
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._require_common_guild",
+        AsyncMock(return_value=actor),
+    )
+    endpoint_by_name = _endpoints(
+        client,
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    welcome = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(kind="welcome_screen"),
+        _context(),
+    )
+    vanity = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(kind="vanity_invite"),
+        _context(),
+    )
+
+    welcome_fields = {
+        field.key: field.value for field in welcome.resources[0].fields
+    }
+    vanity_fields = {
+        field.key: field.value for field in vanity.resources[0].fields
+    }
+    assert welcome_fields["configured"] == "false"
+    assert welcome_fields["community_enabled"] == "true"
+    assert vanity_fields["feature_enabled"] == "false"
+    assert vanity_fields["configured"] == "false"
+    guild.vanity_invite.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_voice_regions_and_prune_estimate_use_safe_official_get_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock()
+    client.http.request = AsyncMock(
+        side_effect=[
+            [
+                {
+                    "id": "japan",
+                    "name": "Japan",
+                    "optimal": True,
+                    "deprecated": False,
+                    "custom": False,
+                }
+            ],
+            [
+                {
+                    "id": "vip-japan",
+                    "name": "VIP Japan",
+                    "optimal": False,
+                    "deprecated": False,
+                    "custom": True,
+                }
+            ],
+            {"pruned": 3},
+        ]
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(
+        administrator=True,
+        manage_guild=True,
+        kick_members=True,
+    )
+    bot = _member_with_permissions(
+        administrator=True,
+        manage_guild=True,
+        kick_members=True,
+    )
+    guild.me = bot
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._require_common_guild",
+        AsyncMock(return_value=actor),
+    )
+    endpoint_by_name = _endpoints(
+        cast(discord.Client, client),
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    global_regions = await endpoint_by_name[
+        "discord.list_platform_resources"
+    ].invoke(
+        DiscordListPlatformResourcesRequest(kind="voice_region"),
+        _context(),
+    )
+    guild_regions = await endpoint_by_name[
+        "discord.list_platform_resources"
+    ].invoke(
+        DiscordListPlatformResourcesRequest(kind="guild_voice_region"),
+        _context(),
+    )
+    prune = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(
+            kind="prune_count",
+            prune_days=14,
+            prune_role_ids=("22", "33"),
+        ),
+        _context(),
+    )
+
+    assert global_regions.resources[0].resource_id == "japan"
+    assert guild_regions.resources[0].resource_id == "vip-japan"
+    prune_fields = {
+        field.key: field.value for field in prune.resources[0].fields
+    }
+    assert prune_fields == {
+        "days": "14",
+            "include_role_ids": "22, 33",
+        "estimated_member_count": "3",
+        "mutates_members": "false",
+    }
+    routes = [
+        call.args[0] for call in client.http.request.await_args_list
+    ]
+    assert [(route.method, route.path) for route in routes] == [
+        ("GET", "/voice/regions"),
+        ("GET", "/guilds/{guild_id}/regions"),
+        ("GET", "/guilds/{guild_id}/prune"),
+    ]
+    assert client.http.request.await_args_list[2].kwargs["params"] == {
+        "days": 14,
+        "include_roles": "22,33",
+    }
+
+
+@pytest.mark.asyncio
+async def test_application_subscriptions_support_list_and_exact_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock()
+    client.application_info = AsyncMock(
+        return_value=SimpleNamespace(
+            owner=SimpleNamespace(id=7),
+            team=None,
+        )
+    )
+    subscription = {
+        "id": "101",
+        "user_id": "7",
+        "sku_ids": ["80"],
+        "entitlement_ids": ["90"],
+        "renewal_sku_ids": ["80"],
+        "current_period_start": "2026-07-01T00:00:00+00:00",
+        "current_period_end": "2026-08-01T00:00:00+00:00",
+        "status": 0,
+        "canceled_at": None,
+    }
+    client.http.request = AsyncMock(
+        side_effect=[[subscription], subscription],
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(administrator=True)
+    actor.id = 7
+    bot = _member_with_permissions(administrator=True)
+    guild.me = bot
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._require_common_guild",
+        AsyncMock(return_value=actor),
+    )
+    endpoint_by_name = _endpoints(
+        cast(discord.Client, client),
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    with pytest.raises(
+        UserError,
+        match=r"discord\.subscription_user_id_required",
+    ):
+        await endpoint_by_name["discord.list_platform_resources"].invoke(
+            DiscordListPlatformResourcesRequest(
+                kind="subscription",
+                resource_id="80",
+            ),
+            _context(),
+        )
+    listed = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(
+            kind="subscription",
+            resource_id="80",
+            user_id="7",
+        ),
+        _context(),
+    )
+    exact = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(
+            kind="subscription",
+            resource_id="80",
+            subresource_id="101",
+        ),
+        _context(),
+    )
+
+    assert listed.resources[0].resource_id == "101"
+    assert exact.resources[0].resource_id == "101"
+    exact_fields = {
+        field.key: field.value for field in exact.resources[0].fields
+    }
+    assert exact_fields["user_id"] == "7"
+    assert exact_fields["entitlement_ids"] == "90"
+    routes = [call.args[0] for call in client.http.request.await_args_list]
+    assert [(route.method, route.path) for route in routes] == [
+        ("GET", "/skus/{sku_id}/subscriptions"),
+        ("GET", "/skus/{sku_id}/subscriptions/{subscription_id}"),
+    ]
+    assert client.http.request.await_args_list[0].kwargs["params"] == {
+        "limit": 16,
+        "user_id": "7",
+    }
+    assert client.http.request.await_args_list[1].kwargs["params"] is None
+
+
+@pytest.mark.asyncio
+async def test_application_role_connection_metadata_is_owner_only_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock()
+    client.application_id = 55
+    client.application_info = AsyncMock(
+        return_value=SimpleNamespace(
+            owner=SimpleNamespace(id=7),
+            team=None,
+        )
+    )
+    client.http.request = AsyncMock(
+        return_value=[
+            {
+                "type": 7,
+                "key": "verified",
+                "name": "Verified",
+                "name_localizations": {"ja": "確認済み"},
+                "description": "Whether this member is verified.",
+                "description_localizations": {"ja": "確認済みか"},
+            }
+        ]
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(administrator=True)
+    actor.id = 7
+    bot = _member_with_permissions(administrator=True)
+    guild.me = bot
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_capabilities._require_common_guild",
+        AsyncMock(return_value=actor),
+    )
+    endpoint_by_name = _endpoints(
+        cast(discord.Client, client),
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    response = await endpoint_by_name["discord.list_platform_resources"].invoke(
+        DiscordListPlatformResourcesRequest(
+            kind="role_connection_metadata",
+        ),
+        _context(),
+    )
+
+    assert response.resources[0].resource_id == "verified"
+    assert {field.key: field.value for field in response.resources[0].fields} == {
+        "type": "7",
+        "key": "verified",
+        "description": "Whether this member is verified.",
+        "name_locales": "ja",
+        "description_locales": "ja",
+    }
+    route = client.http.request.await_args.args[0]
+    assert (route.method, route.path) == (
+        "GET",
+        "/applications/{application_id}/role-connections/metadata",
+    )
+
+
+@pytest.mark.asyncio
 async def test_private_thread_inspection_requires_actual_membership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -525,6 +870,65 @@ async def test_administrator_can_set_a_channel_overwrite(
     assert overwrite.view_channel is True
     assert overwrite.send_messages is True
     assert overwrite.manage_messages is False
+
+
+@pytest.mark.asyncio
+async def test_voice_status_uses_official_route_and_requires_live_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = Mock()
+    client.http.request = AsyncMock(return_value=None)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(
+        administrator=True,
+        manage_channels=True,
+        set_voice_channel_status=True,
+    )
+    bot = _member_with_permissions(
+        administrator=True,
+        manage_channels=True,
+        set_voice_channel_status=True,
+    )
+    bot.voice = None
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.id = 10
+    channel.permissions_for.side_effect = (
+        lambda member: member.guild_permissions
+    )
+    guild.get_channel_or_thread.return_value = channel
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_operations._requested_guild",
+        lambda selected_client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_operations._write_members",
+        AsyncMock(return_value=(actor, bot)),
+    )
+    endpoint_by_name = _endpoints(
+        cast(discord.Client, client),
+        cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+    )
+
+    response = await endpoint_by_name["discord.channel_operation"].invoke(
+        DiscordChannelOperationRequest(
+            operation="set_voice_status",
+            channel_id="10",
+            name="  Audit   in progress  ",
+            reason="Live API audit",
+        ),
+        _context(),
+    )
+
+    assert response.name == "Audit in progress"
+    route = client.http.request.await_args.args[0]
+    assert (route.method, route.path) == (
+        "PUT",
+        "/channels/{channel_id}/voice-status",
+    )
+    assert client.http.request.await_args.kwargs["json"] == {
+        "status": "Audit in progress"
+    }
 
 
 @pytest.mark.asyncio

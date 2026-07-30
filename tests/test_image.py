@@ -748,9 +748,12 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
         resource_ids=("allowed-channel",),
         origin_resource_id="allowed-channel",
     )
-    raw_responses = await asyncio.gather(
-        registry.invoke("image.generate", request, context),
-        registry.invoke("image.generate", request, context),
+    raw_responses = await asyncio.wait_for(
+        asyncio.gather(
+            registry.invoke("image.generate", request, context),
+            registry.invoke("image.generate", request, context),
+        ),
+        timeout=2,
     )
     responses = tuple(cast(ImageGenerateResponse, item) for item in raw_responses)
     response = responses[0]

@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 import discord
 
 from simajilord.agent import (
+    AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
     AgentBusyError,
@@ -257,7 +258,10 @@ class AgentProgressMessage:
         self._closed = True
         await self._cancel_pending()
         await self._delete_temporary_messages()
-        if content.strip() == AGENT_NO_ACTION_CONTENT:
+        if content.strip() in {
+            AGENT_FINAL_DELIVERED_CONTENT,
+            AGENT_NO_ACTION_CONTENT,
+        }:
             return ()
         return agent_message_groups(content)
 

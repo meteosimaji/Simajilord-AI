@@ -448,6 +448,24 @@ async def test_agent_no_action_sentinel_is_never_published() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_tool_final_sentinel_is_never_published() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.reply = AsyncMock()
+    published = Mock(spec=discord.Message)
+    published.id = 43
+    published.delete = AsyncMock()
+    progress = _AgentProgressMessage(source)
+    progress.message = published
+
+    await progress.finish("<simajilord:final-delivered>")
+
+    published.delete.assert_awaited_once_with()
+    source.reply.assert_not_awaited()
+    assert progress.message is None
+
+
+@pytest.mark.asyncio
 async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> None:
     order: list[str] = []
     source = Mock(spec=discord.Message)

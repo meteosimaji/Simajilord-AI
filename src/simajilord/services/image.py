@@ -552,7 +552,7 @@ class ImageGenerationService:
         self._delivery_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._delivery_retry_requested: set[str] = set()
         self._delivery_locks: dict[str, _DeliveryLockState] = {}
-        self._terminal_events: dict[str, asyncio.Event] = {}
+        self._terminal_futures: dict[str, asyncio.Future[None]] = {}
         self._closed = False
 
     async def start(self, delivery_handler: ImageDeliveryHandler) -> None:
@@ -653,20 +653,23 @@ class ImageGenerationService:
     async def wait_for_terminal(self, job_id: str) -> ImageGenerationJob:
         """Wait for durable generation completion independently of delivery."""
 
-        event = self._terminal_events.setdefault(job_id, asyncio.Event())
         while not self._closed:
             job = await asyncio.to_thread(self.store.require, job_id)
             if job.status in {ImageJobStatus.COMPLETED, ImageJobStatus.FAILED}:
-                self._terminal_events.pop(job_id, None)
                 return job
-            event.clear()
-            # Recheck after clearing so completion in this race window cannot
-            # leave the waiter asleep forever.
+            future = self._terminal_futures.get(job_id)
+            if future is None or future.done():
+                future = asyncio.get_running_loop().create_future()
+                self._terminal_futures[job_id] = future
+            # Recheck after publishing the shared one-shot future. Completion
+            # can now either be observed durably here or resolve the future;
+            # unlike a shared Event, one waiter cannot clear another waiter's
+            # notification.
             job = await asyncio.to_thread(self.store.require, job_id)
             if job.status in {ImageJobStatus.COMPLETED, ImageJobStatus.FAILED}:
-                self._terminal_events.pop(job_id, None)
+                self._resolve_terminal_waiters(job_id)
                 return job
-            await event.wait()
+            await future
         raise RuntimeError("Image generation service closed before completion.")
 
     async def mark_delivered(
@@ -713,9 +716,10 @@ class ImageGenerationService:
         self._delivery_retry_tasks.clear()
         self._delivery_retry_requested.clear()
         self._delivery_locks.clear()
-        for event in self._terminal_events.values():
-            event.set()
-        self._terminal_events.clear()
+        for future in self._terminal_futures.values():
+            if not future.done():
+                future.set_result(None)
+        self._terminal_futures.clear()
         if self.provider is not None:
             await self.provider.close()
 
@@ -765,6 +769,7 @@ class ImageGenerationService:
                     job.job_id,
                     error_code=_image_error_code(exc),
                 )
+                self._resolve_terminal_waiters(job.job_id)
                 await self._append_journal(
                     kind="image.job.failed",
                     actor_id=job.actor_id,
@@ -778,6 +783,7 @@ class ImageGenerationService:
                     },
                 )
             else:
+                self._resolve_terminal_waiters(job.job_id)
                 await self._append_journal(
                     kind="image.job.completed",
                     actor_id=job.actor_id,
@@ -790,10 +796,12 @@ class ImageGenerationService:
                         "model": result.model,
                     },
                 )
-            event = self._terminal_events.get(job.job_id)
-            if event is not None:
-                event.set()
             await self._notify(terminal)
+
+    def _resolve_terminal_waiters(self, job_id: str) -> None:
+        future = self._terminal_futures.pop(job_id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
 
     def _progress_callback(self, job_id: str) -> ImageProgressCallback:
         async def progress(step: int, total: int) -> None:

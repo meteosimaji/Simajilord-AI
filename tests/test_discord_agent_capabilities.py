@@ -24,7 +24,9 @@ from simajilord.integrations.discord.capabilities import (
     DiscordPollRequest,
     DiscordReactionRequest,
     DiscordReadMessagesRequest,
+    DiscordReplyMessageRequest,
     DiscordSearchMessagesRequest,
+    DiscordSendEmbedRequest,
     DiscordSendMessageRequest,
     build_discord_endpoints,
 )
@@ -465,6 +467,104 @@ async def test_agent_text_message_suppresses_discord_link_previews() -> None:
 
     assert response.message_id == "31"
     assert channel.send.await_args.kwargs["suppress_embeds"] is True
+
+
+@pytest.mark.asyncio
+async def test_cross_guild_write_infers_unique_channel_guild_when_model_omits_it() -> None:
+    client = Mock(spec=discord.Client)
+    origin_guild = Mock(spec=discord.Guild)
+    origin_guild.id = 10
+    origin_guild.get_channel_or_thread.return_value = None
+    target_guild = Mock(spec=discord.Guild)
+    target_guild.id = 11
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    target_guild.get_member.return_value = actor
+    target_guild.me = bot
+    target_channel = Mock(spec=discord.TextChannel)
+    target_channel.id = 21
+    target_channel.guild = target_guild
+    target_channel.permissions_for.return_value = SimpleNamespace(
+        administrator=True,
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+    )
+    target_channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    target_guild.get_channel_or_thread.return_value = target_channel
+    client.get_guild.return_value = origin_guild
+    client.get_channel.return_value = target_channel
+
+    response = await _endpoint_map(cast(discord.Client, client))[
+        "discord.send_message"
+    ].invoke(
+        DiscordSendMessageRequest(
+            channel_id="21",
+            content="Cross-guild post selected by its unique channel ID.",
+        ),
+        _agent_context(resource_ids=("20",)),
+    )
+
+    assert response.guild_id == "11"
+    assert response.channel_id == "21"
+    target_channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_embed_and_plain_reply_can_target_a_selected_message() -> None:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    guild.get_member.return_value = actor
+    guild.me = bot
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        embed_links=True,
+    )
+    target = Mock(spec=discord.Message)
+    target.id = 30
+    target.reply = AsyncMock(return_value=SimpleNamespace(id=32))
+    channel.fetch_message = AsyncMock(return_value=target)
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+    endpoints = _endpoint_map(cast(discord.Client, client))
+    context = _agent_context(resource_ids=("20",))
+
+    embed_response = await endpoints["discord.send_embed"].invoke(
+        DiscordSendEmbedRequest(
+            channel_id="20",
+            title="Result",
+            reply_to_message_id="30",
+            silent=True,
+            purpose="final",
+        ),
+        context,
+    )
+    reply_response = await endpoints["discord.reply_message"].invoke(
+        DiscordReplyMessageRequest(
+            channel_id="20",
+            message_id="30",
+            content="Plain final response",
+            silent=True,
+            purpose="final",
+        ),
+        context,
+    )
+
+    assert embed_response.message_id == "31"
+    assert channel.send.await_args.kwargs["reference"] is target
+    assert channel.send.await_args.kwargs["silent"] is True
+    assert reply_response.message_id == "32"
+    assert reply_response.guild_id == "10"
+    assert target.reply.await_args.kwargs["silent"] is True
+    assert target.reply.await_args.kwargs["suppress_embeds"] is True
 
 
 def _visibility_guild(

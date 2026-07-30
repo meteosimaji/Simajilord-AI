@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# Legacy remains durable, resumable, and compactable. Experimental paginated
+# projection in bundled Codex runtimes can reject valid fractional rate-limit JSON.
+CODEX_THREAD_HISTORY_MODE = "legacy"
+
 _DISABLED_CODEX_FEATURES = (
     "apps",
     "auth_elicitation",

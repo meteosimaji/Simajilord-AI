@@ -452,6 +452,8 @@ CRITICAL_COLLISION_CASES = (
     ("サーバーウィジェットを確認して", "discord.list_platform_resources"),
     ("バニティURLを確認して", "discord.list_platform_resources"),
     ("アクティブスレッドを一覧にして", "discord.list_platform_resources"),
+    ("SKUのサブスクリプションを確認して", "discord.list_platform_resources"),
+    ("VCのステータスを変更して", "discord.channel_operation"),
     ("このメッセージを引用画像にして", "discord.create_quote_image"),
     ("このメッセージを文章で引用して再投稿して", "discord.post_expanded_message"),
     ("カスタム絵文字のアニメを見せて", "discord.view_custom_emoji"),

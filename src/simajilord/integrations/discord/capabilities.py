@@ -123,6 +123,16 @@ DiscordMessageChannel: TypeAlias = (
     discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel
 )
 DiscordReadableChannel: TypeAlias = DiscordMessageChannel | discord.ForumChannel
+DiscordDeliveryPurpose: TypeAlias = Literal[
+    "progress",
+    "requested_action",
+    "final",
+]
+_OPTIONAL_TARGET_GUILD_DESCRIPTION = (
+    "Target guild ID returned by discord.list_servers. Omit for the origin "
+    "guild, or when channel_id already identifies a cached shared-guild channel; "
+    "the host always rechecks requester and bot membership and permissions."
+)
 _CUSTOM_EMOJI_PATTERN = re.compile(
     r"<(?P<animated>a?):(?P<name>[A-Za-z0-9_]{2,32}):(?P<id>[0-9]{15,22})>"
 )
@@ -953,15 +963,9 @@ class DiscordSendMessageRequest:
     content: str
     guild_id: str | None = dataclass_field(
         default=None,
-        metadata={
-            "description": (
-                "Target guild ID returned by discord.list_servers. Omit for the "
-                "origin guild. Cross-guild posting is re-authorized from live "
-                "requester and bot membership and channel permissions."
-            )
-        },
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
-    purpose: Literal["progress", "requested_action"] = "requested_action"
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -980,14 +984,11 @@ class DiscordSendEmbedRequest:
     tone: Literal["info", "success", "warning", "error"] = "info"
     guild_id: str | None = dataclass_field(
         default=None,
-        metadata={
-            "description": (
-                "Target guild ID returned by discord.list_servers. Omit for the "
-                "origin guild."
-            )
-        },
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
-    purpose: Literal["progress", "requested_action"] = "requested_action"
+    reply_to_message_id: str | None = None
+    silent: bool = False
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1081,16 +1082,11 @@ class DiscordSendFileRequest:
     spoiler: bool = False
     guild_id: str | None = dataclass_field(
         default=None,
-        metadata={
-            "description": (
-                "Target guild ID returned by discord.list_servers. Omit for the "
-                "origin guild."
-            )
-        },
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
     reply_to_message_id: str | None = None
     silent: bool = False
-    purpose: Literal["progress", "requested_action"] = "requested_action"
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1116,16 +1112,11 @@ class DiscordSendFilesRequest:
     caption: str = ""
     guild_id: str | None = dataclass_field(
         default=None,
-        metadata={
-            "description": (
-                "Target guild ID returned by discord.list_servers. Omit for the "
-                "origin guild."
-            )
-        },
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
     reply_to_message_id: str | None = None
     silent: bool = False
-    purpose: Literal["progress", "requested_action"] = "requested_action"
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1143,6 +1134,19 @@ class DiscordSendMessageResponse:
     message_id: str
     channel_id: str
     guild_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordReplyMessageRequest:
+    channel_id: str
+    message_id: str
+    content: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+    silent: bool = False
+    purpose: DiscordDeliveryPurpose = "requested_action"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2957,16 +2961,27 @@ def build_discord_endpoints(
             tone = EmbedTone(request.tone)
         except ValueError as exc:
             raise UserError("discord.embed_tone_invalid") from exc
-        message = await channel.send(
-            embed=agent_embed(
+        reply = (
+            await _fetch_message_for_write(channel, request.reply_to_message_id)
+            if request.reply_to_message_id is not None
+            else None
+        )
+        send_arguments: dict[str, Any] = {
+            "embed": agent_embed(
                 title,
                 description=description or None,
                 fields=tuple(fields),
                 tone=tone,
             ),
-            nonce=_discord_write_nonce(context, "embed"),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+            "nonce": _discord_write_nonce(context, "embed"),
+            "allowed_mentions": discord.AllowedMentions.none(),
+        }
+        if reply is not None:
+            send_arguments["reference"] = reply
+            send_arguments["mention_author"] = False
+        if request.silent:
+            send_arguments["silent"] = True
+        message = await channel.send(**send_arguments)
         return DiscordSendMessageResponse(
             message_id=str(message.id),
             channel_id=str(channel.id),
@@ -2974,13 +2989,15 @@ def build_discord_endpoints(
         )
 
     async def reply_message(
-        request: DiscordMessageWriteRequest,
+        request: DiscordReplyMessageRequest,
         context: InvocationContext,
     ) -> DiscordSendMessageResponse:
         guild, channel, actor, bot = await _write_message_channel(
-            client, context, request.channel_id
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
         )
-        del guild
         _require_channel_permissions(channel, actor, "send_messages")
         _require_channel_permissions(channel, bot, "send_messages")
         if not 1 <= len(request.content) <= 2_000:
@@ -2988,11 +3005,17 @@ def build_discord_endpoints(
         message = await _fetch_message_for_write(channel, request.message_id)
         reply = await message.reply(
             request.content,
+            nonce=_discord_write_nonce(context, "reply"),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
+            silent=request.silent,
         )
-        return DiscordSendMessageResponse(str(reply.id), str(channel.id))
+        return DiscordSendMessageResponse(
+            str(reply.id),
+            str(channel.id),
+            str(guild.id),
+        )
 
     async def edit_own_message(
         request: DiscordMessageWriteRequest,
@@ -5124,7 +5147,8 @@ def build_discord_endpoints(
                     "file attachment, or DM. Routine progress is already shown by the host "
                     "UI; use purpose=progress only for a useful bespoke interim update, or "
                     "purpose=requested_action when the person explicitly requested a "
-                    "separate post."
+                    "separate post. Use purpose=final when this post is the complete answer "
+                    "and host reply delivery should be suppressed."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -5160,7 +5184,9 @@ def build_discord_endpoints(
                     "Post one clean AI-authored Discord embed when a compact structured "
                     "card materially improves a requested result or useful interim update. "
                     "Supports a title, description, up to 10 fields, and a restrained tone; "
-                    "it adds no timestamp, footer, provider label, image URL, or mentions."
+                    "it adds no timestamp, footer, provider label, image URL, or mentions. "
+                    "It may reply to a selected message, and purpose=final makes the card "
+                    "the complete answer."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -5198,7 +5224,10 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.reply_message",
-                summary="Reply as the bot to one readable Discord message.",
+                summary=(
+                    "Reply as the bot to any readable Discord message in an authorized "
+                    "shared server. Use purpose=final when this reply is the complete answer."
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=(
@@ -5212,7 +5241,7 @@ def build_discord_endpoints(
                 ),
                 requires_workspace=True,
             ),
-            DiscordMessageWriteRequest,
+            DiscordReplyMessageRequest,
             DiscordSendMessageResponse,
             reply_message,
         ),
@@ -5757,7 +5786,8 @@ def build_discord_endpoints(
                 summary=(
                     "Send 1-10 workspace files as real Discord attachments, with "
                     "optional descriptions, spoiler treatment, reply target, and "
-                    "silent delivery."
+                    "silent delivery. Use purpose=final when the attachment post is the "
+                    "complete answer."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -5802,7 +5832,8 @@ def build_discord_endpoints(
                 summary=(
                     "Send one workspace file as a real Discord attachment, with "
                     "optional description, spoiler treatment, reply target, and "
-                    "silent delivery."
+                    "silent delivery. Use purpose=final when the attachment post is the "
+                    "complete answer."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -6178,7 +6209,8 @@ def build_discord_endpoints(
                 name="discord.speak",
                 summary=(
                     "Speak a short passage with VOICEVOX in the requester's voice channel. "
-                    "Music is coordinated automatically while speech is playing."
+                    "Music is coordinated automatically while speech is playing. Use "
+                    "purpose=final when the spoken passage is the complete answer."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -7105,7 +7137,12 @@ async def _write_message_channel(
     guild_id: str | None = None,
     required_permissions: tuple[str, ...] = (),
 ) -> tuple[discord.Guild, DiscordMessageChannel, discord.Member, discord.Member]:
-    guild = _requested_guild(client, context, guild_id)
+    guild = _write_guild_for_channel(
+        client,
+        context,
+        channel_id=channel_id,
+        requested_guild_id=guild_id,
+    )
     if str(guild.id) == context.workspace_id:
         _assert_agent_update_scope(context, channel_id)
     channel = _message_channel(guild, channel_id)
@@ -7118,6 +7155,27 @@ async def _write_message_channel(
         for permission in required_permissions:
             _require_channel_permissions(channel, member, permission)
     return guild, channel, actor, bot
+
+
+def _write_guild_for_channel(
+    client: discord.Client,
+    context: InvocationContext,
+    *,
+    channel_id: str,
+    requested_guild_id: str | None,
+) -> discord.Guild:
+    """Infer an omitted cross-guild target from Discord's globally unique channel ID."""
+
+    origin_or_requested = _requested_guild(client, context, requested_guild_id)
+    if requested_guild_id is not None or context.transport != "agent":
+        return origin_or_requested
+    resolved_channel_id = _snowflake(channel_id, "channel")
+    if origin_or_requested.get_channel_or_thread(resolved_channel_id) is not None:
+        return origin_or_requested
+    cached = client.get_channel(resolved_channel_id)
+    if isinstance(cached, (discord.abc.GuildChannel, discord.Thread)):
+        return cached.guild
+    return origin_or_requested
 
 
 async def _guild_member(guild: discord.Guild, user_id: str) -> discord.Member:

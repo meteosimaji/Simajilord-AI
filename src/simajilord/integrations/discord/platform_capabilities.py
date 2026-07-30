@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Literal
 
 import discord
+from discord.http import Route
 
 from simajilord.core import (
     CapabilityDescriptor,
@@ -62,6 +63,11 @@ DiscordPlatformResourceKind = Literal[
     "vanity_invite",
     "active_thread",
     "guild_preview",
+    "voice_region",
+    "guild_voice_region",
+    "prune_count",
+    "subscription",
+    "role_connection_metadata",
 ]
 
 _MAX_PLATFORM_OFFSET = 200
@@ -317,6 +323,24 @@ class DiscordListPlatformResourcesRequest:
             )
         },
     )
+    subresource_id: str | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Optional child resource ID: a subscription ID when kind=subscription "
+                "and resource_id is its parent SKU ID."
+            )
+        },
+    )
+    user_id: str | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Target user ID required when listing kind=subscription with Bot "
+                "authentication. It is not required for one exact subscription ID."
+            )
+        },
+    )
     guild_id: str | None = field(
         default=None,
         metadata={
@@ -332,6 +356,23 @@ class DiscordListPlatformResourcesRequest:
     limit: int = field(
         default=15,
         metadata={"description": "Resource records returned, from 1 through 25."},
+    )
+    prune_days: int = field(
+        default=7,
+        metadata={
+            "description": (
+                "Inactive-day threshold from 1 through 30, used only for kind=prune_count."
+            )
+        },
+    )
+    prune_role_ids: tuple[str, ...] = field(
+        default=(),
+        metadata={
+            "description": (
+                "Optional role IDs included in the non-mutating prune estimate, used only "
+                "for kind=prune_count."
+            )
+        },
     )
 
 
@@ -748,7 +789,11 @@ def build_discord_platform_endpoints(
             bot=bot,
             kind=request.kind,
             resource_id=request.resource_id,
+            subresource_id=request.subresource_id,
+            subscription_user_id=request.user_id,
             needed=request.offset + request.limit + 1,
+            prune_days=request.prune_days,
+            prune_role_ids=request.prune_role_ids,
         )
         page = resources[request.offset : request.offset + request.limit]
         has_more = len(resources) > request.offset + len(page)
@@ -967,7 +1012,9 @@ def build_discord_platform_endpoints(
                     "owner-only application SKUs/entitlements, AutoMod rules, "
                     "integrations, templates, stage instances, role counts, onboarding, "
                     "welcome screen, widget, vanity invite, active threads, or a "
-                    "REST-fetched guild preview. "
+                    "REST-fetched guild preview; it also lists global/guild voice regions "
+                    "and application subscriptions/role-connection metadata, and can "
+                    "estimate inactive members without starting a prune. "
                     "Permission-sensitive families require both requester and bot access."
                 ),
                 risk=RiskLevel.READ,
@@ -997,6 +1044,12 @@ def build_discord_platform_endpoints(
                     "vanity URL",
                     "active threads",
                     "guild preview",
+                    "voice regions",
+                    "guild voice regions",
+                    "prune count",
+                    "inactive member estimate",
+                    "SKU subscriptions",
+                    "application role connection metadata",
                     "監査ログ",
                     "BAN",
                     "招待",
@@ -1016,6 +1069,12 @@ def build_discord_platform_endpoints(
                     "バニティURL",
                     "アクティブスレッド",
                     "サーバープレビュー",
+                    "ボイスリージョン",
+                    "音声リージョン",
+                    "非アクティブメンバー数",
+                    "Prune見積もり",
+                    "サブスクリプション",
+                    "ロール接続メタデータ",
                     "商品",
                     "SKU",
                     "権利",
@@ -1069,14 +1128,18 @@ async def _platform_resources(
     bot: discord.Member,
     kind: DiscordPlatformResourceKind,
     resource_id: str | None,
+    subresource_id: str | None,
+    subscription_user_id: str | None,
     needed: int,
+    prune_days: int,
+    prune_role_ids: tuple[str, ...],
 ) -> list[DiscordPlatformResourceRecord]:
     if kind == "audit_log":
         _require_both_guild_permission(actor, bot, "view_audit_log")
-        records: list[DiscordPlatformResourceRecord] = []
+        audit_records: list[DiscordPlatformResourceRecord] = []
         try:
             async for item in guild.audit_logs(limit=needed):
-                records.append(
+                audit_records.append(
                     _resource(
                         item.id,
                         str(item.action),
@@ -1096,7 +1159,7 @@ async def _platform_resources(
                 )
         except discord.DiscordException as exc:
             raise UserError("discord.audit_log_fetch_failed") from exc
-        return records
+        return audit_records
     if kind == "ban":
         _require_both_guild_permission(actor, bot, "ban_members")
         bans: list[DiscordPlatformResourceRecord] = []
@@ -1171,7 +1234,7 @@ async def _platform_resources(
             events = await guild.fetch_scheduled_events(with_counts=True)
         except discord.DiscordException as exc:
             raise UserError("discord.events_fetch_failed") from exc
-        records = []
+        scheduled_event_records: list[DiscordPlatformResourceRecord] = []
         for event in events:
             channel = event.channel
             if channel is not None and (
@@ -1179,7 +1242,7 @@ async def _platform_resources(
                 or not _can_view_channel(channel, bot)
             ):
                 continue
-            records.append(
+            scheduled_event_records.append(
                 _resource(
                     event.id,
                     event.name,
@@ -1196,7 +1259,7 @@ async def _platform_resources(
                     cover_image_url=event.cover_image.url if event.cover_image else None,
                 )
             )
-        return records
+        return scheduled_event_records
     if kind == "scheduled_event_user":
         if resource_id is None:
             raise UserError("discord.event_id_required")
@@ -1462,7 +1525,7 @@ async def _platform_resources(
             for template in templates
         ]
     if kind == "stage_instance":
-        records = []
+        stage_instance_records: list[DiscordPlatformResourceRecord] = []
         for channel in guild.stage_channels:
             if not _can_view_channel(channel, actor) or not _can_view_channel(channel, bot):
                 continue
@@ -1472,7 +1535,7 @@ async def _platform_resources(
                 continue
             except discord.DiscordException as exc:
                 raise UserError("discord.stage_instances_fetch_failed") from exc
-            records.append(
+            stage_instance_records.append(
                 _resource(
                     instance.id,
                     instance.topic,
@@ -1484,7 +1547,7 @@ async def _platform_resources(
                     scheduled_event_id=instance.scheduled_event_id,
                 )
             )
-        return records
+        return stage_instance_records
     if kind == "role_member_count":
         try:
             counts = await guild.role_member_counts()
@@ -1546,8 +1609,23 @@ async def _platform_resources(
             )
         ]
     if kind == "welcome_screen":
+        _require_both_guild_permission(actor, bot, "manage_guild")
         try:
             screen = await guild.welcome_screen()
+        except discord.NotFound:
+            return [
+                _resource(
+                    guild.id,
+                    "Welcome screen",
+                    kind,
+                    configured=False,
+                    enabled=False,
+                    community_enabled="COMMUNITY" in guild.features,
+                    channel_count=0,
+                )
+            ]
+        except discord.Forbidden as exc:
+            raise UserError("discord.welcome_screen_forbidden") from exc
         except discord.DiscordException as exc:
             raise UserError("discord.welcome_screen_fetch_failed") from exc
         channels = getattr(screen, "welcome_channels", ())
@@ -1556,6 +1634,7 @@ async def _platform_resources(
                 getattr(item, "channel_id", index),
                 getattr(item, "description", None) or f"Welcome channel {index + 1}",
                 kind,
+                configured=True,
                 enabled=screen.enabled,
                 description=getattr(screen, "description", None),
                 channel_id=getattr(item, "channel_id", None),
@@ -1567,40 +1646,104 @@ async def _platform_resources(
                 guild.id,
                 "Welcome screen",
                 kind,
+                configured=True,
                 enabled=screen.enabled,
                 description=getattr(screen, "description", None),
                 channel_count=0,
             )
         ]
     if kind == "widget":
+        _require_both_guild_permission(actor, bot, "manage_guild")
+        try:
+            settings = await client.http.request(
+                Route(
+                    "GET",
+                    "/guilds/{guild_id}/widget",
+                    guild_id=guild.id,
+                )
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.widget_settings_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.widget_settings_fetch_failed") from exc
+        if not isinstance(settings, dict):
+            raise UserError("discord.widget_settings_response_invalid")
+        enabled = settings.get("enabled")
+        channel_id = settings.get("channel_id")
+        if not isinstance(enabled, bool) or (
+            channel_id is not None and not isinstance(channel_id, str)
+        ):
+            raise UserError("discord.widget_settings_response_invalid")
+        if not enabled:
+            return [
+                _resource(
+                    guild.id,
+                    "Server widget",
+                    kind,
+                    enabled=False,
+                    channel_id=channel_id,
+                    public_widget_available=False,
+                    image_url=f"https://discord.com/api/guilds/{guild.id}/widget.png",
+                )
+            ]
         try:
             widget = await guild.widget()
+        except discord.Forbidden as exc:
+            raise UserError("discord.widget_public_forbidden") from exc
         except discord.DiscordException as exc:
-            raise UserError("discord.widget_fetch_failed") from exc
+            raise UserError("discord.widget_public_fetch_failed") from exc
         return [
             _resource(
                 widget.id,
                 widget.name,
                 kind,
+                enabled=True,
+                configured_channel_id=channel_id,
+                public_widget_available=True,
                 presence_count=widget.presence_count,
                 channel_count=len(widget.channels),
                 member_count=len(widget.members),
                 invite_url=widget.invite_url,
+                image_url=f"https://discord.com/api/guilds/{guild.id}/widget.png",
             )
         ]
     if kind == "vanity_invite":
         _require_both_guild_permission(actor, bot, "manage_guild")
+        if "VANITY_URL" not in guild.features:
+            return [
+                _resource(
+                    guild.id,
+                    "Vanity invite",
+                    kind,
+                    feature_enabled=False,
+                    configured=False,
+                    code=guild.vanity_url_code,
+                )
+            ]
         try:
             invite = await guild.vanity_invite()
+        except discord.Forbidden as exc:
+            raise UserError("discord.vanity_invite_forbidden") from exc
         except discord.DiscordException as exc:
             raise UserError("discord.vanity_invite_fetch_failed") from exc
         if invite is None:
-            return []
+            return [
+                _resource(
+                    guild.id,
+                    "Vanity invite",
+                    kind,
+                    feature_enabled=True,
+                    configured=False,
+                    code=guild.vanity_url_code,
+                )
+            ]
         return [
             _resource(
                 invite.code,
                 invite.code,
                 kind,
+                feature_enabled=True,
+                configured=True,
                 url=invite.url,
                 uses=invite.uses,
                 channel_id=getattr(invite.channel, "id", None),
@@ -1611,7 +1754,7 @@ async def _platform_resources(
             threads = await guild.active_threads()
         except discord.DiscordException as exc:
             raise UserError("discord.active_threads_fetch_failed") from exc
-        records = []
+        active_thread_records: list[DiscordPlatformResourceRecord] = []
         for thread in threads:
             if (
                 not _can_view_channel(thread, actor)
@@ -1622,7 +1765,7 @@ async def _platform_resources(
                 or not _can_read_private_thread(thread, bot)
             ):
                 continue
-            records.append(
+            active_thread_records.append(
                 _resource(
                     thread.id,
                     thread.name,
@@ -1642,8 +1785,10 @@ async def _platform_resources(
                     applied_tag_ids=tuple(str(tag.id) for tag in thread.applied_tags),
                 )
             )
-        records.sort(key=lambda item: (item.name.casefold(), item.resource_id))
-        return records[:needed]
+        active_thread_records.sort(
+            key=lambda item: (item.name.casefold(), item.resource_id)
+        )
+        return active_thread_records[:needed]
     if kind == "guild_preview":
         try:
             preview = await client.fetch_guild_preview(guild.id)
@@ -1671,6 +1816,255 @@ async def _platform_resources(
                 ),
             )
         ]
+    if kind in {"voice_region", "guild_voice_region"}:
+        route = (
+            Route("GET", "/voice/regions")
+            if kind == "voice_region"
+            else Route(
+                "GET",
+                "/guilds/{guild_id}/regions",
+                guild_id=guild.id,
+            )
+        )
+        try:
+            payload = await client.http.request(route)
+        except discord.Forbidden as exc:
+            raise UserError("discord.voice_regions_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.voice_regions_fetch_failed") from exc
+        if not isinstance(payload, list) or any(
+            not isinstance(item, dict) for item in payload
+        ):
+            raise UserError("discord.voice_regions_response_invalid")
+        region_records: list[DiscordPlatformResourceRecord] = []
+        for raw in payload:
+            region_id = raw.get("id")
+            name = raw.get("name")
+            if not isinstance(region_id, str) or not isinstance(name, str):
+                raise UserError("discord.voice_regions_response_invalid")
+            region_records.append(
+                _resource(
+                    region_id,
+                    name,
+                    kind,
+                    optimal=raw.get("optimal"),
+                    deprecated=raw.get("deprecated"),
+                    custom=raw.get("custom"),
+                    guild_specific=kind == "guild_voice_region",
+                )
+            )
+        region_records.sort(
+            key=lambda item: (item.name.casefold(), item.resource_id)
+        )
+        return region_records[:needed]
+    if kind == "prune_count":
+        _require_both_guild_permission(actor, bot, "manage_guild")
+        _require_both_guild_permission(actor, bot, "kick_members")
+        if not 1 <= prune_days <= 30:
+            raise UserError("discord.prune_days_invalid")
+        if len(prune_role_ids) > 100:
+            raise UserError("discord.prune_roles_invalid")
+        role_ids = tuple(
+            str(_snowflake(role_id, "role")) for role_id in prune_role_ids
+        )
+        if len(set(role_ids)) != len(role_ids):
+            raise UserError("discord.prune_roles_invalid")
+        params: dict[str, object] = {"days": prune_days}
+        if role_ids:
+            params["include_roles"] = ",".join(role_ids)
+        try:
+            payload = await client.http.request(
+                Route(
+                    "GET",
+                    "/guilds/{guild_id}/prune",
+                    guild_id=guild.id,
+                ),
+                params=params,
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.prune_count_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.prune_count_fetch_failed") from exc
+        if not isinstance(payload, dict):
+            raise UserError("discord.prune_count_response_invalid")
+        pruned = payload.get("pruned")
+        if pruned is not None and (
+            not isinstance(pruned, int) or isinstance(pruned, bool) or pruned < 0
+        ):
+            raise UserError("discord.prune_count_response_invalid")
+        return [
+            _resource(
+                guild.id,
+                f"{prune_days}-day prune estimate",
+                kind,
+                days=prune_days,
+                include_role_ids=role_ids,
+                estimated_member_count=pruned,
+                mutates_members=False,
+            )
+        ]
+    if kind == "subscription":
+        await _require_application_owner(client, actor)
+        if resource_id is None:
+            raise UserError("discord.sku_id_required")
+        sku_id = _snowflake(resource_id, "SKU")
+        raw_subscriptions: list[object] = []
+        try:
+            if subresource_id is not None:
+                payload = await client.http.request(
+                    Route(
+                        "GET",
+                        "/skus/{sku_id}/subscriptions/{subscription_id}",
+                        sku_id=sku_id,
+                        subscription_id=_snowflake(subresource_id, "subscription"),
+                    ),
+                    params=None,
+                )
+                raw_subscriptions.append(payload)
+            else:
+                if subscription_user_id is None:
+                    raise UserError("discord.subscription_user_id_required")
+                subscription_filter_user_id = _snowflake(
+                    subscription_user_id,
+                    "subscription user",
+                )
+                after: str | None = None
+                while len(raw_subscriptions) < needed:
+                    page_limit = min(100, needed - len(raw_subscriptions))
+                    subscription_params: dict[str, object] = {
+                        "limit": page_limit,
+                        "user_id": str(subscription_filter_user_id),
+                    }
+                    if after is not None:
+                        subscription_params["after"] = after
+                    page_payload = await client.http.request(
+                        Route(
+                            "GET",
+                            "/skus/{sku_id}/subscriptions",
+                            sku_id=sku_id,
+                        ),
+                        params=subscription_params,
+                    )
+                    if not isinstance(page_payload, list):
+                        raise UserError("discord.subscriptions_response_invalid")
+                    raw_subscriptions.extend(page_payload)
+                    if len(page_payload) < page_limit:
+                        break
+                    last = page_payload[-1]
+                    if not isinstance(last, dict) or not isinstance(last.get("id"), str):
+                        raise UserError("discord.subscriptions_response_invalid")
+                    after = last["id"]
+        except discord.Forbidden as exc:
+            raise UserError("discord.subscriptions_forbidden") from exc
+        except discord.NotFound as exc:
+            raise UserError("discord.subscription_not_found") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.subscriptions_fetch_failed") from exc
+        subscription_payloads: list[dict[str, object]] = []
+        for raw_subscription in raw_subscriptions:
+            if not isinstance(raw_subscription, dict):
+                raise UserError("discord.subscriptions_response_invalid")
+            subscription_payloads.append(raw_subscription)
+        subscription_records: list[DiscordPlatformResourceRecord] = []
+        for raw in subscription_payloads:
+            subscription_id = raw.get("id")
+            user_id = raw.get("user_id")
+            if not isinstance(subscription_id, str) or not isinstance(user_id, str):
+                raise UserError("discord.subscriptions_response_invalid")
+            subscription_id_lists: dict[str, tuple[str, ...]] = {}
+            for field_name in (
+                "sku_ids",
+                "entitlement_ids",
+                "renewal_sku_ids",
+            ):
+                values = raw.get(field_name)
+                if values is None:
+                    subscription_id_lists[field_name] = ()
+                elif not isinstance(values, list) or any(
+                    not isinstance(item, str) for item in values
+                ):
+                    raise UserError("discord.subscriptions_response_invalid")
+                else:
+                    subscription_id_lists[field_name] = tuple(values)
+            subscription_records.append(
+                _resource(
+                    subscription_id,
+                    f"Subscription {subscription_id}",
+                    kind,
+                    sku_id=sku_id,
+                    user_id=user_id,
+                    sku_ids=subscription_id_lists["sku_ids"],
+                    entitlement_ids=subscription_id_lists["entitlement_ids"],
+                    renewal_sku_ids=subscription_id_lists["renewal_sku_ids"],
+                    current_period_start=raw.get("current_period_start"),
+                    current_period_end=raw.get("current_period_end"),
+                    status=raw.get("status"),
+                    canceled_at=raw.get("canceled_at"),
+                )
+            )
+        return subscription_records[:needed]
+    if kind == "role_connection_metadata":
+        await _require_application_owner(client, actor)
+        application_id = getattr(client, "application_id", None)
+        if application_id is None:
+            raise UserError("discord.application_unavailable")
+        try:
+            payload = await client.http.request(
+                Route(
+                    "GET",
+                    "/applications/{application_id}/role-connections/metadata",
+                    application_id=application_id,
+                )
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.role_connection_metadata_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.role_connection_metadata_fetch_failed") from exc
+        if not isinstance(payload, list):
+            raise UserError("discord.role_connection_metadata_response_invalid")
+        metadata_records: list[DiscordPlatformResourceRecord] = []
+        for raw_metadata in payload[:needed]:
+            if not isinstance(raw_metadata, dict):
+                raise UserError("discord.role_connection_metadata_response_invalid")
+            key = raw_metadata.get("key")
+            name = raw_metadata.get("name")
+            description = raw_metadata.get("description")
+            metadata_type = raw_metadata.get("type")
+            if (
+                not isinstance(key, str)
+                or not isinstance(name, str)
+                or not isinstance(description, str)
+                or not isinstance(metadata_type, int)
+                or isinstance(metadata_type, bool)
+            ):
+                raise UserError("discord.role_connection_metadata_response_invalid")
+            name_localizations = raw_metadata.get("name_localizations")
+            description_localizations = raw_metadata.get("description_localizations")
+            if name_localizations is not None and not isinstance(
+                name_localizations,
+                dict,
+            ):
+                raise UserError("discord.role_connection_metadata_response_invalid")
+            if description_localizations is not None and not isinstance(
+                description_localizations,
+                dict,
+            ):
+                raise UserError("discord.role_connection_metadata_response_invalid")
+            metadata_records.append(
+                _resource(
+                    key,
+                    name,
+                    kind,
+                    type=metadata_type,
+                    key=key,
+                    description=description,
+                    name_locales=tuple(sorted((name_localizations or {}).keys())),
+                    description_locales=tuple(
+                        sorted((description_localizations or {}).keys())
+                    ),
+                )
+            )
+        return metadata_records
     raise UserError("discord.resource_kind_invalid")
 
 

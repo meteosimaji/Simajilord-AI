@@ -102,7 +102,10 @@ with Discord's generic “interaction failed” banner.
   `broader` flags a currently known audience expansion and `uncertain` means the member cache
   cannot prove the complete audience; neither is a mechanical disclosure block or a source of
   write authority. A write to any explicitly selected shared server still requires fresh
-  requester and BOT permissions there; historical reads never grant write authority
+  requester and BOT permissions there; historical reads never grant write authority. When an
+  agent supplies a globally unique cached channel ID but omits its server ID, the write resolver
+  may infer that shared server and then repeats the same live membership and permission checks;
+  an explicit mismatched server ID is never silently corrected
 - The Discord adapter currently registers 106 typed capability endpoints covering the bot-visible
   conversation, moderation, audio, and common server-management areas listed below. This is a
   broad capability catalog, not a one-to-one implementation of every route in Discord's official
@@ -163,10 +166,12 @@ with Discord's generic “interaction failed” banner.
   channels/threads/pins/reactions/poll voters, effective permissions and overwrites,
   audit/bans/invites/events/AutoMod, emojis/stickers/soundboard, token-free webhooks,
   templates/integrations/onboarding/widget/application metadata, message/file/embed delivery,
-  moderation, resource mutation, and audio. Active threads and guild preview data are fetched
-  from REST rather than assumed from cache. The count describes Simajilord's typed abstractions,
-  some of which intentionally group several Discord routes; it does not claim complete official
-  Discord API coverage
+  global and per-server voice regions, non-mutating prune estimates, SKUs/entitlements/
+  subscriptions, application role-connection metadata, voice-channel status, moderation,
+  resource mutation, and audio. Active threads and guild preview data are fetched from REST
+  rather than assumed from cache. The count describes Simajilord's typed abstractions, some of
+  which intentionally group several Discord routes; it does not claim complete official Discord
+  API coverage
 - Plain message sending and voice connection as independently invokable Discord APIs
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and
@@ -197,9 +202,17 @@ with Discord's generic “interaction failed” banner.
   messages. The temporary `Working` embed is
   deleted before the final answer is posted as a new reply, preserving the order of visible
   milestone updates. Accepted-follow-up acknowledgements are tied to the parent turn and removed
-  on either completion or failure. Multi-step work also posts task-specific progress in the
+  on either completion or failure. Discord typing is renewed only while a model notification or
+  an actually running capability keeps the activity lease alive; a quiet app-server does not
+  leave the BOT typing indefinitely. Multi-step work also posts task-specific progress in the
   conversation language, naming checked evidence and the next step without exposing private
   reasoning
+- The AI chooses its final Discord delivery instead of being forced into the triggering
+  mention's reply. The normal default remains a reply, but it may instead use a plain post in an
+  authorized channel, an embed, a reply to another selected message, one or more attachments, a
+  DM, VC speech, or deliberate silence. A successful tool-owned final delivery suppresses the
+  host fallback exactly once; a rejected or failed delivery leaves the normal durable host reply
+  available, so an attempted alternative cannot lose the answer
 - Every successful agent write returns an Action Receipt. Reactions, pin state, role membership,
   timeout state, thread membership/settings, channel topic/slowmode, audio volume, selected
   read-aloud settings, and Focus Timer create/cancel operations have restart-safe inverse or
@@ -269,10 +282,16 @@ and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex ru
 browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 The default runtime profile is `gpt-5.6-sol` with `medium` reasoning. Codex keeps one durable
-provider thread and compacts retained context natively; the host resets it only when the saved
-thread is genuinely unavailable. Agent turns have no wall-clock deadline. A turn is stopped only
-after its configured inactivity window, while a running capability receives its own declared
-timeout. Discord link previews are suppressed for AI-authored text without altering its URLs.
+provider thread in its stable `legacy` history mode and compacts retained context natively; the
+host resets it only when the saved thread is genuinely unavailable. Existing conversations are
+never proactively rotated merely to change their history mode. Agent turns have no wall-clock
+deadline. A turn is stopped only after its configured inactivity window, while a running
+capability receives its own declared timeout. Conversation and image generation share one
+app-server rather than a second image runtime. Its JSONL reader accepts bounded large image
+notifications, reports line size, reader/process state, active tools, recent activity, and
+sanitized stderr on failure, and wakes the affected turn immediately if the transport dies
+instead of waiting for the inactivity window. Discord link previews are suppressed for
+AI-authored text without altering its URLs.
 
 ## Requirements
 
@@ -299,7 +318,10 @@ ignored by Git.
 For private development, `COMMAND_SCOPE=guild` synchronizes commands to each connected server.
 It also removes stale global commands for the same application so users do not see old and new
 commands together. Use `global` only when global publication is intended. Automatic read-aloud
-requires the Discord Message Content intent. Presence and Server Members intents are not used.
+requires the Discord Message Content intent. Full member, Presence/activity, VC, and message
+inspection requires enabling the Message Content, Presence, and Server Members privileged
+intents for this installation; the adapter requests `discord.Intents.all()` so missing portal
+intents are visible as incomplete data rather than silently described as supported.
 
 Set `TTS_PROVIDER=voicevox`, `VOICEVOX_SPEAKER_ID` to a VOICEVOX style ID, and
 `VOICEVOX_ENGINE_PATH` to the local engine executable. The provider only accepts a loopback
@@ -416,6 +438,33 @@ uv run python scripts/manual_agent_discord_qa.py
 This one-shot test gives the AI an exact-message research task and verifies first-party Codex
 web search, multiple concrete intermediate messages, and the final sourced answer. It consumes
 one model turn and live search, and is intentionally not run on push.
+
+To reproduce the official Discord HTTP-route comparison, clone Discord's documentation and pass
+that exact checkout to the audit. The report records the documentation commit, every declared
+route and classification, and implementation/type/permission evidence for all 106 typed
+endpoints; an unknown future route fails closed:
+
+```bash
+git clone --depth 1 https://github.com/discord/discord-api-docs.git /tmp/discord-api-docs
+uv run python scripts/audit_discord_api_coverage.py \
+  --discord-docs /tmp/discord-api-docs \
+  --output /tmp/simajilord-discord-api-coverage.json
+```
+
+The live audit invokes all 106 endpoints against a real connected client. Its first phase uses a
+non-existent workspace to prove every safety boundary. With the explicit write flag, its second
+phase creates one temporary channel in the selected test server, exercises safe reads, replies,
+embeds, files, reactions, pins, threads, polls, and platform-resource reads. It also creates a
+temporary voice channel to set and clear its status; both disposable channels are deleted in
+`finally`. Never point this at a server that is not approved for disposable tests:
+
+```bash
+uv run python scripts/live_discord_capability_audit.py \
+  --guild-id TEST_GUILD_ID \
+  --actor-id ADMIN_USER_ID \
+  --allow-safe-writes \
+  --output .data/audits/discord-live-capabilities.json
+```
 
 To inspect Discord embeds, adaptive buttons, local read-aloud, and music ducking without
 connecting a Discord client:
