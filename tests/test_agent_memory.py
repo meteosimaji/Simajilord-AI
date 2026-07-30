@@ -134,6 +134,69 @@ async def test_memory_upserts_normalized_key_and_survives_store_restart(
 
 
 @pytest.mark.asyncio
+async def test_memory_migrates_and_records_verified_failure_procedure(
+    tmp_path,
+) -> None:
+    path = tmp_path / "memory.sqlite3"
+    context = _context()
+    service = AgentMemoryService(AgentMemoryStore(path))
+    existing = await _remember(
+        service,
+        context=context,
+        scope=AgentMemoryScope.USER,
+        key="response.language",
+        summary="Respond in Japanese.",
+        source_id="111",
+    )
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE agent_memories RENAME TO agent_memories_before_basis_migration;
+            CREATE TABLE agent_memories AS
+                SELECT * FROM agent_memories_before_basis_migration;
+            DROP TABLE agent_memories_before_basis_migration;
+            """
+        )
+
+    restarted = AgentMemoryService(AgentMemoryStore(path))
+    failure = await _remember(
+        restarted,
+        context=context,
+        scope=AgentMemoryScope.PROCEDURE,
+        key="procedure.audio.callback_timeout",
+        summary=(
+            "Dropping the queued item after a playback callback timeout lost "
+            "recovery state; preserve it and retry with a fresh stream."
+        ),
+        source_id="112",
+        basis=AgentMemoryBasis.VERIFIED_FAILURE,
+    )
+    found = await restarted.search(
+        AgentMemorySearchRequest(
+            query="",
+            scopes=(AgentMemoryScope.USER, AgentMemoryScope.PROCEDURE),
+        ),
+        context,
+    )
+
+    assert {item.memory_id for item in found.memories} == {
+        existing.memory.memory_id,
+        failure.memory.memory_id,
+    }
+    assert failure.memory.basis is AgentMemoryBasis.VERIFIED_FAILURE
+    with sqlite3.connect(path) as connection:
+        table_sql = str(
+            connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'agent_memories'
+                """
+            ).fetchone()[0]
+        )
+    assert "verified_failure" in table_sql
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "query, expected_key",
     (
@@ -486,6 +549,17 @@ async def test_memory_update_and_forget_enforce_original_scope(
         (
             AgentMemoryRememberRequest(
                 scope=AgentMemoryScope.USER,
+                key="procedure.failed",
+                summary="This method failed under the verified test condition.",
+                source_message_ids=("111",),
+                basis=AgentMemoryBasis.VERIFIED_FAILURE,
+                confidence=1.0,
+            ),
+            "memory.basis_invalid",
+        ),
+        (
+            AgentMemoryRememberRequest(
+                scope=AgentMemoryScope.USER,
                 key="profile.language",
                 summary="Prefers English.",
                 source_message_ids=("not-a-discord-id",),
@@ -731,7 +805,11 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
         registry,
         ("memory.search", *AGENT_MEMORY_WRITE_CAPABILITIES),
         required_grants=required_grants,
-        eager_capabilities=("memory.search",),
+        eager_capabilities=(
+            "memory.search",
+            "memory.remember",
+            "memory.update",
+        ),
         write_capabilities=AGENT_MEMORY_WRITE_CAPABILITIES,
     )
     context = _context(
@@ -743,7 +821,12 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
         for namespace in catalog.dynamic_specs(context)
         for tool in namespace["tools"]
     }
-    assert {"memory_search", "capability_search"} <= tool_names
+    assert {
+        "memory_search",
+        "memory_remember",
+        "memory_update",
+        "capability_search",
+    } <= tool_names
     memory_tool = next(
         tool
         for namespace in catalog.dynamic_specs(context)

@@ -30,7 +30,7 @@ from .providers import (
     AgentProvider,
     SteerableAgentProvider,
 )
-from .store import AgentConversationRecord, AgentConversationStore
+from .store import AgentConversationStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +42,6 @@ class AgentLimits:
     per_workspace_requests: int
     per_workspace_window_seconds: int
     max_tokens_per_24_hours: int
-    max_conversation_turns: int
-    max_context_ratio: float
     max_response_characters: int
     max_active_turns: int
     max_pending_turns: int
@@ -114,21 +112,6 @@ class AgentService:
                     conversation.provider_thread_id if conversation is not None else None
                 )
                 continuity_reset_reason: str | None = None
-                if conversation is not None and self._must_rotate(conversation):
-                    await self.store.rotate(request.conversation_id, model=self.model)
-                    provider_thread_id = None
-                    continuity_reset_reason = "context_budget"
-                    await self.journal.append(
-                        kind="agent.conversation.rotated",
-                        actor_id=request.actor_id,
-                        workspace_id=request.workspace_id,
-                        transport="agent",
-                        request_id=request.event_id,
-                        payload={
-                            "conversation_id": request.conversation_id,
-                            "reason": "context_budget",
-                        },
-                    )
                 context = InvocationContext(
                     actor_id=request.actor_id,
                     workspace_id=request.workspace_id,
@@ -572,18 +555,6 @@ class AgentService:
                     24 * 60 * 60,
                 ),
             )
-
-    def _must_rotate(self, conversation: AgentConversationRecord) -> bool:
-        if conversation.turn_count >= self.limits.max_conversation_turns:
-            return True
-        input_tokens = conversation.last_input_tokens
-        context_window = conversation.model_context_window
-        return (
-            isinstance(context_window, int)
-            and context_window > 0
-            and input_tokens / context_window >= self.limits.max_context_ratio
-        )
-
 
 async def _finish_cleanup(awaitable: Awaitable[None]) -> None:
     """Finish mandatory cleanup before preserving an arriving cancellation."""

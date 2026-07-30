@@ -170,6 +170,7 @@ class AgentMemoryBasis(StrEnum):
 
     USER_STATED = "user_stated"
     VERIFIED_SUCCESS = "verified_success"
+    VERIFIED_FAILURE = "verified_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +234,7 @@ class AgentMemorySearchRequest:
         metadata={
             "description": (
                 "Optional kind filter: user_stated preferences/rules or "
-                "verified_success procedures."
+                "verified_success/verified_failure procedure outcomes."
             )
         },
     )
@@ -294,8 +295,9 @@ class AgentMemoryRememberRequest:
     summary: str = field(
         metadata={
             "description": (
-                "A short paraphrased preference, rule, or successful procedure; "
-                "never a message body, attachment, credential, or inferred profile."
+                "A short paraphrased preference, rule, or verified successful/failed "
+                "procedure outcome; never a message body, attachment, credential, "
+                "or inferred profile."
             )
         }
     )
@@ -355,6 +357,134 @@ class AgentMemoryForgetRequest:
 class AgentMemoryForgetResponse:
     memory_id: str
     forgotten: bool
+
+
+def _memory_table_sql(table_name: str, *, if_not_exists: bool) -> str:
+    if table_name not in {"agent_memories", "agent_memories_basis_v2"}:
+        raise ValueError("unexpected memory table name")
+    create_mode = "IF NOT EXISTS " if if_not_exists else ""
+    return f"""
+        CREATE TABLE {create_mode}{table_name} (
+            memory_id TEXT PRIMARY KEY,
+            locator TEXT NOT NULL UNIQUE,
+            scope TEXT NOT NULL CHECK (
+                scope IN ('user', 'channel', 'workspace', 'procedure')
+            ),
+            workspace_id TEXT NOT NULL,
+            owner_user_id TEXT,
+            channel_id TEXT,
+            memory_key TEXT NOT NULL
+                CHECK (length(memory_key) BETWEEN 1 AND {MAX_MEMORY_KEY_CHARACTERS}),
+            summary TEXT NOT NULL
+                CHECK (
+                    length(summary) BETWEEN 1 AND
+                    {MAX_MEMORY_SUMMARY_CHARACTERS}
+                ),
+            source_message_ids_json TEXT NOT NULL,
+            source_message_locators_json TEXT NOT NULL DEFAULT '[]',
+            basis TEXT NOT NULL CHECK (
+                basis IN (
+                    'user_stated',
+                    'verified_success',
+                    'verified_failure'
+                )
+            ),
+            confidence REAL NOT NULL CHECK (
+                confidence >= {MIN_MEMORY_CONFIDENCE}
+                AND confidence <= 1.0
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT NOT NULL,
+            expires_at TEXT,
+            CHECK (
+                (scope = 'user' AND owner_user_id IS NOT NULL
+                    AND channel_id IS NULL)
+                OR
+                (scope = 'channel' AND owner_user_id IS NULL
+                    AND channel_id IS NOT NULL)
+                OR
+                (scope IN ('workspace', 'procedure')
+                    AND owner_user_id IS NULL AND channel_id IS NULL)
+            ),
+            CHECK (
+                (
+                    scope = 'procedure'
+                    AND basis IN ('verified_success', 'verified_failure')
+                )
+                OR
+                (scope != 'procedure' AND basis = 'user_stated')
+            )
+        )
+    """
+
+
+def _create_memory_indexes(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS agent_memories_workspace_scope
+        ON agent_memories(workspace_id, scope)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS agent_memories_user
+        ON agent_memories(workspace_id, owner_user_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS agent_memories_channel
+        ON agent_memories(workspace_id, channel_id)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS agent_memories_expiry
+        ON agent_memories(expires_at)
+        """
+    )
+
+
+def _migrate_memory_basis_constraint(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'agent_memories'
+        """
+    ).fetchone()
+    if row is None or "verified_failure" in str(row["sql"]):
+        return
+
+    columns = (
+        "memory_id, locator, scope, workspace_id, owner_user_id, channel_id, "
+        "memory_key, summary, source_message_ids_json, "
+        "source_message_locators_json, basis, confidence, created_at, "
+        "updated_at, last_used_at, expires_at"
+    )
+    connection.commit()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            _memory_table_sql("agent_memories_basis_v2", if_not_exists=False)
+        )
+        connection.execute(
+            f"""
+            INSERT INTO agent_memories_basis_v2 ({columns})
+            SELECT {columns}
+            FROM agent_memories
+            """
+        )
+        connection.execute("DROP TABLE agent_memories")
+        connection.execute(
+            "ALTER TABLE agent_memories_basis_v2 RENAME TO agent_memories"
+        )
+        _create_memory_indexes(connection)
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 class AgentMemoryStore:
@@ -540,64 +670,10 @@ class AgentMemoryStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.executescript(
-                f"""
-                CREATE TABLE IF NOT EXISTS agent_memories (
-                    memory_id TEXT PRIMARY KEY,
-                    locator TEXT NOT NULL UNIQUE,
-                    scope TEXT NOT NULL CHECK (
-                        scope IN ('user', 'channel', 'workspace', 'procedure')
-                    ),
-                    workspace_id TEXT NOT NULL,
-                    owner_user_id TEXT,
-                    channel_id TEXT,
-                    memory_key TEXT NOT NULL
-                        CHECK (length(memory_key) BETWEEN 1 AND {MAX_MEMORY_KEY_CHARACTERS}),
-                    summary TEXT NOT NULL
-                        CHECK (
-                            length(summary) BETWEEN 1 AND
-                            {MAX_MEMORY_SUMMARY_CHARACTERS}
-                        ),
-                    source_message_ids_json TEXT NOT NULL,
-                    source_message_locators_json TEXT NOT NULL DEFAULT '[]',
-                    basis TEXT NOT NULL CHECK (
-                        basis IN ('user_stated', 'verified_success')
-                    ),
-                    confidence REAL NOT NULL CHECK (
-                        confidence >= {MIN_MEMORY_CONFIDENCE}
-                        AND confidence <= 1.0
-                    ),
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_used_at TEXT NOT NULL,
-                    expires_at TEXT,
-                    CHECK (
-                        (scope = 'user' AND owner_user_id IS NOT NULL
-                            AND channel_id IS NULL)
-                        OR
-                        (scope = 'channel' AND owner_user_id IS NULL
-                            AND channel_id IS NOT NULL)
-                        OR
-                        (scope IN ('workspace', 'procedure')
-                            AND owner_user_id IS NULL AND channel_id IS NULL)
-                    ),
-                    CHECK (
-                        (scope = 'procedure' AND basis = 'verified_success')
-                        OR
-                        (scope != 'procedure' AND basis = 'user_stated')
-                    )
-                );
-
-                CREATE INDEX IF NOT EXISTS agent_memories_workspace_scope
-                    ON agent_memories(workspace_id, scope);
-                CREATE INDEX IF NOT EXISTS agent_memories_user
-                    ON agent_memories(workspace_id, owner_user_id);
-                CREATE INDEX IF NOT EXISTS agent_memories_channel
-                    ON agent_memories(workspace_id, channel_id);
-                CREATE INDEX IF NOT EXISTS agent_memories_expiry
-                    ON agent_memories(expires_at);
-                """
+            connection.execute(
+                _memory_table_sql("agent_memories", if_not_exists=True)
             )
+            _create_memory_indexes(connection)
             columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -643,6 +719,7 @@ class AgentMemoryStore:
                     """,
                     (_source_locators_json(locators), str(row["memory_id"])),
                 )
+            _migrate_memory_basis_constraint(connection)
         os.chmod(self.path, 0o600)
 
     def _remember(
@@ -1298,7 +1375,8 @@ def build_memory_endpoints(
                 name="memory.remember",
                 summary=(
                     "Upsert one short user-stated preference/rule or verified "
-                    "successful procedure, citing exact Discord message locators."
+                    "successful/failed procedure outcome, citing exact Discord "
+                    "message locators."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -1554,7 +1632,10 @@ def _validate_basis(
     summary: str,
 ) -> None:
     if scope is AgentMemoryScope.PROCEDURE:
-        if basis is not AgentMemoryBasis.VERIFIED_SUCCESS:
+        if basis not in {
+            AgentMemoryBasis.VERIFIED_SUCCESS,
+            AgentMemoryBasis.VERIFIED_FAILURE,
+        }:
             raise UserError("memory.basis_invalid")
     elif basis is not AgentMemoryBasis.USER_STATED:
         raise UserError("memory.basis_invalid")

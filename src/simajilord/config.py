@@ -112,7 +112,7 @@ class Settings:
     agent_model: str
     agent_escalation_model: str
     codex_executable: str
-    agent_timeout_seconds: float
+    agent_idle_timeout_seconds: float
     agent_reasoning_effort: str
     agent_max_tool_calls: int
     agent_max_tool_output_characters: int
@@ -121,8 +121,6 @@ class Settings:
     agent_per_workspace_requests: int
     agent_per_workspace_window_seconds: int
     agent_max_tokens_per_24_hours: int
-    agent_max_conversation_turns: int
-    agent_max_context_ratio: float
     agent_max_response_characters: int
     agent_max_active_turns: int
     agent_max_pending_turns: int
@@ -179,6 +177,20 @@ def _positive_float(name: str, default: float, *, maximum: float) -> float:
     if not 0 < value <= maximum:
         raise ConfigurationError(f"{name} must be greater than 0 and at most {maximum}.")
     return value
+
+
+def _positive_float_with_legacy_name(
+    name: str,
+    legacy_name: str,
+    default: float,
+    *,
+    maximum: float,
+) -> float:
+    """Prefer an explicit setting while preserving existing deployments."""
+
+    if name in os.environ:
+        return _positive_float(name, default, maximum=maximum)
+    return _positive_float(legacy_name, default, maximum=maximum)
 
 
 def _bounded_float(
@@ -740,15 +752,16 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_file_sandbox_enabled=agent_file_sandbox_enabled,
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
-        agent_model=_text("AGENT_MODEL", "gpt-5.6-terra"),
+        agent_model=_text("AGENT_MODEL", "gpt-5.6-sol"),
         agent_escalation_model=_text(
             "AGENT_ESCALATION_MODEL",
-            "gpt-5.6-terra",
+            "gpt-5.6-sol",
         ),
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
-        agent_timeout_seconds=_positive_float(
+        agent_idle_timeout_seconds=_positive_float_with_legacy_name(
+            "AGENT_IDLE_TIMEOUT_SECONDS",
             "AGENT_TIMEOUT_SECONDS",
-            1_800.0,
+            600.0,
             maximum=1_800.0,
         ),
         agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "medium"),
@@ -790,18 +803,6 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             150_000,
             minimum=1_000,
             maximum=10_000_000,
-        ),
-        agent_max_conversation_turns=_bounded_int(
-            "AGENT_MAX_CONVERSATION_TURNS",
-            24,
-            minimum=2,
-            maximum=1_000,
-        ),
-        agent_max_context_ratio=_bounded_float(
-            "AGENT_MAX_CONTEXT_RATIO",
-            0.5,
-            minimum=0.1,
-            maximum=0.9,
         ),
         agent_max_response_characters=_bounded_int(
             "AGENT_MAX_RESPONSE_CHARACTERS",

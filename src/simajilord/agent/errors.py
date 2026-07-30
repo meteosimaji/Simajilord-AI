@@ -37,7 +37,7 @@ class AgentProviderLimitError(AgentProviderError):
 
 
 class AgentTimeoutError(AgentProviderError):
-    """The host interrupted a turn after its configured execution deadline."""
+    """The host interrupted a turn after its configured inactivity window."""
 
     def __init__(
         self,

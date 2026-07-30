@@ -2526,6 +2526,7 @@ def build_discord_endpoints(
         message = await channel.send(
             request.content,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
         return DiscordSendMessageResponse(
             message_id=str(message.id),
@@ -2549,6 +2550,7 @@ def build_discord_endpoints(
             request.content,
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
         return DiscordSendMessageResponse(str(reply.id), str(channel.id))
 
@@ -2572,6 +2574,7 @@ def build_discord_endpoints(
         await message.edit(
             content=request.content,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress=True,
         )
         return DiscordMessageWriteResponse(request.channel_id, request.message_id)
 
@@ -3316,6 +3319,7 @@ def build_discord_endpoints(
                 request.caption or None,
                 file=discord.File(io.BytesIO(content), filename=filename),
                 allowed_mentions=discord.AllowedMentions.none(),
+                suppress_embeds=True,
             )
         except discord.Forbidden as exc:
             raise UserError("discord.file_send_forbidden") from exc

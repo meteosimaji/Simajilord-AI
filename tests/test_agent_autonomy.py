@@ -1308,6 +1308,7 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
         batch.batch_id,
         0,
     )
+    assert target.reply.await_args.kwargs["suppress_embeds"] is True
     channel.send.assert_not_awaited()
     receipt_call = receipts.record_posted_messages.await_args
     assert receipt_call.kwargs["channel_id"] == "20"

@@ -25,6 +25,7 @@ from simajilord.integrations.discord.capabilities import (
     DiscordReactionRequest,
     DiscordReadMessagesRequest,
     DiscordSearchMessagesRequest,
+    DiscordSendMessageRequest,
     build_discord_endpoints,
 )
 from simajilord.runtime import SimajilordRuntime
@@ -423,6 +424,38 @@ def _permission(*, readable: bool) -> SimpleNamespace:
         administrator=False,
         manage_threads=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_text_message_suppresses_discord_link_previews() -> None:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    guild.get_member.return_value = actor
+    guild.me = bot
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+    )
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+
+    response = await _endpoint_map(cast(discord.Client, client))["discord.send_message"].invoke(
+        DiscordSendMessageRequest(
+            channel_id="20",
+            content="Source: https://example.com/article",
+        ),
+        _agent_context(resource_ids=("20",)),
+    )
+
+    assert response.message_id == "31"
+    assert channel.send.await_args.kwargs["suppress_embeds"] is True
 
 
 def _visibility_guild(

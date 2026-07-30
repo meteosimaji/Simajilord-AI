@@ -144,6 +144,7 @@ from simajilord.integrations.discord.cogs import (
     edit_deferred_error,
     error_message,
     server_info_embed,
+    translation_embed,
     user_info_embed,
 )
 from simajilord.integrations.discord.help_catalog import (
@@ -331,8 +332,10 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
         *,
         file: discord.File,
         allowed_mentions: discord.AllowedMentions,
+        suppress_embeds: bool,
     ) -> discord.Message:
         del content, allowed_mentions
+        assert suppress_embeds is True
         runtime.files.import_bytes("guild", "result.bin", b"newer")
         assert file.fp.read() == b"authorized"
         return sent
@@ -480,6 +483,7 @@ async def test_agent_final_is_posted_after_temporary_progress_is_deleted() -> No
         "discord:message:42",
         0,
     )
+    assert source.reply.await_args.kwargs["suppress_embeds"] is True
     source.channel.send.assert_not_awaited()
     on_posted.assert_awaited_once_with(final_message)
     assert progress.message is None
@@ -538,6 +542,7 @@ async def test_agent_failure_replaces_working_with_a_new_reply() -> None:
         0,
         purpose="error",
     )
+    assert source.reply.await_args.kwargs["suppress_embeds"] is True
     on_posted.assert_not_awaited()
     assert progress.message is None
 
@@ -1003,6 +1008,18 @@ def test_translation_region_picker_has_no_next_or_previous_controls() -> None:
     assert "Previous" not in labels
 
 
+def test_translation_result_hides_backend_metadata() -> None:
+    embed = translation_embed(
+        original="Hello",
+        translation="こんにちは",
+        source_language="en",
+        target_language="ja",
+    )
+
+    assert embed.title == "Translation · en → ja"
+    assert embed.footer.text is None
+
+
 @pytest.mark.asyncio
 async def test_translation_target_matching_detection_requests_source_without_timeout() -> None:
     languages = (
@@ -1363,6 +1380,7 @@ def test_structured_translation_extracts_and_rebuilds_discord_message() -> None:
     rendered = _translation_result_embeds(message, response, show_original=False)
     translated_embed = rendered[1]
     assert rendered[0].description == "T:Content"
+    assert rendered[0].footer.text is None
     assert translated_embed.title == "T:Title"
     assert translated_embed.description == "T:Description"
     assert translated_embed.author.name == "T:Author"
@@ -3641,7 +3659,7 @@ def test_agent_timeout_message_explains_interruption_and_uncertain_results() -> 
             write_attempted=True,
         )
     )
-    assert "2 minutes 5 seconds execution limit" in message
+    assert "no observable activity for 2 minutes 5 seconds" in message
     assert "stopped" in message
     assert "runtime was restarted automatically" in message
     assert "could create a duplicate" in message

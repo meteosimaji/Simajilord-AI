@@ -289,6 +289,22 @@ class AgentToolCatalog:
             )
         return self._aliases.get(tool_name)
 
+    def timeout_seconds_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> float | None:
+        """Return the capability's own execution limit for host watchdog routing."""
+
+        capability_name = self.capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        if capability_name is None:
+            return None
+        return self._registry.endpoint(capability_name).descriptor.timeout_seconds
+
     def canonical_tool_name_for_call(
         self,
         *,

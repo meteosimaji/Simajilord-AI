@@ -49,9 +49,12 @@ class GetMessageRequest:
 class GetMessageResponse:
     message_id: str
     channel_id: str
+    guild_id: str
     author_id: str
     author_name: str
-    content: str
+    content_chunk: str
+    content_length: int
+    offset: int
     next_offset: int | None = None
     complete: bool = True
 
@@ -78,6 +81,7 @@ async def run() -> dict[str, object]:
         "確認できた内容と残る作業が具体的に分かるようにしてください。"
     )
     sent_messages: list[str] = []
+    read_message_ids: list[str] = []
     progress: list[dict[str, object]] = []
     registry = CapabilityRegistry()
 
@@ -87,12 +91,19 @@ async def run() -> dict[str, object]:
     ) -> GetMessageResponse:
         if request.channel_id != "channel-qa" or request.message_id != "message-qa":
             raise RuntimeError("The manual QA requested an unexpected Discord pointer.")
+        read_message_ids.append(request.message_id)
+        end = min(len(source_message), request.offset + request.max_characters)
         return GetMessageResponse(
             message_id=request.message_id,
             channel_id=request.channel_id,
+            guild_id="guild-qa",
             author_id="user-qa",
             author_name="QA User",
-            content=source_message,
+            content_chunk=source_message[request.offset:end],
+            content_length=len(source_message),
+            offset=request.offset,
+            next_offset=end if end < len(source_message) else None,
+            complete=end == len(source_message),
         )
 
     async def send_message(
@@ -152,9 +163,9 @@ async def run() -> dict[str, object]:
         root = Path(temporary)
         provider = CodexAppServerProvider(
             executable="codex",
-            model="gpt-5.6-terra",
+            model="gpt-5.6-sol",
             workspace_dir=root / "workspace",
-            timeout_seconds=600,
+            idle_timeout_seconds=600,
             reasoning_effort="medium",
             tools=tools,
             max_tool_calls=32,
@@ -170,8 +181,6 @@ async def run() -> dict[str, object]:
                 per_workspace_requests=10,
                 per_workspace_window_seconds=3_600,
                 max_tokens_per_24_hours=150_000,
-                max_conversation_turns=24,
-                max_context_ratio=0.5,
                 max_response_characters=3_800,
                 max_active_turns=4,
                 max_pending_turns=20,
@@ -201,14 +210,20 @@ async def run() -> dict[str, object]:
 
     result = {
         "model": response.model,
+        "read_message_ids": read_message_ids,
         "progress": progress,
         "intermediate_messages": sent_messages,
         "final_response": response.content,
         "response_characters": len(response.content),
         "passed": (
-            len(sent_messages) >= 2
+            read_message_ids == ["message-qa"]
             and all(len(message) >= 25 for message in sent_messages)
-            and any(item["stage"] == "searching_web" for item in progress)
+            and {
+                "starting",
+                "reading_discord",
+                "searching_web",
+                "preparing_response",
+            }.issubset({str(item["stage"]) for item in progress})
             and "https://" in response.content
             and len(response.content) >= 200
         ),

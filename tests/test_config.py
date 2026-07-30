@@ -19,6 +19,11 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_SAFE_COMPUTE_ACCESS",
     "AGENT_FILE_SANDBOX_ENABLED",
     "AGENT_CURATED_SKILLS_ENABLED",
+    "AGENT_MODEL",
+    "AGENT_ESCALATION_MODEL",
+    "AGENT_REASONING_EFFORT",
+    "AGENT_IDLE_TIMEOUT_SECONDS",
+    "AGENT_TIMEOUT_SECONDS",
     "AGENT_MAX_TOOL_CALLS",
     "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
     "AGENT_MAX_PENDING_TURNS",
@@ -104,9 +109,10 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
 
     assert settings.tts_provider == "macos"
     assert settings.voicevox_auto_start is False
-    assert settings.agent_model == "gpt-5.6-terra"
-    assert settings.agent_escalation_model == "gpt-5.6-terra"
+    assert settings.agent_model == "gpt-5.6-sol"
+    assert settings.agent_escalation_model == "gpt-5.6-sol"
     assert settings.agent_reasoning_effort == "medium"
+    assert settings.agent_idle_timeout_seconds == 600
     assert settings.agent_max_tool_calls == 32
     assert settings.agent_max_tool_output_characters == 24_000
     assert settings.agent_max_active_turns == 4
@@ -117,6 +123,21 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_autonomy_batch_seconds == 10
     assert settings.agent_autonomy_max_runs == 0
     assert settings.agent_autonomy_max_pending_events_per_actor == 50
+
+
+def test_agent_idle_watchdog_prefers_explicit_name_and_accepts_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_TIMEOUT_SECONDS", "125")
+
+    legacy = load_settings(dotenv_path=dotenv_path)
+    assert legacy.agent_idle_timeout_seconds == 125
+
+    monkeypatch.setenv("AGENT_IDLE_TIMEOUT_SECONDS", "90")
+    explicit = load_settings(dotenv_path=dotenv_path)
+    assert explicit.agent_idle_timeout_seconds == 90
 
 
 def test_agent_security_policies_are_explicit_and_typed(

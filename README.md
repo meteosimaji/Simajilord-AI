@@ -52,8 +52,9 @@ with Discord's generic “interaction failed” banner.
   music/read-aloud volume, shuffle, move, requester-only clearing, skip, stop, leave, loop,
   bounded per-server/per-user admission, and persistent button controls. A Discord 403 removes
   the denied dashboard binding from both memory and durable state so restart does not revive it
-- The Now Playing panel reports invariant playback/loop duration instead of a projected relative
-  end timestamp, so a durable panel cannot later display an already-expired `Ends` value
+- The Now Playing panel reports Discord's live relative end time for an actively playing,
+  non-track-looping item (for example, `1分後`) and recalculates it after seek, resume, or speed
+  changes; paused, disconnected, waiting, and per-track loop states keep invariant timing text
 - Zero-click track search when one result is clear, with direct one-click choices only for
   genuinely ambiguous same-name tracks. A selection disables and updates the same visible
   result message while the track is being added
@@ -160,11 +161,13 @@ with Discord's generic “interaction failed” banner.
   permission-checked moderation. Destructive actions require the explicit capability policy,
   the active contributor's permissions, a reason/evidence where applicable, and a journaled
   result; retrieving an old administrator message can never authorize a new action
-- Bounded per-server FIFO AI-turn queues with durable conversation IDs, context-budget
-  rotation, exact-message verification, progressive status updates, and corrective retries
-  after failed writes. Separate servers can run turns concurrently without allowing two turns
-  from the same server to overtake each other. Codex notifications and tool budgets are routed
-  per thread/turn, so concurrent servers cannot consume each other's completion events.
+- Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
+  context compaction, exact-message verification, progressive status updates, and corrective
+  retries after failed writes. The host does not pre-emptively rotate a healthy Codex thread by
+  turn count or context ratio. Separate servers can run turns concurrently without allowing two
+  turns from the same server to overtake each other. Codex notifications, inactivity watchdogs,
+  and tool budgets are routed per thread/turn, so concurrent servers cannot consume each other's
+  completion events.
   Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
   as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
   remain attached. An accepted contributor may request a write only through that follow-up's
@@ -198,11 +201,13 @@ with Discord's generic “interaction failed” banner.
   actor, for seven days. It stores IDs and a small scalar inverse (maximum 4 KiB), never a file
   body, deleted-message body, or large snapshot.
 - Durable agent memory is independent of Codex provider threads in
-  `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success
-  `procedure` scopes enforce same-user/same-channel/same-server visibility. Records contain only
-  a short summary, exact source Discord message IDs, confidence, timestamps, and optional expiry;
+  `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success/failure
+  `procedure` scopes enforce same-user/same-channel/same-server visibility. Records contain only a
+  short summary, exact source Discord message IDs, confidence, timestamps, and optional expiry;
   message bodies, attachments, secret-like values, inferred profiles, and low-confidence guesses
-  are rejected. Eager `memory.search` uses a bounded bilingual lexical matcher tolerant of
+  are rejected. Eager `memory.search`, `memory.remember`, and `memory.update` tools let the agent
+  retrieve relevant context and capture at most one reusable outcome after substantive work
+  without recording every turn. Search uses a bounded bilingual lexical matcher tolerant of
   case/width/punctuation and common English/CJK wording variants, with scope, evidence basis,
   minimum-confidence, update-time, and `next_offset` filters; an empty query returns the most
   recently used accessible records. Normalized keys upsert duplicates, search updates
@@ -229,9 +234,10 @@ with Discord's generic “interaction failed” banner.
   `AutonomyEventQueue` without adding a second scheduler
 - Restart-safe GPT Image 2 generation through the saved Codex OAuth login, with atomic
   user/server/pending admission. Agent requests wait in the same turn, receive the generated
-  image as model-visible media plus a server-scoped workspace file, and explicitly choose
-  whether to post it with `discord.send_file`; the legacy delivery worker remains only for
-  jobs that were explicitly submitted with automatic delivery enabled
+  image as model-visible media plus a server-scoped workspace file, and post it with
+  `discord.send_file`. If the primary turn omits that send, one bounded same-thread correction
+  retries the delivery without regenerating the image; the legacy delivery worker remains only
+  for jobs that were explicitly submitted with automatic delivery enabled
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls
@@ -246,9 +252,11 @@ The optional agent is default-off. Event autonomy is inert until the agent is en
 and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex runtime has
 browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
-The default runtime profile is `gpt-5.6-terra` with `medium` reasoning. Context protection is
-rotation, not lossy in-place compression: when the configured turn or context-ratio limit is
-reached, a new provider thread starts while durable audit records remain stored.
+The default runtime profile is `gpt-5.6-sol` with `medium` reasoning. Codex keeps one durable
+provider thread and compacts retained context natively; the host resets it only when the saved
+thread is genuinely unavailable. Agent turns have no wall-clock deadline. A turn is stopped only
+after its configured inactivity window, while a running capability receives its own declared
+timeout. Discord link previews are suppressed for AI-authored text without altering its URLs.
 
 ## Requirements
 

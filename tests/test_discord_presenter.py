@@ -325,15 +325,16 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
             speed=1.25,
             pitch=1.0,
             waiting_for_voice=False,
-        )
+            connected=True,
+        ),
+        now_epoch=1_800_000_000,
     )
     assert embed.title == "Audio · Now playing"
     assert embed.timestamp is None
     assert embed.footer.text is None
     fields = {field.name: field.value for field in embed.fields}
     upcoming = next(field.value for field in embed.fields if field.name.startswith("Up Next"))
-    assert "Playing · duration `3:00`" in (embed.description or "")
-    assert "Ends <t:" not in (embed.description or "")
+    assert "Playing · Ends <t:1800000108:R> · duration `3:00`" in (embed.description or "")
     assert "0:45 / 3:00" not in (embed.description or "")
     assert ":T>" not in (embed.description or "")
     assert "Next" in upcoming
@@ -347,6 +348,34 @@ def test_music_embed_contains_track_progress_queue_and_operational_state() -> No
     assert "Speed 1.25x" in fields["Tuning"]
     assert "Bob" in upcoming
     assert embed.thumbnail.url == "https://img.example.com/current.jpg"
+
+
+def test_disconnected_track_does_not_project_an_end_timestamp() -> None:
+    embed = music_queue_embed(
+        AudioQueueResponse(
+            current=AudioQueueItem(
+                title="Waiting",
+                page_url="https://example.com/waiting",
+                kind="music",
+                duration_seconds=180,
+                requested_by_name="Alice",
+            ),
+            pending=(),
+            paused=False,
+            loop_mode="none",
+            destination_id="123",
+            auto_leave=True,
+            position_seconds=45,
+            speed=1.0,
+            pitch=1.0,
+            waiting_for_voice=False,
+            connected=False,
+        ),
+        now_epoch=1_800_000_000,
+    )
+
+    assert "Playing · duration `3:00`" in (embed.description or "")
+    assert "Ends <t:" not in (embed.description or "")
 
 
 def test_track_loop_does_not_render_an_expiring_end_timestamp() -> None:

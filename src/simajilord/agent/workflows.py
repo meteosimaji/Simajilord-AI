@@ -477,7 +477,7 @@ _WORKFLOWS = (
             workflow_id="memory.selective_capture",
             summary=(
                 "Reuse or selectively save an explicit stable preference or a "
-                "verified successful procedure without creating a turn log."
+                "reusable verified success/failure lesson without creating a turn log."
             ),
             required_grants=("memory",),
             steps=(
@@ -489,7 +489,8 @@ _WORKFLOWS = (
                 _step(
                     2,
                     "memory.remember",
-                    "Save only high-confidence user-stated preference or verified procedure.",
+                    "Save only a high-confidence user-stated preference or one "
+                    "reusable verified success/failure lesson.",
                 ),
                 _step(
                     3,
@@ -511,11 +512,14 @@ _WORKFLOWS = (
         keywords=(
             "memory preference procedure",
             "remember success",
+            "remember failure",
             "long-term",
             "メモリ",
             "好み",
             "以前",
             "成功",
+            "失敗",
+            "うまくいかなかった",
             "やり方",
             "再利用",
             "手順",

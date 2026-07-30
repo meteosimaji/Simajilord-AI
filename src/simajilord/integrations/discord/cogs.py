@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -726,6 +727,7 @@ def music_queue_embed(
     loading_emoji: str = "⏳",
     audio_wave_emoji: str = "〰️",
     radio_emoji: str = "📻",
+    now_epoch: float | None = None,
 ) -> discord.Embed:
     fields: list[EmbedField] = []
     upcoming = tuple(item for item in response.pending if item.kind == AudioKind.MUSIC.value)
@@ -744,11 +746,16 @@ def music_queue_embed(
         elif LoopMode(response.loop_mode) is LoopMode.TRACK:
             timing = f"Looping track · `{_duration(current.duration_seconds)}` per loop"
         elif current.duration_seconds > elapsed:
-            # This canonical card is updated on state changes, not every second.
-            # An absolute Discord timestamp becomes a misleading past "Ends" value
-            # when an edit is delayed or the process restarts. Keep only duration,
-            # which remains true for the lifetime of this card.
-            timing = f"Playing · duration `{_duration(current.duration_seconds)}`"
+            end_epoch = _playback_end_epoch(
+                response,
+                now_epoch=time.time() if now_epoch is None else now_epoch,
+            )
+            timing = (
+                f"Playing · Ends <t:{end_epoch}:R> · "
+                f"duration `{_duration(current.duration_seconds)}`"
+                if end_epoch is not None
+                else f"Playing · duration `{_duration(current.duration_seconds)}`"
+            )
         else:
             timing = "Finishing"
         description_lines = [
@@ -856,6 +863,34 @@ def music_queue_embed(
     if response.current and response.current.thumbnail_url:
         embed.set_thumbnail(url=response.current.thumbnail_url)
     return embed
+
+
+def _playback_end_epoch(
+    response: AudioQueueResponse,
+    *,
+    now_epoch: float,
+) -> int | None:
+    """Project a live non-looping track end into Discord's relative-time syntax."""
+
+    current = response.current
+    if (
+        current is None
+        or response.paused
+        or not response.connected
+        or response.waiting_for_voice
+        or response.voice_activation_required
+        or LoopMode(response.loop_mode) is LoopMode.TRACK
+        or current.duration_seconds <= 0
+        or response.speed <= 0
+    ):
+        return None
+    remaining_track_seconds = current.duration_seconds - max(
+        0.0,
+        response.position_seconds,
+    )
+    if remaining_track_seconds <= 0:
+        return None
+    return math.ceil(now_epoch + remaining_track_seconds / response.speed)
 
 
 def music_now_playing_embed(response: AudioQueueResponse) -> discord.Embed:
@@ -1371,7 +1406,7 @@ def _music_dashboard_fingerprint(
     response: AudioQueueResponse,
     read_aloud_route: ReadAloudRoute | None = None,
 ) -> tuple[object, ...]:
-    """Ignore elapsed seconds and read-aloud overlays; retain visible music state."""
+    """Retain visible state and timing anchors without polling every second."""
 
     current = response.current
     autoplay_next = response.autoplay_next
@@ -1399,6 +1434,7 @@ def _music_dashboard_fingerprint(
             if item.kind == AudioKind.MUSIC.value
         ),
         response.paused,
+        round(response.position_seconds, 3) if current is not None else None,
         response.loop_mode,
         response.destination_id,
         response.auto_leave,
@@ -5759,7 +5795,6 @@ def translation_embed(
     translation: str,
     source_language: str,
     target_language: str,
-    provider: str,
     author_name: str | None = None,
     show_original: bool = False,
 ) -> discord.Embed:
@@ -5773,13 +5808,11 @@ def translation_embed(
         fields.append(EmbedField("Original", _translation_text(original), inline=False))
     if author_name:
         fields.append(EmbedField("Author", discord.utils.escape_markdown(author_name)))
-    embed = command_embed(
+    return command_embed(
         title,
         fields=tuple(fields),
         tone=EmbedTone.SUCCESS,
     )
-    embed.set_footer(text=f"On-device · {provider}")
-    return embed
 
 
 def _translated_segment_map(
@@ -5813,8 +5846,6 @@ def _translation_result_embeds(
         ),
         tone=EmbedTone.SUCCESS,
     )
-    cache_label = " · cached" if response.cached else ""
-    summary.set_footer(text=f"On-device · {response.provider}{cache_label}")
     embeds: list[discord.Embed] = [summary]
 
     for embed_index, source_embed in enumerate(message.embeds[:8]):
@@ -6980,7 +7011,6 @@ class TranslationCog(commands.Cog):
                     translation=response.translation,
                     source_language=response.source_language,
                     target_language=response.target_language,
-                    provider=response.provider,
                     show_original=show_original,
                 ),
             )
@@ -8806,11 +8836,13 @@ class AgentCog(commands.Cog):
                 nonce=nonce,
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none(),
+                suppress_embeds=True,
             )
         return await channel.send(
             content,
             nonce=nonce,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
 
 
@@ -9707,12 +9739,14 @@ class AgentAutonomyCog(commands.Cog):
                             nonce=record.nonce,
                             mention_author=False,
                             allowed_mentions=discord.AllowedMentions.none(),
+                            suppress_embeds=True,
                         )
                     else:
                         posted = await channel.send(
                             content,
                             nonce=record.nonce,
                             allowed_mentions=discord.AllowedMentions.none(),
+                            suppress_embeds=True,
                         )
                 record = await self.runtime.autonomy_events.mark_delivery_sent(
                     batch,

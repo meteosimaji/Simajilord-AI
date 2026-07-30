@@ -243,6 +243,7 @@ async def test_curated_memory_workflow_connects_search_update_and_forget() -> No
     "query",
     (
         "前に成功したやり方をもう一度使いたい",
+        "前にうまくいかなかった方法を思い出して",
         "私の好みを思い出して",
     ),
 )

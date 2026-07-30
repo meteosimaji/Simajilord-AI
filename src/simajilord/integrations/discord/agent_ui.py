@@ -114,11 +114,11 @@ def agent_error_text(error: Exception) -> str:
                 "write may have started and replaying it could create a duplicate."
             )
         elif error.auto_retry_attempted:
-            retry = " A safe automatic retry before any write also timed out."
+            retry = " A safe automatic retry before any write also became inactive."
         else:
             retry = ""
         return (
-            f"The AI turn reached its {limit} execution limit and was stopped."
+            f"The AI turn produced no observable activity for {limit} and was stopped."
             f"{recovery}{retry}"
             " Any partial response or operation result is unconfirmed."
         )
@@ -223,6 +223,7 @@ class AgentProgressMessage:
             nonce=agent_delivery_nonce(self.delivery_key, 0),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
         await self._notify_posted(first)
         for index, message_content in enumerate(messages[1:], start=1):
@@ -230,6 +231,7 @@ class AgentProgressMessage:
                 message_content,
                 nonce=agent_delivery_nonce(self.delivery_key, index),
                 allowed_mentions=discord.AllowedMentions.none(),
+                suppress_embeds=True,
             )
             await self._notify_posted(posted)
 
@@ -256,6 +258,7 @@ class AgentProgressMessage:
             ),
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
+            suppress_embeds=True,
         )
 
     async def add_temporary_message(self, message: discord.Message) -> None:

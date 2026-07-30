@@ -19,7 +19,7 @@ from simajilord.providers.image.codex import (
 def _provider(tmp_path: Path) -> CodexImageProvider:
     return CodexImageProvider(
         executable="codex",
-        model="gpt-5.6-terra",
+        model="gpt-5.6-sol",
         workspace_dir=tmp_path / "workspace",
         timeout_seconds=60,
     )

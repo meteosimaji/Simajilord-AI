@@ -255,7 +255,8 @@ def build_image_endpoints(
                 side_effects=(
                     "Starts hosted GPT Image generation through the saved Codex login.",
                     "Imports the generated file into Simajilord local storage.",
-                    "Does not post to Discord; the agent chooses whether and how to send it.",
+                    "Does not post by itself; the active agent turn must follow with "
+                    "discord.send_file.",
                 ),
                 requires_workspace=True,
                 idempotency="idempotent_write",
