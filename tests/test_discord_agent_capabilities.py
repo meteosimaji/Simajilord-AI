@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
@@ -729,14 +730,21 @@ async def test_discord_read_messages_returns_explicit_chronological_order() -> N
     endpoints = _endpoint_map(cast(discord.Client, client))
 
     response = await endpoints["discord.read_messages"].invoke(
-        DiscordReadMessagesRequest(channel_id="20", limit=2),
-        _agent_context(),
+        DiscordReadMessagesRequest(
+            channel_id="20",
+            limit=2,
+            before_message_id="99",
+        ),
+        replace(_agent_context(), active_message_id="99"),
     )
 
     assert tuple(item.message_id for item in response.messages) == ("31", "32")
     assert response.oldest_message_id == "31"
     assert response.newest_message_id == "32"
     assert response.order == "oldest_to_newest"
+    assert response.anchor_message_id == "99"
+    assert response.anchor_is_active_message is True
+    assert response.immediate_predecessor_message_id == "32"
     assert response.has_more is True
     assert response.next_before_message_id == "31"
 

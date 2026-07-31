@@ -65,6 +65,7 @@ def test_evidence_plan_is_semantic_and_not_a_host_keyword_audit() -> None:
     )
 
     budget.evidence_plan_recorded = True
+    budget.execution_model = "primary"
     budget.conversation_context_required = True
     assert _evidence_plan_gap(budget)[0] == "agent.conversation_context_required"
     budget.conversation_context_satisfied = True
@@ -80,13 +81,12 @@ def test_write_cannot_bypass_the_ai_authored_evidence_plan() -> None:
     assert _write_readiness_failure(budget)[0] == "agent.evidence_plan_required"
 
     budget.evidence_plan_recorded = True
+    budget.execution_model = "primary"
     assert _write_readiness_failure(budget) is None
 
 
 def test_context_is_retrieved_only_when_ai_requests_it_and_is_anchored() -> None:
-    assert "recent_context" not in {
-        item.name for item in fields(DiscordGetMessageResponse)
-    }
+    assert "recent_context" not in {item.name for item in fields(DiscordGetMessageResponse)}
     budget = _budget()
     output = json.dumps(
         {
@@ -173,12 +173,11 @@ async def test_ai_evidence_plan_supports_context_and_source_independently(
 ) -> None:
     endpoints = {
         item.descriptor.name: item
-        for item in build_source_inspection_endpoints(
-            SourceInspectionService(tmp_path)
-        )
+        for item in build_source_inspection_endpoints(SourceInspectionService(tmp_path))
     }
     response = await endpoints["turn.evidence_plan"].invoke(
         EvidencePlanRequest(
+            execution_model="escalation",
             conversation_context="required",
             source_inspection="not_required",
             reason="The current message refers implicitly to the preceding discussion.",
@@ -187,13 +186,16 @@ async def test_ai_evidence_plan_supports_context_and_source_independently(
     )
 
     assert response == EvidencePlanResponse(
+        execution_model="escalation",
         conversation_context="required",
         source_inspection="not_required",
+        reason="The current message refers implicitly to the preceding discussion.",
         recorded=True,
     )
     with pytest.raises(UserError, match=r"agent\.evidence_plan_reason_invalid"):
         await endpoints["turn.evidence_plan"].invoke(
             EvidencePlanRequest(
+                execution_model="primary",
                 conversation_context="not_required",
                 source_inspection="not_required",
                 reason=" ",
@@ -210,8 +212,7 @@ async def test_source_inspection_is_bounded_and_excludes_runtime_data(
     source_dir.mkdir(parents=True)
     source_file = source_dir / "feature.py"
     source_file.write_text(
-        "def current_implementation() -> str:\n"
-        "    return 'verified source evidence'\n",
+        "def current_implementation() -> str:\n    return 'verified source evidence'\n",
         encoding="utf-8",
     )
     tests_dir = tmp_path / "tests"
@@ -222,16 +223,11 @@ async def test_source_inspection_is_bounded_and_excludes_runtime_data(
     )
     (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
     swift_dir = (
-        tmp_path
-        / "native"
-        / "macos"
-        / "TranslationHelper"
-        / "Sources"
-        / "TranslationHelper"
+        tmp_path / "native" / "macos" / "TranslationHelper" / "Sources" / "TranslationHelper"
     )
     swift_dir.mkdir(parents=True)
     (swift_dir / "main.swift").write_text(
-        "let nativeEvidence = \"verified native source evidence\"\n",
+        'let nativeEvidence = "verified native source evidence"\n',
         encoding="utf-8",
     )
     activity_dir = tmp_path / "activity" / "src"
@@ -251,28 +247,21 @@ async def test_source_inspection_is_bounded_and_excludes_runtime_data(
     data_dir.mkdir()
     (data_dir / "private.py").write_text("SECRET = 'hidden'\n", encoding="utf-8")
     service = SourceInspectionService(tmp_path)
-    endpoints = {
-        item.descriptor.name: item
-        for item in build_source_inspection_endpoints(service)
-    }
+    endpoints = {item.descriptor.name: item for item in build_source_inspection_endpoints(service)}
 
     search = await endpoints["source.search"].invoke(
         SourceSearchRequest(query="verified source"),
         InvocationContext("actor", "guild", "agent", "event"),
     )
     assert isinstance(search, SourceSearchResponse)
-    assert tuple(item.path for item in search.matches) == (
-        "src/simajilord/feature.py",
-    )
+    assert tuple(item.path for item in search.matches) == ("src/simajilord/feature.py",)
     native_search = await service.search("verified native source evidence")
     activity_search = await service.search("verified activity source evidence")
     generated_search = await service.search("never search generated static")
     assert tuple(item.path for item in native_search.matches) == (
         "native/macos/TranslationHelper/Sources/TranslationHelper/main.swift",
     )
-    assert tuple(item.path for item in activity_search.matches) == (
-        "activity/src/main.js",
-    )
+    assert tuple(item.path for item in activity_search.matches) == ("activity/src/main.js",)
     assert generated_search.matches == ()
 
     read = await endpoints["source.read"].invoke(

@@ -22,9 +22,7 @@ class SourceSearchRequest:
     path_prefix: str | None = field(
         default=None,
         metadata={
-            "description": (
-                "Optional repository-relative directory such as src/simajilord/agent."
-            )
+            "description": ("Optional repository-relative directory such as src/simajilord/agent.")
         },
     )
     limit: int = 12
@@ -67,6 +65,7 @@ class SourceReadResponse:
 class EvidencePlanRequest:
     """The model's semantic decision; the host never derives it from user text."""
 
+    execution_model: Literal["primary", "escalation"]
     conversation_context: Literal["required", "not_required"]
     source_inspection: Literal["required", "not_required"]
     reason: str
@@ -74,8 +73,10 @@ class EvidencePlanRequest:
 
 @dataclass(frozen=True, slots=True)
 class EvidencePlanResponse:
+    execution_model: Literal["primary", "escalation"]
     conversation_context: Literal["required", "not_required"]
     source_inspection: Literal["required", "not_required"]
+    reason: str
     recorded: bool
 
 
@@ -90,8 +91,10 @@ def build_source_inspection_endpoints(
         if not reason or len(reason) > 400:
             raise UserError("agent.evidence_plan_reason_invalid")
         return EvidencePlanResponse(
+            execution_model=request.execution_model,
             conversation_context=request.conversation_context,
             source_inspection=request.source_inspection,
+            reason=reason,
             recorded=True,
         )
 
@@ -106,8 +109,7 @@ def build_source_inspection_endpoints(
         )
         return SourceSearchResponse(
             matches=tuple(
-                SourceMatchItem(match.path, match.line, match.text)
-                for match in result.matches
+                SourceMatchItem(match.path, match.line, match.text) for match in result.matches
             ),
             searched_files=result.searched_files,
             truncated=result.truncated,
@@ -138,9 +140,12 @@ def build_source_inspection_endpoints(
             CapabilityDescriptor(
                 name="turn.evidence_plan",
                 summary=(
-                    "After reading the exact active request, semantically decide whether "
-                    "answering it requires earlier channel context and/or current "
-                    "Simajilord source evidence. The AI decides from meaning, never from "
+                    "After reading the exact active request, semantically decide the "
+                    "required evidence and execution model. Default to the primary model "
+                    "and use decomposition, evidence, and tools; length or technicality "
+                    "alone is not a reason to escalate. Choose the escalation model only "
+                    "for a concrete residual judgment or reliability risk the harness "
+                    "cannot adequately resolve. The AI decides from meaning, never from "
                     "a host keyword list."
                 ),
                 risk=RiskLevel.READ,

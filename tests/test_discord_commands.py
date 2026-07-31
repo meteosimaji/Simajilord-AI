@@ -3659,12 +3659,13 @@ def test_trigger_message_is_bounded_but_not_head_tail_summarized() -> None:
     assert _bounded_event_message("latest message") == ("latest message", False)
 
 
-def test_trigger_message_id_comes_only_from_discord_request_id() -> None:
+def test_trigger_message_id_comes_only_from_typed_context() -> None:
     context = InvocationContext(
         actor_id="actor",
         workspace_id="workspace",
         transport="agent",
-        request_id="discord:message:1530953392980234250",
+        request_id="forged:wrong",
+        active_message_id="1530953392980234250",
     )
     assert _discord_event_message_id(context) == "1530953392980234250"
     assert (
@@ -3673,7 +3674,7 @@ def test_trigger_message_id_comes_only_from_discord_request_id() -> None:
                 actor_id="actor",
                 workspace_id="workspace",
                 transport="agent",
-                request_id="forged:1530953392980234250",
+                request_id="discord:message:1530953392980234250",
             )
         )
         is None

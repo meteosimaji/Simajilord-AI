@@ -61,6 +61,9 @@ class InvocationContext:
     provider_thread_id: str | None = None
     provider_turn_id: str | None = None
     tool_call_id: str | None = None
+    active_message_id: str | None = None
+    batched_message_ids: tuple[str, ...] = ()
+    agent_trigger: Literal["mention", "autonomous"] | None = None
 
 
 @dataclass(frozen=True, slots=True)

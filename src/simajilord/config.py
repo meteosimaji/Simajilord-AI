@@ -782,7 +782,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_model=_text("AGENT_MODEL", "gpt-5.6-luna"),
         agent_escalation_model=_text(
             "AGENT_ESCALATION_MODEL",
-            "gpt-5.6-luna",
+            "gpt-5.6-terra",
         ),
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         agent_idle_timeout_seconds=_positive_float_with_legacy_name(
@@ -791,7 +791,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             600.0,
             maximum=1_800.0,
         ),
-        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "medium"),
+        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "high"),
         agent_max_tool_calls=_positive_int(
             "AGENT_MAX_TOOL_CALLS",
             32,

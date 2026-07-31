@@ -166,6 +166,9 @@ class AgentService:
                     origin_resource_id=request.channel_id,
                     approvals=request.approvals,
                     public_reference_id=request.public_reference_id,
+                    active_message_id=request.message_id,
+                    batched_message_ids=_request_batched_message_ids(request),
+                    agent_trigger=request.trigger.value,
                 )
                 memory_context: tuple[AgentMemoryRecord, ...] = ()
                 if self.memory is not None and AGENT_MEMORY_GRANT in request.grants:
@@ -379,6 +382,8 @@ class AgentService:
                 # turn's durable public reference so traces and feedback can be
                 # resolved after restart.
                 public_reference_id=original.public_reference_id,
+                active_message_id=request.message_id,
+                agent_trigger=request.trigger.value,
             )
             accepted = await self.provider.steer(
                 event_prompt=_follow_up_prompt(
@@ -817,6 +822,23 @@ def _event_prompt(
             ),
         )
     )
+
+
+def _request_batched_message_ids(request: AgentRequest) -> tuple[str, ...]:
+    """Return host-typed Discord pointers without parsing the model prompt."""
+
+    message_ids: list[str] = []
+    seen: set[str] = set()
+    for event in request.events:
+        value = event.payload.get("message_id")
+        if not isinstance(value, str):
+            continue
+        message_id = value.strip()
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        message_ids.append(message_id)
+    return tuple(message_ids)
 
 
 def _conversation_rotation_reason(

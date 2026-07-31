@@ -619,6 +619,9 @@ class DiscordReadMessagesResponse:
     oldest_message_id: str | None
     newest_message_id: str | None = None
     order: Literal["oldest_to_newest"] = "oldest_to_newest"
+    anchor_message_id: str | None = None
+    anchor_is_active_message: bool = False
+    immediate_predecessor_message_id: str | None = None
     source_guild_id: str = ""
     source_channel_id: str = ""
     visibility: Literal["guild_public", "restricted", "uncertain"] = "uncertain"
@@ -2006,10 +2009,21 @@ def build_discord_endpoints(
         has_more = len(newest_first_with_lookahead) > request.limit
         newest_first = newest_first_with_lookahead[: request.limit]
         messages = tuple(reversed(newest_first))
+        anchor_is_active_message = (
+            request.before_message_id is not None
+            and request.before_message_id == context.active_message_id
+        )
         return DiscordReadMessagesResponse(
             messages=messages,
             oldest_message_id=messages[0].message_id if messages else None,
             newest_message_id=messages[-1].message_id if messages else None,
+            anchor_message_id=request.before_message_id,
+            anchor_is_active_message=anchor_is_active_message,
+            immediate_predecessor_message_id=(
+                messages[-1].message_id
+                if messages and anchor_is_active_message
+                else None
+            ),
             source_guild_id=str(guild.id),
             source_channel_id=str(channel.id),
             visibility=visibility,
@@ -4677,7 +4691,9 @@ def build_discord_endpoints(
                 name="discord.read_messages",
                 summary=(
                     "Read one bounded chronological page from an authorized channel, with "
-                    "reply/thread and cached reaction signals for trend analysis."
+                    "reply/thread and cached reaction signals for trend analysis. When "
+                    "before_message_id is the typed active event, the response explicitly "
+                    "identifies the active anchor and its immediate Discord predecessor."
                 ),
                 risk=RiskLevel.READ,
                 keywords=(
@@ -8097,11 +8113,9 @@ def _bounded_event_message(content: str) -> tuple[str, bool]:
 
 
 def _discord_event_message_id(context: InvocationContext) -> str | None:
-    prefix = "discord:message:"
-    if not context.request_id.startswith(prefix):
-        return None
-    message_id = context.request_id.removeprefix(prefix)
-    return message_id if message_id.isdecimal() else None
+    """Use the transport-typed event pointer, never text parsed from an identifier."""
+
+    return context.active_message_id
 
 
 def _assert_agent_channel_scope(

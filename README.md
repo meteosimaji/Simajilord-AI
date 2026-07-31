@@ -491,11 +491,22 @@ without attaching the check to CI or consuming Discord API rate limits:
 
 ```bash
 uv run python scripts/manual_agent_discord_qa.py
+uv run python scripts/manual_agent_discord_qa.py --scenario context
+uv run python scripts/manual_agent_discord_qa.py \
+  --scenario handoff --escalation-model gpt-5.6-luna
+uv run python scripts/manual_agent_discord_qa.py \
+  --scenario handoff --escalation-model gpt-5.6-terra
 ```
 
 This one-shot test gives the AI an exact-message research task and verifies first-party Codex
-web search, multiple concrete intermediate messages, and the final sourced answer. It consumes
-one model turn and live search, and is intentionally not run on push.
+web search, the AI-authored primary-first evidence plan, Luna-high completion, concrete
+intermediate messaging, and the final sourced answer. It consumes live model/search usage and
+is intentionally not run on push. The context scenario reuses one provider thread, leaves an
+unrelated prior turn in it, injects an instruction-like third-party history message, and verifies
+that Luna retrieves a bounded page anchored before `↑これどう思う？` without treating history as
+authority or confusing provider-thread order with the typed Discord
+`immediate_predecessor_message_id`. The two handoff commands form an A/B pair: Luna investigates
+in both runs, while only the second finalization model changes.
 
 To reproduce the official Discord HTTP-route comparison, clone Discord's documentation and pass
 that exact checkout to the audit. The report records the documentation commit, every declared
