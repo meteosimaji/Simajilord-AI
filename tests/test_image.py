@@ -289,9 +289,12 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
 async def test_image_worker_persists_progress_and_terminal_delivery(tmp_path: Path) -> None:
     service = _service(tmp_path)
     delivered: list[ImageJobStatus] = []
+    terminal_delivery = asyncio.Event()
 
     async def delivery(job: object) -> None:
         delivered.append(job.status)  # type: ignore[attr-defined]
+        if job.status is ImageJobStatus.COMPLETED:  # type: ignore[attr-defined]
+            terminal_delivery.set()
 
     await service.start(delivery)
     job = await service.submit(
@@ -312,6 +315,7 @@ async def test_image_worker_persists_progress_and_terminal_delivery(tmp_path: Pa
     current = service.store.require(job.job_id)
     assert current.output_path is not None and current.output_path.is_file()
     assert current.progress_step == 12
+    await asyncio.wait_for(terminal_delivery.wait(), timeout=1)
     assert ImageJobStatus.RUNNING in delivered
     assert ImageJobStatus.COMPLETED in delivered
     await service.set_delivery_message(job.job_id, "progress-message")
