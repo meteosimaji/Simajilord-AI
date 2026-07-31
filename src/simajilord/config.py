@@ -762,10 +762,10 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_file_sandbox_enabled=agent_file_sandbox_enabled,
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
-        agent_model=_text("AGENT_MODEL", "gpt-5.6-sol"),
+        agent_model=_text("AGENT_MODEL", "gpt-5.6-luna"),
         agent_escalation_model=_text(
             "AGENT_ESCALATION_MODEL",
-            "gpt-5.6-sol",
+            "gpt-5.6-luna",
         ),
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         agent_idle_timeout_seconds=_positive_float_with_legacy_name(

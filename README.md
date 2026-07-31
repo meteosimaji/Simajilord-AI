@@ -293,7 +293,7 @@ The optional agent is default-off. Event autonomy is inert until the agent is en
 and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex runtime has
 browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
-The default runtime profile is `gpt-5.6-sol` with `medium` reasoning. Codex keeps one durable
+The default runtime profile is `gpt-5.6-luna` with `medium` reasoning. Codex keeps one durable
 provider thread in its stable `legacy` history mode and compacts retained context natively; the
 host resets it only when the saved thread is genuinely unavailable. Existing conversations are
 never proactively rotated merely to change their history mode. Agent turns have no wall-clock
