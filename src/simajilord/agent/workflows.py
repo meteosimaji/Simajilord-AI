@@ -434,15 +434,20 @@ _WORKFLOWS = (
                 _step(
                     1,
                     "capability_search",
-                    "Find the closest write capability from the concrete action and object.",
+                    "Inspect the complete available index for the concrete action and object.",
                 ),
                 _step(
                     2,
-                    "capability_invoke",
-                    "Invoke it with the active event authorization handle and schema fields.",
+                    "capability_describe",
+                    "Load exactly one selected write contract and retain its contract ID.",
                 ),
                 _step(
                     3,
+                    "capability_invoke",
+                    "Invoke it with that contract ID, active authorization, and schema fields.",
+                ),
+                _step(
+                    4,
                     "action.undo",
                     "Use the receipt action_id only if the user later asks to revert it.",
                 ),

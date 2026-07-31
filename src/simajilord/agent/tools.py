@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 import binascii
 import dataclasses
+import hashlib
+import hmac
 import json
 import logging
 import math
+import secrets
 import types
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
@@ -24,7 +27,6 @@ from simajilord.core import (
     RiskLevel,
 )
 from simajilord.core.errors import CapabilityError
-from simajilord.core.search import normalize_search_text
 
 from .actions import ActionReceipt, ActionReceiptService
 from .errors import AgentToolError
@@ -32,37 +34,16 @@ from .errors import AgentToolError
 _TOOL_NAMESPACE = "simajilord"
 _LIST_TOOL = "capability_list"
 _SEARCH_TOOL = "capability_search"
+_DESCRIBE_TOOL = "capability_describe"
+_RESOLUTION_TOOL = "capability_resolution"
 _INVOKE_TOOL = "capability_invoke"
 _AUTHORIZATION_EVENT_ID = "authorization_event_id"
-_MAX_CAPABILITY_SEARCH_OFFSET = 10_000
+_MAX_CAPABILITY_LIST_OFFSET = 10_000
 _MAX_CAPABILITY_SEARCH_LIMIT = 25
+_DEFAULT_CONCRETE_SEARCH_LIMIT = 10
 _CAPABILITY_LIST_CURSOR_PREFIX = "simajilord-tools-v1:"
-_CAPABILITY_BROWSE_QUERIES = frozenset(
-    {
-        "abilities",
-        "ability",
-        "available capabilities",
-        "available tools",
-        "capabilities",
-        "capability",
-        "features",
-        "できること",
-        "ツール",
-        "ヘルプ",
-        "機能一覧",
-        "能力一覧",
-        "一覧",
-        "何ができる",
-        "何ができますか",
-        "機能",
-        "能力",
-        "tools",
-        "what are your capabilities",
-        "what can you do",
-        "what capabilities do you have",
-        "what tools do you have",
-    }
-)
+_CAPABILITY_CATALOG_ID_PREFIX = "capcat_v1_"
+_CAPABILITY_CONTRACT_ID_PREFIX = "capcon_v1_"
 _CONTENT_RESULT_KEYS = ("content", "content_chunk", "text")
 _RESULT_IDENTITY_KEYS = (
     "path",
@@ -121,6 +102,8 @@ class AgentToolCallMetadata:
         "capability_invoke",
         "capability_search",
         "capability_list",
+        "capability_describe",
+        "capability_resolution",
     ]
     capability_name: str | None
     risk: RiskLevel | None
@@ -174,6 +157,10 @@ class AgentToolCatalog:
         self._destructive_capabilities = frozenset(destructive_capabilities)
         self._image_output_capabilities = frozenset(image_output_capabilities)
         self._action_receipts = action_receipts
+        # Opaque discovery proofs are scoped to this runtime instance and one
+        # stable InvocationContext. The model can copy them but cannot mint a
+        # contract without first calling capability_describe.
+        self._discovery_secret = secrets.token_bytes(32)
         allowed = set(self._allowed_capabilities)
         unknown_eager = self._eager_capabilities - allowed
         unknown_writes = self._write_capabilities - allowed
@@ -224,7 +211,13 @@ class AgentToolCatalog:
         aliases: dict[str, str] = {}
         for capability_name in self._allowed_capabilities:
             alias = _tool_alias(capability_name)
-            if alias in {_LIST_TOOL, _SEARCH_TOOL, _INVOKE_TOOL}:
+            if alias in {
+                _LIST_TOOL,
+                _SEARCH_TOOL,
+                _DESCRIBE_TOOL,
+                _RESOLUTION_TOOL,
+                _INVOKE_TOOL,
+            }:
                 raise AgentToolError(
                     f"Dynamic tool alias is reserved by the capability broker: {alias}"
                 )
@@ -330,9 +323,15 @@ class AgentToolCatalog:
                 "capability_invoke",
                 "capability_search",
                 "capability_list",
+                "capability_describe",
+                "capability_resolution",
             ] = "capability_list"
         elif tool_name == _SEARCH_TOOL:
             route = "capability_search"
+        elif tool_name == _DESCRIBE_TOOL:
+            route = "capability_describe"
+        elif tool_name == _RESOLUTION_TOOL:
+            route = "capability_resolution"
         elif tool_name == _INVOKE_TOOL:
             route = "capability_invoke"
         else:
@@ -408,11 +407,13 @@ class AgentToolCatalog:
         tools: list[Mapping[str, object]] = []
         hidden_configured = False
         hidden_available = False
+        any_available = False
         for alias, capability_name in sorted(self._aliases.items()):
             if capability_name not in self._eager_capabilities:
                 hidden_configured = True
             if not self._is_available(capability_name, context):
                 continue
+            any_available = True
             endpoint = self._validated_endpoint(capability_name, context)
             if capability_name not in self._eager_capabilities:
                 hidden_available = True
@@ -431,6 +432,9 @@ class AgentToolCatalog:
         if hidden_configured:
             tools.append(_list_spec())
             tools.append(_search_spec())
+            tools.append(_resolution_spec())
+        if hidden_configured and any_available:
+            tools.append(_describe_spec())
         if hidden_available:
             tools.append(_invoke_spec())
         if not tools:
@@ -471,6 +475,24 @@ class AgentToolCatalog:
         if tool_name == _SEARCH_TOOL:
             return AgentToolOutput(
                 self._search(
+                    arguments,
+                    context=context,
+                    max_output_characters=max_output_characters,
+                    before_invoke=before_invoke,
+                )
+            )
+        if tool_name == _DESCRIBE_TOOL:
+            return AgentToolOutput(
+                self._describe(
+                    arguments,
+                    context=context,
+                    max_output_characters=max_output_characters,
+                    before_invoke=before_invoke,
+                )
+            )
+        if tool_name == _RESOLUTION_TOOL:
+            return AgentToolOutput(
+                self._resolve_discovery(
                     arguments,
                     context=context,
                     max_output_characters=max_output_characters,
@@ -560,7 +582,7 @@ class AgentToolCatalog:
                     "name": item.descriptor.name,
                     "summary": item.descriptor.summary,
                     "risk": item.descriptor.risk.value,
-                    "invoke_with": _INVOKE_TOOL,
+                    "use_for_concrete_need": _SEARCH_TOOL,
                     "authorization_event_id_required": (
                         item.descriptor.name in self._write_capabilities
                     ),
@@ -590,25 +612,20 @@ class AgentToolCatalog:
     ) -> str:
         if not isinstance(arguments, dict):
             raise AgentToolError("Capability search arguments must be an object.")
-        unknown = set(arguments) - {"query", "offset", "limit"}
+        unknown = set(arguments) - {"query", "limit"}
         if unknown:
             raise AgentToolError(
                 f"Unknown capability search fields: {', '.join(sorted(unknown))}"
             )
         query = arguments.get("query", "")
-        offset = arguments.get("offset", 0)
-        limit = arguments.get("limit", 3)
-        if not isinstance(query, str):
-            raise AgentToolError("Capability search query must be text.")
-        if (
-            not isinstance(offset, int)
-            or isinstance(offset, bool)
-            or not 0 <= offset <= _MAX_CAPABILITY_SEARCH_OFFSET
-        ):
+        limit = arguments.get("limit")
+        if not isinstance(query, str) or not query.strip():
             raise AgentToolError(
-                "Capability search offset must be between 0 and "
-                f"{_MAX_CAPABILITY_SEARCH_OFFSET}."
+                "Capability search requires one concrete need; use capability_list "
+                "for general ability browsing."
             )
+        if limit is None:
+            limit = _DEFAULT_CONCRETE_SEARCH_LIMIT
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
@@ -620,30 +637,18 @@ class AgentToolCatalog:
             )
         if before_invoke is not None:
             before_invoke()
-        browse = _is_capability_browse_query(query)
         registered = self._registry.all()
-        candidates = (
-            tuple(
-                item
-                for item in registered
-                if item.descriptor.name in self._allowed_capabilities
+        candidates = tuple(
+            item
+            for item in self._registry.search(
+                query,
+                limit=max(1, len(registered)),
             )
-            if browse
-            else tuple(
-                item
-                for item in self._registry.search(
-                    query,
-                    limit=max(1, len(registered)),
-                )
-                if item.descriptor.name in self._allowed_capabilities
-            )
+            if item.descriptor.name in self._allowed_capabilities
         )
         available_matches: list[Any] = []
         unavailable_reason_counts: dict[str, int] = {}
-        candidate_names = {item.descriptor.name for item in candidates}
-        if browse:
-            candidate_names.update(self._allowed_capabilities)
-        for capability_name in sorted(candidate_names):
+        for capability_name in sorted(self._allowed_capabilities):
             reason = self._unavailable_reason(capability_name, context)
             if reason is not None:
                 unavailable_reason_counts[reason] = (
@@ -653,43 +658,172 @@ class AgentToolCatalog:
             if self._unavailable_reason(item.descriptor.name, context) is None:
                 self._validated_endpoint(item.descriptor.name, context)
                 available_matches.append(item)
-        page = available_matches[offset : offset + limit]
-        next_offset = offset + len(page)
-        has_more = next_offset < len(available_matches)
+        page = available_matches[:limit]
+        available_catalog = tuple(
+            item
+            for item in registered
+            if (
+                item.descriptor.name in self._allowed_capabilities
+                and self._unavailable_reason(item.descriptor.name, context) is None
+            )
+        )
         payload = {
             "query": query,
-            "browse": browse,
-            "detail": "summary" if browse else "schema",
-            "offset": offset,
+            "detail": "summary",
             "matches": [
                 {
                     "name": item.descriptor.name,
                     "summary": item.descriptor.summary,
                     "risk": item.descriptor.risk.value,
-                    "invoke_with": _INVOKE_TOOL,
+                    "describe_with": _DESCRIBE_TOOL,
                     "authorization_event_id_required": (
                         item.descriptor.name in self._write_capabilities
-                    ),
-                    **(
-                        {}
-                        if browse
-                        else {
-                            "metadata": _descriptor_metadata(item.descriptor),
-                            "input_schema": _dataclass_schema(item.request_type),
-                        }
                     ),
                 }
                 for item in page
             ],
-            "next_offset": next_offset if has_more else None,
-            "has_more": has_more,
-            "total_results": len(available_matches),
+            "ranked_hints_returned": len(page),
+            "ranked_hints_truncated": len(page) < len(available_matches),
+            "total_ranked_results": len(available_matches),
             "unavailable_reason_counts": unavailable_reason_counts,
+            "catalog_complete": True,
+            "catalog_id": _capability_catalog_id(
+                available_catalog,
+                context=context,
+                secret=self._discovery_secret,
+            ),
+            "catalog_index": _capability_catalog_index(available_catalog),
+            "describe_with": _DESCRIBE_TOOL,
+            "resolve_unavailable_with": _RESOLUTION_TOOL,
+        }
+        return _bounded_capability_search_json(
+            payload,
+            max_output_characters=max_output_characters,
+            request={"query": query},
+        )
+
+    def _describe(
+        self,
+        arguments: object,
+        *,
+        context: InvocationContext,
+        max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
+    ) -> str:
+        """Return the exact contract for one AI-selected available capability."""
+
+        if not isinstance(arguments, dict):
+            raise AgentToolError("Capability description arguments must be an object.")
+        unknown = set(arguments) - {"catalog_id", "name"}
+        if unknown:
+            raise AgentToolError(
+                f"Unknown capability description fields: {', '.join(sorted(unknown))}"
+            )
+        catalog_id = arguments.get("catalog_id")
+        capability_name = arguments.get("name")
+        if not isinstance(catalog_id, str) or not catalog_id:
+            raise AgentToolError("Capability description catalog_id must be text.")
+        if not isinstance(capability_name, str) or not capability_name:
+            raise AgentToolError("Capability description name must be text.")
+        if (
+            capability_name not in self._allowed_capabilities
+            or self._unavailable_reason(capability_name, context) is not None
+        ):
+            raise AgentToolError("The capability is not available for this turn.")
+        available_catalog = tuple(
+            item
+            for item in self._registry.all()
+            if (
+                item.descriptor.name in self._allowed_capabilities
+                and self._unavailable_reason(item.descriptor.name, context) is None
+            )
+        )
+        _validate_capability_catalog_id(
+            catalog_id,
+            available_catalog,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        endpoint = self._validated_endpoint(capability_name, context)
+        if before_invoke is not None:
+            before_invoke()
+        payload = {
+            "catalog_id": catalog_id,
+            "name": endpoint.descriptor.name,
+            "summary": endpoint.descriptor.summary,
+            "risk": endpoint.descriptor.risk.value,
+            "metadata": _descriptor_metadata(endpoint.descriptor),
+            "input_schema": _dataclass_schema(endpoint.request_type),
+            "invoke_with": _INVOKE_TOOL,
+            "contract_id": _capability_contract_id(
+                catalog_id,
+                endpoint.descriptor.name,
+                context=context,
+                secret=self._discovery_secret,
+            ),
+            "authorization_event_id_required": (
+                endpoint.descriptor.name in self._write_capabilities
+            ),
         }
         return _bounded_json(
             payload,
             max_output_characters=max_output_characters,
-            request={"offset": offset},
+            request={"catalog_id": catalog_id, "name": capability_name},
+        )
+
+    def _resolve_discovery(
+        self,
+        arguments: object,
+        *,
+        context: InvocationContext,
+        max_output_characters: int,
+        before_invoke: Callable[[], None] | None,
+    ) -> str:
+        """Record the model's semantic no-match conclusion against a full index."""
+
+        if not isinstance(arguments, dict):
+            raise AgentToolError("Capability resolution arguments must be an object.")
+        unknown = set(arguments) - {"catalog_id", "conclusion", "reason"}
+        if unknown:
+            raise AgentToolError(
+                f"Unknown capability resolution fields: {', '.join(sorted(unknown))}"
+            )
+        catalog_id = arguments.get("catalog_id")
+        conclusion = arguments.get("conclusion")
+        reason = arguments.get("reason")
+        if not isinstance(catalog_id, str) or not catalog_id:
+            raise AgentToolError("Capability resolution catalog_id must be text.")
+        if conclusion != "unavailable":
+            raise AgentToolError(
+                "Capability resolution conclusion must be unavailable."
+            )
+        if not isinstance(reason, str) or not reason.strip():
+            raise AgentToolError("Capability resolution reason must be non-empty text.")
+        available_catalog = tuple(
+            item
+            for item in self._registry.all()
+            if (
+                item.descriptor.name in self._allowed_capabilities
+                and self._unavailable_reason(item.descriptor.name, context) is None
+            )
+        )
+        _validate_capability_catalog_id(
+            catalog_id,
+            available_catalog,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        if before_invoke is not None:
+            before_invoke()
+        return _bounded_json(
+            {
+                "catalog_id": catalog_id,
+                "conclusion": "unavailable",
+                "reason": " ".join(reason.split())[:1_000],
+                "recorded": True,
+            },
+            max_output_characters=max_output_characters,
+            request={"catalog_id": catalog_id},
         )
 
     async def _invoke_discovered(
@@ -704,6 +838,7 @@ class AgentToolCatalog:
             raise AgentToolError("Capability invocation arguments must be an object.")
         unknown = set(arguments) - {
             "name",
+            "contract_id",
             "arguments",
             _AUTHORIZATION_EVENT_ID,
         }
@@ -712,11 +847,40 @@ class AgentToolCatalog:
                 f"Unknown capability invocation fields: {', '.join(sorted(unknown))}"
             )
         capability_name = arguments.get("name")
+        contract_id = arguments.get("contract_id")
         capability_arguments = arguments.get("arguments")
         if not isinstance(capability_name, str):
             raise AgentToolError("Capability name must be text.")
+        if not isinstance(contract_id, str) or not contract_id:
+            raise AgentToolError(
+                "Capability invocation requires contract_id from capability_describe."
+            )
         if capability_name not in self._allowed_capabilities:
             raise AgentToolError("The capability is not allowed.")
+        available_catalog = tuple(
+            item
+            for item in self._registry.all()
+            if (
+                item.descriptor.name in self._allowed_capabilities
+                and self._unavailable_reason(item.descriptor.name, context) is None
+            )
+        )
+        catalog_id = _capability_catalog_id(
+            available_catalog,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        expected_contract_id = _capability_contract_id(
+            catalog_id,
+            capability_name,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        if not secrets.compare_digest(contract_id, expected_contract_id):
+            raise AgentToolError(
+                "Capability contract is missing, stale, or belongs to another capability; "
+                "search and describe exactly one candidate again."
+            )
         return await self._invoke_capability(
             capability_name,
             _without_authorization_event_id(capability_arguments),
@@ -928,8 +1092,10 @@ def _list_spec() -> Mapping[str, object]:
         "description": (
             "List available Simajilord capabilities as compact summaries without loading "
             "their input schemas. Use this for general ability questions. Copy next_cursor "
-            "unchanged into cursor until has_more is false, then use capability_search for "
-            "one concrete action and capability_invoke to execute it."
+            "unchanged into cursor until has_more is false. For one concrete need, use "
+            "capability_search, select a capability by meaning from its complete catalog "
+            "index, then load only that contract with capability_describe; do not invoke "
+            "directly from this list."
         ),
         "inputSchema": {
             "type": "object",
@@ -955,11 +1121,16 @@ def _search_spec() -> Mapping[str, object]:
         "type": "function",
         "name": _SEARCH_TOOL,
         "description": (
-            "Search available Simajilord capabilities, or browse them with an empty/general "
-            "ability query. Browse pages are compact summaries so a full catalog can be paged "
-            "without loading every schema. Concrete searches include invocation schemas. "
-            "Follow next_offset until has_more is false. Unavailable tools are reported only "
-            "as coarse reason counts; their names and schemas stay hidden."
+            "Find candidates for one concrete need without loading any input schemas. A "
+            "concrete result includes ranked summaries plus a complete compact index of every "
+            "capability available in this turn. Select from that index by meaning rather than "
+            "assuming rank is exhaustive, then call capability_describe for one candidate at a "
+            "time, copying catalog_id. After invoking it, the same catalog can describe another "
+            "necessary candidate. The returned contract_id is required to invoke it. "
+            "If none is semantically suitable, call capability_resolution with the returned "
+            "catalog_id before claiming the capability is unavailable. Use "
+            "capability_list—not a specially worded search—for general ability browsing. "
+            "Unavailable capability names and schemas stay hidden."
         ),
         "inputSchema": {
             "type": "object",
@@ -967,76 +1138,89 @@ def _search_spec() -> Mapping[str, object]:
                 "query": {
                     "type": "string",
                     "description": (
-                        "Concrete verb plus object, such as '過去メッセージを検索' or "
-                        "'assign a role'. Use empty text or a general ability question "
-                        "to browse the available catalog."
+                        "Describe the one concrete state, ability, or action that is needed. "
+                        "The host uses this only for ranked hints; the AI must semantically "
+                        "inspect the complete catalog_index itself."
                     ),
-                    "default": "",
-                },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": _MAX_CAPABILITY_SEARCH_OFFSET,
-                    "default": 0,
-                    "description": "Copy next_offset from the previous result page.",
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": _MAX_CAPABILITY_SEARCH_LIMIT,
                     "description": (
-                        "Use up to 25 for compact catalog browsing; use a small value for "
-                        "concrete schema searches."
+                        "Ranked hints return short summaries only and default to 10. The "
+                        "complete name index is independent of this limit."
                     ),
                 },
             },
+            "required": ["query"],
             "additionalProperties": False,
         },
     }
 
 
-def _is_capability_browse_query(query: str) -> bool:
-    normalized = normalize_search_text(query)
-    if not normalized or normalized in _CAPABILITY_BROWSE_QUERIES:
-        return True
+def _describe_spec() -> Mapping[str, object]:
+    return {
+        "type": "function",
+        "name": _DESCRIBE_TOOL,
+        "description": (
+            "Load the exact input schema and operational metadata for one capability selected "
+            "semantically from capability_search's complete catalog index. Load only the "
+            "candidate you intend to invoke or cite as an available ability. Copy catalog_id "
+            "from that search; this returns the contract_id required by capability_invoke."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "catalog_id": {
+                    "type": "string",
+                    "description": "Copy catalog_id from capability_search.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Copy one complete capability name from matches or catalog_index."
+                    ),
+                },
+            },
+            "required": ["catalog_id", "name"],
+            "additionalProperties": False,
+        },
+    }
 
-    compact = normalized.replace(" ", "")
-    if (
-        compact.startswith(("何ができる", "なにができる"))
-        or "どんなことができる" in compact
-        or "できることを教え" in compact
-    ):
-        return True
-    japanese_subject = any(
-        marker in compact
-        for marker in ("機能", "能力", "ツール", "操作", "できること")
-    )
-    japanese_list = any(
-        marker in compact
-        for marker in ("一覧", "全部", "全て", "すべて", "利用可能", "見せて", "教えて")
-    )
-    if japanese_subject and japanese_list:
-        return True
 
-    tokens = set(normalized.split())
-    english_subject = bool(
-        tokens
-        & {
-            "ability",
-            "abilities",
-            "capability",
-            "capabilities",
-            "feature",
-            "features",
-            "operation",
-            "operations",
-            "tool",
-            "tools",
-        }
-    )
-    english_list = bool(tokens & {"all", "available", "every", "list", "show"})
-    english_have_question = "what" in tokens and "have" in tokens
-    return english_subject and (english_list or english_have_question)
+def _resolution_spec() -> Mapping[str, object]:
+    return {
+        "type": "function",
+        "name": _RESOLUTION_TOOL,
+        "description": (
+            "Record the AI's semantic conclusion that no currently available capability fits "
+            "one concrete need. Use this only after reviewing the complete catalog_index from "
+            "capability_search; it validates the opaque catalog_id. This is the required "
+            "grounding step before saying a capability is unavailable."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "catalog_id": {
+                    "type": "string",
+                    "description": "Copy catalog_id from the concrete capability_search result.",
+                },
+                "conclusion": {
+                    "type": "string",
+                    "enum": ["unavailable"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "A concise semantic reason no indexed capability satisfies the need."
+                    ),
+                },
+            },
+            "required": ["catalog_id", "conclusion", "reason"],
+            "additionalProperties": False,
+        },
+    }
 
 
 def _encode_capability_list_cursor(offset: int) -> str:
@@ -1060,9 +1244,95 @@ def _decode_capability_list_cursor(cursor: object) -> int:
         offset = int(raw_offset)
     except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
         raise AgentToolError("Capability list cursor is invalid.") from exc
-    if not 0 <= offset <= _MAX_CAPABILITY_SEARCH_OFFSET:
+    if not 0 <= offset <= _MAX_CAPABILITY_LIST_OFFSET:
         raise AgentToolError("Capability list cursor is out of range.")
     return offset
+
+
+def _capability_catalog_id(
+    endpoints: Sequence[Any],
+    *,
+    context: InvocationContext,
+    secret: bytes,
+) -> str:
+    """Return an opaque proof bound to this runtime, request, and full catalog."""
+
+    names = sorted(item.descriptor.name for item in endpoints)
+    payload = "\0".join(
+        ("catalog", _capability_discovery_scope(context), *names)
+    ).encode("utf-8")
+    digest = hmac.new(secret, payload, hashlib.sha256).hexdigest()[:32]
+    return f"{_CAPABILITY_CATALOG_ID_PREFIX}{digest}"
+
+
+def _validate_capability_catalog_id(
+    catalog_id: str,
+    endpoints: Sequence[Any],
+    *,
+    context: InvocationContext,
+    secret: bytes,
+) -> None:
+    expected = _capability_catalog_id(
+        endpoints,
+        context=context,
+        secret=secret,
+    )
+    if not secrets.compare_digest(catalog_id, expected):
+        raise AgentToolError(
+            "Capability catalog changed, belongs to another turn, or was not fully "
+            "inspected; search again."
+        )
+
+
+def _capability_contract_id(
+    catalog_id: str,
+    capability_name: str,
+    *,
+    context: InvocationContext,
+    secret: bytes,
+) -> str:
+    """Prove that one exact contract was loaded for this request and catalog."""
+
+    payload = "\0".join(
+        (
+            "contract",
+            _capability_discovery_scope(context),
+            catalog_id,
+            capability_name,
+        )
+    ).encode("utf-8")
+    digest = hmac.new(secret, payload, hashlib.sha256).hexdigest()[:32]
+    return f"{_CAPABILITY_CONTRACT_ID_PREFIX}{digest}"
+
+
+def _capability_discovery_scope(context: InvocationContext) -> str:
+    """Use stable host identity fields; provider call IDs legitimately change per step."""
+
+    return "\0".join(
+        (
+            context.actor_id,
+            context.workspace_id or "",
+            context.transport,
+            context.request_id,
+            context.origin_resource_id or "",
+            context.active_message_id or "",
+            *context.resource_ids,
+        )
+    )
+
+
+def _capability_catalog_index(
+    endpoints: Sequence[Any],
+) -> Mapping[str, tuple[str, ...]]:
+    grouped: dict[str, list[str]] = {}
+    for item in sorted(endpoints, key=lambda entry: entry.descriptor.name):
+        name = item.descriptor.name
+        namespace, _, _ = name.partition(".")
+        grouped.setdefault(namespace, []).append(name)
+    return {
+        namespace: tuple(local_names)
+        for namespace, local_names in sorted(grouped.items())
+    }
 
 
 def _invoke_spec() -> Mapping[str, object]:
@@ -1070,13 +1340,18 @@ def _invoke_spec() -> Mapping[str, object]:
         "type": "function",
         "name": _INVOKE_TOOL,
         "description": (
-            "Invoke one capability returned by capability_search. This remains valid when "
-            "the same capability also has a dedicated tool alias."
+            "Invoke one capability after loading its exact current contract with "
+            "capability_describe. Copy its opaque contract_id; a guessed name or contract from "
+            "another turn or capability is rejected."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
+                "contract_id": {
+                    "type": "string",
+                    "description": "Opaque contract_id returned by capability_describe.",
+                },
                 "arguments": {"type": "object"},
                 _AUTHORIZATION_EVENT_ID: {
                     "type": "string",
@@ -1086,7 +1361,7 @@ def _invoke_spec() -> Mapping[str, object]:
                     ),
                 },
             },
-            "required": ["name", "arguments"],
+            "required": ["name", "contract_id", "arguments"],
             "additionalProperties": False,
         },
     }
@@ -1283,6 +1558,61 @@ def _convert_value(value: object, annotation: object) -> object:
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
         return _build_dataclass(annotation, value)
     raise TypeError(f"Unsupported value type: {annotation!r}")
+
+
+def _bounded_capability_search_json(
+    value: Mapping[str, object],
+    *,
+    max_output_characters: int,
+    request: object | None,
+) -> str:
+    """Keep a concrete search's complete name index ahead of extra ranked matches."""
+
+    if max_output_characters < 200:
+        raise AgentToolError("Dynamic tool output budget is too small.")
+    original_matches = value.get("matches")
+    if not isinstance(original_matches, list):
+        return _bounded_json(
+            value,
+            max_output_characters=max_output_characters,
+            request=request,
+        )
+    total_results = value.get("total_ranked_results")
+    total = (
+        total_results
+        if isinstance(total_results, int) and not isinstance(total_results, bool)
+        else len(original_matches)
+    )
+    visible_matches = list(original_matches)
+    while True:
+        candidate = dict(value)
+        candidate["matches"] = visible_matches
+        candidate["ranked_hints_returned"] = len(visible_matches)
+        candidate["ranked_hints_truncated"] = len(visible_matches) < total
+        if len(_encode_json(_json_value(candidate))) <= max_output_characters:
+            return _encode_json(_json_value(candidate))
+        if not visible_matches:
+            break
+        visible_matches.pop()
+
+    # An incomplete catalog must never carry a valid proof that could ground an
+    # unavailable conclusion. The caller can report the bounded limitation or
+    # page capability_list, but cannot mistake a partial index for evidence.
+    fallback = {
+        "query": value.get("query"),
+        "catalog_complete": False,
+        "catalog_id": None,
+        "catalog_fallback": _LIST_TOOL,
+        "matches": [],
+        "ranked_hints_returned": 0,
+        "ranked_hints_truncated": True,
+        "error": "complete_capability_index_exceeds_output_budget",
+    }
+    return _bounded_json(
+        fallback,
+        max_output_characters=max_output_characters,
+        request=request,
+    )
 
 
 def _bounded_json(

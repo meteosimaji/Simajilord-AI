@@ -925,11 +925,31 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
     )
     payload = json.loads(search_output.text)
     assert payload["memories"][0]["memory_id"] == remembered.memory.memory_id
+    broker_discovery = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "search the requester's selective memory"},
+        context=context,
+        max_output_characters=10_000,
+    )
+    broker_catalog_id = json.loads(broker_discovery.text)["catalog_id"]
+    broker_contract = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_describe",
+        arguments={
+            "catalog_id": broker_catalog_id,
+            "name": "memory.search",
+        },
+        context=context,
+        max_output_characters=10_000,
+    )
+    broker_contract_id = json.loads(broker_contract.text)["contract_id"]
     brokered_search_output = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
         arguments={
             "name": "memory.search",
+            "contract_id": broker_contract_id,
             "arguments": {
                 "query": "Japanese",
                 "scopes": ["user"],

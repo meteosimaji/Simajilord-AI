@@ -66,8 +66,31 @@ class EvidencePlanRequest:
     """The model's semantic decision; the host never derives it from user text."""
 
     execution_model: Literal["primary", "escalation"]
-    conversation_context: Literal["required", "not_required"]
-    source_inspection: Literal["required", "not_required"]
+    conversation_context: Literal["required", "not_required"] = field(
+        metadata={
+            "description": (
+                "Required only when earlier Discord messages can change the active request's "
+                "meaning or referent. Current live platform state alone does not require history."
+            )
+        },
+    )
+    source_inspection: Literal["required", "not_required"] = field(
+        metadata={
+            "description": (
+                "Required only when current Simajilord implementation evidence is needed."
+            )
+        },
+    )
+    capability_discovery: Literal["required", "not_required"] = field(
+        metadata={
+            "description": (
+                "Required whenever the answer itself may assert, deny, explain, or give an "
+                "opinion about a current Simajilord state, ability, or action. This includes "
+                "questions about whether something is possible even when no execution is "
+                "requested. The model must then use capability_search's complete index."
+            )
+        },
+    )
     reason: str
 
 
@@ -76,6 +99,7 @@ class EvidencePlanResponse:
     execution_model: Literal["primary", "escalation"]
     conversation_context: Literal["required", "not_required"]
     source_inspection: Literal["required", "not_required"]
+    capability_discovery: Literal["required", "not_required"]
     reason: str
     recorded: bool
 
@@ -94,6 +118,7 @@ def build_source_inspection_endpoints(
             execution_model=request.execution_model,
             conversation_context=request.conversation_context,
             source_inspection=request.source_inspection,
+            capability_discovery=request.capability_discovery,
             reason=reason,
             recorded=True,
         )
@@ -145,8 +170,9 @@ def build_source_inspection_endpoints(
                     "and use decomposition, evidence, and tools; length or technicality "
                     "alone is not a reason to escalate. Choose the escalation model only "
                     "for a concrete residual judgment or reliability risk the harness "
-                    "cannot adequately resolve. The AI decides from meaning, never from "
-                    "a host keyword list."
+                    "cannot adequately resolve. Declare capability discovery required for "
+                    "claims about current Simajilord state, ability, or action, not only when "
+                    "executing one. The AI decides from meaning, never from a host keyword list."
                 ),
                 risk=RiskLevel.READ,
                 keywords=(

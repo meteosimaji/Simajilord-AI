@@ -40,6 +40,8 @@ from simajilord.agent.providers.codex import (
     _AppServerTransportError,
     _base_instructions,
     _blocking_write_capability,
+    _capability_discovery_gap,
+    _capability_discovery_tool_failure,
     _continuation_tool_budget,
     _encode_app_server_message,
     _is_final_delivery,
@@ -108,6 +110,7 @@ class FollowUpEvidencePlanRequest:
     execution_model: Literal["primary", "escalation"]
     conversation_context: Literal["required", "not_required"]
     source_inspection: Literal["required", "not_required"]
+    capability_discovery: Literal["required", "not_required"]
     reason: str
 
 
@@ -116,6 +119,7 @@ class FollowUpEvidencePlanResponse:
     execution_model: Literal["primary", "escalation"]
     conversation_context: Literal["required", "not_required"]
     source_inspection: Literal["required", "not_required"]
+    capability_discovery: Literal["required", "not_required"]
     reason: str
     recorded: bool
 
@@ -576,6 +580,14 @@ def test_continuation_budget_preserves_cumulative_write_and_delivery_state() -> 
         final_delivery_successes={"discord.send_message"},
         last_write_authorization_event_id="authorization",
         discord_disclosure_observations=[("guild", "channel", "full")],
+        capability_discovery_pending=True,
+        capability_discovery_required=True,
+        capability_discovery_searches=2,
+        capability_discovery_resolutions=1,
+        capability_discovery_catalog_id="capcat_v1_test",
+        capability_discovery_name="audio.queue",
+        capability_discovery_contract_id="capcon_v1_test",
+        capability_discovery_contract_used=True,
     )
 
     continued = _continuation_tool_budget(
@@ -599,6 +611,14 @@ def test_continuation_budget_preserves_cumulative_write_and_delivery_state() -> 
     assert continued.final_delivery_successes == {"discord.send_message"}
     assert continued.last_write_authorization_event_id == "authorization"
     assert continued.discord_disclosure_observations == [("guild", "channel", "full")]
+    assert continued.capability_discovery_pending is True
+    assert continued.capability_discovery_required is True
+    assert continued.capability_discovery_searches == 2
+    assert continued.capability_discovery_resolutions == 1
+    assert continued.capability_discovery_catalog_id == "capcat_v1_test"
+    assert continued.capability_discovery_name == "audio.queue"
+    assert continued.capability_discovery_contract_id == "capcon_v1_test"
+    assert continued.capability_discovery_contract_used is True
     continued.write_attempts.add("discord.send_embed")
     assert "discord.send_embed" not in source.write_attempts
 
@@ -2460,19 +2480,40 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
     assert schema["properties"]["offset"]["type"] == "integer"
     assert "required" not in schema
 
+    context = InvocationContext("actor", "workspace", "agent", "request")
     output = await catalog.invoke(
         namespace="simajilord",
         tool_name="test_read",
         arguments={"offset": 1},
-        context=InvocationContext("actor", "workspace", "agent", "request"),
+        context=context,
         max_output_characters=1_000,
     )
     assert '"content":"bc"' in output
+    discovery = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "read one bounded test chunk"},
+        context=context,
+        max_output_characters=1_000,
+    )
+    catalog_id = json.loads(discovery.text)["catalog_id"]
+    contract = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_describe",
+        arguments={"catalog_id": catalog_id, "name": "test.read"},
+        context=context,
+        max_output_characters=1_000,
+    )
+    contract_id = json.loads(contract.text)["contract_id"]
     brokered_output = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
-        arguments={"name": "test.read", "arguments": {"offset": 2}},
-        context=InvocationContext("actor", "workspace", "agent", "request"),
+        arguments={
+            "name": "test.read",
+            "contract_id": contract_id,
+            "arguments": {"offset": 2},
+        },
+        context=context,
         max_output_characters=1_000,
     )
     assert '"content":"cd"' in brokered_output
@@ -2781,6 +2822,8 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         "test_read",
         "capability_list",
         "capability_search",
+        "capability_resolution",
+        "capability_describe",
         "capability_invoke",
     ]
     search = await catalog.invoke(
@@ -2790,17 +2833,93 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
         context=granted,
         max_output_characters=2_000,
     )
-    assert '"name":"image.generate"' in search
-    assert '"input_schema"' in search
-    assert '"invoke_with":"capability_invoke"' in search
+    search_payload = json.loads(search.text)
+    assert search_payload["catalog_complete"] is True
+    assert search_payload["catalog_index"] == {
+        "image": ["image.generate"],
+        "test": ["test.read"],
+    }
+    assert search_payload["matches"][0]["name"] == "image.generate"
+    assert "input_schema" not in search.text
+    assert search_payload["describe_with"] == "capability_describe"
+    assert search_payload["resolve_unavailable_with"] == "capability_resolution"
+    description = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_describe",
+        arguments={
+            "catalog_id": search_payload["catalog_id"],
+            "name": "image.generate",
+        },
+        context=granted,
+        max_output_characters=2_000,
+    )
+    description_payload = json.loads(description.text)
+    assert description_payload["name"] == "image.generate"
+    assert description_payload["catalog_id"] == search_payload["catalog_id"]
+    assert description_payload["contract_id"].startswith("capcon_v1_")
+    assert description_payload["input_schema"]["properties"]["subject"]["type"] == "string"
+    resolution = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_resolution",
+        arguments={
+            "catalog_id": search_payload["catalog_id"],
+            "conclusion": "unavailable",
+            "reason": "No indexed capability fits a different concrete need.",
+        },
+        context=granted,
+        max_output_characters=2_000,
+    )
+    assert json.loads(resolution.text)["recorded"] is True
+    with pytest.raises(AgentToolError, match="catalog changed"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="capability_resolution",
+            arguments={
+                "catalog_id": "capcat_forged",
+                "conclusion": "unavailable",
+                "reason": "Forged catalog.",
+            },
+            context=granted,
+            max_output_characters=2_000,
+        )
+    with pytest.raises(AgentToolError, match="another turn"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="capability_describe",
+            arguments={
+                "catalog_id": search_payload["catalog_id"],
+                "name": "image.generate",
+            },
+            context=InvocationContext(
+                "actor",
+                "workspace",
+                "agent",
+                "different-request",
+                grants=frozenset({AGENT_IMAGE_GRANT}),
+            ),
+            max_output_characters=2_000,
+        )
+    with pytest.raises(AgentToolError, match="requires contract_id"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="capability_invoke",
+            arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
+            context=granted,
+            max_output_characters=2_000,
+        )
     result = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
-        arguments={"name": "image.generate", "arguments": {"subject": "cat"}},
+        arguments={
+            "name": "image.generate",
+            "contract_id": description_payload["contract_id"],
+            "arguments": {"subject": "cat"},
+        },
         context=granted,
         max_output_characters=2_000,
     )
     assert '"job_id":"image:cat"' in result
+    nested_authorization["contract_id"] = description_payload["contract_id"]
     nested_result = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
@@ -2889,6 +3008,10 @@ def test_agent_tool_catalog_rejects_duplicate_allowlist_entries() -> None:
         AgentToolCatalog(registry, ("capability.search",))
     with pytest.raises(AgentToolError, match="reserved"):
         AgentToolCatalog(registry, ("capability.list",))
+    with pytest.raises(AgentToolError, match="reserved"):
+        AgentToolCatalog(registry, ("capability.describe",))
+    with pytest.raises(AgentToolError, match="reserved"):
+        AgentToolCatalog(registry, ("capability.resolution",))
 
 
 def test_agent_tool_schema_cannot_shadow_broker_authorization_field() -> None:
@@ -3025,7 +3148,7 @@ async def test_capability_search_never_leaks_missing_grant_or_approval() -> None
 
 
 @pytest.mark.asyncio
-async def test_capability_search_browses_stable_pages_for_empty_and_general_queries() -> None:
+async def test_capability_search_always_returns_the_same_complete_semantic_index() -> None:
     registry = CapabilityRegistry()
 
     async def read(
@@ -3050,7 +3173,7 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
     )
     context = InvocationContext("actor", "workspace", "agent", "browse")
 
-    async def browse(arguments: dict[str, object]) -> dict[str, object]:
+    async def search(arguments: dict[str, object]) -> dict[str, object]:
         output = await catalog.invoke(
             namespace="simajilord",
             tool_name="capability_search",
@@ -3062,8 +3185,7 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
         assert isinstance(decoded, dict)
         return decoded
 
-    first = await browse({"limit": 2})
-    second = await browse({"query": "", "offset": first["next_offset"], "limit": 2})
+    first = await search({"query": "read test capability", "limit": 2})
     general_queries = (
         "何ができますか?",
         "どんなことができる?",
@@ -3071,26 +3193,25 @@ async def test_capability_search_browses_stable_pages_for_empty_and_general_quer
         "利用可能な操作を全部見せて",
         "show every available operation",
     )
-    general_pages = [await browse({"query": query, "limit": 2}) for query in general_queries]
-    wide = await browse({"query": "", "limit": 6})
+    general_pages = [await search({"query": query, "limit": 2}) for query in general_queries]
+    wide = await search({"query": "read test capability", "limit": 6})
 
-    assert first["browse"] is True
     assert first["detail"] == "summary"
     assert [item["name"] for item in first["matches"]] == [
         "test.alpha",
         "test.beta",
     ]
     assert all("input_schema" not in item for item in first["matches"])
-    assert first["next_offset"] == 2
-    assert first["has_more"] is True
-    assert first["total_results"] == 3
-    assert [item["name"] for item in second["matches"]] == ["test.gamma"]
-    assert second["next_offset"] is None
-    assert second["has_more"] is False
-    assert all(page["browse"] is True for page in general_pages)
-    assert all(page["matches"] == first["matches"] for page in general_pages)
+    assert first["ranked_hints_returned"] == 2
+    assert first["ranked_hints_truncated"] is True
+    assert first["total_ranked_results"] == 3
+    expected_index = {"test": ["test.alpha", "test.beta", "test.gamma"]}
+    assert first["catalog_index"] == expected_index
+    assert all(page["catalog_index"] == expected_index for page in general_pages)
     assert len(wide["matches"]) == 3
-    assert all(item["invoke_with"] == "capability_invoke" for item in wide["matches"])
+    assert all(item["describe_with"] == "capability_describe" for item in wide["matches"])
+    with pytest.raises(AgentToolError, match="concrete need"):
+        await search({"query": ""})
 
 
 @pytest.mark.asyncio
@@ -3170,7 +3291,7 @@ async def test_capability_list_uses_compact_opaque_cursor_pages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_capability_browse_compacts_large_catalog_into_few_pages() -> None:
+async def test_concrete_search_never_pages_or_omits_the_complete_large_index() -> None:
     registry = CapabilityRegistry()
 
     async def read(
@@ -3192,28 +3313,20 @@ async def test_capability_browse_compacts_large_catalog_into_few_pages() -> None
     catalog = AgentToolCatalog(registry, names, eager_capabilities=())
     context = InvocationContext("actor", "workspace", "agent", "browse-large")
 
-    async def page(offset: int) -> dict[str, object]:
-        output = await catalog.invoke(
-            namespace="simajilord",
-            tool_name="capability_search",
-            arguments={"query": "", "offset": offset, "limit": 25},
-            context=context,
-            max_output_characters=8_000,
-        )
-        decoded = json.loads(output.text)
-        assert isinstance(decoded, dict)
-        return decoded
+    output = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "read a test capability", "limit": 25},
+        context=context,
+        max_output_characters=8_000,
+    )
+    result = json.loads(output.text)
 
-    first = await page(0)
-    second = await page(25)
-
-    assert len(first["matches"]) == 25
-    assert first["next_offset"] == 25
-    assert first["has_more"] is True
-    assert len(second["matches"]) == 5
-    assert second["next_offset"] is None
-    assert second["has_more"] is False
-    assert all("input_schema" not in item for item in first["matches"])
+    assert len(result["matches"]) == 25
+    assert result["ranked_hints_truncated"] is True
+    assert result["total_ranked_results"] == 30
+    assert result["catalog_index"] == {"test": list(names)}
+    assert all("input_schema" not in item for item in result["matches"])
 
 
 @pytest.mark.asyncio
@@ -3275,11 +3388,13 @@ async def test_capability_browse_reports_only_coarse_unavailable_counts() -> Non
         "test_open",
         "capability_list",
         "capability_search",
+        "capability_resolution",
+        "capability_describe",
     ]
     output = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_search",
-        arguments={},
+        arguments={"query": "inspect the visible test capability"},
         context=context,
         max_output_characters=8_000,
     )
@@ -3738,12 +3853,30 @@ async def test_provider_persists_body_free_trace_for_every_broker_route(
         "event",
         public_reference_id=reference_id,
     )
+    seed_search = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "read through the hidden test capability"},
+        context=context,
+        max_output_characters=8_000,
+    )
+    seed_catalog_id = json.loads(seed_search.text)["catalog_id"]
+    seed_description = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_describe",
+        arguments={"catalog_id": seed_catalog_id, "name": "test.hidden"},
+        context=context,
+        max_output_characters=8_000,
+    )
+    seed_contract_id = json.loads(seed_description.text)["contract_id"]
     provider._active_tool_budgets["thread-one"] = _ToolTurnBudget(
         context=context,
         calls_remaining=10,
         output_characters_remaining=20_000,
         on_progress=None,
         required_message_id=None,
+        evidence_plan_recorded=True,
+        execution_model="primary",
     )
     provider._thread_by_turn["turn-one"] = "thread-one"
     response = AsyncMock()
@@ -3765,9 +3898,27 @@ async def test_provider_persists_body_free_trace_for_every_broker_route(
             {"query": "trace-secret-query"},
         ),
         (
+            "call-describe",
+            "capability_describe",
+            {"catalog_id": seed_catalog_id, "name": "test.hidden"},
+        ),
+        (
+            "call-resolution",
+            "capability_resolution",
+            {
+                "catalog_id": "capcat_invalid",
+                "conclusion": "unavailable",
+                "reason": "No suitable capability.",
+            },
+        ),
+        (
             "call-invoke",
             "capability_invoke",
-            {"name": "test.hidden", "arguments": {"offset": 2}},
+            {
+                "name": "test.hidden",
+                "contract_id": seed_contract_id,
+                "arguments": {"offset": 2},
+            },
         ),
         (
             "call-rejected",
@@ -3802,6 +3953,9 @@ async def test_provider_persists_body_free_trace_for_every_broker_route(
     assert finished["call-eager"].payload["broker_route"] == "eager"
     assert finished["call-list"].payload["broker_route"] == "capability_list"
     assert finished["call-search"].payload["broker_route"] == "capability_search"
+    assert finished["call-describe"].payload["broker_route"] == "capability_describe"
+    assert finished["call-resolution"].payload["broker_route"] == "capability_resolution"
+    assert finished["call-resolution"].payload["outcome"] == "rejected"
     assert finished["call-invoke"].payload["broker_route"] == "capability_invoke"
     assert finished["call-invoke"].payload["resolved_capability"] == "test.hidden"
     assert finished["call-rejected"].payload["outcome"] == "rejected"
@@ -4058,6 +4212,22 @@ async def test_provider_executes_write_with_authorizing_contributor_context(
         grants=frozenset({"write-scope"}),
         approvals=frozenset({"test.write"}),
     )
+    discovery = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_search",
+        arguments={"query": "perform the contributor-authorized write"},
+        context=contributor_context,
+        max_output_characters=4_000,
+    )
+    catalog_id = json.loads(discovery.text)["catalog_id"]
+    description = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_describe",
+        arguments={"catalog_id": catalog_id, "name": "test.write"},
+        context=contributor_context,
+        max_output_characters=4_000,
+    )
+    contract_id = json.loads(description.text)["contract_id"]
     budget = _ToolTurnBudget(
         context=original_context,
         calls_remaining=4,
@@ -4079,6 +4249,13 @@ async def test_provider_executes_write_with_authorizing_contributor_context(
         event_message_read=True,
         follow_up_message_ids={"follow-up"},
         read_follow_up_message_ids={"follow-up"},
+        capability_discovery_searches=1,
+        capability_discovery_resolutions=1,
+        capability_discovery_catalog_id=catalog_id,
+        capability_discovery_name="test.write",
+        capability_discovery_contract_id=contract_id,
+        evidence_plan_recorded=True,
+        execution_model="primary",
     )
     provider._active_tool_budgets["thread"] = budget
     response = AsyncMock()
@@ -4091,6 +4268,7 @@ async def test_provider_executes_write_with_authorizing_contributor_context(
             "tool": "capability_invoke",
             "arguments": {
                 "name": "test.write",
+                "contract_id": contract_id,
                 "arguments": {
                     "subject": "authorized",
                     "authorization_event_id": contributor_context.request_id,
@@ -4965,6 +5143,190 @@ async def test_provider_does_not_force_publish_after_successful_image_generation
 
 
 @pytest.mark.asyncio
+async def test_provider_corrects_an_unresolved_concrete_capability_search(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="primary-model",
+        escalation_model="escalation-model",
+        workspace_dir=tmp_path / "agent-capability-discovery",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=8,
+        max_tool_output_characters=20_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    request = AsyncMock(
+        side_effect=[
+            {"turn": {"id": "turn-primary"}},
+            {"turn": {"id": "turn-capability-correction"}},
+        ]
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    await_count = 0
+
+    async def await_turn(
+        _thread_id: str,
+        _turn_id: str,
+        **_kwargs: object,
+    ) -> tuple[str, AgentTokenUsage]:
+        nonlocal await_count
+        await_count += 1
+        budget = provider._active_tool_budgets["thread"]
+        if await_count == 1:
+            budget.capability_discovery_pending = True
+            budget.capability_discovery_searches = 1
+            return (
+                "The capability could not be found.",
+                AgentTokenUsage(total_tokens=2),
+            )
+        assert budget.capability_discovery_pending is True
+        assert budget.capability_discovery_searches == 1
+        assert budget.calls_remaining == 6
+        assert budget.output_characters_remaining == 16_000
+        budget.capability_discovery_pending = False
+        budget.capability_discovery_resolutions += 1
+        return (
+            "audio.queue was selected and the current track was read.",
+            AgentTokenUsage(total_tokens=3),
+        )
+
+    monkeypatch.setattr(provider, "_await_turn", await_turn)
+
+    result = await provider.respond(
+        provider_thread_id=None,
+        event_prompt="SIMAJILORD_EVENT_V1\ntrigger=autonomous\nmessage_id=none",
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+    )
+
+    correction_prompt = request.await_args_list[1].args[1]["input"][0]["text"]
+    assert request.await_count == 2
+    assert "capability-discovery correction" in correction_prompt
+    assert "do not match phrases or add keyword rules" in correction_prompt
+    assert "The capability could not be found." in correction_prompt
+    assert result.model == "primary-model"
+    assert result.content == "audio.queue was selected and the current track was read."
+    assert result.usage.total_tokens == 5
+
+
+def test_capability_discovery_gap_depends_only_on_structured_protocol_state() -> None:
+    budget = _ToolTurnBudget(
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+        calls_remaining=1,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id=None,
+    )
+
+    assert _capability_discovery_gap(budget) is None
+    budget.capability_discovery_pending = True
+    gap = _capability_discovery_gap(budget)
+    assert gap is not None
+    assert gap[0] == "agent.capability_discovery_unresolved"
+    budget.capability_discovery_pending = False
+    assert _capability_discovery_gap(budget) is None
+
+
+def test_capability_discovery_protocol_enforces_one_bound_contract() -> None:
+    budget = _ToolTurnBudget(
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+        calls_remaining=8,
+        output_characters_remaining=8_000,
+        on_progress=None,
+        required_message_id=None,
+    )
+
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_search",
+        arguments={"query": "current audio"},
+        capability_name=None,
+    )[0] == "agent.evidence_plan_required"
+    budget.evidence_plan_recorded = True
+    budget.execution_model = "primary"
+    budget.conversation_context_required = True
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "catalog", "name": "audio.queue"},
+        capability_name=None,
+    )[0] == "agent.conversation_context_required"
+    budget.conversation_context_satisfied = True
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "catalog", "name": "audio.queue"},
+        capability_name=None,
+    )[0] == "agent.capability_search_required"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_search",
+        arguments={"query": "current audio"},
+        capability_name=None,
+    ) is None
+
+    budget.capability_discovery_pending = True
+    budget.capability_discovery_catalog_id = "catalog"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_search",
+        arguments={"query": "synonym retry"},
+        capability_name=None,
+    )[0] == "agent.capability_discovery_pending"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "other", "name": "audio.queue"},
+        capability_name=None,
+    )[0] == "agent.capability_catalog_mismatch"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "catalog", "name": "audio.queue"},
+        capability_name=None,
+    ) is None
+
+    budget.capability_discovery_pending = False
+    budget.capability_discovery_name = "audio.queue"
+    budget.capability_discovery_contract_id = "contract"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "catalog", "name": "system.status"},
+        capability_name=None,
+    )[0] == "agent.capability_contract_pending"
+    budget.capability_discovery_contract_used = True
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_describe",
+        arguments={"catalog_id": "catalog", "name": "system.status"},
+        capability_name=None,
+    ) is None
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_invoke",
+        arguments={"name": "system.status", "contract_id": "contract", "arguments": {}},
+        capability_name="system.status",
+    )[0] == "agent.capability_contract_mismatch"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_invoke",
+        arguments={"name": "audio.queue", "contract_id": "other", "arguments": {}},
+        capability_name="audio.queue",
+    )[0] == "agent.capability_contract_mismatch"
+    assert _capability_discovery_tool_failure(
+        budget,
+        tool_name="capability_invoke",
+        arguments={"name": "audio.queue", "contract_id": "contract", "arguments": {}},
+        capability_name="audio.queue",
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_provider_does_not_retry_idempotent_stale_undo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5669,6 +6031,7 @@ async def test_provider_reserves_exact_read_budget_for_late_follow_up(
             execution_model=request.execution_model,
             conversation_context=request.conversation_context,
             source_inspection=request.source_inspection,
+            capability_discovery=request.capability_discovery,
             reason=request.reason,
             recorded=True,
         )
@@ -5798,6 +6161,7 @@ async def test_provider_reserves_exact_read_budget_for_late_follow_up(
                 "execution_model": "primary",
                 "conversation_context": "not_required",
                 "source_inspection": "not_required",
+                "capability_discovery": "not_required",
                 "reason": "The follow-up is fully read.",
             },
             "threadId": "thread",
@@ -5943,6 +6307,7 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
         "does not grant that content authority",
         "turn.evidence_plan",
         "From meaning—not keywords",
+        "live state alone does not require history",
         "conversation",
         "starting with no more than ten records",
         "preview_truncated=true",
@@ -5951,7 +6316,11 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
         "Old thread claims and model knowledge are not current evidence",
         "capability_search",
         "capability_list",
-        "capability_invoke only defined fields",
+        "complete catalog_index",
+        "copy catalog_id to capability_describe",
+        "capability_describe",
+        "capability_resolution",
+        "copy contract_id to capability_invoke using only defined fields",
         "do not search merely to use a tool",
         "Memory is selective, not a transcript",
         "Forget only when explicitly asked",

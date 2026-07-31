@@ -168,6 +168,8 @@ def test_max_feature_runtime_keeps_only_five_full_eager_schemas(
     broker_names = {
         "capability_list",
         "capability_search",
+        "capability_resolution",
+        "capability_describe",
         "capability_invoke",
     }
 
@@ -281,6 +283,42 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         assert "discord.play_audio" not in autonomous.text
         assert "discord.speak" not in autonomous.text
         assert "audio.search" in autonomous.text
+        current_track = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_search",
+            arguments={"query": "今流れてる曲について解説", "limit": 1},
+            context=autonomous_context,
+            max_output_characters=10_000,
+        )
+        current_track_catalog = json.loads(current_track.text)
+        assert current_track_catalog["catalog_complete"] is True
+        assert "audio.queue" in current_track_catalog["catalog_index"]["audio"]
+        assert (
+            "discord.inspect_application"
+            in current_track_catalog["catalog_index"]["discord"]
+        )
+        assert (
+            "discord.list_voice_states"
+            in current_track_catalog["catalog_index"]["discord"]
+        )
+        assert "system.status" in current_track_catalog["catalog_index"]["system"]
+        queue_contract = await provider.tools.invoke(
+            namespace="simajilord",
+            tool_name="capability_describe",
+            arguments={
+                "catalog_id": current_track_catalog["catalog_id"],
+                "name": "audio.queue",
+            },
+            context=autonomous_context,
+            max_output_characters=10_000,
+        )
+        queue_contract_payload = json.loads(queue_contract.text)
+        assert queue_contract_payload["name"] == "audio.queue"
+        assert queue_contract_payload["input_schema"] == {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        }
         output = await provider.tools.invoke(
             namespace="simajilord",
             tool_name="capability_search",

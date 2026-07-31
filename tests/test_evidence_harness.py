@@ -10,6 +10,7 @@ import pytest
 from simajilord.agent.providers import codex
 from simajilord.agent.providers.codex import (
     _evidence_plan_gap,
+    _require_evidence_plan_refresh_after_context,
     _tool_read_anchored_conversation_context,
     _ToolTurnBudget,
     _write_readiness_failure,
@@ -72,6 +73,9 @@ def test_evidence_plan_is_semantic_and_not_a_host_keyword_audit() -> None:
     budget.source_inspection_required = True
     assert _evidence_plan_gap(budget)[0] == "agent.source_inspection_required"
     budget.source_inspection_satisfied = True
+    budget.capability_discovery_required = True
+    assert _evidence_plan_gap(budget)[0] == "agent.capability_discovery_required"
+    budget.capability_discovery_searches = 1
     assert _evidence_plan_gap(budget) is None
 
 
@@ -116,6 +120,30 @@ def test_context_is_retrieved_only_when_ai_requests_it_and_is_anchored() -> None
         output=output,
         budget=budget,
     )
+
+
+def test_context_evidence_requires_a_fresh_semantic_plan() -> None:
+    budget = _budget()
+    budget.evidence_plan_recorded = True
+    budget.execution_model = "primary"
+    budget.evidence_plan_reason = "The active reference needs earlier context."
+    budget.conversation_context_required = True
+    budget.source_inspection_required = True
+    budget.source_inspection_satisfied = True
+    budget.capability_discovery_required = True
+    budget.capability_discovery_pending = True
+    budget.capability_discovery_searches = 1
+    budget.capability_discovery_catalog_id = "catalog"
+
+    _require_evidence_plan_refresh_after_context(budget)
+
+    assert budget.conversation_context_satisfied is True
+    assert _evidence_plan_gap(budget)[0] == "agent.evidence_plan_required"
+    assert budget.execution_model is None
+    assert budget.evidence_plan_reason is None
+    assert budget.source_inspection_satisfied is False
+    assert budget.capability_discovery_searches == 0
+    assert budget.capability_discovery_catalog_id is None
 
 
 def test_provider_thread_rotation_bounds_stale_self_history() -> None:
@@ -180,6 +208,7 @@ async def test_ai_evidence_plan_supports_context_and_source_independently(
             execution_model="escalation",
             conversation_context="required",
             source_inspection="not_required",
+            capability_discovery="not_required",
             reason="The current message refers implicitly to the preceding discussion.",
         ),
         InvocationContext("actor", "guild", "agent", "event"),
@@ -189,6 +218,7 @@ async def test_ai_evidence_plan_supports_context_and_source_independently(
         execution_model="escalation",
         conversation_context="required",
         source_inspection="not_required",
+        capability_discovery="not_required",
         reason="The current message refers implicitly to the preceding discussion.",
         recorded=True,
     )
@@ -198,6 +228,7 @@ async def test_ai_evidence_plan_supports_context_and_source_independently(
                 execution_model="primary",
                 conversation_context="not_required",
                 source_inspection="not_required",
+                capability_discovery="required",
                 reason=" ",
             ),
             InvocationContext("actor", "guild", "agent", "event"),

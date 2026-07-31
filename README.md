@@ -170,10 +170,20 @@ with Discord's generic “interaction failed” banner.
   message read, the semantic evidence plan, selective memory search, and (when granted) local web
   search. General ability
   questions use compact cursor-paged `capability_list`, modeled after MCP `tools/list`; concrete
-  goals use `capability_search` to load only matching schemas and `capability_invoke` to execute
-  one. File, workflow, image, audio, Discord mutation, and the rest stay deferred regardless of
+  goals use `capability_search` for short ranked summaries plus a complete, compact index of all
+  capabilities available in that turn. The AI selects from that index by meaning, loads only one
+  exact contract with `capability_describe`, and copies its opaque contract ID into
+  `capability_invoke`; guessed contracts and IDs from another request are rejected. A semantic
+  no-match conclusion is recorded against the request-bound catalog ID with
+  `capability_resolution`.
+  A concrete search left without either selection or resolution receives one bounded corrective
+  turn. File, workflow, image, audio, Discord mutation, and the rest stay deferred regardless of
   how many grants the caller has. Natural-language command strings and per-platform URL trigger
   tables are not the capability router
+- A plan that requires earlier Discord context is provisional. After the bounded history read
+  anchored to the active message, the host invalidates that plan and any discovery contract, then
+  requires a fresh AI semantic plan before capability browsing. History stays selective while a
+  pre-context plan cannot ground a current ability claim
 - `AGENT_WEB_SEARCH_ACCESS` exposes both Codex first-party live search through the host's existing
   ChatGPT OAuth session and Simajilord's local `web.search`, `web.fetch`, and `web.find` tools.
   This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
@@ -495,6 +505,10 @@ without attaching the check to CI or consuming Discord API rate limits:
 ```bash
 uv run python scripts/manual_agent_discord_qa.py
 uv run python scripts/manual_agent_discord_qa.py --scenario context
+uv run python scripts/manual_agent_discord_qa.py --scenario capability
+uv run python scripts/manual_agent_discord_qa.py --scenario bot
+uv run python scripts/manual_agent_discord_qa.py --scenario status
+uv run python scripts/manual_agent_discord_qa.py --scenario capability_context
 uv run python scripts/manual_agent_discord_qa.py \
   --scenario handoff --escalation-model gpt-5.6-luna
 uv run python scripts/manual_agent_discord_qa.py \
@@ -508,8 +522,15 @@ is intentionally not run on push. The context scenario reuses one provider threa
 unrelated prior turn in it, injects an instruction-like third-party history message, and verifies
 that Luna retrieves a bounded page anchored before `↑これどう思う？` without treating history as
 authority or confusing provider-thread order with the typed Discord
-`immediate_predecessor_message_id`. The two handoff commands form an A/B pair: Luna investigates
-in both runs, while only the second finalization model changes.
+`immediate_predecessor_message_id`. The capability scenario uses the actual failed wording
+`今流れてる曲について解説`; its Japanese text is absent from the English descriptor, so the check
+passes only when Luna selects `audio.queue` semantically from the complete index, describes it,
+invokes it, and reports the typed current-track result. The BOT and status cases exercise
+`discord.inspect_application` and `system.status`; `capability_context` combines the exact
+`↑これどう思う？` regression with an instruction-like history item and live audio discovery.
+All capability cases also verify the persisted body-free `search → describe → invoke` trace, not
+only the final prose. The two handoff commands form an A/B pair:
+Luna investigates in both runs, while only the second finalization model changes.
 
 To reproduce the official Discord HTTP-route comparison, clone Discord's documentation and pass
 that exact checkout to the audit. The report records the documentation commit, every declared
