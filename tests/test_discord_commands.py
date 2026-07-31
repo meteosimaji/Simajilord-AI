@@ -3681,6 +3681,31 @@ def test_trigger_message_id_comes_only_from_typed_context() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_bot_unloads_cogs_before_closing_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+
+    async def close_activity() -> None:
+        order.append("activity")
+
+    async def close_discord(_bot: commands.Bot) -> None:
+        order.append("discord")
+
+    async def close_runtime() -> None:
+        order.append("runtime")
+
+    bot = object.__new__(SimajilordDiscordBot)
+    bot.activity_server = SimpleNamespace(close=close_activity)
+    bot.runtime = SimpleNamespace(close=close_runtime)
+    monkeypatch.setattr(commands.Bot, "close", close_discord)
+
+    await SimajilordDiscordBot.close(bot)
+
+    assert order == ["activity", "discord", "runtime"]
+
+
 def test_agent_response_chunks_prefer_readable_boundaries() -> None:
     chunks = _discord_message_chunks("alpha beta gamma", maximum=10)
     assert chunks == ("alpha beta", "gamma")

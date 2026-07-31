@@ -401,8 +401,8 @@ class SimajilordDiscordBot(commands.Bot):
 
     async def close(self) -> None:
         await self.activity_server.close()
-        await self.runtime.close()
         await super().close()
+        await self.runtime.close()
 
 
 async def _send_image_progress(
