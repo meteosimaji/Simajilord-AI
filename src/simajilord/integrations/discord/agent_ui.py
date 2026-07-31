@@ -22,6 +22,7 @@ from simajilord.agent import (
     AgentRateLimitError,
     AgentTimeoutError,
     AgentUnavailableError,
+    is_agent_public_reference_id,
 )
 
 from .presenter import EmbedTone, command_embed
@@ -86,7 +87,11 @@ def agent_delivery_nonce(
     return f"sla{digest[:22]}"
 
 
-def agent_error_text(error: Exception) -> str:
+def agent_error_text(
+    error: Exception,
+    *,
+    reference_id: str | None = None,
+) -> str:
     if isinstance(error, AgentBusyError):
         return "The AI request queue is full. Please try again shortly."
     if isinstance(error, AgentRateLimitError):
@@ -97,13 +102,13 @@ def agent_error_text(error: Exception) -> str:
             )
         return "This AI request is rate-limited. Please try again later."
     if isinstance(error, AgentUnavailableError):
-        return "Simajilord AI is currently unavailable on this host."
-    if isinstance(error, AgentProviderLimitError):
-        return (
+        message = "Simajilord AI is currently unavailable on this host."
+    elif isinstance(error, AgentProviderLimitError):
+        message = (
             "The AI provider usage limit has been reached. "
             "Please try again after the provider limit resets."
         )
-    if isinstance(error, AgentTimeoutError):
+    elif isinstance(error, AgentTimeoutError):
         limit = _english_duration(max(1, round(error.timeout_seconds)))
         recovery = (
             " The execution runtime was restarted automatically."
@@ -119,12 +124,22 @@ def agent_error_text(error: Exception) -> str:
             retry = " A safe automatic retry before any write also became inactive."
         else:
             retry = ""
-        return (
+        message = (
             f"The AI turn produced no observable activity for {limit} and was stopped."
             f"{recovery}{retry}"
             " Any partial response or operation result is unconfirmed."
         )
-    return "The AI request could not be completed."
+    else:
+        message = "The AI request could not be completed."
+    if reference_id is None:
+        return message
+    if not is_agent_public_reference_id(reference_id):
+        log.error("Refusing to display malformed agent reference ID")
+        return message
+    return (
+        f"{message}\n"
+        f"Reference ID: `{reference_id}`. Share this ID with the administrator."
+    )
 
 
 def _english_duration(total_seconds: int) -> str:

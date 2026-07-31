@@ -704,6 +704,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "files.download_url",
         "files.write_text",
         "files.replace_text",
+        "feedback.create",
         "image.generate",
         "media.download",
         "media.save",

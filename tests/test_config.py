@@ -64,6 +64,7 @@ _AGENT_ENVIRONMENT_NAMES = (
     "VOICEVOX_AUTO_START",
     "VOICEVOX_TIMEOUT_SECONDS",
     "VOICEVOX_READINESS_TTL_SECONDS",
+    "TRANSLATION_HELPER_PATH",
     "READ_ALOUD_CHUNK_CHARACTERS",
     "MAX_PENDING_MUSIC",
     "MAX_PENDING_MUSIC_PER_USER",
@@ -437,3 +438,25 @@ def test_voicevox_settings_require_loopback_and_executable_for_auto_start(
     monkeypatch.setenv("VOICEVOX_BASE_URL", "https://voice.example.com")
     with pytest.raises(ConfigurationError, match="loopback HTTP URL"):
         load_settings(dotenv_path=dotenv_path)
+
+
+def test_translation_helper_requires_private_execute_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    helper = tmp_path / "TranslationHelper"
+    helper.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("TRANSLATION_HELPER_PATH", str(helper))
+
+    helper.chmod(0o600)
+    with pytest.raises(ConfigurationError, match="chmod 700"):
+        load_settings(dotenv_path=dotenv_path)
+
+    helper.chmod(0o755)
+    with pytest.raises(ConfigurationError, match="chmod 700"):
+        load_settings(dotenv_path=dotenv_path)
+
+    helper.chmod(0o700)
+    settings = load_settings(dotenv_path=dotenv_path)
+    assert settings.translation_helper_path == helper.resolve()

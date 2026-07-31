@@ -28,6 +28,11 @@ from .compute import (
     FileDownloadUrlRequest,
     build_compute_endpoints,
 )
+from .feedback import (
+    FeedbackCreateRequest,
+    FeedbackCreateResponse,
+    build_feedback_endpoint,
+)
 from .files import build_file_endpoints
 from .focus_timer import (
     FocusTimerCancelRequest,
@@ -66,6 +71,16 @@ from .read_aloud import (
     build_read_aloud_endpoint,
     build_read_aloud_policy_endpoints,
     build_read_aloud_route_endpoints,
+)
+from .source_inspection import (
+    EvidencePlanRequest,
+    EvidencePlanResponse,
+    SourceMatchItem,
+    SourceReadRequest,
+    SourceReadResponse,
+    SourceSearchRequest,
+    SourceSearchResponse,
+    build_source_inspection_endpoints,
 )
 from .speech import (
     SpeechSpeakRequest,
@@ -138,6 +153,10 @@ __all__ = [
     "ComputeRunRequest",
     "DownloadRequest",
     "DownloadResponse",
+    "EvidencePlanRequest",
+    "EvidencePlanResponse",
+    "FeedbackCreateRequest",
+    "FeedbackCreateResponse",
     "FileDownloadUrlRequest",
     "FocusTimerCancelRequest",
     "FocusTimerCreateRequest",
@@ -159,6 +178,11 @@ __all__ = [
     "ReadAloudResponse",
     "RollRequest",
     "RollResponse",
+    "SourceMatchItem",
+    "SourceReadRequest",
+    "SourceReadResponse",
+    "SourceSearchRequest",
+    "SourceSearchResponse",
     "SpeechSpeakRequest",
     "SpeechSpeakResponse",
     "SyntheticMediaAnalyzeRequest",
@@ -183,6 +207,7 @@ __all__ = [
     "build_audio_endpoints",
     "build_compute_endpoints",
     "build_download_endpoint",
+    "build_feedback_endpoint",
     "build_file_endpoints",
     "build_focus_timer_endpoints",
     "build_image_endpoints",
@@ -191,6 +216,7 @@ __all__ = [
     "build_read_aloud_endpoint",
     "build_read_aloud_policy_endpoints",
     "build_read_aloud_route_endpoints",
+    "build_source_inspection_endpoints",
     "build_speech_endpoint",
     "build_system_endpoints",
     "build_translation_endpoints",

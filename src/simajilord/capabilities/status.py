@@ -44,6 +44,13 @@ class StatusResponse:
     last_radio_failure_at_epoch: int | None
     overlay_failure_count: int
     dashboard_429_count: int
+    audit_pending_event_count: int
+    audit_retried_event_count: int
+    audit_outbox_event_count: int
+    audit_lost_event_count: int
+    audit_last_failure_at_epoch: int | None
+    audit_last_failure_type: str | None
+    audit_writer_state: str
 
 
 def build_status_endpoint(
@@ -61,6 +68,7 @@ def build_status_endpoint(
         web_ready, web_backend, _web_warning = await web.status()
         maintenance_report = maintenance.last_report
         diagnostics = await journal.operation_diagnostics()
+        audit = await journal.audit_health()
         return StatusResponse(
             status="ok",
             capability_count=len(registry.all()),
@@ -89,6 +97,17 @@ def build_status_endpoint(
             ),
             overlay_failure_count=diagnostics.overlay_failure_count,
             dashboard_429_count=diagnostics.dashboard_429_count,
+            audit_pending_event_count=audit.pending_events,
+            audit_retried_event_count=audit.retried_event_count,
+            audit_outbox_event_count=audit.outbox_event_count,
+            audit_lost_event_count=audit.lost_event_count,
+            audit_last_failure_at_epoch=(
+                int(audit.last_failure_at.timestamp())
+                if audit.last_failure_at is not None
+                else None
+            ),
+            audit_last_failure_type=audit.last_failure_type,
+            audit_writer_state=audit.writer_state,
         )
 
     return endpoint(

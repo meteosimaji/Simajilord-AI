@@ -16,6 +16,8 @@ from .contracts import (
     AgentResponseStatus,
     AgentTokenUsage,
     AgentTrigger,
+    is_agent_public_reference_id,
+    new_agent_public_reference_id,
 )
 
 _IN_PROGRESS_STATUS = "in_progress"
@@ -41,6 +43,7 @@ class AgentPendingHostDelivery:
     """One completed turn whose Discord response is not durably delivered."""
 
     event_id: str
+    public_reference_id: str
     actor_id: str
     workspace_id: str | None
     channel_id: str
@@ -55,6 +58,7 @@ class AgentInterruptedMention:
     """One explicit mention left active when an earlier process stopped."""
 
     event_id: str
+    public_reference_id: str
     channel_id: str
     source_message_id: str
     occurred_at: datetime
@@ -74,6 +78,28 @@ class AgentHostDeliveryRecord:
     receipted_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRequestRecord:
+    """Body-free request metadata addressable by a public reference ID."""
+
+    public_reference_id: str
+    event_id: str
+    conversation_id: str
+    trigger: AgentTrigger
+    actor_id: str
+    workspace_id: str | None
+    channel_id: str
+    source_message_id: str | None
+    model: str
+    status: str
+    provider_thread_id: str | None
+    error_type: str | None
+    occurred_at: datetime
+    started_at: datetime
+    completed_at: datetime | None
+    host_delivered_at: datetime | None
 
 
 class AgentConversationStore:
@@ -104,6 +130,29 @@ class AgentConversationStore:
     async def completed_response(self, event_id: str) -> AgentResponse | None:
         async with self._lock:
             return await asyncio.to_thread(self._select_completed_response, event_id)
+
+    async def public_reference_id_for_event(self, event_id: str) -> str | None:
+        """Return the persisted public reference without exposing request bodies."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._select_public_reference_id_for_event,
+                event_id,
+            )
+
+    async def request_by_public_reference_id(
+        self,
+        public_reference_id: str,
+    ) -> AgentRequestRecord | None:
+        """Resolve one opaque support identifier to bounded request metadata."""
+
+        if not is_agent_public_reference_id(public_reference_id):
+            raise ValueError("invalid agent public reference ID")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._select_request_by_public_reference_id,
+                public_reference_id,
+            )
 
     async def pending_host_deliveries(
         self,
@@ -346,6 +395,7 @@ class AgentConversationStore:
 
                 CREATE TABLE IF NOT EXISTS agent_requests (
                     event_id TEXT PRIMARY KEY,
+                    public_reference_id TEXT NOT NULL UNIQUE,
                     conversation_id TEXT NOT NULL,
                     trigger TEXT NOT NULL,
                     actor_id TEXT NOT NULL,
@@ -412,6 +462,48 @@ class AgentConversationStore:
                     """,
                     (AgentResponseStatus.COMPLETED.value,),
                 )
+            if "public_reference_id" not in request_columns:
+                connection.execute(
+                    "ALTER TABLE agent_requests ADD COLUMN public_reference_id TEXT"
+                )
+            existing_references = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT public_reference_id
+                    FROM agent_requests
+                    WHERE public_reference_id IS NOT NULL
+                      AND public_reference_id != ''
+                    """
+                )
+            }
+            missing_reference_rows = connection.execute(
+                """
+                SELECT event_id
+                FROM agent_requests
+                WHERE public_reference_id IS NULL OR public_reference_id = ''
+                ORDER BY event_id
+                """
+            ).fetchall()
+            for (event_id,) in missing_reference_rows:
+                reference_id = new_agent_public_reference_id()
+                while reference_id in existing_references:
+                    reference_id = new_agent_public_reference_id()
+                connection.execute(
+                    """
+                    UPDATE agent_requests
+                    SET public_reference_id = ?
+                    WHERE event_id = ?
+                    """,
+                    (reference_id, event_id),
+                )
+                existing_references.add(reference_id)
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS agent_requests_public_reference
+                ON agent_requests(public_reference_id)
+                """
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS agent_requests_host_pending
@@ -434,6 +526,46 @@ class AgentConversationStore:
                 (conversation_id,),
             ).fetchone()
             return _conversation_from_row(row) if row is not None else None
+        finally:
+            connection.close()
+
+    def _select_public_reference_id_for_event(self, event_id: str) -> str | None:
+        connection = _connection(self.path)
+        try:
+            row = connection.execute(
+                """
+                SELECT public_reference_id
+                FROM agent_requests
+                WHERE event_id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            return (
+                str(row["public_reference_id"])
+                if row is not None and row["public_reference_id"] is not None
+                else None
+            )
+        finally:
+            connection.close()
+
+    def _select_request_by_public_reference_id(
+        self,
+        public_reference_id: str,
+    ) -> AgentRequestRecord | None:
+        connection = _connection(self.path)
+        try:
+            row = connection.execute(
+                """
+                SELECT event_id, public_reference_id, conversation_id, trigger,
+                       actor_id, workspace_id, channel_id, message_id, model,
+                       status, provider_thread_id, error_type, occurred_at,
+                       started_at, completed_at, host_delivered_at
+                FROM agent_requests
+                WHERE public_reference_id = ?
+                """,
+                (public_reference_id,),
+            ).fetchone()
+            return _request_record_from_row(row) if row is not None else None
         finally:
             connection.close()
 
@@ -501,8 +633,9 @@ class AgentConversationStore:
         try:
             rows = connection.execute(
                 """
-                SELECT event_id, actor_id, workspace_id, channel_id, message_id,
-                       response_content, occurred_at, completed_at
+                SELECT event_id, public_reference_id, actor_id, workspace_id,
+                       channel_id, message_id, response_content, occurred_at,
+                       completed_at
                 FROM agent_requests
                 WHERE status = ?
                   AND trigger = ?
@@ -529,8 +662,9 @@ class AgentConversationStore:
         try:
             row = connection.execute(
                 """
-                SELECT event_id, actor_id, workspace_id, channel_id, message_id,
-                       response_content, occurred_at, completed_at
+                SELECT event_id, public_reference_id, actor_id, workspace_id,
+                       channel_id, message_id, response_content, occurred_at,
+                       completed_at
                 FROM agent_requests
                 WHERE event_id = ?
                   AND status = ?
@@ -562,7 +696,8 @@ class AgentConversationStore:
         try:
             rows = connection.execute(
                 """
-                SELECT event_id, channel_id, message_id, occurred_at, started_at
+                SELECT event_id, public_reference_id, channel_id, message_id,
+                       occurred_at, started_at
                 FROM agent_requests
                 WHERE status = ?
                   AND trigger = ?
@@ -897,6 +1032,8 @@ class AgentConversationStore:
             connection.close()
 
     def _begin(self, request: AgentRequest, model: str) -> None:
+        if not is_agent_public_reference_id(request.public_reference_id):
+            raise ValueError("invalid agent public reference ID")
         now = datetime.now(UTC).isoformat()
         connection = sqlite3.connect(self.path)
         try:
@@ -915,9 +1052,10 @@ class AgentConversationStore:
             connection.execute(
                 """
                 INSERT INTO agent_requests(
-                    event_id, conversation_id, trigger, actor_id, workspace_id,
-                    channel_id, message_id, model, status, occurred_at, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                    event_id, public_reference_id, conversation_id, trigger,
+                    actor_id, workspace_id, channel_id, message_id, model,
+                    status, occurred_at, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
                 ON CONFLICT(event_id) DO UPDATE SET
                     status = CASE
                         WHEN agent_requests.status = 'completed'
@@ -937,6 +1075,7 @@ class AgentConversationStore:
                 """,
                 (
                     request.event_id,
+                    request.public_reference_id,
                     request.conversation_id,
                     request.trigger.value,
                     request.actor_id,
@@ -948,6 +1087,21 @@ class AgentConversationStore:
                     now,
                 ),
             )
+            stored_reference = connection.execute(
+                """
+                SELECT public_reference_id
+                FROM agent_requests
+                WHERE event_id = ?
+                """,
+                (request.event_id,),
+            ).fetchone()
+            if (
+                stored_reference is None
+                or str(stored_reference[0]) != request.public_reference_id
+            ):
+                raise ValueError(
+                    "agent event ID is bound to a different public reference ID"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -1188,6 +1342,7 @@ def _pending_host_delivery_from_row(
     assert completed_at is not None
     return AgentPendingHostDelivery(
         event_id=str(row["event_id"]),
+        public_reference_id=str(row["public_reference_id"]),
         actor_id=str(row["actor_id"]),
         workspace_id=_optional_text(row["workspace_id"]),
         channel_id=str(row["channel_id"]),
@@ -1205,6 +1360,7 @@ def _interrupted_mention_from_row(
     assert message_id is not None
     return AgentInterruptedMention(
         event_id=str(row["event_id"]),
+        public_reference_id=str(row["public_reference_id"]),
         channel_id=str(row["channel_id"]),
         source_message_id=str(message_id),
         occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
@@ -1228,6 +1384,37 @@ def _host_delivery_from_row(row: sqlite3.Row) -> AgentHostDeliveryRecord:
         ),
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
+    )
+
+
+def _request_record_from_row(row: sqlite3.Row) -> AgentRequestRecord:
+    completed_at = row["completed_at"]
+    host_delivered_at = row["host_delivered_at"]
+    return AgentRequestRecord(
+        public_reference_id=str(row["public_reference_id"]),
+        event_id=str(row["event_id"]),
+        conversation_id=str(row["conversation_id"]),
+        trigger=AgentTrigger(str(row["trigger"])),
+        actor_id=str(row["actor_id"]),
+        workspace_id=_optional_text(row["workspace_id"]),
+        channel_id=str(row["channel_id"]),
+        source_message_id=_optional_text(row["message_id"]),
+        model=str(row["model"]),
+        status=str(row["status"]),
+        provider_thread_id=_optional_text(row["provider_thread_id"]),
+        error_type=_optional_text(row["error_type"]),
+        occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
+        started_at=datetime.fromisoformat(str(row["started_at"])),
+        completed_at=(
+            datetime.fromisoformat(str(completed_at))
+            if completed_at is not None
+            else None
+        ),
+        host_delivered_at=(
+            datetime.fromisoformat(str(host_delivered_at))
+            if host_delivered_at is not None
+            else None
+        ),
     )
 
 

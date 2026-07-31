@@ -1014,6 +1014,7 @@ async def test_agent_recovers_prior_process_mention_as_a_fresh_turn() -> None:
     now = datetime.now(UTC)
     interrupted = AgentInterruptedMention(
         event_id="discord:message:40",
+        public_reference_id="agt_0123456789abcdef0123",
         channel_id="20",
         source_message_id="40",
         occurred_at=now - timedelta(minutes=1),
@@ -1084,6 +1085,9 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
     )
     runtime = SimpleNamespace(
         agent=agent,
+        agent_store=SimpleNamespace(
+            public_reference_id_for_event=AsyncMock(return_value=None)
+        ),
         settings=SimpleNamespace(
             agent_autonomy_mode=AgentAutonomyMode.ACT,
             agent_autonomy_guild_ids=frozenset({"10"}),
@@ -1250,6 +1254,9 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
     )
     runtime = SimpleNamespace(
         agent=agent,
+        agent_store=SimpleNamespace(
+            public_reference_id_for_event=AsyncMock(return_value=None)
+        ),
         action_receipts=receipts,
         autonomy_events=autonomy_events,
         settings=SimpleNamespace(
@@ -1447,6 +1454,7 @@ async def test_mention_recovery_does_not_reuse_saved_identical_chunk() -> None:
     now = datetime.now(UTC)
     pending = AgentPendingHostDelivery(
         event_id="discord:message:201",
+        public_reference_id="agt_0123456789abcdef0123",
         actor_id="101",
         workspace_id="10",
         channel_id="20",

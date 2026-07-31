@@ -39,9 +39,11 @@ from .providers import (
     AgentProvider,
     SteerableAgentProvider,
 )
-from .store import AgentConversationStore
+from .store import AgentConversationRecord, AgentConversationStore
 
 log = logging.getLogger(__name__)
+_MAX_PROVIDER_THREAD_TURNS = 12
+_MAX_PROVIDER_CONTEXT_FRACTION = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +127,35 @@ class AgentService:
                     conversation.provider_thread_id if conversation is not None else None
                 )
                 continuity_reset_reason: str | None = None
+                rotation_reason = _conversation_rotation_reason(conversation)
+                if (
+                    conversation is not None
+                    and provider_thread_id is not None
+                    and rotation_reason is not None
+                ):
+                    await self.store.rotate(
+                        request.conversation_id,
+                        model=self.model,
+                    )
+                    await self.journal.append(
+                        kind="agent.conversation.rotated",
+                        actor_id=request.actor_id,
+                        workspace_id=request.workspace_id,
+                        transport="agent",
+                        request_id=request.event_id,
+                        payload={
+                            "public_reference_id": request.public_reference_id,
+                            "conversation_id": request.conversation_id,
+                            "reason": rotation_reason,
+                            "previous_turn_count": conversation.turn_count,
+                            "previous_input_tokens": conversation.last_input_tokens,
+                            "model_context_window": (
+                                conversation.model_context_window
+                            ),
+                        },
+                    )
+                    provider_thread_id = None
+                    continuity_reset_reason = rotation_reason
                 context = InvocationContext(
                     actor_id=request.actor_id,
                     workspace_id=request.workspace_id,
@@ -134,6 +165,7 @@ class AgentService:
                     grants=request.grants,
                     origin_resource_id=request.channel_id,
                     approvals=request.approvals,
+                    public_reference_id=request.public_reference_id,
                 )
                 memory_context: tuple[AgentMemoryRecord, ...] = ()
                 if self.memory is not None and AGENT_MEMORY_GRANT in request.grants:
@@ -146,7 +178,10 @@ class AgentService:
                             workspace_id=request.workspace_id,
                             transport="agent",
                             request_id=request.event_id,
-                            payload={"error_type": type(exc).__name__},
+                            payload={
+                                "error_type": type(exc).__name__,
+                                "public_reference_id": request.public_reference_id,
+                            },
                         )
                 if on_progress is not None:
                     await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
@@ -159,6 +194,7 @@ class AgentService:
                         event_prompt=_event_prompt(
                             request,
                             max_response_characters=self.limits.max_response_characters,
+                            runtime_model=self.model,
                             continuity_reset_reason=continuity_reset_reason,
                             memory_context=memory_context,
                         ),
@@ -172,6 +208,7 @@ class AgentService:
                         event_prompt=_event_prompt(
                             request,
                             max_response_characters=self.limits.max_response_characters,
+                            runtime_model=self.model,
                             continuity_reset_reason="saved_thread_unavailable",
                             memory_context=memory_context,
                         ),
@@ -219,6 +256,7 @@ class AgentService:
                     transport="agent",
                     request_id=request.event_id,
                     payload={
+                        "public_reference_id": request.public_reference_id,
                         "conversation_id": request.conversation_id,
                         "trigger": request.trigger.value,
                         "model": result.model,
@@ -250,6 +288,7 @@ class AgentService:
                 return response
         except Exception as exc:
             failure_payload: dict[str, object] = {
+                "public_reference_id": request.public_reference_id,
                 "conversation_id": request.conversation_id,
                 "trigger": request.trigger.value,
                 "model": self.model,
@@ -269,6 +308,13 @@ class AgentService:
                 request,
                 model=self.model,
                 error_type=type(exc).__name__,
+            )
+            log.error(
+                "Agent turn failed request=%s reference=%s error=%s",
+                request.event_id,
+                request.public_reference_id,
+                type(exc).__name__,
+                exc_info=True,
             )
             await self.journal.append(
                 kind="agent.turn.failed",
@@ -328,6 +374,11 @@ class AgentService:
                 grants=request.grants,
                 origin_resource_id=request.channel_id,
                 approvals=request.approvals,
+                # A steered message contributes its own actor and event identity,
+                # but it remains part of the original provider turn. Keep the
+                # turn's durable public reference so traces and feedback can be
+                # resolved after restart.
+                public_reference_id=original.public_reference_id,
             )
             accepted = await self.provider.steer(
                 event_prompt=_follow_up_prompt(
@@ -345,6 +396,7 @@ class AgentService:
                     transport="agent",
                     request_id=request.event_id,
                     payload={
+                        "public_reference_id": original.public_reference_id,
                         "conversation_id": original.conversation_id,
                         "original_actor_id": original.actor_id,
                         "follow_up_actor_id": request.actor_id,
@@ -413,6 +465,7 @@ class AgentService:
                         transport="agent",
                         request_id=request.event_id,
                         payload={
+                            "public_reference_id": request.public_reference_id,
                             "reason": rejection_reason,
                             "trigger": request.trigger.value,
                         },
@@ -447,6 +500,7 @@ class AgentService:
                         transport="agent",
                         request_id=request.event_id,
                         payload={
+                            "public_reference_id": request.public_reference_id,
                             "conversation_id": request.conversation_id,
                             "promoted_from": promoted_from,
                             "reason": "capability_grant_expansion",
@@ -454,6 +508,19 @@ class AgentService:
                     )
                 await self.store.begin(request, model=self.model)
                 turn_begun = True
+                await self.journal.append(
+                    kind="agent.turn.started",
+                    actor_id=request.actor_id,
+                    workspace_id=request.workspace_id,
+                    transport="agent",
+                    request_id=request.event_id,
+                    payload={
+                        "public_reference_id": request.public_reference_id,
+                        "conversation_id": request.conversation_id,
+                        "trigger": request.trigger.value,
+                        "model": self.model,
+                    },
+                )
 
             if not active_counted:
                 if queued and on_progress is not None:
@@ -644,6 +711,7 @@ def _event_prompt(
     request: AgentRequest,
     *,
     max_response_characters: int,
+    runtime_model: str | None = None,
     continuity_reset_reason: str | None = None,
     memory_context: tuple[AgentMemoryRecord, ...] = (),
 ) -> str:
@@ -701,6 +769,13 @@ def _event_prompt(
             f"actor_id={request.actor_id}",
             f"actor_name={request.actor_name}",
             f"occurred_at={request.occurred_at.isoformat()}",
+            *((f"host_fact_runtime_model={runtime_model}",) if runtime_model else ()),
+            (
+                "Host facts in this event and context retrieved for this exact turn are "
+                "newer than old assistant text. Never turn a host fact into a proposal "
+                "or future assumption. Direct user corrections in newly retrieved "
+                "conversation context replace the corrected assumption for this turn."
+            ),
             *_response_delivery_budget(max_response_characters),
             f"batched_event_count={len(event_pointers)}",
             *(f"batched_event={pointer}" for pointer in event_pointers),
@@ -742,6 +817,26 @@ def _event_prompt(
             ),
         )
     )
+
+
+def _conversation_rotation_reason(
+    conversation: AgentConversationRecord | None,
+) -> str | None:
+    """Bound stale self-generated narrative before the provider reaches capacity."""
+
+    if conversation is None:
+        return None
+    if conversation.turn_count >= _MAX_PROVIDER_THREAD_TURNS:
+        return "bounded_thread_turn_limit"
+    input_tokens = conversation.last_input_tokens
+    context_window = conversation.model_context_window
+    if (
+        context_window is not None
+        and context_window > 0
+        and input_tokens / context_window >= _MAX_PROVIDER_CONTEXT_FRACTION
+    ):
+        return "bounded_thread_context_pressure"
+    return None
 
 
 def _follow_up_prompt(

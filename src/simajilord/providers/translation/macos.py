@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,17 +23,135 @@ from simajilord.services.translation import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TranslationHelperResolution:
+    """One explicit, source-checkout, or unavailable helper resolution."""
+
+    ready: bool
+    source: str
+    command: tuple[str, ...]
+    error_code: str | None
+    detail: str
+
+
+def source_translation_package(runtime_path: Path) -> Path | None:
+    """Resolve the Swift package only beside an actual source checkout."""
+
+    candidate = (
+        runtime_path.resolve().parents[2]
+        / "native"
+        / "macos"
+        / "TranslationHelper"
+    )
+    return candidate if (candidate / "Package.swift").is_file() else None
+
+
+def resolve_translation_helper(
+    package_path: Path | None,
+    *,
+    executable_path: Path | None = None,
+) -> TranslationHelperResolution:
+    """Resolve one runnable helper without guessing a wheel-adjacent source tree."""
+
+    if executable_path is not None:
+        configured = executable_path.expanduser().resolve()
+        if not configured.is_file():
+            return TranslationHelperResolution(
+                ready=False,
+                source="configured",
+                command=(),
+                error_code="translation.helper_missing",
+                detail=(
+                    "TRANSLATION_HELPER_PATH does not point to an existing file: "
+                    f"{configured}"
+                ),
+            )
+        mode = stat.S_IMODE(configured.stat().st_mode)
+        if mode & 0o077 or not os.access(configured, os.X_OK):
+            return TranslationHelperResolution(
+                ready=False,
+                source="configured",
+                command=(),
+                error_code="translation.helper_unavailable",
+                detail=(
+                    "TRANSLATION_HELPER_PATH must be an owner-executable private file. "
+                    f"Run: chmod 700 {configured}"
+                ),
+            )
+        return TranslationHelperResolution(
+            ready=True,
+            source="configured",
+            command=(str(configured),),
+            error_code=None,
+            detail="Using TRANSLATION_HELPER_PATH.",
+        )
+
+    package = package_path.resolve() if package_path is not None else None
+    if package is not None and (package / "Package.swift").is_file():
+        candidates = (
+            package / ".build" / "release" / "TranslationHelper",
+            package
+            / ".build"
+            / "arm64-apple-macosx"
+            / "release"
+            / "TranslationHelper",
+        )
+        for candidate in candidates:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return TranslationHelperResolution(
+                    ready=True,
+                    source="source-build",
+                    command=(str(candidate),),
+                    error_code=None,
+                    detail="Using a helper built in the source checkout.",
+                )
+        if shutil.which("swift") is None:
+            return TranslationHelperResolution(
+                ready=False,
+                source="source-swift",
+                command=(),
+                error_code="translation.helper_unavailable",
+                detail="The source Swift package exists, but the swift executable is unavailable.",
+            )
+        return TranslationHelperResolution(
+            ready=True,
+            source="source-swift",
+            command=(
+                "swift",
+                "run",
+                "--package-path",
+                str(package),
+                "--configuration",
+                "release",
+                "TranslationHelper",
+            ),
+            error_code=None,
+            detail="The helper will be built from the source checkout with swift run.",
+        )
+
+    return TranslationHelperResolution(
+        ready=False,
+        source="installed-wheel",
+        command=(),
+        error_code="translation.helper_missing",
+        detail=(
+            "No source Swift package is available. Build TranslationHelper separately, "
+            "run chmod 700 on it, and set TRANSLATION_HELPER_PATH."
+        ),
+    )
+
+
 class MacOSTranslationProvider:
     """Invoke a small Swift JSON-Lines helper with no cloud translation API."""
 
     def __init__(
         self,
-        package_path: Path,
+        package_path: Path | None,
         *,
         executable_path: Path | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
-        self._package_path = package_path.resolve()
+        self._package_path = package_path.resolve() if package_path is not None else None
         self._executable_path = executable_path.resolve() if executable_path else None
         self._timeout_seconds = timeout_seconds
         self._process: asyncio.subprocess.Process | None = None
@@ -43,33 +165,17 @@ class MacOSTranslationProvider:
         return "apple-translation"
 
     def _command(self) -> tuple[str, ...]:
-        candidates = (
-            self._executable_path,
-            self._package_path / ".build" / "release" / "TranslationHelper",
-            self._package_path
-            / ".build"
-            / "arm64-apple-macosx"
-            / "release"
-            / "TranslationHelper",
+        resolution = resolve_translation_helper(
+            self._package_path,
+            executable_path=self._executable_path,
         )
-        for candidate in candidates:
-            if candidate is not None and candidate.is_file():
-                return (str(candidate),)
-        if not (self._package_path / "Package.swift").is_file():
+        if not resolution.ready:
             raise TranslationProviderError(
-                "translation.helper_missing",
-                f"Swift package is missing: {self._package_path}",
+                resolution.error_code or "translation.helper_unavailable",
+                resolution.detail,
                 fallback_allowed=True,
             )
-        return (
-            "swift",
-            "run",
-            "--package-path",
-            str(self._package_path),
-            "--configuration",
-            "release",
-            "TranslationHelper",
-        )
+        return resolution.command
 
     async def _start_process(self) -> asyncio.subprocess.Process:
         async with self._process_lock:

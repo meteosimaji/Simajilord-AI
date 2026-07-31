@@ -101,6 +101,15 @@ with Discord's generic “interaction failed” banner.
   chronological pages for sampling—including voice-channel chat. Results expose stable
   server/channel/message IDs, explicit completeness, continuation cursors, and
   reaction/reply/thread signals so the agent can continue a long search without guessing
+- Every explicit AI turn records a typed semantic evidence plan after reading the exact active
+  message. The AI—not a host keyword list—decides whether it needs earlier channel conversation
+  or current Simajilord source. Earlier messages are fetched only when required, anchored before
+  the active message, and remain interpretation evidence rather than additional requests to
+  answer. Current implementation questions use bounded, read-only `source.search` /
+  `source.read` access to allowlisted package, Activity, native-helper and script source plus
+  tests, workflows, and top-level docs; generated static assets, vendor code, runtime data,
+  `.env`, secrets, symlinks, and arbitrary host paths are excluded. A required evidence source
+  must actually be read before a host reply or write can be finalized
 - Read-only Discord research may cross to another shared server when both the active requester
   and BOT still have View Channel and Read Message History access (and private-thread membership
   where applicable). Each result includes a time-local source-visibility/disclosure advisory.
@@ -157,8 +166,9 @@ with Discord's generic “interaction failed” banner.
   generic media saving, selective memory, and Action Receipt/Undo flows. These are typed
   Simajilord-tool recipes, not Codex user/global skills: no plugin, MCP, shell, or host path
   is loaded, and workflows requiring unavailable capabilities or grants are omitted
-- At most four full eager schemas are shown at turn start: exact-message read, bounded nearby
-  message read, selective memory search, and (when granted) local web search. General ability
+- At most five full eager schemas are shown at turn start: exact-message read, bounded nearby
+  message read, the semantic evidence plan, selective memory search, and (when granted) local web
+  search. General ability
   questions use compact cursor-paged `capability_list`, modeled after MCP `tools/list`; concrete
   goals use `capability_search` to load only matching schemas and `capability_invoke` to execute
   one. File, workflow, image, audio, Discord mutation, and the rest stay deferred regardless of
@@ -191,8 +201,11 @@ with Discord's generic “interaction failed” banner.
   result; retrieving an old administrator message can never authorize a new action
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
   context compaction, exact-message verification, progressive status updates, and corrective
-  retries after failed writes. The host does not pre-emptively rotate a healthy Codex thread by
-  turn count or context ratio. Separate servers can run turns concurrently without allowing two
+  retries after failed writes. A provider thread is rotated before stale self-generated narrative
+  dominates the turn: after 12 completed turns or once the previous input reaches 35% of the
+  reported context window. The replacement receives only current host facts, selectively sourced
+  memory, and context fetched for the active request. Separate servers can run turns concurrently
+  without allowing two
   turns from the same server to overtake each other. Codex notifications, inactivity watchdogs,
   and tool budgets are routed per thread/turn, so concurrent servers cannot consume each other's
   completion events.
@@ -344,6 +357,21 @@ Set `TTS_PROVIDER=voicevox`, `VOICEVOX_SPEAKER_ID` to a VOICEVOX style ID, and
 HTTP endpoint. With `VOICEVOX_AUTO_START=true`, the BOT starts the engine on first speech and
 stops only the process it owns during clean shutdown.
 
+For on-device macOS translation, a source checkout can build
+`native/macos/TranslationHelper` lazily with Swift. The platform wheel deliberately remains
+portable and does not contain a Mach-O executable. When running from an installed wheel, build
+the helper separately, keep it private and executable, and configure its absolute path:
+
+```bash
+swift build --package-path native/macos/TranslationHelper -c release
+chmod 700 native/macos/TranslationHelper/.build/release/TranslationHelper
+export TRANSLATION_HELPER_PATH="$PWD/native/macos/TranslationHelper/.build/release/TranslationHelper"
+simajilord-translation-doctor
+```
+
+An installed wheel with no `TRANSLATION_HELPER_PATH` reports
+`translation.helper_missing` instead of guessing a nonexistent source-tree path.
+
 An optional Netscape cookie file may be configured with `MEDIA_COOKIE_FILE`. It must be an
 existing local file with mode `0600`. The platform never extracts cookies from a browser.
 
@@ -382,6 +410,7 @@ for URL Mapping and production-hosting requirements.
 ## Commands
 
 - `/help`, `/status`
+- `/feedback` opens a private Modal and saves the report locally without asking for a triage kind
 - `/audio` opens the shared music and read-aloud control panel
 - `/play` adds a track and `/radio` starts or stops continuous related playback
 - `/join` selects up to 25 conversations to read in the current VC
@@ -419,6 +448,11 @@ Undo state is separately bounded in `.data/agent_actions.sqlite3`; inverse behav
 static code policy, so the database does not retain source file or message content.
 Durable memory state is separately bounded in `.data/agent_memory.sqlite3` and never stores the
 source Discord message body or attachment.
+Feedback is separate in `.data/feedback.sqlite3`. `/feedback` and an explicitly authorized AI
+request both call the same `feedback.create` capability; reporter, workspace, channel, event, and
+optional `agt_` reference come only from the host invocation context. Submitters cannot choose
+kind or status. Administrators can run `simajilord-feedback list`, `show`, `set-kind`,
+`set-status`, or `export`; the model has no inbox-read or triage capability.
 
 `.data/audio_sessions.json` stores only stable media page references, requester attribution,
 recent history, and queue policy. Signed stream URLs are deliberately excluded. A restart
@@ -432,6 +466,8 @@ uv run ruff check src tests
 uv run mypy src/simajilord
 uv run pytest
 uv run simajilord-audio-doctor
+uv run simajilord-translation-doctor
+uv run simajilord-feedback list
 uv run simajilord-web-doctor "Python"
 uv run python -m compileall -q src
 ```

@@ -16,6 +16,7 @@ from simajilord.agent import (
     AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
     AGENT_DISCORD_MODERATION_CAPABILITIES,
     AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_FEEDBACK_GRANT,
     AGENT_FILE_GRANT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
@@ -49,6 +50,7 @@ from simajilord.capabilities import (
     build_audio_endpoints,
     build_compute_endpoints,
     build_download_endpoint,
+    build_feedback_endpoint,
     build_file_endpoints,
     build_focus_timer_endpoints,
     build_image_endpoints,
@@ -57,6 +59,7 @@ from simajilord.capabilities import (
     build_read_aloud_endpoint,
     build_read_aloud_policy_endpoints,
     build_read_aloud_route_endpoints,
+    build_source_inspection_endpoints,
     build_speech_endpoint,
     build_system_endpoints,
     build_translation_endpoints,
@@ -75,13 +78,17 @@ from simajilord.providers.image import (
 )
 from simajilord.providers.moderation import HiveSyntheticMediaProvider
 from simajilord.providers.speech import MacOSSayProvider, VoicevoxSpeechProvider
-from simajilord.providers.translation import MacOSTranslationProvider
+from simajilord.providers.translation import (
+    MacOSTranslationProvider,
+    source_translation_package,
+)
 from simajilord.providers.web import AiohttpPublicWebFetcher, SearxngSearchProvider
 from simajilord.services import (
     AgentFileSandbox,
     AudioSessionManager,
     AudioStateStore,
     DataMaintenanceService,
+    FeedbackService,
     FocusTimerService,
     ImageGenerationService,
     ImageGenerationStore,
@@ -93,6 +100,7 @@ from simajilord.services import (
     QuoteImageService,
     ReadAloudService,
     ServiceOperationMetric,
+    SourceInspectionService,
     SpeechService,
     TranslationService,
     TranslationStore,
@@ -121,6 +129,8 @@ class SimajilordRuntime:
     files: AgentFileSandbox | None
     compute: WorkspaceComputeService | None
     memory: AgentMemoryService
+    feedback: FeedbackService
+    source_inspection: SourceInspectionService
     journal: EventJournal
     autonomy_events: AutonomyEventQueue
     action_receipts: ActionReceiptService | None
@@ -150,6 +160,8 @@ class SimajilordRuntime:
             settings.data_dir / "agent_memory.sqlite3"
         )
         memory = AgentMemoryService(memory_store)
+        feedback = FeedbackService(settings.data_dir / "feedback.sqlite3")
+        source_inspection = SourceInspectionService.for_runtime_file(Path(__file__))
 
         async def record_service_metric(metric: ServiceOperationMetric) -> None:
             await journal.append(
@@ -378,12 +390,7 @@ class SimajilordRuntime:
             rate_limit_exempt_actor_ids=settings.agent_rate_limit_exempt_user_ids,
         )
         quote = QuoteImageService()
-        translation_package = (
-            Path(__file__).resolve().parents[2]
-            / "native"
-            / "macos"
-            / "TranslationHelper"
-        )
+        translation_package = source_translation_package(Path(__file__))
         translation = TranslationService(
             (
                 MacOSTranslationProvider(
@@ -488,6 +495,10 @@ class SimajilordRuntime:
                 "timer.create",
                 "timer.list",
                 "timer.cancel",
+                "turn.evidence_plan",
+                "source.search",
+                "source.read",
+                "feedback.create",
                 "memory.search",
                 *AGENT_MEMORY_WRITE_CAPABILITIES,
                 "moderation.status",
@@ -508,6 +519,7 @@ class SimajilordRuntime:
             required_grants: dict[str, str] = {
                 "action.undo": AGENT_MESSAGE_GRANT,
                 "memory.search": AGENT_MEMORY_GRANT,
+                "feedback.create": AGENT_FEEDBACK_GRANT,
                 **{
                     name: AGENT_MEMORY_GRANT
                     for name in AGENT_MEMORY_WRITE_CAPABILITIES
@@ -620,6 +632,7 @@ class SimajilordRuntime:
                 eager_capabilities=(
                     "discord.get_message",
                     "discord.read_messages",
+                    "turn.evidence_plan",
                     "memory.search",
                     "web.search",
                 ),
@@ -638,6 +651,7 @@ class SimajilordRuntime:
                         *discord_requested_write_capabilities,
                         *AGENT_MEMORY_WRITE_CAPABILITIES,
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
+                        "feedback.create",
                     )
                     + (
                         ("image.generate",)
@@ -692,6 +706,7 @@ class SimajilordRuntime:
                 escalation_model=settings.agent_escalation_model,
                 allow_image_generation=shared_image_provider is not None,
                 image_timeout_seconds=settings.image_timeout_seconds,
+                trace_sink=journal,
             )
             if shared_image_provider is not None:
                 shared_image_provider.bind(codex_provider)
@@ -750,6 +765,8 @@ class SimajilordRuntime:
             files=files,
             compute=compute,
             memory=memory,
+            feedback=feedback,
+            source_inspection=source_inspection,
             journal=journal,
             autonomy_events=autonomy_events,
             action_receipts=action_receipts,
@@ -785,6 +802,8 @@ class SimajilordRuntime:
             *(build_file_endpoints(files) if files is not None else ()),
             *(build_compute_endpoints(compute) if compute is not None else ()),
             *build_memory_endpoints(memory),
+            build_feedback_endpoint(feedback),
+            *build_source_inspection_endpoints(source_inspection),
             *((curated_workflow_endpoint,) if curated_workflow_endpoint else ()),
             *(
                 (build_action_undo_endpoint(action_receipts),)

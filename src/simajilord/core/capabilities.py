@@ -57,6 +57,10 @@ class InvocationContext:
     grants: frozenset[str] = frozenset()
     origin_resource_id: str | None = None
     approvals: frozenset[str] = frozenset()
+    public_reference_id: str | None = None
+    provider_thread_id: str | None = None
+    provider_turn_id: str | None = None
+    tool_call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

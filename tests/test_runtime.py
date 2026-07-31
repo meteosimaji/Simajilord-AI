@@ -118,7 +118,7 @@ def test_agent_and_image_queue_share_the_primary_codex_provider(
         asyncio.run(runtime.close())
 
 
-def test_max_feature_runtime_keeps_only_four_full_eager_schemas(
+def test_max_feature_runtime_keeps_only_five_full_eager_schemas(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -175,9 +175,10 @@ def test_max_feature_runtime_keeps_only_four_full_eager_schemas(
         "discord_get_message",
         "discord_read_messages",
         "memory_search",
+        "turn_evidence_plan",
         "web_search",
     }
-    assert len(names - broker_names) == 4
+    assert len(names - broker_names) == 5
     asyncio.run(runtime.close())
 
 

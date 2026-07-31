@@ -9,6 +9,13 @@ from .compute import (
     WorkspaceComputeService,
     WorkspaceDownloadResult,
 )
+from .feedback import (
+    FeedbackCreateResult,
+    FeedbackKind,
+    FeedbackReport,
+    FeedbackService,
+    FeedbackStatus,
+)
 from .files import AgentFileSandbox
 from .focus_timer import FocusTimer, FocusTimerService, FocusTimerStatus
 from .image import ImageGenerationService, ImageGenerationStore
@@ -29,6 +36,12 @@ from .read_aloud import (
     ReadAloudMode,
     ReadAloudRoute,
     ReadAloudService,
+)
+from .source_inspection import (
+    SourceInspectionService,
+    SourceMatch,
+    SourceReadResult,
+    SourceSearchResult,
 )
 from .speech import SpeechProvider, SpeechService
 from .translation import (
@@ -57,6 +70,11 @@ __all__ = [
     "ComputeLimits",
     "ComputeRunResult",
     "DataMaintenanceService",
+    "FeedbackCreateResult",
+    "FeedbackKind",
+    "FeedbackReport",
+    "FeedbackService",
+    "FeedbackStatus",
     "FocusTimer",
     "FocusTimerService",
     "FocusTimerStatus",
@@ -82,6 +100,10 @@ __all__ = [
     "ReadAloudService",
     "ServiceMetricHook",
     "ServiceOperationMetric",
+    "SourceInspectionService",
+    "SourceMatch",
+    "SourceReadResult",
+    "SourceSearchResult",
     "SpeechProvider",
     "SpeechQueueReservation",
     "SpeechService",

@@ -36,6 +36,7 @@ from .contracts import (
     AGENT_DISCORD_MODERATION_CAPABILITIES,
     AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
     AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
+    AGENT_FEEDBACK_GRANT,
     AGENT_FILE_GRANT,
     AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_HIVE_GRANT,
@@ -64,6 +65,8 @@ from .contracts import (
     AgentResponseStatus,
     AgentTokenUsage,
     AgentTrigger,
+    is_agent_public_reference_id,
+    new_agent_public_reference_id,
 )
 from .errors import (
     AgentBusyError,
@@ -111,6 +114,7 @@ __all__ = [
     "AGENT_DISCORD_MODERATION_CAPABILITIES",
     "AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES",
     "AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS",
+    "AGENT_FEEDBACK_GRANT",
     "AGENT_FILE_GRANT",
     "AGENT_FINAL_DELIVERED_CONTENT",
     "AGENT_HIVE_GRANT",
@@ -188,4 +192,6 @@ __all__ = [
     "build_action_undo_endpoint",
     "build_curated_workflow_endpoint",
     "build_memory_endpoints",
+    "is_agent_public_reference_id",
+    "new_agent_public_reference_id",
 ]

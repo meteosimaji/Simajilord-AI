@@ -28,6 +28,7 @@ from simajilord.agent import (
     AGENT_REPOST_GRANT,
     AGENT_WEB_GRANT,
     AgentAutonomyMode,
+    AgentBusyError,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentProviderLimitError,
@@ -147,6 +148,7 @@ from simajilord.integrations.discord.cogs import (
     translation_embed,
     user_info_embed,
 )
+from simajilord.integrations.discord.feedback import FeedbackCog
 from simajilord.integrations.discord.help_catalog import (
     HELP_ENTRIES,
     HELP_ENTRIES_BY_TOPIC,
@@ -793,6 +795,7 @@ def test_common_music_actions_have_short_top_level_commands() -> None:
 def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
     cog_types = (
         HelpCog,
+        FeedbackCog,
         SystemCog,
         FocusTimerCog,
         MusicCog,
@@ -839,6 +842,7 @@ def test_public_command_and_option_descriptions_use_the_official_english_surface
     japanese = re.compile(r"[ぁ-んァ-ヶ一-龯]")
     cog_types = (
         HelpCog,
+        FeedbackCog,
         SystemCog,
         FocusTimerCog,
         MusicCog,
@@ -2897,6 +2901,7 @@ def test_web_commands_use_one_discoverable_group() -> None:
 def test_public_command_tree_has_no_legacy_or_duplicate_top_level_names() -> None:
     cog_types = (
         HelpCog,
+        FeedbackCog,
         SystemCog,
         FocusTimerCog,
         MusicCog,
@@ -2912,6 +2917,7 @@ def test_public_command_tree_has_no_legacy_or_duplicate_top_level_names() -> Non
     assert len(top_level) == len(set(top_level))
     assert set(top_level) == {
         "help",
+        "feedback",
         "status",
         "system",
         "timer",
@@ -3740,6 +3746,34 @@ def test_agent_timeout_message_explains_interruption_and_uncertain_results() -> 
     assert "runtime was restarted automatically" in message
     assert "could create a duplicate" in message
     assert "partial response or operation result is unconfirmed" in message
+
+
+def test_agent_execution_failure_displays_only_valid_public_reference() -> None:
+    reference_id = "agt_0123456789abcdef0123"
+
+    message = _agent_error_text(
+        RuntimeError("failed"),
+        reference_id=reference_id,
+    )
+
+    assert f"Reference ID: `{reference_id}`" in message
+    assert _agent_error_text(
+        RuntimeError("failed"),
+        reference_id="discord:message:secret",
+    ) == "The AI request could not be completed."
+
+
+def test_agent_admission_rejections_never_display_public_reference() -> None:
+    reference_id = "agt_0123456789abcdef0123"
+
+    assert reference_id not in _agent_error_text(
+        AgentBusyError("busy"),
+        reference_id=reference_id,
+    )
+    assert reference_id not in _agent_error_text(
+        AgentRateLimitError("limited"),
+        reference_id=reference_id,
+    )
 
 
 def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:

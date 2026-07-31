@@ -369,6 +369,21 @@ def _optional_private_file(name: str) -> Path | None:
     return path
 
 
+def _optional_private_executable(name: str) -> Path | None:
+    raw_path = os.getenv(name, "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise ConfigurationError(f"{name} does not point to an existing executable.")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077 or not os.access(path, os.X_OK):
+        raise ConfigurationError(
+            f"{name} must be an owner-executable private file. Run: chmod 700 {path}"
+        )
+    return path
+
+
 def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     """Load settings without overriding variables already set by the process."""
 
@@ -671,7 +686,9 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             maximum=86_400.0,
         ),
         translation_enabled=_boolean("TRANSLATION_ENABLED", True),
-        translation_helper_path=_optional_private_file("TRANSLATION_HELPER_PATH"),
+        translation_helper_path=_optional_private_executable(
+            "TRANSLATION_HELPER_PATH"
+        ),
         translation_timeout_seconds=_positive_float(
             "TRANSLATION_TIMEOUT_SECONDS",
             30.0,

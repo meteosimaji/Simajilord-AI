@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -13,6 +14,7 @@ AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS = 1_900
 AGENT_AUTONOMY_ACTOR_ID = "simajilord:autonomy"
 AGENT_AUDIO_GRANT = "audio"
 AGENT_COMPUTE_GRANT = "safe_compute"
+AGENT_FEEDBACK_GRANT = "feedback"
 AGENT_FILE_GRANT = "files"
 AGENT_HIVE_GRANT = "hive_analysis"
 AGENT_IMAGE_GRANT = "image"
@@ -115,7 +117,27 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     *AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
     *AGENT_TIMER_WRITE_CAPABILITIES,
     *AGENT_MEMORY_WRITE_CAPABILITIES,
+    "feedback.create",
 )
+_AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS = 20
+
+
+def new_agent_public_reference_id() -> str:
+    """Return an opaque, Discord-safe identifier for one agent request."""
+
+    return f"agt_{secrets.token_hex(_AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS // 2)}"
+
+
+def is_agent_public_reference_id(value: str) -> bool:
+    """Validate the public format without decoding any internal identity."""
+
+    prefix = "agt_"
+    if not value.startswith(prefix):
+        return False
+    suffix = value[len(prefix) :]
+    return len(suffix) == _AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS and all(
+        character in "0123456789abcdef" for character in suffix
+    )
 
 
 class GoalState(StrEnum):
@@ -214,6 +236,7 @@ class AgentRequest:
     message_id: str | None
     occurred_at: datetime
     resource_ids: tuple[str, ...]
+    public_reference_id: str
     grants: frozenset[str] = frozenset()
     approvals: frozenset[str] = frozenset()
     events: tuple[AgentEvent, ...] = ()

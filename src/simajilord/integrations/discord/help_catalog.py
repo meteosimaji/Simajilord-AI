@@ -72,6 +72,20 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         notes=("The topic field supports autocomplete.",),
     ),
     _entry(
+        "feedback",
+        "Getting started",
+        "Open a private form and save a report to the local administrator inbox.",
+        "/feedback",
+        "/feedback",
+        side_effects=(
+            "Persists the submitted report with your Discord actor ID and source context.",
+        ),
+        notes=(
+            "The form and acknowledgement are visible only to you.",
+            "Triage kind and status are assigned later by the administrator.",
+        ),
+    ),
+    _entry(
         "system ping",
         "Getting started",
         "Check Discord gateway latency and whether the BOT can answer.",

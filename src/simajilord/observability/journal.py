@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from uuid import uuid4
 
 from simajilord.core.capabilities import InvocationContext
 
@@ -25,6 +26,9 @@ _SENSITIVE_PARTS = (
 )
 _AUDIT_QUEUE_MAX_EVENTS = 4_096
 _AUDIT_BATCH_MAX_EVENTS = 64
+_AUDIT_OUTBOX_MAX_EVENTS = 16_384
+_AUDIT_OVERFLOW_TASK_MAX = 128
+_AUDIT_RETRY_DELAYS_SECONDS = (0.05, 0.2)
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class EventRecord:
     sequence: int
+    event_id: str
     occurred_at: datetime
     kind: str
     actor_id: str | None
@@ -51,7 +56,21 @@ class OperationDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditHealth:
+    """Current asynchronous audit durability state."""
+
+    pending_events: int
+    retried_event_count: int
+    outbox_event_count: int
+    lost_event_count: int
+    last_failure_at: datetime | None
+    last_failure_type: str | None
+    writer_state: str
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingEvent:
+    event_id: str
     occurred_at: str
     kind: str
     payload: dict[str, object]
@@ -76,14 +95,22 @@ class EventJournal:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.outbox_path = path.with_name("audit_outbox.sqlite3")
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._write_lock = asyncio.Lock()
+        self._outbox_lock = asyncio.Lock()
         self._audit_queue: asyncio.Queue[
             _PendingEvent | _FlushAuditQueue | _CloseAuditQueue
         ] = asyncio.Queue(maxsize=_AUDIT_QUEUE_MAX_EVENTS)
         self._audit_writer_task: asyncio.Task[None] | None = None
+        self._overflow_tasks: set[asyncio.Task[None]] = set()
+        self._retried_event_count = 0
+        self._lost_event_count = 0
+        self._last_audit_failure_at: datetime | None = None
+        self._last_audit_failure_type: str | None = None
         self._closed = False
         self._initialize()
+        self._initialize_outbox()
 
     async def record_invocation(
         self,
@@ -99,6 +126,10 @@ class EventJournal:
             "capability": capability_name,
             "outcome": "failed" if error else "succeeded",
             "duration_ms": round(duration_ms, 3),
+            "public_reference_id": context.public_reference_id,
+            "provider_thread_id": context.provider_thread_id,
+            "provider_turn_id": context.provider_turn_id,
+            "tool_call_id": context.tool_call_id,
             "request": _safe_value(request),
         }
         if error is None:
@@ -109,17 +140,20 @@ class EventJournal:
         if self._closed:
             raise RuntimeError("Event journal is closed.")
         self._ensure_audit_writer()
-        await self._audit_queue.put(
-            _PendingEvent(
-                occurred_at=datetime.now(UTC).isoformat(),
-                kind="capability.invocation",
-                payload=cast_payload(_safe_value(payload)),
-                actor_id=context.actor_id,
-                workspace_id=context.workspace_id,
-                transport=context.transport,
-                request_id=context.request_id,
-            )
+        pending = _PendingEvent(
+            event_id=_new_event_id(),
+            occurred_at=datetime.now(UTC).isoformat(),
+            kind="capability.invocation",
+            payload=cast_payload(_safe_value(payload)),
+            actor_id=context.actor_id,
+            workspace_id=context.workspace_id,
+            transport=context.transport,
+            request_id=context.request_id,
         )
+        try:
+            self._audit_queue.put_nowait(pending)
+        except asyncio.QueueFull:
+            self._schedule_overflow_spool(pending)
 
     async def append(
         self,
@@ -135,7 +169,9 @@ class EventJournal:
 
         if self._closed:
             raise RuntimeError("Event journal is closed.")
+        self._ensure_audit_writer()
         pending = _PendingEvent(
+            event_id=_new_event_id(),
             occurred_at=datetime.now(UTC).isoformat(),
             kind=kind,
             payload=cast_payload(_safe_value(payload)),
@@ -168,6 +204,30 @@ class EventJournal:
 
         return await asyncio.to_thread(self._latest_sequence)
 
+    async def agent_trace(
+        self,
+        *,
+        request_id: str | None = None,
+        public_reference_id: str | None = None,
+        limit: int = 500,
+    ) -> tuple[EventRecord, ...]:
+        """Return one bounded, chronological agent trace without body search."""
+
+        if request_id is None and public_reference_id is None:
+            raise ValueError("request_id or public_reference_id is required")
+        if request_id is not None and not request_id.strip():
+            raise ValueError("request_id must not be empty")
+        if public_reference_id is not None and not public_reference_id.strip():
+            raise ValueError("public_reference_id must not be empty")
+        bounded_limit = min(max(limit, 1), 1_000)
+        await self._flush_audit_queue()
+        return await asyncio.to_thread(
+            self._select_agent_trace,
+            request_id,
+            public_reference_id,
+            bounded_limit,
+        )
+
     async def prune(self, *, before: datetime) -> int:
         """Delete retained events older than an explicit UTC cutoff."""
 
@@ -181,12 +241,37 @@ class EventJournal:
 
         return await asyncio.to_thread(self._operation_diagnostics)
 
+    async def audit_health(self) -> AuditHealth:
+        """Return bounded audit queue, retry, outbox, and loss health."""
+
+        async with self._outbox_lock:
+            outbox_count = await asyncio.to_thread(self._outbox_count)
+        task = self._audit_writer_task
+        if self._closed and (task is None or task.done()):
+            writer_state = "closed"
+        elif task is None:
+            writer_state = "idle"
+        elif task.done():
+            writer_state = "failed"
+        else:
+            writer_state = "running"
+        return AuditHealth(
+            pending_events=self._audit_queue.qsize(),
+            retried_event_count=self._retried_event_count,
+            outbox_event_count=outbox_count,
+            lost_event_count=self._lost_event_count,
+            last_failure_at=self._last_audit_failure_at,
+            last_failure_type=self._last_audit_failure_type,
+            writer_state=writer_state,
+        )
+
     async def close(self) -> None:
         """Flush capability audits and stop the lazy writer."""
 
         if self._closed:
             return
         self._closed = True
+        await self._await_overflow_tasks()
         await self._flush_audit_queue()
         task = self._audit_writer_task
         if task is None or task.done():
@@ -200,6 +285,35 @@ class EventJournal:
         await completed
         await task
         self._audit_writer_task = None
+
+    def _schedule_overflow_spool(self, event: _PendingEvent) -> None:
+        if len(self._overflow_tasks) >= _AUDIT_OVERFLOW_TASK_MAX:
+            self._lost_event_count += 1
+            log.critical(
+                "Capability audit overflow task limit reached; event lost event_id=%s",
+                event.event_id,
+            )
+            return
+        task = asyncio.create_task(
+            self._spool_overflow_event(event),
+            name=f"simajilord-event-journal-overflow-{event.event_id}",
+        )
+        self._overflow_tasks.add(task)
+        task.add_done_callback(self._overflow_tasks.discard)
+
+    async def _spool_overflow_event(self, event: _PendingEvent) -> None:
+        if await self._spool_batch_safely((event,)):
+            return
+        self._lost_event_count += 1
+        log.critical(
+            "Capability audit queue overflow could not be spooled; event lost event_id=%s",
+            event.event_id,
+        )
+
+    async def _await_overflow_tasks(self) -> None:
+        tasks = tuple(self._overflow_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _ensure_audit_writer(self) -> None:
         task = self._audit_writer_task
@@ -223,11 +337,20 @@ class EventJournal:
             log.exception("Capability audit writer stopped unexpectedly.")
 
     async def _flush_audit_queue(self) -> None:
+        await self._await_overflow_tasks()
         task = self._audit_writer_task
-        if self._audit_queue.empty() and (task is None or task.done()):
+        async with self._outbox_lock:
+            outbox_pending = await asyncio.to_thread(self._outbox_count)
+        if (
+            self._audit_queue.empty()
+            and outbox_pending == 0
+            and (task is None or task.done())
+        ):
             if task is not None:
                 self._consume_writer_result(task)
                 self._audit_writer_task = None
+            return
+        if self._closed and (task is None or task.done()):
             return
         self._ensure_audit_writer()
         loop = asyncio.get_running_loop()
@@ -236,6 +359,7 @@ class EventJournal:
         await completed
 
     async def _audit_writer(self) -> None:
+        await self._replay_outbox_safely()
         while True:
             item = await self._audit_queue.get()
             if isinstance(item, _PendingEvent):
@@ -255,13 +379,17 @@ class EventJournal:
                 for _ in batch:
                     self._audit_queue.task_done()
                 if control is not None:
+                    await self._replay_outbox_safely(drain=True)
                     should_close = isinstance(control, _CloseAuditQueue)
                     if not control.completed.done():
                         control.completed.set_result(None)
                     self._audit_queue.task_done()
                     if should_close:
                         return
+                else:
+                    await self._replay_outbox_safely()
                 continue
+            await self._replay_outbox_safely(drain=True)
             should_close = isinstance(item, _CloseAuditQueue)
             if not item.completed.done():
                 item.completed.set_result(None)
@@ -273,14 +401,85 @@ class EventJournal:
         self,
         batch: tuple[_PendingEvent, ...],
     ) -> None:
+        for attempt in range(len(_AUDIT_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                async with self._write_lock:
+                    await asyncio.to_thread(self._insert_batch, batch)
+                return
+            except Exception as exc:
+                self._record_audit_failure(exc)
+                if attempt >= len(_AUDIT_RETRY_DELAYS_SECONDS):
+                    break
+                self._retried_event_count += len(batch)
+                await asyncio.sleep(_AUDIT_RETRY_DELAYS_SECONDS[attempt])
+        log.error(
+            "Capability audit batch exhausted retries; moving to outbox events=%s",
+            len(batch),
+            exc_info=True,
+        )
+        if await self._spool_batch_safely(batch):
+            return
+        self._lost_event_count += len(batch)
+        log.critical(
+            "Capability audit batch could not be persisted or spooled; events lost=%s",
+            len(batch),
+        )
+
+    def _record_audit_failure(self, error: Exception) -> None:
+        self._last_audit_failure_at = datetime.now(UTC)
+        self._last_audit_failure_type = type(error).__name__
+
+    async def _spool_batch_safely(
+        self,
+        batch: tuple[_PendingEvent, ...],
+    ) -> bool:
         try:
-            async with self._write_lock:
-                await asyncio.to_thread(self._insert_batch, batch)
-        except Exception:
+            async with self._outbox_lock:
+                await asyncio.to_thread(self._outbox_put, batch)
+            return True
+        except Exception as exc:
+            self._record_audit_failure(exc)
             log.exception(
-                "Capability audit batch persistence failed events=%s",
+                "Capability audit outbox persistence failed events=%s",
                 len(batch),
             )
+            return False
+
+    async def _replay_outbox_safely(self, *, drain: bool = False) -> None:
+        max_batches = _AUDIT_OUTBOX_MAX_EVENTS if drain else 4
+        for _ in range(max_batches):
+            async with self._outbox_lock:
+                batch = await asyncio.to_thread(
+                    self._outbox_select,
+                    _AUDIT_BATCH_MAX_EVENTS,
+                )
+            if not batch:
+                return
+            self._retried_event_count += len(batch)
+            try:
+                async with self._write_lock:
+                    await asyncio.to_thread(self._insert_batch, batch)
+            except Exception as exc:
+                self._record_audit_failure(exc)
+                log.warning(
+                    "Capability audit outbox replay deferred events=%s error=%s",
+                    len(batch),
+                    type(exc).__name__,
+                )
+                return
+            try:
+                async with self._outbox_lock:
+                    await asyncio.to_thread(
+                        self._outbox_delete,
+                        tuple(item.event_id for item in batch),
+                    )
+            except Exception as exc:
+                self._record_audit_failure(exc)
+                log.exception(
+                    "Capability audit outbox cleanup failed events=%s",
+                    len(batch),
+                )
+                return
 
     def _initialize(self) -> None:
         connection = sqlite3.connect(self.path)
@@ -290,6 +489,7 @@ class EventJournal:
                 """
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     actor_id TEXT,
@@ -300,6 +500,23 @@ class EventJournal:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "event_id" not in columns:
+                connection.execute("ALTER TABLE events ADD COLUMN event_id TEXT")
+            connection.execute(
+                """
+                UPDATE events
+                SET event_id = 'legacy:' || sequence
+                WHERE event_id IS NULL OR event_id = ''
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS events_event_id "
+                "ON events(event_id)"
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS events_workspace_sequence "
                 "ON events(workspace_id, sequence)"
@@ -307,6 +524,20 @@ class EventJournal:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS events_kind_sequence "
                 "ON events(kind, sequence)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS events_request_sequence "
+                "ON events(request_id, sequence)"
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS events_public_reference_sequence
+                ON events(
+                    json_extract(payload_json, '$.public_reference_id'),
+                    sequence
+                )
+                WHERE json_valid(payload_json)
+                """
             )
             connection.execute(
                 """
@@ -355,6 +586,34 @@ class EventJournal:
             connection.close()
         os.chmod(self.path, 0o600)
 
+    def _initialize_outbox(self) -> None:
+        connection = sqlite3.connect(self.outbox_path)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    occurred_at TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    actor_id TEXT,
+                    workspace_id TEXT,
+                    transport TEXT,
+                    request_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    spooled_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS audit_outbox_spooled "
+                "ON audit_outbox(spooled_at, event_id)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        os.chmod(self.outbox_path, 0o600)
+
     def _insert(self, event: _PendingEvent) -> int:
         connection = sqlite3.connect(self.path)
         try:
@@ -381,11 +640,13 @@ class EventJournal:
         cursor = connection.execute(
             """
             INSERT INTO events(
-                occurred_at, kind, actor_id, workspace_id, transport,
+                event_id, occurred_at, kind, actor_id, workspace_id, transport,
                 request_id, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(event_id) DO NOTHING
             """,
             (
+                event.event_id,
                 event.occurred_at,
                 event.kind,
                 event.actor_id,
@@ -395,9 +656,21 @@ class EventJournal:
                 json.dumps(event.payload, ensure_ascii=False, sort_keys=True),
             ),
         )
-        if cursor.lastrowid is None:
-            raise RuntimeError("SQLite did not return an event sequence.")
-        sequence = int(cursor.lastrowid)
+        inserted = cursor.rowcount > 0
+        if inserted:
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return an event sequence.")
+            sequence = int(cursor.lastrowid)
+        else:
+            row = connection.execute(
+                "SELECT sequence FROM events WHERE event_id = ?",
+                (event.event_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("SQLite ignored an event without retaining its ID.")
+            sequence = int(row[0])
+        if not inserted:
+            return sequence
         self._project_operation_event(connection, sequence, event)
         return sequence
 
@@ -458,18 +731,151 @@ class EventJournal:
                     (after_sequence, workspace_id, limit),
                 ).fetchall()
             return tuple(
-                EventRecord(
-                    sequence=int(row["sequence"]),
-                    occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
+                _event_record_from_row(row)
+                for row in rows
+            )
+        finally:
+            connection.close()
+
+    def _select_agent_trace(
+        self,
+        request_id: str | None,
+        public_reference_id: str | None,
+        limit: int,
+    ) -> tuple[EventRecord, ...]:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        try:
+            clauses: list[str] = []
+            values: list[object] = []
+            if request_id is not None:
+                clauses.append("request_id = ?")
+                values.append(request_id)
+            if public_reference_id is not None:
+                clauses.append(
+                    """
+                    (
+                        json_valid(payload_json)
+                        AND json_extract(
+                            payload_json,
+                            '$.public_reference_id'
+                        ) = ?
+                    )
+                    """
+                )
+                values.append(public_reference_id)
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM events
+                WHERE {" OR ".join(clauses)}
+                ORDER BY sequence
+                LIMIT ?
+                """,
+                (*values, limit),
+            ).fetchall()
+            return tuple(_event_record_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def _outbox_put(self, events: tuple[_PendingEvent, ...]) -> None:
+        connection = sqlite3.connect(self.outbox_path, timeout=10)
+        try:
+            existing_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT event_id FROM audit_outbox WHERE event_id IN "
+                    f"({','.join('?' for _ in events)})",
+                    tuple(event.event_id for event in events),
+                ).fetchall()
+            }
+            current_count = int(
+                connection.execute("SELECT COUNT(*) FROM audit_outbox").fetchone()[0]
+            )
+            new_count = sum(event.event_id not in existing_ids for event in events)
+            if current_count + new_count > _AUDIT_OUTBOX_MAX_EVENTS:
+                raise RuntimeError("Capability audit outbox is full.")
+            spooled_at = datetime.now(UTC).isoformat()
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO audit_outbox(
+                    event_id, occurred_at, kind, actor_id, workspace_id,
+                    transport, request_id, payload_json, spooled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        event.event_id,
+                        event.occurred_at,
+                        event.kind,
+                        event.actor_id,
+                        event.workspace_id,
+                        event.transport,
+                        event.request_id,
+                        json.dumps(
+                            event.payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        spooled_at,
+                    )
+                    for event in events
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _outbox_select(self, limit: int) -> tuple[_PendingEvent, ...]:
+        connection = sqlite3.connect(self.outbox_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                    event_id, occurred_at, kind, actor_id, workspace_id,
+                    transport, request_id, payload_json
+                FROM audit_outbox
+                ORDER BY spooled_at, event_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return tuple(
+                _PendingEvent(
+                    event_id=str(row["event_id"]),
+                    occurred_at=str(row["occurred_at"]),
                     kind=str(row["kind"]),
                     actor_id=row["actor_id"],
                     workspace_id=row["workspace_id"],
                     transport=row["transport"],
                     request_id=row["request_id"],
-                    payload=json.loads(str(row["payload_json"])),
+                    payload=cast_payload(json.loads(str(row["payload_json"]))),
                 )
                 for row in rows
             )
+        finally:
+            connection.close()
+
+    def _outbox_delete(self, event_ids: tuple[str, ...]) -> None:
+        if not event_ids:
+            return
+        connection = sqlite3.connect(self.outbox_path, timeout=10)
+        try:
+            connection.execute(
+                "DELETE FROM audit_outbox WHERE event_id IN "
+                f"({','.join('?' for _ in event_ids)})",
+                event_ids,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _outbox_count(self) -> int:
+        connection = sqlite3.connect(self.outbox_path, timeout=10)
+        try:
+            row = connection.execute("SELECT COUNT(*) FROM audit_outbox").fetchone()
+            return int(row[0])
         finally:
             connection.close()
 
@@ -578,7 +984,29 @@ class EventJournal:
             connection.close()
 
 
+def _event_record_from_row(row: sqlite3.Row) -> EventRecord:
+    return EventRecord(
+        sequence=int(row["sequence"]),
+        event_id=str(row["event_id"]),
+        occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
+        kind=str(row["kind"]),
+        actor_id=row["actor_id"],
+        workspace_id=row["workspace_id"],
+        transport=row["transport"],
+        request_id=row["request_id"],
+        payload=cast_payload(json.loads(str(row["payload_json"]))),
+    )
+
+
 def _safe_value(value: object, *, key: str = "") -> object:
+    if (
+        key == "authorization_reference_id"
+        and isinstance(value, str)
+        and value.startswith("authref_")
+        and len(value) == 28
+        and all(character in "0123456789abcdef" for character in value[8:])
+    ):
+        return value
     if any(part in key.lower() for part in _SENSITIVE_PARTS):
         return "[REDACTED]"
     if isinstance(value, (bytes, bytearray, memoryview)):
@@ -606,6 +1034,10 @@ def _safe_value(value: object, *, key: str = "") -> object:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return _bounded(repr(value), 1_000)
+
+
+def _new_event_id() -> str:
+    return f"evt_{uuid4().hex}"
 
 
 def cast_payload(value: object) -> dict[str, object]:

@@ -28,6 +28,9 @@ simajilord-discord = "simajilord.integrations.discord.__main__:main"
 simajilord-audio-doctor = "simajilord.diagnostics.audio:main"
 simajilord-offline-preview = "simajilord.diagnostics.offline_discord:main"
 simajilord-web-doctor = "simajilord.diagnostics.web:main"
+simajilord-translation-doctor = "simajilord.diagnostics.translation:main"
+simajilord-agent-reference = "simajilord.diagnostics.agent_reference:main"
+simajilord-feedback = "simajilord.diagnostics.feedback:main"
 
 [dependency-groups]
 dev = [

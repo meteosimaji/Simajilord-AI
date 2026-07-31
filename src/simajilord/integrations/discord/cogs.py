@@ -28,6 +28,7 @@ from simajilord.agent import (
     ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
     AGENT_COMPUTE_GRANT,
+    AGENT_FEEDBACK_GRANT,
     AGENT_FILE_GRANT,
     AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_HIVE_GRANT,
@@ -52,6 +53,7 @@ from simajilord.agent import (
     AutonomyEnqueueResult,
     AutonomyEventBatch,
     AutonomyEventKind,
+    new_agent_public_reference_id,
 )
 from simajilord.agent.autonomy import (
     AutonomyDeliveryConflictError,
@@ -306,6 +308,13 @@ _ERROR_MESSAGES = {
     "local_media.audio_stream_missing": "That file does not contain a playable audio stream.",
     "local_media.invalid_media": "ffprobe could not validate that attachment as media.",
     "local_media.reference_invalid": "The saved local-media reference is invalid.",
+    "feedback.details_required": "Describe what happened or what would help.",
+    "feedback.details_too_long": "Feedback details must be at most 4,000 characters.",
+    "feedback.title_too_long": "The feedback title must be at most 160 characters.",
+    "feedback.expected_too_long": (
+        "Expected behaviour must be at most 2,000 characters."
+    ),
+    "feedback.requester_mismatch": "Only the person who opened this form may submit it.",
     "local_media.cache_full": (
         "The local media store is full. Finish or remove queued local files first."
     ),
@@ -3607,6 +3616,24 @@ class SystemCog(commands.Cog):
                             )
                             + f"\nOverlay failures: **{response.overlay_failure_count}**"
                             + f"\nDashboard 429s: **{response.dashboard_429_count}**"
+                        ),
+                        inline=False,
+                    ),
+                    EmbedField(
+                        "Audit durability",
+                        (
+                            f"Writer: **{response.audit_writer_state}**"
+                            f"\nPending: **{response.audit_pending_event_count}**"
+                            f" · Outbox: **{response.audit_outbox_event_count}**"
+                            f"\nRetried events: **{response.audit_retried_event_count}**"
+                            f" · Lost: **{response.audit_lost_event_count}**"
+                            + (
+                                "\nLast failure: "
+                                f"**{response.audit_last_failure_type or 'unknown'}** · "
+                                f"<t:{response.audit_last_failure_at_epoch}:R>"
+                                if response.audit_last_failure_at_epoch is not None
+                                else "\nLast failure: **None since process start**"
+                            )
                         ),
                         inline=False,
                     ),
@@ -8200,6 +8227,8 @@ def _agent_grants(
     settings = runtime.settings
     autonomy_mode = settings.agent_autonomy_mode if autonomous else None
     grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
+    if not autonomous:
+        grants.add(AGENT_FEEDBACK_GRANT)
     if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
         grants.update((AGENT_QUOTE_GRANT, AGENT_REPOST_GRANT))
     if not autonomous or autonomy_mode in {
@@ -8292,6 +8321,7 @@ def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
         grants=request.grants,
         origin_resource_id=request.channel_id,
         approvals=request.approvals,
+        public_reference_id=request.public_reference_id,
     )
 
 
@@ -8444,6 +8474,10 @@ class AgentCog(commands.Cog):
         actor_id = str(message.author.id)
         grants = _agent_grants(self.runtime, actor_id=actor_id)
         approvals = frozenset(AGENT_REQUESTED_WRITE_CAPABILITIES)
+        public_reference_id = (
+            await self.runtime.agent_store.public_reference_id_for_event(event_id)
+            or new_agent_public_reference_id()
+        )
         request = AgentRequest(
             conversation_id=discord_conversation_id(
                 guild_id=message.guild.id if message.guild else None,
@@ -8460,6 +8494,7 @@ class AgentCog(commands.Cog):
             message_id=str(message.id),
             occurred_at=occurred_at,
             resource_ids=resource_ids,
+            public_reference_id=public_reference_id,
             grants=grants,
             approvals=approvals,
         )
@@ -8504,8 +8539,22 @@ class AgentCog(commands.Cog):
                 on_progress=progress.update,
             )
         except Exception as exc:
-            log.exception("Mention agent turn failed message=%s", message.id)
-            await progress.fail(_agent_error_text(exc))
+            log.exception(
+                "Mention agent turn failed message=%s reference=%s",
+                message.id,
+                request.public_reference_id,
+            )
+            persisted_reference_id = (
+                await self.runtime.agent_store.public_reference_id_for_event(
+                    request.event_id
+                )
+            )
+            await progress.fail(
+                _agent_error_text(
+                    exc,
+                    reference_id=persisted_reference_id,
+                )
+            )
         else:
             chunks = await progress.prepare(response.content)
             pending = await self.runtime.agent_store.pending_host_delivery(
@@ -8527,8 +8576,10 @@ class AgentCog(commands.Cog):
                     # The completed model response remains in SQLite and the
                     # recovery loop will retry without re-running any tools.
                     log.exception(
-                        "Agent response delivery deferred request=%s channel=%s",
+                        "Agent response delivery deferred request=%s reference=%s "
+                        "channel=%s",
                         request.event_id,
+                        request.public_reference_id,
                         request.channel_id,
                     )
                     self._host_delivery_wakeup.set()
@@ -8617,8 +8668,10 @@ class AgentCog(commands.Cog):
                     except Exception:
                         had_failure = True
                         log.exception(
-                            "Agent host delivery recovery failed request=%s channel=%s",
+                            "Agent host delivery recovery failed request=%s "
+                            "reference=%s channel=%s",
                             delivery.event_id,
+                            delivery.public_reference_id,
                             delivery.channel_id,
                         )
             except asyncio.CancelledError:
@@ -8687,6 +8740,7 @@ class AgentCog(commands.Cog):
                 request_id=pending.event_id,
                 resource_ids=(pending.channel_id,),
                 origin_resource_id=pending.channel_id,
+                public_reference_id=pending.public_reference_id,
             )
             for record, content in zip(records, chunks, strict=True):
                 message_id = record.message_id
@@ -9927,6 +9981,12 @@ class AgentAutonomyCog(commands.Cog):
             message_id=message_id,
             occurred_at=max(event.occurred_at for event in batch.events),
             resource_ids=resource_ids,
+            public_reference_id=(
+                await self.runtime.agent_store.public_reference_id_for_event(
+                    batch.batch_id
+                )
+                or new_agent_public_reference_id()
+            ),
             grants=grants,
             approvals=approvals,
             events=event_pointers,
@@ -9968,6 +10028,7 @@ class AgentAutonomyCog(commands.Cog):
             request_id=batch.batch_id,
             resource_ids=resource_ids,
             origin_resource_id=channel_id,
+            public_reference_id=request.public_reference_id,
         )
         try:
             await self._deliver_response(
@@ -10483,10 +10544,13 @@ class PrefixCog(commands.Cog):
 
 
 async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
+    from .feedback import FeedbackCog
+
     dashboard = MusicDashboardManager(bot, runtime)
     setattr(bot, _MUSIC_DASHBOARD_ATTRIBUTE, dashboard)
     bot.add_view(MusicControlsView(runtime, dashboard))
     await bot.add_cog(HelpCog())
+    await bot.add_cog(FeedbackCog(runtime))
     await bot.add_cog(SystemCog(bot, runtime))
     await bot.add_cog(FocusTimerCog(bot, runtime))
     music_cog = MusicCog(bot, runtime, dashboard)

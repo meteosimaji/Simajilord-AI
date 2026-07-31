@@ -10,6 +10,7 @@ import logging
 import math
 import types
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -109,6 +110,22 @@ class AgentToolOutput:
 
     def __contains__(self, value: str) -> bool:
         return value in self.text
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class AgentToolCallMetadata:
+    """Body-free routing and risk metadata for one provider tool request."""
+
+    route: Literal[
+        "eager",
+        "capability_invoke",
+        "capability_search",
+        "capability_list",
+    ]
+    capability_name: str | None
+    risk: RiskLevel | None
+    write: bool
+    destructive: bool
 
 
 class AgentToolCatalog:
@@ -298,6 +315,43 @@ class AgentToolCatalog:
                 else None
             )
         return self._aliases.get(tool_name)
+
+    def trace_metadata_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> AgentToolCallMetadata:
+        """Resolve trace metadata without retaining or returning call arguments."""
+
+        if tool_name == _LIST_TOOL:
+            route: Literal[
+                "eager",
+                "capability_invoke",
+                "capability_search",
+                "capability_list",
+            ] = "capability_list"
+        elif tool_name == _SEARCH_TOOL:
+            route = "capability_search"
+        elif tool_name == _INVOKE_TOOL:
+            route = "capability_invoke"
+        else:
+            route = "eager"
+        capability_name = self.capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        risk: RiskLevel | None = None
+        if capability_name is not None:
+            with suppress(CapabilityError):
+                risk = self._registry.endpoint(capability_name).descriptor.risk
+        return AgentToolCallMetadata(
+            route=route,
+            capability_name=capability_name,
+            risk=risk,
+            write=capability_name in self._write_capabilities,
+            destructive=capability_name in self._destructive_capabilities,
+        )
 
     def timeout_seconds_for_call(
         self,

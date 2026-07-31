@@ -49,3 +49,18 @@ class SteerableAgentProvider(Protocol):
         event_prompt: str,
         context: InvocationContext,
     ) -> bool: ...
+
+
+class AgentToolTraceSink(Protocol):
+    """Minimal structured event port used by provider-specific tool tracing."""
+
+    async def append(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, object],
+        actor_id: str | None = None,
+        workspace_id: str | None = None,
+        transport: str | None = None,
+        request_id: str | None = None,
+    ) -> int: ...

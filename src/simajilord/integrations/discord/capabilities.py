@@ -7253,8 +7253,9 @@ def _require_guild_permission(member: discord.Member, permission: str) -> None:
 def _discord_write_nonce(context: InvocationContext, purpose: str) -> str:
     """Deduplicate one exact model tool call without merging intentional calls."""
 
+    invocation_id = context.tool_call_id or context.request_id
     digest = hashlib.sha256(
-        f"{purpose}\0{context.request_id}".encode()
+        f"{purpose}\0{invocation_id}".encode()
     ).hexdigest()
     return f"sla{digest[:22]}"
 
