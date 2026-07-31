@@ -211,7 +211,10 @@ with Discord's generic “interaction failed” banner.
   completion events.
   Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
   as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
-  remain attached. An accepted contributor may request a write only through that follow-up's
+  remain attached. Each accepted follow-up receives a bounded evidence allowance that only its
+  exact message read and the following semantic evidence plan can use; if that allowance cannot
+  be reserved, the message stays a separate turn instead of being accepted into an unreadable
+  parent turn. An accepted contributor may request a write only through that follow-up's
   opaque host authorization and the contributor's own grants and Discord permissions; it cannot
   borrow the original requester's authority. Rate limits are checked before admission, while
   `MAX_ACTIVE_AGENT_TURNS`, `MAX_PENDING_AGENT_TURNS`, and

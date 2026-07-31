@@ -68,6 +68,8 @@ from .base import AgentProgressCallback, AgentToolTraceSink, ProviderTurnResult
 log = logging.getLogger(__name__)
 
 _MAX_TOOL_RESULT_CHARACTERS = 8_000
+_FOLLOW_UP_EVIDENCE_TOOL_CALLS = 3
+_FOLLOW_UP_EVIDENCE_OUTPUT_CHARACTERS = _MAX_TOOL_RESULT_CHARACTERS
 _TOOL_WATCHDOG_GRACE_SECONDS = 5.0
 _APP_SERVER_INPUT_LINE_LIMIT_BYTES = 4_000_000
 _APP_SERVER_STDOUT_LIMIT_BYTES = 80_000_000
@@ -200,6 +202,8 @@ class _ToolTurnBudget:
     event_message_read: bool = False
     follow_up_message_ids: set[str] = field(default_factory=set)
     read_follow_up_message_ids: set[str] = field(default_factory=set)
+    follow_up_evidence_calls_remaining: int = 0
+    follow_up_evidence_output_characters_remaining: int = 0
     last_progress: AgentProgressStage | None = None
     last_progress_activity_at: float = 0.0
     write_successes: set[str] = field(default_factory=set)
@@ -237,6 +241,8 @@ class _ToolTraceState:
     authorization_reference_id: str | None
     calls_remaining_before: int | None
     output_characters_before: int | None
+    follow_up_evidence_calls_before: int | None
+    follow_up_evidence_output_characters_before: int | None
     started_at: float
     outcome: str = "failed"
     error_code: str | None = "agent.tool_handler_interrupted"
@@ -287,6 +293,12 @@ def _continuation_tool_budget(
         follow_up_message_ids=(set(source.follow_up_message_ids) if source is not None else set()),
         read_follow_up_message_ids=(
             set(source.read_follow_up_message_ids) if source is not None else set()
+        ),
+        follow_up_evidence_calls_remaining=(
+            source.follow_up_evidence_calls_remaining if source is not None else 0
+        ),
+        follow_up_evidence_output_characters_remaining=(
+            source.follow_up_evidence_output_characters_remaining if source is not None else 0
         ),
         last_progress=(source.last_progress if source is not None else None),
         last_progress_activity_at=(source.last_progress_activity_at if source is not None else 0.0),
@@ -798,9 +810,7 @@ class CodexAppServerProvider:
                     output_characters_remaining=self.max_tool_output_characters,
                     on_progress=on_progress,
                     required_message_id=required_message_id,
-                    evidence_anchor_message_id=(
-                        required_message_id if not autonomous else None
-                    ),
+                    evidence_anchor_message_id=(required_message_id if not autonomous else None),
                     last_progress=(
                         AgentProgressStage.STARTING if on_progress is not None else None
                     ),
@@ -1243,8 +1253,37 @@ class CodexAppServerProvider:
         authorization_event_id, provider_prompt = _with_opaque_authorization(event_prompt)
         follow_up_message_id = context.active_message_id
         budget = self._active_tool_budgets.get(thread_id)
-        if budget is not None and follow_up_message_id is not None:
-            budget.follow_up_message_ids.add(follow_up_message_id)
+        if budget is None or follow_up_message_id is None:
+            return False
+        reserve_calls = min(
+            _FOLLOW_UP_EVIDENCE_TOOL_CALLS,
+            self.max_tool_calls,
+        )
+        reserve_output_characters = min(
+            _FOLLOW_UP_EVIDENCE_OUTPUT_CHARACTERS,
+            self.max_tool_output_characters,
+        )
+        if (
+            reserve_calls <= 0
+            or reserve_output_characters < 200
+            or (budget.follow_up_evidence_calls_remaining + reserve_calls > self.max_tool_calls)
+            or (
+                budget.follow_up_evidence_output_characters_remaining + reserve_output_characters
+                > self.max_tool_output_characters
+            )
+        ):
+            log.info(
+                "Agent follow-up routed to a separate turn request=%s reference=%s "
+                "reason=follow_up_evidence_budget_unavailable",
+                context.request_id,
+                budget.context.public_reference_id,
+            )
+            return False
+        previous_reserve_calls = budget.follow_up_evidence_calls_remaining
+        previous_reserve_output_characters = budget.follow_up_evidence_output_characters_remaining
+        budget.follow_up_message_ids.add(follow_up_message_id)
+        budget.follow_up_evidence_calls_remaining += reserve_calls
+        budget.follow_up_evidence_output_characters_remaining += reserve_output_characters
         accepted = False
         try:
             response = await self._request(
@@ -1284,8 +1323,12 @@ class CodexAppServerProvider:
                     watchdog.touch("turn_steered")
             return accepted
         finally:
-            if not accepted and budget is not None and follow_up_message_id is not None:
+            if not accepted:
                 budget.follow_up_message_ids.discard(follow_up_message_id)
+                budget.follow_up_evidence_calls_remaining = previous_reserve_calls
+                budget.follow_up_evidence_output_characters_remaining = (
+                    previous_reserve_output_characters
+                )
 
     async def close(self) -> None:
         async with self._start_lock:
@@ -2064,28 +2107,6 @@ class CodexAppServerProvider:
                 error_code="agent.turn_not_active",
             )
             return
-        if budget.calls_remaining <= 0 or budget.output_characters_remaining < 200:
-            reason = (
-                "The per-turn capability call limit was reached."
-                if budget.calls_remaining <= 0
-                else "The per-turn capability output limit was reached."
-            )
-            await self._traced_tool_response(
-                request_id,
-                trace,
-                success=False,
-                text=_tool_error_json(
-                    code="agent.tool_budget_exhausted",
-                    reason=(
-                        f"{reason} The agent turn remains active and must summarize "
-                        "verified results or ask the user to continue in a new turn."
-                    ),
-                    retryable=False,
-                ),
-                outcome="rejected",
-                error_code="agent.tool_budget_exhausted",
-            )
-            return
         tool_name = raw_params.get("tool")
         namespace = raw_params.get("namespace")
         if not isinstance(tool_name, str):
@@ -2102,6 +2123,62 @@ class CodexAppServerProvider:
             tool_name=tool_name,
             arguments=raw_params.get("arguments"),
         )
+        canonical_tool_name = self.tools.canonical_tool_name_for_call(
+            tool_name=tool_name,
+            arguments=raw_params.get("arguments"),
+        )
+        capability_arguments = self.tools.capability_arguments_for_call(
+            tool_name=tool_name,
+            arguments=raw_params.get("arguments"),
+        )
+        follow_up_evidence_call = _is_follow_up_evidence_call(
+            budget,
+            capability_name=capability_name,
+            canonical_tool_name=canonical_tool_name,
+            capability_arguments=capability_arguments,
+        )
+        available_calls = budget.calls_remaining + (
+            budget.follow_up_evidence_calls_remaining if follow_up_evidence_call else 0
+        )
+        available_output_characters = budget.output_characters_remaining + (
+            budget.follow_up_evidence_output_characters_remaining if follow_up_evidence_call else 0
+        )
+        if available_calls <= 0 or available_output_characters < 200:
+            reason = (
+                "The per-turn capability call limit was reached."
+                if available_calls <= 0
+                else "The per-turn capability output limit was reached."
+            )
+            if (
+                not follow_up_evidence_call
+                and _follow_up_evidence_is_pending(budget)
+                and budget.follow_up_evidence_calls_remaining > 0
+                and budget.follow_up_evidence_output_characters_remaining >= 200
+            ):
+                next_step = (
+                    " Protected evidence budget remains only for reading every "
+                    "accepted follow-up with discord.get_message and then recording "
+                    "turn.evidence_plan; complete those required steps before "
+                    "summarizing."
+                )
+            else:
+                next_step = (
+                    " The agent turn remains active and must summarize verified "
+                    "results or ask the user to continue in a new turn."
+                )
+            await self._traced_tool_response(
+                request_id,
+                trace,
+                success=False,
+                text=_tool_error_json(
+                    code="agent.tool_budget_exhausted",
+                    reason=f"{reason}{next_step}",
+                    retryable=False,
+                ),
+                outcome="rejected",
+                error_code="agent.tool_budget_exhausted",
+            )
+            return
         await self._emit_tool_progress(
             budget,
             tool_name,
@@ -2112,17 +2189,9 @@ class CodexAppServerProvider:
         # per-turn character budget still bounds total retrieved context.
         per_call_budget = min(
             _MAX_TOOL_RESULT_CHARACTERS,
-            budget.output_characters_remaining,
+            available_output_characters,
         )
         write_capability = self.tools.write_capability_for_call(
-            tool_name=tool_name,
-            arguments=raw_params.get("arguments"),
-        )
-        canonical_tool_name = self.tools.canonical_tool_name_for_call(
-            tool_name=tool_name,
-            arguments=raw_params.get("arguments"),
-        )
-        capability_arguments = self.tools.capability_arguments_for_call(
             tool_name=tool_name,
             arguments=raw_params.get("arguments"),
         )
@@ -2286,11 +2355,14 @@ class CodexAppServerProvider:
         def consume_validated_call() -> None:
             """Charge only a call whose complete request will reach its handler."""
 
-            if budget.calls_remaining <= 0:
+            if budget.calls_remaining > 0:
+                budget.calls_remaining -= 1
+            elif follow_up_evidence_call and budget.follow_up_evidence_calls_remaining > 0:
+                budget.follow_up_evidence_calls_remaining -= 1
+            else:
                 raise AgentToolError(
                     "The per-turn capability call limit was reached before invocation."
                 )
-            budget.calls_remaining -= 1
             if write_capability is not None:
                 budget.write_attempts.add(write_capability)
 
@@ -2360,7 +2432,11 @@ class CodexAppServerProvider:
                 ):
                     budget.read_follow_up_message_ids.add(message_id)
                     _mark_authorization_message_read(budget, message_id)
-            budget.output_characters_remaining -= len(output)
+            _consume_tool_output_characters(
+                budget,
+                len(output),
+                allow_follow_up_evidence=follow_up_evidence_call,
+            )
             if capability_name == "turn.evidence_plan" and isinstance(capability_arguments, dict):
                 budget.evidence_plan_recorded = True
                 requested_execution_model = capability_arguments.get("execution_model")
@@ -2381,6 +2457,9 @@ class CodexAppServerProvider:
                 budget.source_inspection_required = (
                     capability_arguments.get("source_inspection") == "required"
                 )
+                if not (budget.follow_up_message_ids - budget.read_follow_up_message_ids):
+                    budget.follow_up_evidence_calls_remaining = 0
+                    budget.follow_up_evidence_output_characters_remaining = 0
             if capability_name in {"source.read", "source.search"}:
                 budget.source_inspection_satisfied = True
             if _tool_read_anchored_conversation_context(
@@ -2601,6 +2680,14 @@ class CodexAppServerProvider:
             output_characters_before=(
                 budget.output_characters_remaining if budget is not None else None
             ),
+            follow_up_evidence_calls_before=(
+                budget.follow_up_evidence_calls_remaining if budget is not None else None
+            ),
+            follow_up_evidence_output_characters_before=(
+                budget.follow_up_evidence_output_characters_remaining
+                if budget is not None
+                else None
+            ),
             started_at=monotonic(),
         )
 
@@ -2654,6 +2741,10 @@ class CodexAppServerProvider:
             "authorization_reference_id": trace.authorization_reference_id,
             "calls_remaining_before": trace.calls_remaining_before,
             "output_characters_before": trace.output_characters_before,
+            "follow_up_evidence_calls_before": (trace.follow_up_evidence_calls_before),
+            "follow_up_evidence_output_characters_before": (
+                trace.follow_up_evidence_output_characters_before
+            ),
         }
         if kind == "agent.tool.finished":
             budget = trace.budget
@@ -2664,6 +2755,14 @@ class CodexAppServerProvider:
                     ),
                     "output_characters_after": (
                         budget.output_characters_remaining if budget is not None else None
+                    ),
+                    "follow_up_evidence_calls_after": (
+                        budget.follow_up_evidence_calls_remaining if budget is not None else None
+                    ),
+                    "follow_up_evidence_output_characters_after": (
+                        budget.follow_up_evidence_output_characters_remaining
+                        if budget is not None
+                        else None
                     ),
                     "outcome": trace.outcome,
                     "error_code": trace.error_code,
@@ -2991,6 +3090,58 @@ def _is_final_delivery(
         and isinstance(arguments, dict)
         and arguments.get("purpose") == "final"
     )
+
+
+def _is_follow_up_evidence_call(
+    budget: _ToolTurnBudget,
+    *,
+    capability_name: str | None,
+    canonical_tool_name: str,
+    capability_arguments: object,
+) -> bool:
+    """Limit the protected budget to evidence required by an accepted follow-up."""
+
+    unread_follow_ups = budget.follow_up_message_ids - budget.read_follow_up_message_ids
+    if (
+        canonical_tool_name == "discord_get_message"
+        and isinstance(capability_arguments, dict)
+        and capability_arguments.get("message_id") in unread_follow_ups
+    ):
+        return True
+    return (
+        capability_name == "turn.evidence_plan"
+        and budget.evidence_anchor_message_id in budget.follow_up_message_ids
+        and not budget.evidence_plan_recorded
+    )
+
+
+def _follow_up_evidence_is_pending(budget: _ToolTurnBudget) -> bool:
+    return bool(budget.follow_up_message_ids - budget.read_follow_up_message_ids) or (
+        budget.evidence_anchor_message_id in budget.follow_up_message_ids
+        and not budget.evidence_plan_recorded
+    )
+
+
+def _consume_tool_output_characters(
+    budget: _ToolTurnBudget,
+    characters: int,
+    *,
+    allow_follow_up_evidence: bool,
+) -> None:
+    """Charge normal output first and use protected follow-up evidence only if allowed."""
+
+    normal_characters = min(characters, budget.output_characters_remaining)
+    budget.output_characters_remaining -= normal_characters
+    remaining = characters - normal_characters
+    if allow_follow_up_evidence:
+        evidence_characters = min(
+            remaining,
+            budget.follow_up_evidence_output_characters_remaining,
+        )
+        budget.follow_up_evidence_output_characters_remaining -= evidence_characters
+        remaining -= evidence_characters
+    if remaining:
+        raise AgentToolError("The capability output exceeded its validated per-turn budget.")
 
 
 def _write_readiness_failure_reason(

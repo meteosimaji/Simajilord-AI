@@ -86,6 +86,41 @@ class ReadResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class FollowUpMessageRequest:
+    channel_id: str
+    message_id: str
+    offset: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpMessageResponse:
+    message_id: str
+    content_chunk: str
+    content_length: int
+    offset: int
+    next_offset: int | None
+    complete: bool
+    edited_at_iso: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpEvidencePlanRequest:
+    execution_model: Literal["primary", "escalation"]
+    conversation_context: Literal["required", "not_required"]
+    source_inspection: Literal["required", "not_required"]
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpEvidencePlanResponse:
+    execution_model: Literal["primary", "escalation"]
+    conversation_context: Literal["required", "not_required"]
+    source_inspection: Literal["required", "not_required"]
+    reason: str
+    recorded: bool
+
+
+@dataclass(frozen=True, slots=True)
 class WriteRequest:
     subject: str
 
@@ -533,6 +568,8 @@ def test_continuation_budget_preserves_cumulative_write_and_delivery_state() -> 
         event_message_read=True,
         follow_up_message_ids={"follow-up"},
         read_follow_up_message_ids={"follow-up"},
+        follow_up_evidence_calls_remaining=2,
+        follow_up_evidence_output_characters_remaining=700,
         write_successes={"discord.send_message"},
         write_failures=[("discord.speak", "audio.not_connected")],
         write_attempts={"discord.send_message", "discord.speak"},
@@ -554,6 +591,8 @@ def test_continuation_budget_preserves_cumulative_write_and_delivery_state() -> 
     assert continued.event_message_read is True
     assert continued.follow_up_message_ids == {"follow-up"}
     assert continued.read_follow_up_message_ids == {"follow-up"}
+    assert continued.follow_up_evidence_calls_remaining == 2
+    assert continued.follow_up_evidence_output_characters_remaining == 700
     assert continued.write_successes == {"discord.send_message"}
     assert continued.write_failures == [("discord.speak", "audio.not_connected")]
     assert continued.write_attempts == {"discord.send_message", "discord.speak"}
@@ -5594,8 +5633,180 @@ async def test_provider_steers_active_turn_and_requires_follow_up_read(
     assert budget.context == context
     assert budget.follow_up_message_ids == {"follow-up"}
     assert budget.read_follow_up_message_ids == set()
+    assert budget.follow_up_evidence_calls_remaining == 3
+    assert budget.follow_up_evidence_output_characters_remaining == 4_000
     assert budget.authorization_contexts["auth_follow-up-token"] == context
     assert budget.authorization_message_ids["auth_follow-up-token"] == ("follow-up")
+
+
+@pytest.mark.asyncio
+async def test_provider_reserves_exact_read_budget_for_late_follow_up(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def get_message(
+        request: FollowUpMessageRequest,
+        _: InvocationContext,
+    ) -> FollowUpMessageResponse:
+        content = "その後即キックして"
+        return FollowUpMessageResponse(
+            message_id=request.message_id,
+            content_chunk=content,
+            content_length=len(content),
+            offset=request.offset,
+            next_offset=None,
+            complete=True,
+            edited_at_iso=None,
+        )
+
+    async def evidence_plan(
+        request: FollowUpEvidencePlanRequest,
+        _: InvocationContext,
+    ) -> FollowUpEvidencePlanResponse:
+        return FollowUpEvidencePlanResponse(
+            execution_model=request.execution_model,
+            conversation_context=request.conversation_context,
+            source_inspection=request.source_inspection,
+            reason=request.reason,
+            recorded=True,
+        )
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.get_message",
+                summary="Read one exact Discord message.",
+                risk=RiskLevel.READ,
+            ),
+            FollowUpMessageRequest,
+            FollowUpMessageResponse,
+            get_message,
+        )
+    )
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                name="turn.evidence_plan",
+                summary="Record a semantic evidence plan.",
+                risk=RiskLevel.READ,
+            ),
+            FollowUpEvidencePlanRequest,
+            FollowUpEvidencePlanResponse,
+            evidence_plan,
+        )
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-follow-up-budget",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(
+            registry,
+            ("discord.get_message", "turn.evidence_plan"),
+        ),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    original_context = InvocationContext(
+        actor_id="original-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:original",
+        origin_resource_id="channel",
+    )
+    follow_up_context = replace(
+        original_context,
+        actor_id="follow-up-user",
+        request_id="discord:message:follow-up",
+        active_message_id="follow-up",
+    )
+    budget = _ToolTurnBudget(
+        context=original_context,
+        calls_remaining=0,
+        output_characters_remaining=129,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+    )
+    provider._active_routes[("guild", "channel")] = (
+        "thread",
+        "turn",
+        "original-user",
+    )
+    provider._active_tool_budgets["thread"] = budget
+    monkeypatch.setattr(
+        provider,
+        "_request",
+        AsyncMock(return_value={"turnId": "turn"}),
+    )
+    tool_response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", tool_response)
+
+    assert (
+        await provider.steer(
+            event_prompt="SIMAJILORD_FOLLOW_UP_V1\nmessage_id=follow-up",
+            context=follow_up_context,
+        )
+        is True
+    )
+    assert budget.follow_up_evidence_calls_remaining == 3
+    assert budget.follow_up_evidence_output_characters_remaining == 4_000
+
+    await provider._handle_dynamic_tool(
+        "search-without-normal-budget",
+        {
+            "namespace": "simajilord",
+            "tool": "capability_search",
+            "arguments": {"query": "server bot invitation"},
+            "threadId": "thread",
+        },
+    )
+    rejected = json.loads(tool_response.await_args.kwargs["text"])
+    assert rejected["error"]["code"] == "agent.tool_budget_exhausted"
+    assert "Protected evidence budget remains" in rejected["error"]["reason"]
+    assert "discord.get_message" in rejected["error"]["reason"]
+    assert budget.follow_up_evidence_calls_remaining == 3
+    assert budget.follow_up_evidence_output_characters_remaining == 4_000
+
+    await provider._handle_dynamic_tool(
+        "read-follow-up",
+        {
+            "namespace": "simajilord",
+            "tool": "discord_get_message",
+            "arguments": {
+                "channel_id": "channel",
+                "message_id": "follow-up",
+            },
+            "threadId": "thread",
+        },
+    )
+    assert tool_response.await_args.kwargs["success"] is True
+    assert budget.read_follow_up_message_ids == {"follow-up"}
+    assert budget.output_characters_remaining == 0
+    assert budget.follow_up_evidence_calls_remaining == 2
+    assert budget.follow_up_evidence_output_characters_remaining < 4_000
+
+    await provider._handle_dynamic_tool(
+        "plan-follow-up",
+        {
+            "namespace": "simajilord",
+            "tool": "turn_evidence_plan",
+            "arguments": {
+                "execution_model": "primary",
+                "conversation_context": "not_required",
+                "source_inspection": "not_required",
+                "reason": "The follow-up is fully read.",
+            },
+            "threadId": "thread",
+        },
+    )
+    assert tool_response.await_args.kwargs["success"] is True
+    assert budget.evidence_plan_recorded is True
+    assert budget.follow_up_evidence_calls_remaining == 0
+    assert budget.follow_up_evidence_output_characters_remaining == 0
 
 
 @pytest.mark.asyncio
@@ -5649,6 +5860,64 @@ async def test_provider_does_not_require_a_rejected_follow_up_read(
 
     assert accepted is False
     assert budget.follow_up_message_ids == set()
+    assert budget.follow_up_evidence_calls_remaining == 0
+    assert budget.follow_up_evidence_output_characters_remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_routes_follow_up_separately_when_evidence_reserve_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-follow-up-fallback",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    context = InvocationContext(
+        actor_id="follow-up-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:second-follow-up",
+        origin_resource_id="channel",
+        active_message_id="second-follow-up",
+        agent_trigger="mention",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=0,
+        output_characters_remaining=129,
+        on_progress=None,
+        required_message_id="original",
+        event_message_read=True,
+        follow_up_message_ids={"first-follow-up"},
+        follow_up_evidence_calls_remaining=3,
+        follow_up_evidence_output_characters_remaining=4_000,
+    )
+    provider._active_routes[("guild", "channel")] = (
+        "thread",
+        "turn",
+        "original-user",
+    )
+    provider._active_tool_budgets["thread"] = budget
+    request = AsyncMock()
+    monkeypatch.setattr(provider, "_request", request)
+
+    accepted = await provider.steer(
+        event_prompt="SIMAJILORD_FOLLOW_UP_V1\nmessage_id=second-follow-up",
+        context=context,
+    )
+
+    assert accepted is False
+    request.assert_not_awaited()
+    assert budget.follow_up_message_ids == {"first-follow-up"}
+    assert budget.follow_up_evidence_calls_remaining == 3
+    assert budget.follow_up_evidence_output_characters_remaining == 4_000
 
 
 def test_base_instructions_are_short_and_use_runtime_identity() -> None:
