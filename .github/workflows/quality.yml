@@ -70,12 +70,27 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --all-groups
       - name: Build the on-device Translation helper
-        run: swift build --package-path native/macos/TranslationHelper -c release
+        run: |
+          swift build --package-path native/macos/TranslationHelper -c release
+          chmod 700 native/macos/TranslationHelper/.build/release/TranslationHelper
       - name: Smoke-test local language detection
         run: |
           printf '%s\n' '{"operation":"detect","text":"おはようございます"}' \
             | native/macos/TranslationHelper/.build/release/TranslationHelper \
             | python -c 'import json,sys; data=json.load(sys.stdin); assert data["ok"]'
+      - name: Smoke-test Translation helper resolution from an installed wheel
+        run: |
+          uv build
+          python -m venv "$RUNNER_TEMP/simajilord-wheel-smoke"
+          "$RUNNER_TEMP/simajilord-wheel-smoke/bin/pip" install dist/*.whl
+          TRANSLATION_HELPER_PATH="$PWD/native/macos/TranslationHelper/.build/release/TranslationHelper" \
+            "$RUNNER_TEMP/simajilord-wheel-smoke/bin/simajilord-translation-doctor" --json
+          if env -u TRANSLATION_HELPER_PATH \
+            "$RUNNER_TEMP/simajilord-wheel-smoke/bin/simajilord-translation-doctor" --json
+          then
+            echo "Installed wheel unexpectedly resolved a source checkout helper."
+            exit 1
+          fi
       - name: macOS integration tests
         run: uv run pytest -q tests/test_translation.py tests/test_discord_audio.py
       - name: Offline Discord preview
