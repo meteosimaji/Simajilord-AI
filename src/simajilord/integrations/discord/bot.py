@@ -151,6 +151,13 @@ class SimajilordDiscordBot(commands.Bot):
             self.user.id,
             len(self.guilds),
         )
+        if self.runtime.agent is not None:
+            log.info(
+                "Agent runtime profile model=%s escalation_model=%s effort=%s",
+                self.runtime.settings.agent_model,
+                self.runtime.settings.agent_escalation_model,
+                self.runtime.settings.agent_reasoning_effort,
+            )
         if not self._audio_restored:
             await self._restore_audio_sessions()
             await self._prepare_read_aloud_presence()
