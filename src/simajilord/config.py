@@ -816,7 +816,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         agent_max_response_characters=_bounded_int(
             "AGENT_MAX_RESPONSE_CHARACTERS",
-            3_800,
+            7_600,
             minimum=200,
             maximum=8_000,
         ),

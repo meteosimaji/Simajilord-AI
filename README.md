@@ -37,6 +37,11 @@ operational feedback such as command success, validation, and permission errors.
 generates conversational text and chooses `discord.send_message` separately.
 Agent replies match the depth of the request: concise wording removes filler, but substantive
 questions still receive a direct answer, reasoning, context, and important limitations.
+Before every turn and accepted follow-up, the host declares the exact total response-character
+budget and Discord's safe per-message boundary. The agent chooses whether one host reply, semantic
+multi-message breaks, a plain post, selected-message reply, authorized channel, embed, file, DM,
+or VC speech best fits the task. Transport-side splitting remains only a final Discord safety net;
+an over-budget provider response is logged explicitly instead of being an invisible truncation.
 Explicit human commands use compact English embeds with useful result fields and a Discord
 timestamp; implementation labels and decorative footer text are intentionally omitted.
 Unexpected command errors show the same reference ID that is recorded in the host log, so a

@@ -27,6 +27,7 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_TIMEOUT_SECONDS",
     "AGENT_MAX_TOOL_CALLS",
     "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
+    "AGENT_MAX_RESPONSE_CHARACTERS",
     "AGENT_MAX_PENDING_TURNS",
     "MAX_ACTIVE_AGENT_TURNS",
     "MAX_PENDING_AGENT_TURNS",
@@ -118,6 +119,7 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_idle_timeout_seconds == 600
     assert settings.agent_max_tool_calls == 32
     assert settings.agent_max_tool_output_characters == 24_000
+    assert settings.agent_max_response_characters == 7_600
     assert settings.agent_max_active_turns == 4
     assert settings.agent_max_pending_turns == 20
     assert settings.agent_max_pending_turns_per_user == 2
@@ -138,6 +140,7 @@ def test_gateway_privileged_intents_are_explicit_opt_ins(
     defaults = load_settings(dotenv_path=dotenv_path)
     default_intents = _gateway_intents(defaults)
 
+    assert defaults.agent_max_response_characters == 7_600
     assert default_intents.message_content is True
     assert default_intents.members is False
     assert default_intents.presences is False

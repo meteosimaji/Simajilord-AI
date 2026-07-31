@@ -683,6 +683,11 @@ async def test_agent_event_uses_pointer_only_and_reuses_thread(tmp_path) -> None
     assert provider.calls[1][0] == "thread-1"
     assert "message_id=4" in provider.calls[0][1]
     assert "No message body is included" in provider.calls[0][1]
+    assert "response_character_budget=3800" in provider.calls[0][1]
+    assert "discord_safe_message_characters=1900" in provider.calls[0][1]
+    assert "<simajilord:message-break> alone between messages" in provider.calls[0][1]
+    assert "Host reply is convenient, not mandatory" in provider.calls[0][1]
+    assert "never leave a clipped ending" in provider.calls[0][1]
 
 
 @pytest.mark.asyncio
@@ -1228,6 +1233,9 @@ async def test_agent_steers_same_channel_follow_up_with_distinct_actor_identity(
     assert "actor_id=different-user" in prompt
     assert "same_actor_as_original=false" in prompt
     assert "message_id=follow-up-message" in prompt
+    assert "response_character_budget=3800" in prompt
+    assert "discord_safe_message_characters=1900" in prompt
+    assert "never leave a clipped ending" in prompt
     assert context.actor_id == "different-user"
     assert context.grants == original.grants
 
@@ -2266,6 +2274,7 @@ async def test_agent_preserves_provider_thread_without_preemptive_rotation(
 def test_event_prompt_marks_saved_thread_recovery_without_inventing_context() -> None:
     prompt = _event_prompt(
         _request(),
+        max_response_characters=3_800,
         continuity_reset_reason="saved_thread_unavailable",
     )
 
@@ -5011,10 +5020,13 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
     assert "not minimizing substance" in normalized
     assert "one reactive sentence is usually insufficient" in normalized
     assert "address the concrete weakness and improve it" in instructions
-    assert "The host already shows routine progress" in instructions
+    assert "The host shows routine progress" in instructions
     assert "purpose=requested_action" in instructions
     assert "purpose=final" in instructions
-    assert "the host replies to the trigger" in normalized
+    assert "A host reply is simplest for ordinary conversation" in normalized
+    assert "it is not mandatory" in normalized
+    assert "plain post, selected-message reply, authorized channel" in normalized
+    assert "choose semantic message boundaries" in normalized
     assert AGENT_FINAL_DELIVERED_CONTENT in instructions
     assert "<simajilord:no-action>" in instructions
     assert "Codex web search" in instructions

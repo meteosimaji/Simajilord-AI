@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -13,8 +14,10 @@ from simajilord.core import InvocationContext
 from simajilord.observability import EventJournal
 
 from .contracts import (
+    AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
     AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_MEMORY_GRANT,
+    AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
     AgentProgressStage,
     AgentProgressUpdate,
@@ -37,6 +40,8 @@ from .providers import (
     SteerableAgentProvider,
 )
 from .store import AgentConversationStore
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +158,7 @@ class AgentService:
                         provider_thread_id=provider_thread_id,
                         event_prompt=_event_prompt(
                             request,
+                            max_response_characters=self.limits.max_response_characters,
                             continuity_reset_reason=continuity_reset_reason,
                             memory_context=memory_context,
                         ),
@@ -165,6 +171,7 @@ class AgentService:
                         provider_thread_id=None,
                         event_prompt=_event_prompt(
                             request,
+                            max_response_characters=self.limits.max_response_characters,
                             continuity_reset_reason="saved_thread_unavailable",
                             memory_context=memory_context,
                         ),
@@ -180,10 +187,22 @@ class AgentService:
                                 origin_key,
                                 original_event_id=request.event_id,
                             )
+                provider_content = result.content.strip()
+                response_truncated = (
+                    len(provider_content) > self.limits.max_response_characters
+                )
                 content = _bounded_text(
-                    result.content.strip(),
+                    provider_content,
                     self.limits.max_response_characters,
                 )
+                if response_truncated:
+                    log.warning(
+                        "Agent response exceeded the declared character budget "
+                        "request=%s provider_characters=%d budget=%d",
+                        request.event_id,
+                        len(provider_content),
+                        self.limits.max_response_characters,
+                    )
                 response = AgentResponse(
                     status=AgentResponseStatus.COMPLETED,
                     conversation_id=request.conversation_id,
@@ -203,7 +222,12 @@ class AgentService:
                         "conversation_id": request.conversation_id,
                         "trigger": request.trigger.value,
                         "model": result.model,
+                        "provider_response_characters": len(provider_content),
                         "response_characters": len(content),
+                        "response_character_budget": (
+                            self.limits.max_response_characters
+                        ),
+                        "response_truncated": response_truncated,
                         "delivery_disposition": (
                             "agent_tool"
                             if content == AGENT_FINAL_DELIVERED_CONTENT
@@ -309,6 +333,7 @@ class AgentService:
                 event_prompt=_follow_up_prompt(
                     request,
                     original_actor_id=original.actor_id,
+                    max_response_characters=self.limits.max_response_characters,
                 ),
                 context=context,
             )
@@ -618,6 +643,7 @@ async def _finish_cleanup(awaitable: Awaitable[None]) -> None:
 def _event_prompt(
     request: AgentRequest,
     *,
+    max_response_characters: int,
     continuity_reset_reason: str | None = None,
     memory_context: tuple[AgentMemoryRecord, ...] = (),
 ) -> str:
@@ -675,6 +701,7 @@ def _event_prompt(
             f"actor_id={request.actor_id}",
             f"actor_name={request.actor_name}",
             f"occurred_at={request.occurred_at.isoformat()}",
+            *_response_delivery_budget(max_response_characters),
             f"batched_event_count={len(event_pointers)}",
             *(f"batched_event={pointer}" for pointer in event_pointers),
             f"requester_memory_count={len(memory_pointers)}",
@@ -721,6 +748,7 @@ def _follow_up_prompt(
     request: AgentRequest,
     *,
     original_actor_id: str,
+    max_response_characters: int,
 ) -> str:
     message_id = request.message_id or "none"
     same_actor = request.actor_id == original_actor_id
@@ -734,6 +762,7 @@ def _follow_up_prompt(
             f"actor_id={request.actor_id}",
             f"actor_name={request.actor_name}",
             f"same_actor_as_original={'true' if same_actor else 'false'}",
+            *_response_delivery_budget(max_response_characters),
             (
                 "A user sent this while the current task was running. Read the exact "
                 "Discord message through the bounded message tool and incorporate it "
@@ -747,6 +776,33 @@ def _follow_up_prompt(
                 "authority."
             ),
         )
+    )
+
+
+def _response_delivery_budget(max_response_characters: int) -> tuple[str, ...]:
+    """Tell the model about the host limits before it chooses a delivery route."""
+
+    return (
+        f"response_character_budget={max_response_characters}",
+        f"discord_safe_message_characters={AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS}",
+        (
+            "Plan the complete answer before writing. The response_character_budget is "
+            "a hard total for final text returned to the host, including message-break "
+            "markers. Finish every section and sentence within it; prefer a concise complete "
+            "answer over text the host must truncate."
+        ),
+        (
+            f"Aim for one message when it fits. For a meaningfully longer answer, choose "
+            f"semantic boundaries and place {AGENT_MESSAGE_BREAK} alone between messages. "
+            "The host's technical Discord splitting is only a safety fallback."
+        ),
+        (
+            "Choose the final delivery route deliberately from the capabilities actually "
+            "shown: host reply, plain post, reply to a selected message, another authorized "
+            "channel, embed, file, DM, or VC speech. Host reply is convenient, not mandatory. "
+            "If the answer cannot fit the response budget, use suitable final-delivery tools "
+            "for multiple purposeful messages or a file; never leave a clipped ending."
+        ),
     )
 
 

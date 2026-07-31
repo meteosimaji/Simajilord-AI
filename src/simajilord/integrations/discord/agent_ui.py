@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 import discord
 
 from simajilord.agent import (
+    AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
     AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
@@ -31,7 +32,7 @@ log = logging.getLogger(__name__)
 def discord_message_chunks(
     content: str,
     *,
-    maximum: int = 1_900,
+    maximum: int = AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
 ) -> tuple[str, ...]:
     """Bound Discord output without asking the model to repeat a long answer."""
 
