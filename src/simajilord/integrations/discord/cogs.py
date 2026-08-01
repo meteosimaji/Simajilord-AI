@@ -5648,6 +5648,7 @@ _HIVE_SOURCE_LABELS = {
     "gemini3": "Gemini 3",
     "glide": "GLIDE",
     "gptimage1_5": "GPT Image 1.5",
+    "gptimage2": "GPT Image 2",
     "grok": "Grok",
     "grokimagine": "Grok Imagine",
     "haiper": "Haiper",
@@ -8354,6 +8355,15 @@ async def _record_agent_host_posts(
         return False
 
 
+def _agent_response_uses_host_delivery(content: str) -> bool:
+    """Return false for responses already delivered by a tool or intentionally silent."""
+
+    return content.strip() not in {
+        AGENT_FINAL_DELIVERED_CONTENT,
+        AGENT_NO_ACTION_CONTENT,
+    }
+
+
 class AgentCog(commands.Cog):
     """Wake one shared agent conversation only for explicit mentions."""
 
@@ -8561,10 +8571,16 @@ class AgentCog(commands.Cog):
                 request.event_id
             )
             if pending is None:
-                log.error(
-                    "Completed agent turn has no pending host record request=%s",
-                    request.event_id,
-                )
+                if _agent_response_uses_host_delivery(response.content):
+                    log.error(
+                        "Completed agent turn has no pending host record request=%s",
+                        request.event_id,
+                    )
+                else:
+                    log.debug(
+                        "Agent turn requires no host delivery request=%s",
+                        request.event_id,
+                    )
             else:
                 try:
                     await self._deliver_host_response(

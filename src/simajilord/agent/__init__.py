@@ -97,6 +97,7 @@ from .memory import (
 )
 from .workflows import (
     CuratedWorkflow,
+    CuratedWorkflowCatalogItem,
     CuratedWorkflowSearchRequest,
     CuratedWorkflowSearchResponse,
     CuratedWorkflowStep,
@@ -185,6 +186,7 @@ __all__ = [
     "AutonomyLeaseLostError",
     "AutonomyQueuedEvent",
     "CuratedWorkflow",
+    "CuratedWorkflowCatalogItem",
     "CuratedWorkflowSearchRequest",
     "CuratedWorkflowSearchResponse",
     "CuratedWorkflowStep",

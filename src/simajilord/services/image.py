@@ -21,6 +21,7 @@ from simajilord.core.errors import ProviderError, UserError
 from simajilord.domain.image import (
     ImageAspectRatio,
     ImageGenerationJob,
+    ImageGenerationModel,
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
@@ -418,7 +419,7 @@ class ImageGenerationStore:
                     progress_total INTEGER NOT NULL DEFAULT 12,
                     delivery_message_id TEXT,
                     delivered INTEGER NOT NULL DEFAULT 0,
-                    auto_deliver INTEGER NOT NULL DEFAULT 1,
+                    auto_deliver INTEGER NOT NULL DEFAULT 0,
                     handoff_completed INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS image_jobs_status_created
@@ -459,7 +460,7 @@ class ImageGenerationStore:
             if "auto_deliver" not in columns:
                 connection.execute(
                     "ALTER TABLE image_generation_jobs "
-                    "ADD COLUMN auto_deliver INTEGER NOT NULL DEFAULT 1"
+                    "ADD COLUMN auto_deliver INTEGER NOT NULL DEFAULT 0"
                 )
             if "handoff_completed" not in columns:
                 connection.execute(
@@ -576,7 +577,7 @@ class ImageGenerationService:
         delivery_target_id: str,
         reply_to_message_id: str | None,
         prompt: ImageGenerationPrompt,
-        auto_deliver: bool = True,
+        auto_deliver: bool = False,
         idempotency_key: str | None = None,
     ) -> ImageGenerationJob:
         job_id = (
@@ -749,6 +750,7 @@ class ImageGenerationService:
                     width=job.width,
                     height=job.height,
                     seed=job.seed,
+                    model=job.prompt.model,
                     on_progress=self._progress_callback(job.job_id),
                 )
                 terminal = await asyncio.to_thread(
@@ -968,6 +970,7 @@ def build_image_brief(prompt: ImageGenerationPrompt) -> str:
         "avoid": prompt.avoid.strip(),
         "rendering": prompt.rendering.value,
         "aspect_ratio": prompt.aspect_ratio.value,
+        "model": prompt.model.value,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
@@ -1028,6 +1031,7 @@ def _job_values(job: ImageGenerationJob) -> tuple[object, ...]:
             **asdict(job.prompt),
             "aspect_ratio": job.prompt.aspect_ratio.value,
             "rendering": job.prompt.rendering.value,
+            "model": job.prompt.model.value,
         },
         ensure_ascii=False,
     )
@@ -1071,6 +1075,9 @@ def _row_job(row: sqlite3.Row) -> ImageGenerationJob:
         aspect_ratio=ImageAspectRatio(str(raw["aspect_ratio"])),
         rendering=ImageRendering(str(raw["rendering"])),
         seed=int(raw["seed"]) if raw.get("seed") is not None else None,
+        model=ImageGenerationModel(
+            str(raw.get("model", ImageGenerationModel.GPT_IMAGE_2.value))
+        ),
     )
     output = row["output_path"]
     return ImageGenerationJob(

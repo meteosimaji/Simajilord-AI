@@ -111,6 +111,8 @@ def test_agent_and_image_queue_share_the_primary_codex_provider(
         assert isinstance(runtime.image.provider, SharedCodexImageProvider)
         assert runtime.image.provider._provider is runtime.agent.provider
         assert runtime.agent.provider.allow_image_generation is True
+        assert runtime.agent.provider.max_tool_calls is None
+        assert runtime.agent.provider.max_tool_output_characters is None
         assert runtime.agent.provider.image_timeout_seconds == (
             settings.image_timeout_seconds
         )

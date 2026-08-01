@@ -30,7 +30,7 @@ from simajilord.providers.image.codex import (
 def _provider(tmp_path: Path) -> CodexImageProvider:
     return CodexImageProvider(
         executable="codex",
-        model="gpt-5.6-sol",
+        model="gpt-5.6-luna",
         workspace_dir=tmp_path / "workspace",
         timeout_seconds=60,
     )
@@ -39,7 +39,8 @@ def _provider(tmp_path: Path) -> CodexImageProvider:
 def _primary_provider(tmp_path: Path) -> CodexAppServerProvider:
     return CodexAppServerProvider(
         executable="codex",
-        model="gpt-5.6-sol",
+        model="gpt-5.6-luna",
+        escalation_model="gpt-5.6-terra",
         workspace_dir=tmp_path / "agent-workspace",
         idle_timeout_seconds=60,
         reasoning_effort="medium",
@@ -78,13 +79,14 @@ def test_codex_image_prompt_preserves_brief_and_requested_shape() -> None:
     )
 
     assert "exactly one image" in prompt
+    assert prompt.startswith("$imagegen\n")
     assert "landscape (768:512 target ratio)" in prompt
     assert '"subject":"one cat"' in prompt
     assert '"avoid":"text"' in prompt
 
 
 @pytest.mark.asyncio
-async def test_fallback_image_thread_uses_stable_history_mode(
+async def test_standalone_image_thread_uses_stable_history_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -99,6 +101,8 @@ async def test_fallback_image_thread_uses_stable_history_mode(
     assert method == "thread/start"
     assert params["ephemeral"] is True
     assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
+    assert params["model"] == "gpt-5.6-luna"
+    assert params["allowProviderModelFallback"] is False
 
 
 def test_codex_image_imports_only_from_generated_directory(
@@ -312,6 +316,81 @@ async def test_primary_image_inactivity_resets_shared_runtime_without_retry(
 
 
 @pytest.mark.asyncio
+async def test_primary_image_generation_uses_luna_orchestrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _primary_provider(tmp_path)
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    request = AsyncMock(
+        side_effect=[
+            {"thread": {"id": "image-thread"}},
+            {"turn": {"id": "image-turn"}},
+        ]
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(
+        provider,
+        "_await_generated_image",
+        AsyncMock(side_effect=TimeoutError),
+    )
+    monkeypatch.setattr(provider, "_interrupt_quietly", AsyncMock())
+    monkeypatch.setattr(provider, "_reset_after_runtime_failure", AsyncMock(return_value=True))
+
+    with pytest.raises(TimeoutError):
+        await provider.generate_image(
+            brief_json='{"subject":"one dog"}',
+            destination=tmp_path / "image.png",
+            width=512,
+            height=512,
+            seed=1,
+        )
+
+    assert request.await_args_list[0].args[1]["model"] == "gpt-5.6-luna"
+    assert request.await_args_list[1].args[1]["model"] == "gpt-5.6-luna"
+
+
+@pytest.mark.asyncio
+async def test_primary_image_generation_does_not_switch_models_when_image_tool_is_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _primary_provider(tmp_path)
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    request = AsyncMock(
+        side_effect=[
+            {"thread": {"id": "image-thread"}},
+            {"turn": {"id": "image-turn"}},
+        ]
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(
+        provider,
+        "_await_generated_image",
+        AsyncMock(side_effect=ProviderError("$imagegen did not start.")),
+    )
+    monkeypatch.setattr(provider, "_interrupt_quietly", AsyncMock())
+    monkeypatch.setattr(
+        provider,
+        "_reset_after_runtime_failure",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(ProviderError, match="did not start"):
+        await provider.generate_image(
+            brief_json='{"subject":"one dog"}',
+            destination=tmp_path / "image.png",
+            width=512,
+            height=512,
+            seed=1,
+        )
+
+    requested_models = [call.args[1]["model"] for call in request.await_args_list]
+    assert requested_models == ["gpt-5.6-luna", "gpt-5.6-luna"]
+    assert request.await_args_list[0].args[1]["allowProviderModelFallback"] is False
+
+
+@pytest.mark.asyncio
 async def test_codex_image_reports_turn_without_generated_file(
     tmp_path: Path,
 ) -> None:
@@ -327,5 +406,5 @@ async def test_codex_image_reports_turn_without_generated_file(
         )
     )
 
-    with pytest.raises(ProviderError, match="without generating an image file"):
+    with pytest.raises(ProviderError, match="without starting image generation"):
         await provider._await_image("thread", "turn", on_progress=None)

@@ -17,6 +17,7 @@ from typing import Any
 from PIL import Image
 
 from simajilord.core.errors import ProviderError
+from simajilord.domain.image import ImageGenerationModel
 from simajilord.providers.codex_features import (
     CODEX_THREAD_HISTORY_MODE,
     codex_feature_arguments,
@@ -65,9 +66,12 @@ class CodexImageProvider:
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel = ImageGenerationModel.GPT_IMAGE_2,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult:
         del seed  # The hosted Codex image tool does not expose deterministic seeds.
+        if model is not ImageGenerationModel.GPT_IMAGE_2:
+            raise ProviderError("Only gpt-image-2 is supported for image generation.")
         prompt = _image_prompt(brief_json, width=width, height=height)
         started = monotonic()
         async with self._generation_lock:
@@ -187,6 +191,7 @@ class CodexImageProvider:
                 "thread/start",
                 {
                     "model": self.model,
+                    "allowProviderModelFallback": False,
                     "cwd": str(self.workspace_dir),
                     "sandbox": "read-only",
                     "approvalPolicy": "never",
@@ -245,6 +250,8 @@ class CodexImageProvider:
         on_progress: ImageProgressCallback | None,
     ) -> dict[str, object]:
         image_item: dict[str, object] | None = None
+        image_started = False
+        observed_item_types: list[str] = []
         while True:
             method, params = await self._notifications.get()
             if _optional_text(params.get("threadId")) not in {None, thread_id}:
@@ -253,7 +260,10 @@ class CodexImageProvider:
             if notification_turn_id not in {None, turn_id}:
                 continue
             item = params.get("item")
+            if isinstance(item, dict) and isinstance(item.get("type"), str):
+                observed_item_types.append(str(item["type"]))
             if method == "item/started" and _is_image_item(item):
+                image_started = True
                 if on_progress is not None:
                     await on_progress(3, 12)
                 continue
@@ -271,7 +281,16 @@ class CodexImageProvider:
             if image_item is None:
                 image_item = _image_item_from_turn(turn.get("items"))
             if image_item is None:
-                raise ProviderError("Codex completed without generating an image file.")
+                observed = ", ".join(observed_item_types[-12:]) or "none"
+                if not image_started:
+                    raise ProviderError(
+                        "The explicit $imagegen execution completed without starting "
+                        f"image generation; observed item types: {observed}."
+                    )
+                raise ProviderError(
+                    "Codex completed after starting image generation but without "
+                    f"returning an image file; observed item types: {observed}."
+                )
             status = _optional_text(image_item.get("status"))
             if status is not None and status.casefold() in {
                 "failed",
@@ -432,6 +451,7 @@ def _image_prompt(brief_json: str, *, width: int, height: int) -> str:
         else ("landscape" if width > height else "portrait")
     )
     return (
+        "$imagegen\n"
         "Generate exactly one image with the built-in image generation tool.\n"
         f"Requested composition: {aspect} ({width}:{height} target ratio).\n"
         "Treat this JSON as the complete production brief; preserve all positive "

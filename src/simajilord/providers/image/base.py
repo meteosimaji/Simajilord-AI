@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from simajilord.domain.image import ImageGenerationModel
+
 ImageProgressCallback = Callable[[int, int], Awaitable[None]]
 
 
@@ -27,6 +29,7 @@ class ImageGenerationProvider(Protocol):
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult: ...
 

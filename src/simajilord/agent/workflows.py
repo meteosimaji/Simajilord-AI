@@ -52,9 +52,17 @@ class CuratedWorkflow:
 
 
 @dataclass(frozen=True, slots=True)
+class CuratedWorkflowCatalogItem:
+    workflow_id: str
+    summary: str
+
+
+@dataclass(frozen=True, slots=True)
 class CuratedWorkflowSearchResponse:
     query: str
     workflows: tuple[CuratedWorkflow, ...]
+    catalog_index: tuple[CuratedWorkflowCatalogItem, ...]
+    catalog_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +125,14 @@ def build_curated_workflow_endpoint(
         return CuratedWorkflowSearchResponse(
             query=query,
             workflows=tuple(item.workflow for item in matches),
+            catalog_index=tuple(
+                CuratedWorkflowCatalogItem(
+                    workflow_id=item.workflow.workflow_id,
+                    summary=item.workflow.summary,
+                )
+                for item in available
+            ),
+            catalog_complete=True,
         )
 
     return endpoint(
@@ -124,7 +140,9 @@ def build_curated_workflow_endpoint(
             name="workflow.search",
             summary=(
                 "Find a package-owned multi-step workflow for Discord, web/PDF, "
-                "files, media, memory, or reversible actions."
+                "files, media, memory, or reversible actions. Ranked matches are "
+                "lexical hints only; always inspect the complete catalog_index "
+                "semantically, then query the exact workflow_id when needed."
             ),
             risk=RiskLevel.READ,
             keywords=(
@@ -629,12 +647,19 @@ _WORKFLOWS = (
                 _step(
                     3,
                     "discord.send_file",
-                    "Publish the full original only when the user asked to show or post it.",
+                    (
+                        "Decide from the exact request's meaning and conversation context "
+                        "whether publishing the full original fulfils the user's intent; "
+                        "no particular delivery verb is required."
+                    ),
                 ),
             ),
             stop_conditions=(
                 "The terminal result and model-visible preview are available.",
-                "The user asked to hide, compare, describe, or iterate; do not publish.",
+                (
+                    "The request means the result should remain private for comparison or "
+                    "iteration, or privacy or safety risk is unresolved; do not publish."
+                ),
                 "Discord attachment delivery succeeds or returns an exact permission error.",
             ),
         ),

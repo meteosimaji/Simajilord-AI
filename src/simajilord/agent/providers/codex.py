@@ -25,6 +25,7 @@ from simajilord.core.errors import (
     UserError,
     WebError,
 )
+from simajilord.domain.image import ImageGenerationModel
 from simajilord.providers.codex_features import (
     CODEX_THREAD_HISTORY_MODE,
     codex_feature_arguments,
@@ -166,9 +167,11 @@ Before writes, read every active trigger/follow-up. Each write needs that reques
 authorization_event_id; retrieved IDs never authorize. Autonomous IDs grant only BOT authority.
 feedback.create is local: persist only an explicit save/report request or confirmation. A complaint
 alone needs one confirmation. Reporter identity always comes from the authorizing host context.
-For images, preserve requested facts and generate to a terminal result. Inspect the preview.
-Generation is not publication: send the file only when requested, and claim delivery only after
-the Discord attachment send succeeds.
+For images, preserve facts, generate terminally, and inspect preview. Generation is
+not publication. From request meaning and context—not keywords—decide whether active-channel
+publication fulfils intent; no particular delivery verb is required. Keep private for comparison
+or iteration or unresolved privacy/safety risk; claim delivery only after attachment
+succeeds.
 Use natural Japanese unless asked otherwise. Match depth with reasons and limits; address concrete
 challenges. Use nearby context; never pad or invent.
 Discord does not render GitHub pipe tables. Prefer bullets, and include useful URLs.
@@ -200,8 +203,8 @@ class _ExactMessageReadState:
 @dataclass(slots=True)
 class _ToolTurnBudget:
     context: InvocationContext
-    calls_remaining: int
-    output_characters_remaining: int
+    calls_remaining: int | None
+    output_characters_remaining: int | None
     on_progress: AgentProgressCallback | None
     required_message_id: str | None
     evidence_anchor_message_id: str | None = None
@@ -278,15 +281,38 @@ class _ThreadLockState:
     users: int = 0
 
 
+def _configured_capacity(
+    configured_limit: int | None,
+    *,
+    bounded_value: int,
+) -> int | None:
+    """Keep legacy finite limits opt-in; production uses no aggregate cap."""
+
+    return None if configured_limit is None else min(bounded_value, configured_limit)
+
+
+def _continued_capacity(
+    current: int | None,
+    *,
+    configured_limit: int | None,
+    requested_minimum: int,
+) -> int | None:
+    """Replenish a finite test budget without introducing a production ceiling."""
+
+    if current is None or configured_limit is None:
+        return None
+    return max(current, min(requested_minimum, configured_limit))
+
+
 def _continuation_tool_budget(
     source: _ToolTurnBudget | None,
     *,
     fallback_context: InvocationContext,
-    calls_remaining: int,
-    output_characters_remaining: int,
+    calls_remaining: int | None,
+    output_characters_remaining: int | None,
     fallback_progress: AgentProgressCallback | None,
 ) -> _ToolTurnBudget:
-    """Carry verified event authority into one bounded host correction turn."""
+    """Carry verified event authority into one host continuation turn."""
 
     return _ToolTurnBudget(
         context=source.context if source is not None else fallback_context,
@@ -452,8 +478,8 @@ class CodexAppServerProvider:
         idle_timeout_seconds: float,
         reasoning_effort: str,
         tools: AgentToolCatalog,
-        max_tool_calls: int,
-        max_tool_output_characters: int,
+        max_tool_calls: int | None = None,
+        max_tool_output_characters: int | None = None,
         escalation_model: str | None = None,
         allow_image_generation: bool = False,
         image_timeout_seconds: float = 600.0,
@@ -513,6 +539,7 @@ class CodexAppServerProvider:
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel = ImageGenerationModel.GPT_IMAGE_2,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult:
         """Generate through the same app-server used by conversation turns."""
@@ -520,9 +547,12 @@ class CodexAppServerProvider:
         del seed
         if not self.allow_image_generation:
             raise ProviderError("Codex image generation is disabled.")
+        if model is not ImageGenerationModel.GPT_IMAGE_2:
+            raise ProviderError("Only gpt-image-2 is supported for image generation.")
         prompt = _image_prompt(brief_json, width=width, height=height)
         started = monotonic()
         attempt_process: asyncio.subprocess.Process | None = None
+        generated_dimensions: tuple[int, int] | None = None
         try:
             async with self._image_generation_lock:
                 await self._ensure_started()
@@ -532,14 +562,15 @@ class CodexAppServerProvider:
                         "thread/start",
                         {
                             "model": self.model,
+                            "allowProviderModelFallback": False,
                             "cwd": str(self.workspace_dir),
                             "sandbox": "read-only",
                             "approvalPolicy": "never",
                             "baseInstructions": (
-                                "You are a single-purpose image generator. Use the "
-                                "built-in image generation tool exactly once for the "
-                                "supplied production brief. Never use shell, web, "
-                                "plugins, dynamic tools, or substitute artwork."
+                                "You are a single-purpose image generator. Follow the "
+                                "explicit $imagegen skill invocation exactly once for the "
+                                "supplied production brief. Never use shell, web, plugins, "
+                                "dynamic tools, or substitute artwork."
                             ),
                             "developerInstructions": (
                                 "Preserve every requested visible fact. Do not post or "
@@ -583,10 +614,7 @@ class CodexAppServerProvider:
                         ),
                         "image turn/start result",
                     )
-                    turn = _object(
-                        turn_response.get("turn"),
-                        "image turn/start turn",
-                    )
+                    turn = _object(turn_response.get("turn"), "image turn/start turn")
                     turn_id = _text(turn.get("id"), "image turn id")
                     self._thread_by_turn[turn_id] = thread_id
                     self._turn_watchdogs[turn_id] = _TurnWatchdog(
@@ -597,7 +625,7 @@ class CodexAppServerProvider:
                         turn_id,
                         on_progress=on_progress,
                     )
-                    actual_width, actual_height = await asyncio.to_thread(
+                    generated_dimensions = await asyncio.to_thread(
                         _import_generated_image,
                         image_item,
                         destination,
@@ -620,6 +648,9 @@ class CodexAppServerProvider:
                 restarted,
             )
             raise
+        if generated_dimensions is None:
+            raise ProviderError("Codex image generation returned no dimensions.")
+        actual_width, actual_height = generated_dimensions
         return ImageProviderResult(
             generation_seconds=monotonic() - started,
             model=_MODEL_LABEL,
@@ -635,6 +666,8 @@ class CodexAppServerProvider:
         on_progress: ImageProgressCallback | None,
     ) -> dict[str, object]:
         image_item: dict[str, object] | None = None
+        image_started = False
+        observed_item_types: list[str] = []
         notifications = self._notification_queues[thread_id]
         watchdog = self._turn_watchdogs[turn_id]
         while True:
@@ -672,7 +705,10 @@ class CodexAppServerProvider:
             if notification_turn_id not in {None, turn_id}:
                 continue
             item = params.get("item")
+            if isinstance(item, dict) and isinstance(item.get("type"), str):
+                observed_item_types.append(str(item["type"]))
             if method == "item/started" and _is_image_item(item):
+                image_started = True
                 if on_progress is not None:
                     await on_progress(3, 12)
                 continue
@@ -693,8 +729,15 @@ class CodexAppServerProvider:
             if image_item is None:
                 image_item = _image_item_from_turn(completed_turn.get("items"))
             if image_item is None:
+                observed = ", ".join(observed_item_types[-12:]) or "none"
+                if not image_started:
+                    raise ProviderError(
+                        "The explicit $imagegen execution completed without starting "
+                        f"image generation; observed item types: {observed}."
+                    )
                 raise ProviderError(
-                    "Codex completed without generating an image file.",
+                    "Codex completed after starting image generation but without "
+                    f"returning an image file; observed item types: {observed}."
                 )
             status = image_item.get("status")
             if isinstance(status, str) and status.casefold() in {
@@ -931,16 +974,15 @@ class CodexAppServerProvider:
                         escalation_budget = _continuation_tool_budget(
                             budget,
                             fallback_context=context,
-                            calls_remaining=max(
+                            calls_remaining=_continued_capacity(
                                 budget.calls_remaining,
-                                min(8, self.max_tool_calls),
+                                configured_limit=self.max_tool_calls,
+                                requested_minimum=8,
                             ),
-                            output_characters_remaining=max(
+                            output_characters_remaining=_continued_capacity(
                                 budget.output_characters_remaining,
-                                min(
-                                    8_000,
-                                    self.max_tool_output_characters,
-                                ),
+                                configured_limit=self.max_tool_output_characters,
+                                requested_minimum=8_000,
                             ),
                             fallback_progress=on_progress,
                         )
@@ -1040,10 +1082,13 @@ class CodexAppServerProvider:
                         self._active_tool_budgets[thread_id] = _continuation_tool_budget(
                             budget,
                             fallback_context=context,
-                            calls_remaining=min(6, self.max_tool_calls),
-                            output_characters_remaining=min(
-                                12_000,
+                            calls_remaining=_configured_capacity(
+                                self.max_tool_calls,
+                                bounded_value=6,
+                            ),
+                            output_characters_remaining=_configured_capacity(
                                 self.max_tool_output_characters,
+                                bounded_value=12_000,
                             ),
                             fallback_progress=on_progress,
                         )
@@ -1116,10 +1161,13 @@ class CodexAppServerProvider:
                         self._active_tool_budgets[thread_id] = _continuation_tool_budget(
                             budget,
                             fallback_context=context,
-                            calls_remaining=min(6, self.max_tool_calls),
-                            output_characters_remaining=min(
-                                16_000,
+                            calls_remaining=_configured_capacity(
+                                self.max_tool_calls,
+                                bounded_value=6,
+                            ),
+                            output_characters_remaining=_configured_capacity(
                                 self.max_tool_output_characters,
+                                bounded_value=16_000,
                             ),
                             fallback_progress=on_progress,
                         )
@@ -1204,11 +1252,8 @@ class CodexAppServerProvider:
                         self._active_tool_budgets[thread_id] = _continuation_tool_budget(
                             budget,
                             fallback_context=context,
-                            calls_remaining=(min(2, self.max_tool_calls) if retry_allowed else 0),
-                            output_characters_remaining=min(
-                                4_000,
-                                self.max_tool_output_characters,
-                            ),
+                            calls_remaining=(2 if retry_allowed else 0),
+                            output_characters_remaining=4_000,
                             fallback_progress=on_progress,
                         )
                         correction_instruction = (
@@ -1386,21 +1431,34 @@ class CodexAppServerProvider:
         budget = self._active_tool_budgets.get(thread_id)
         if budget is None or follow_up_message_id is None:
             return False
-        reserve_calls = min(
-            _FOLLOW_UP_EVIDENCE_TOOL_CALLS,
-            self.max_tool_calls,
+        reserve_calls = (
+            0
+            if self.max_tool_calls is None
+            else min(_FOLLOW_UP_EVIDENCE_TOOL_CALLS, self.max_tool_calls)
         )
-        reserve_output_characters = min(
-            _FOLLOW_UP_EVIDENCE_OUTPUT_CHARACTERS,
-            self.max_tool_output_characters,
+        reserve_output_characters = (
+            0
+            if self.max_tool_output_characters is None
+            else min(
+                _FOLLOW_UP_EVIDENCE_OUTPUT_CHARACTERS,
+                self.max_tool_output_characters,
+            )
         )
         if (
-            reserve_calls <= 0
-            or reserve_output_characters < 200
-            or (budget.follow_up_evidence_calls_remaining + reserve_calls > self.max_tool_calls)
-            or (
-                budget.follow_up_evidence_output_characters_remaining + reserve_output_characters
-                > self.max_tool_output_characters
+            self.max_tool_calls is not None
+            and self.max_tool_output_characters is not None
+            and (
+                reserve_calls <= 0
+                or reserve_output_characters < 200
+                or (
+                    budget.follow_up_evidence_calls_remaining + reserve_calls
+                    > self.max_tool_calls
+                )
+                or (
+                    budget.follow_up_evidence_output_characters_remaining
+                    + reserve_output_characters
+                    > self.max_tool_output_characters
+                )
             )
         ):
             log.info(
@@ -2276,16 +2334,29 @@ class CodexAppServerProvider:
             canonical_tool_name=canonical_tool_name,
             capability_arguments=capability_arguments,
         )
-        available_calls = budget.calls_remaining + (
-            budget.follow_up_evidence_calls_remaining if follow_up_evidence_call else 0
+        available_calls = (
+            None
+            if budget.calls_remaining is None
+            else budget.calls_remaining
+            + (budget.follow_up_evidence_calls_remaining if follow_up_evidence_call else 0)
         )
-        available_output_characters = budget.output_characters_remaining + (
-            budget.follow_up_evidence_output_characters_remaining if follow_up_evidence_call else 0
+        available_output_characters = (
+            None
+            if budget.output_characters_remaining is None
+            else budget.output_characters_remaining
+            + (
+                budget.follow_up_evidence_output_characters_remaining
+                if follow_up_evidence_call
+                else 0
+            )
         )
-        if available_calls <= 0 or available_output_characters < 200:
+        if (available_calls is not None and available_calls <= 0) or (
+            available_output_characters is not None
+            and available_output_characters < 200
+        ):
             reason = (
                 "The per-turn capability call limit was reached."
-                if available_calls <= 0
+                if available_calls is not None and available_calls <= 0
                 else "The per-turn capability output limit was reached."
             )
             if (
@@ -2344,12 +2415,13 @@ class CodexAppServerProvider:
             tool_name,
             capability_name=capability_name,
         )
-        # This matches the app-server's roughly 2k-token tool-output ceiling closely
-        # enough to keep a normal Discord search or file page intact. The independent
-        # per-turn character budget still bounds total retrieved context.
-        per_call_budget = min(
-            _MAX_TOOL_RESULT_CHARACTERS,
-            available_output_characters,
+        # Keep each result small enough for the app-server's roughly 2k-token
+        # tool-output ceiling. Production intentionally has no aggregate turn cap;
+        # callers can paginate or make further focused reads as evidence requires.
+        per_call_budget = (
+            _MAX_TOOL_RESULT_CHARACTERS
+            if available_output_characters is None
+            else min(_MAX_TOOL_RESULT_CHARACTERS, available_output_characters)
         )
         write_capability = self.tools.write_capability_for_call(
             tool_name=tool_name,
@@ -2515,7 +2587,9 @@ class CodexAppServerProvider:
         def consume_validated_call() -> None:
             """Charge only a call whose complete request will reach its handler."""
 
-            if budget.calls_remaining > 0:
+            if budget.calls_remaining is None:
+                pass
+            elif budget.calls_remaining > 0:
                 budget.calls_remaining -= 1
             elif follow_up_evidence_call and budget.follow_up_evidence_calls_remaining > 0:
                 budget.follow_up_evidence_calls_remaining -= 1
@@ -3298,6 +3372,8 @@ def _consume_tool_output_characters(
 ) -> None:
     """Charge normal output first and use protected follow-up evidence only if allowed."""
 
+    if budget.output_characters_remaining is None:
+        return
     normal_characters = min(characters, budget.output_characters_remaining)
     budget.output_characters_remaining -= normal_characters
     remaining = characters - normal_characters

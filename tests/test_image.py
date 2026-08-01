@@ -26,6 +26,7 @@ from simajilord.core import CapabilityRegistry, InvocationContext
 from simajilord.core.errors import UserError
 from simajilord.domain.image import (
     ImageGenerationJob,
+    ImageGenerationModel,
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
@@ -57,9 +58,10 @@ class FakeImageProvider:
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel,
         on_progress: object = None,
     ) -> ImageProviderResult:
-        del brief_json, seed
+        del brief_json, seed, model
         self.generate_calls += 1
         if callable(on_progress):
             await on_progress(6, 12)
@@ -112,6 +114,7 @@ def _job(
     job_id: str,
     status: ImageJobStatus,
     delivery_message_id: str | None = None,
+    auto_deliver: bool = False,
 ) -> ImageGenerationJob:
     output = tmp_path / "output" / f"{job_id}.png"
     if status is ImageJobStatus.COMPLETED:
@@ -137,6 +140,7 @@ def _job(
             else None
         ),
         delivery_message_id=delivery_message_id,
+        auto_deliver=auto_deliver,
     )
 
 
@@ -164,6 +168,7 @@ def test_image_brief_preserves_full_production_brief() -> None:
         "avoid": prompt.avoid,
         "rendering": "photo",
         "aspect_ratio": "square",
+        "model": "gpt-image-2",
     }
 
 
@@ -281,7 +286,7 @@ def test_image_store_migrates_pre_delivery_message_database(tmp_path: Path) -> N
     migrated = store.require(job.job_id)
     assert migrated.delivery_message_id == "123"
     assert migrated.delivered is True
-    assert migrated.auto_deliver is True
+    assert migrated.auto_deliver is False
     assert migrated.handoff_completed is False
 
 
@@ -303,6 +308,7 @@ async def test_image_worker_persists_progress_and_terminal_delivery(tmp_path: Pa
         delivery_target_id="channel",
         reply_to_message_id="message",
         prompt=_prompt(),
+        auto_deliver=True,
     )
     for _ in range(100):
         current = service.store.require(job.job_id)
@@ -346,6 +352,7 @@ async def test_image_terminal_delivery_retries_without_service_restart(
         delivery_target_id="channel",
         reply_to_message_id="message",
         prompt=_prompt(),
+        auto_deliver=True,
     )
     for _ in range(250):
         if service.store.require(job.job_id).delivered:
@@ -386,6 +393,7 @@ async def test_terminal_retry_is_not_lost_while_an_older_retry_is_in_flight(
         delivery_target_id="channel",
         reply_to_message_id="message",
         prompt=_prompt(),
+        auto_deliver=True,
         brief_json=build_image_brief(_prompt()),
         status=ImageJobStatus.RUNNING,
         output_path=None,
@@ -426,6 +434,7 @@ async def test_image_delivery_lock_serializes_and_reloads_terminal_state(
         tmp_path,
         job_id="serialized-delivery",
         status=ImageJobStatus.RUNNING,
+        auto_deliver=True,
     )
     service.store.insert(running)
     first_started = asyncio.Event()
@@ -470,6 +479,7 @@ async def test_two_terminal_notifications_publish_only_once(tmp_path: Path) -> N
         tmp_path,
         job_id="single-terminal-delivery",
         status=ImageJobStatus.COMPLETED,
+        auto_deliver=True,
     )
     service.store.insert(terminal)
     first_started = asyncio.Event()
@@ -513,6 +523,7 @@ async def test_image_journal_failure_does_not_change_completed_result(
         delivery_target_id="channel",
         reply_to_message_id="message",
         prompt=_prompt(),
+        auto_deliver=True,
     )
     for _ in range(100):
         current = service.store.require(job.job_id)
@@ -737,6 +748,7 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
     registry = CapabilityRegistry()
     for item in build_image_endpoints(service, files):
         registry.register(item)
+    assert "model" not in registry.endpoint("image.generate").schema.request_fields
     request = ImageGenerateRequest(
         subject="a friendly shiba inu",
         scene="a park",
@@ -766,6 +778,10 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
     provider = cast(FakeImageProvider, service.provider)
     assert provider.generate_calls == 1
     assert response.status is ImageJobStatus.COMPLETED
+    assert response.requested_model is ImageGenerationModel.GPT_IMAGE_2
+    assert job.prompt.model is ImageGenerationModel.GPT_IMAGE_2
+    assert "Decide semantically" in response.next_action
+    assert "no particular delivery verb is required" in response.next_action
     assert response.image_data_url.startswith("data:image/")
     assert response.preview_size_bytes <= response.size_bytes
     assert (response.preview_width, response.preview_height) == (512, 512)

@@ -497,8 +497,6 @@ async def run(
             idle_timeout_seconds=600,
             reasoning_effort="high",
             tools=tools,
-            max_tool_calls=32,
-            max_tool_output_characters=24_000,
             trace_sink=journal,
         )
         service = AgentService(

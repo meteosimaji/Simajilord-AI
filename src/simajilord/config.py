@@ -116,8 +116,6 @@ class Settings:
     codex_executable: str
     agent_idle_timeout_seconds: float
     agent_reasoning_effort: str
-    agent_max_tool_calls: int
-    agent_max_tool_output_characters: int
     agent_per_user_requests: int
     agent_per_user_window_seconds: int
     agent_per_workspace_requests: int
@@ -792,17 +790,6 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             maximum=1_800.0,
         ),
         agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "high"),
-        agent_max_tool_calls=_positive_int(
-            "AGENT_MAX_TOOL_CALLS",
-            32,
-            maximum=64,
-        ),
-        agent_max_tool_output_characters=_bounded_int(
-            "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
-            24_000,
-            minimum=500,
-            maximum=80_000,
-        ),
         agent_per_user_requests=_positive_int(
             "AGENT_PER_USER_REQUESTS",
             3,

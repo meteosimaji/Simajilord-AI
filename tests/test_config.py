@@ -25,8 +25,6 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_REASONING_EFFORT",
     "AGENT_IDLE_TIMEOUT_SECONDS",
     "AGENT_TIMEOUT_SECONDS",
-    "AGENT_MAX_TOOL_CALLS",
-    "AGENT_MAX_TOOL_OUTPUT_CHARACTERS",
     "AGENT_MAX_RESPONSE_CHARACTERS",
     "AGENT_MAX_PENDING_TURNS",
     "MAX_ACTIVE_AGENT_TURNS",
@@ -118,8 +116,6 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_escalation_model == "gpt-5.6-terra"
     assert settings.agent_reasoning_effort == "high"
     assert settings.agent_idle_timeout_seconds == 600
-    assert settings.agent_max_tool_calls == 32
-    assert settings.agent_max_tool_output_characters == 24_000
     assert settings.agent_max_response_characters == 7_600
     assert settings.agent_max_active_turns == 4
     assert settings.agent_max_pending_turns == 20
@@ -384,21 +380,6 @@ def test_admin_only_feature_requires_a_fixed_admin_id(
         ConfigurationError,
         match="AGENT_ADMIN_USER_IDS is required",
     ):
-        load_settings(dotenv_path=dotenv_path)
-
-
-def test_agent_tool_output_budget_accepts_eighty_thousand_character_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
-    monkeypatch.setenv("AGENT_MAX_TOOL_OUTPUT_CHARACTERS", "80000")
-
-    settings = load_settings(dotenv_path=dotenv_path)
-    assert settings.agent_max_tool_output_characters == 80_000
-
-    monkeypatch.setenv("AGENT_MAX_TOOL_OUTPUT_CHARACTERS", "80001")
-    with pytest.raises(ConfigurationError, match="must be between 500 and 80000"):
         load_settings(dotenv_path=dotenv_path)
 
 

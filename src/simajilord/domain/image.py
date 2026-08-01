@@ -25,6 +25,10 @@ class ImageJobStatus(StrEnum):
     FAILED = "failed"
 
 
+class ImageGenerationModel(StrEnum):
+    GPT_IMAGE_2 = "gpt-image-2"
+
+
 @dataclass(frozen=True, slots=True)
 class ImageGenerationPrompt:
     """Structured fields compiled into a provider-neutral production brief."""
@@ -39,6 +43,7 @@ class ImageGenerationPrompt:
     aspect_ratio: ImageAspectRatio = ImageAspectRatio.SQUARE
     rendering: ImageRendering = ImageRendering.PHOTO
     seed: int | None = None
+    model: ImageGenerationModel = ImageGenerationModel.GPT_IMAGE_2
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,5 +69,5 @@ class ImageGenerationJob:
     progress_total: int = 12
     delivery_message_id: str | None = None
     delivered: bool = False
-    auto_deliver: bool = True
+    auto_deliver: bool = False
     handoff_completed: bool = False

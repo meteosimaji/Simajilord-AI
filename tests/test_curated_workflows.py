@@ -47,6 +47,49 @@ async def test_curated_workflow_search_finds_goal_without_command_trigger() -> N
     ) == ("web.search", "web.fetch", "web.find")
 
 
+async def test_image_workflow_publication_is_semantic_not_phrase_gated() -> None:
+    endpoint = build_curated_workflow_endpoint(
+        frozenset({"image.generate", "image.status", "discord.send_file"})
+    )
+    response = await endpoint.invoke(
+        CuratedWorkflowSearchRequest(query="画像を作って完成品を判断して"),
+        InvocationContext(
+            "actor",
+            "workspace",
+            "agent",
+            "event",
+            grants=frozenset({"image", "files"}),
+        ),
+    )
+
+    workflow = response.workflows[0]
+    assert workflow.workflow_id == "image.generate_review_publish"
+    assert "exact request's meaning" in workflow.steps[-1].instruction
+    assert "no particular delivery verb is required" in workflow.steps[-1].instruction
+    assert "privacy or safety risk is unresolved" in workflow.stop_conditions[1]
+
+
+async def test_workflow_search_exposes_complete_catalog_beyond_lexical_matches() -> None:
+    endpoint = build_curated_workflow_endpoint(
+        frozenset({"image.generate", "image.status", "discord.send_file"})
+    )
+    response = await endpoint.invoke(
+        CuratedWorkflowSearchRequest(query="この場に合う創作物をこしらえて結果を判断して"),
+        InvocationContext(
+            "actor",
+            "workspace",
+            "agent",
+            "event",
+            grants=frozenset({"image", "files"}),
+        ),
+    )
+
+    assert response.catalog_complete is True
+    assert tuple(item.workflow_id for item in response.catalog_index) == (
+        "image.generate_review_publish",
+    )
+
+
 async def test_curated_workflow_search_handles_natural_japanese_and_nfkc() -> None:
     endpoint = build_curated_workflow_endpoint(
         frozenset(

@@ -701,8 +701,6 @@ class SimajilordRuntime:
                 idle_timeout_seconds=settings.agent_idle_timeout_seconds,
                 reasoning_effort=settings.agent_reasoning_effort,
                 tools=agent_tools,
-                max_tool_calls=settings.agent_max_tool_calls,
-                max_tool_output_characters=settings.agent_max_tool_output_characters,
                 escalation_model=settings.agent_escalation_model,
                 allow_image_generation=shared_image_provider is not None,
                 image_timeout_seconds=settings.image_timeout_seconds,

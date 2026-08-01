@@ -5471,6 +5471,66 @@ async def test_provider_returns_structured_tool_budget_exhaustion(
 
 
 @pytest.mark.asyncio
+async def test_provider_default_turn_has_no_aggregate_tool_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[int] = []
+    registry = CapabilityRegistry()
+
+    async def read(
+        request: ReadRequest,
+        _: InvocationContext,
+    ) -> ReadResponse:
+        invoked.append(request.offset)
+        return ReadResponse(content=str(request.offset), next_offset=None)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor("test.read", "Read one value.", RiskLevel.READ),
+            ReadRequest,
+            ReadResponse,
+            read,
+        )
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-unlimited-tools",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(registry, ("test.read",)),
+    )
+    budget = _ToolTurnBudget(
+        context=InvocationContext("actor", "workspace", "agent", "event"),
+        calls_remaining=None,
+        output_characters_remaining=None,
+        on_progress=None,
+        required_message_id=None,
+    )
+    provider._active_tool_budgets["thread"] = budget
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+
+    for index in range(100):
+        await provider._handle_dynamic_tool(
+            index,
+            {
+                "namespace": "simajilord",
+                "tool": "test_read",
+                "arguments": {"offset": index},
+                "threadId": "thread",
+            },
+        )
+
+    assert invoked == list(range(100))
+    assert response.await_count == 100
+    assert response.await_args.kwargs["success"] is True
+    assert budget.calls_remaining is None
+    assert budget.output_characters_remaining is None
+
+
+@pytest.mark.asyncio
 async def test_retrieved_past_message_cannot_become_write_authority(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6329,6 +6389,8 @@ def test_base_instructions_are_short_and_use_runtime_identity() -> None:
         "Reporter identity always comes from the authorizing host context",
         "authorization_event_id",
         "Generation is not publication",
+        "no particular delivery verb is required",
+        "private for comparison or iteration",
         "claim delivery only after",
         "Discord does not render GitHub pipe tables",
         "No host post-processor will rewrite",

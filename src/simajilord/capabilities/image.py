@@ -21,6 +21,7 @@ from simajilord.core.errors import UserError
 from simajilord.domain.image import (
     ImageAspectRatio,
     ImageGenerationJob,
+    ImageGenerationModel,
     ImageGenerationPrompt,
     ImageJobStatus,
     ImageRendering,
@@ -119,6 +120,8 @@ class ImageGenerateResponse:
     width: int
     height: int
     generation_seconds: float
+    requested_model: ImageGenerationModel
+    provider_model: str
     next_action: str
 
 
@@ -140,6 +143,8 @@ class ImageStatusResponse:
     error_code: str | None
     terminal: bool
     retryable: bool
+    requested_model: ImageGenerationModel
+    provider_model: str | None
     next_action: str
 
 
@@ -171,6 +176,7 @@ def build_image_endpoints(
                 aspect_ratio=request.aspect_ratio,
                 rendering=request.rendering,
                 seed=request.seed,
+                model=ImageGenerationModel.GPT_IMAGE_2,
             ),
             auto_deliver=False,
             idempotency_key=context.request_id,
@@ -236,6 +242,8 @@ def build_image_endpoints(
             error_code=job.error_code,
             terminal=terminal,
             retryable=retryable,
+            requested_model=job.prompt.model,
+            provider_model=job.provider_model,
             next_action=next_action,
         )
 
@@ -333,13 +341,18 @@ async def _agent_image_result(
         width=job.width,
         height=job.height,
         generation_seconds=job.generation_seconds or 0.0,
+        requested_model=job.prompt.model,
+        provider_model=job.provider_model or job.prompt.model.value,
         next_action=(
             "Inspect the lightweight preview attached to this tool result. The path is "
-            "the full-resolution original. Respect the user's publication intent: send "
-            "the original with discord.send_file or discord.send_files only when they "
-            "asked to show/post/deliver it; otherwise keep it unpublished for comparison, "
-            "description, or iteration. Never claim Discord delivery until the attachment "
-            "send succeeds."
+            "the full-resolution original. Decide semantically from the exact active "
+            "request and conversation context whether publishing it in Discord fulfills "
+            "the user's intent. A request to create an image in the active public channel "
+            "can imply that the result should be shown; no particular delivery verb is "
+            "required. Keep it unpublished when the user requests private comparison or "
+            "iteration, or when publication would introduce unresolved privacy or safety "
+            "risk. Use discord.send_file or discord.send_files when you decide to publish. "
+            "Never claim Discord delivery until the attachment send succeeds."
         ),
     )
 

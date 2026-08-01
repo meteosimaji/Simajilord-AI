@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from simajilord.agent import AGENT_FINAL_DELIVERED_CONTENT, AGENT_NO_ACTION_CONTENT
 from simajilord.capabilities.audio import (
     AudioHistoryItem,
     AudioHistoryResponse,
@@ -32,6 +33,7 @@ from simajilord.integrations.discord.capabilities import (
     DiscordExpandMessageResponse,
 )
 from simajilord.integrations.discord.cogs import (
+    _agent_response_uses_host_delivery,
     async_progress_embed,
     music_added_embed,
     music_history_embed,
@@ -64,6 +66,12 @@ def test_command_embed_keeps_useful_timestamp_without_meta_footer() -> None:
     assert embed.footer.text is None
     assert embed.fields[0].name == "Status"
     assert embed.fields[0].value == "ok"
+
+
+def test_agent_tool_delivery_and_silence_do_not_require_host_outbox() -> None:
+    assert not _agent_response_uses_host_delivery(AGENT_FINAL_DELIVERED_CONTENT)
+    assert not _agent_response_uses_host_delivery(f" {AGENT_NO_ACTION_CONTENT}\n")
+    assert _agent_response_uses_host_delivery("A normal host reply")
 
 
 def test_quote_text_respects_limits_shorter_than_its_suffix() -> None:
@@ -294,8 +302,8 @@ def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
             sample_count=1,
             model="hive/ai-generated-and-deepfake-content-detection",
             threshold=0.9,
-            top_source="stablediffusionxl",
-            top_source_score=0.99166,
+            top_source="gptimage2",
+            top_source_score=0.9919605,
             verdict=SyntheticMediaVerdict.AI_GENERATED,
             version="1",
             cached=False,
@@ -313,7 +321,7 @@ def test_hive_embed_separates_ai_deepfake_and_generator_signals() -> None:
     fields = {field.name: field.value for field in embed.fields}
     assert fields["AI-generated"] == "**100.0%** · High"
     assert fields["Deepfake"] == "**0.0%** · Low"
-    assert fields["Likely generation source"] == "**Stable Diffusion XL** · 99.2%"
+    assert fields["Likely generation source"] == "**GPT Image 2** · 99.2%"
     assert "HIVE API quota" not in fields
     assert embed.footer.text is None
     assert embed.thumbnail.url == "https://cdn.example.com/sample.png"

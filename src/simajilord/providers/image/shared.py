@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Protocol
 
 from simajilord.core.errors import ProviderError
+from simajilord.domain.image import ImageGenerationModel
 
 from .base import ImageProgressCallback, ImageProviderResult
 
@@ -19,8 +20,11 @@ class CodexImageGenerationPort(Protocol):
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult: ...
+
+    async def close(self) -> None: ...
 
 
 class SharedCodexImageProvider:
@@ -42,6 +46,7 @@ class SharedCodexImageProvider:
         width: int,
         height: int,
         seed: int,
+        model: ImageGenerationModel,
         on_progress: ImageProgressCallback | None = None,
     ) -> ImageProviderResult:
         provider = self._provider
@@ -53,6 +58,7 @@ class SharedCodexImageProvider:
             width=width,
             height=height,
             seed=seed,
+            model=model,
             on_progress=on_progress,
         )
 
