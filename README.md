@@ -211,10 +211,10 @@ with Discord's generic “interaction failed” banner.
   result; retrieving an old administrator message can never authorize a new action
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
   context compaction, exact-message verification, progressive status updates, and corrective
-  retries after failed writes. A provider thread is rotated before stale self-generated narrative
-  dominates the turn: after 12 completed turns or once the previous input reaches 35% of the
-  reported context window. The replacement receives only current host facts, selectively sourced
-  memory, and context fetched for the active request. Separate servers can run turns concurrently
+  retries after failed writes. Native `contextCompaction` lifecycle events renew the inactivity
+  watchdog, update the temporary progress message, and are recorded in the body-free agent trace.
+  The host does not discard a healthy provider thread at a fixed turn count or token percentage.
+  Separate servers can run turns concurrently
   without allowing two
   turns from the same server to overtake each other. Codex notifications, inactivity watchdogs,
   and tool budgets are routed per thread/turn, so concurrent servers cannot consume each other's
@@ -259,29 +259,36 @@ with Discord's generic “interaction failed” banner.
   Final replies and autonomous host posts are also receipted after each Discord send using only
   channel/message IDs, even though they bypass the model tool catalog. If ledger persistence
   fails, their already-sent delivery evidence stays pending and only receipt persistence is
-  retried; the Discord message is not posted again. A
+  retried; the Discord message is not posted again. Recovery uses a known message ID directly;
+  only a crash before that ID is saved falls back to nonce reconciliation, and one recovery pass
+  shares that bounded history read across pending deliveries in the same channel. A
   single-source autonomous reply is attributed to that source actor for natural same-actor
   Undo; a mixed-source batch remains BOT-owned instead of arbitrarily granting one member
   control over the post. If a final confirmation follows a substantive write in the same turn,
   ID-less Undo prefers that write; a reply-only turn instead removes its latest host post.
   The bounded `.data/agent_actions.sqlite3` ledger retains at most 2,000 records, at most 100 per
   actor, for seven days. It stores IDs and a small scalar inverse (maximum 4 KiB), never a file
-  body, deleted-message body, or large snapshot.
+  body, deleted-message body, or large snapshot. The same database places every provider write
+  behind a body-free `planned → dispatched → confirmed|unknown → reconciled` effect ledger.
+  A process restart converts an unconfirmed dispatch to `unknown`; interrupted mention recovery
+  then refuses to replay that whole model turn, instead of risking a duplicate external action.
 - Durable agent memory is independent of Codex provider threads in
   `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success/failure
   `procedure` scopes enforce same-user/same-channel/same-server visibility. Records contain only a
   short summary, exact source Discord message IDs, confidence, timestamps, and optional expiry;
   message bodies, attachments, secret-like values, inferred profiles, and low-confidence guesses
-  are rejected. Eager `memory.search`, `memory.remember`, and `memory.update` tools let the agent
+  are rejected. `memory.search`, `memory.remember`, and `memory.update` tools let the agent
   retrieve relevant context and capture at most one reusable outcome after substantive work
-  without recording every turn. Search uses a bounded bilingual lexical matcher tolerant of
+  without recording every turn. Recent rows are not injected into every prompt: the agent first
+  reads the exact active Discord event and searches memory only when that task needs it. Search
+  uses a bounded bilingual lexical matcher tolerant of
   case/width/punctuation and common English/CJK wording variants, with scope, evidence basis,
   minimum-confidence, update-time, and `next_offset` filters; an empty query returns the most
   recently used accessible records. Normalized keys upsert duplicates, search updates
   `last_used_at`, and expiry plus total/workspace/user/channel/procedure caps keep the database
   bounded. Memory writes still require the exact authorizing event and return non-undoable
   Action Receipts; forgetting is intentionally irreversible. Provider conversation continuity
-  and this distilled memory are separate, so rotating a full model context does not turn raw
+  and this distilled memory are separate, so resetting provider continuity does not turn raw
   chat history into durable memory.
 - Event-driven autonomy stores content-free message/edit/reaction/thread/voice/timer/audio
   pointers in `.data/agent_autonomy.sqlite3`. The first event opens one fixed 5–15 second
@@ -321,8 +328,8 @@ browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 The default runtime profile is `gpt-5.6-luna` with `medium` reasoning. Codex keeps one durable
 provider thread in its stable `legacy` history mode and compacts retained context natively; the
-host resets it only when the saved thread is genuinely unavailable. Existing conversations are
-never proactively rotated merely to change their history mode. Agent turns have no wall-clock
+host automatically resets it only when the saved thread is genuinely unavailable. Existing
+conversations are never proactively rotated at a fixed host threshold. Agent turns have no wall-clock
 deadline. A turn is stopped only after its configured inactivity window, while a running
 capability receives its own declared timeout. Conversation and image generation share one
 app-server rather than a second image runtime. Its JSONL reader accepts bounded large image
@@ -330,6 +337,17 @@ notifications, reports line size, reader/process state, active tools, recent act
 sanitized stderr on failure, and wakes the affected turn immediately if the transport dies
 instead of waiting for the inactivity window. Discord link previews are suppressed for
 AI-authored text without altering its URLs.
+
+As an offline last resort after stopping the bot (for example, after a broken provider/tool
+migration), reset only provider continuity and keep request, delivery, audit, memory, feedback,
+and action evidence:
+
+```bash
+uv run simajilord-agent-reset --all --yes
+```
+
+The command creates a timestamped SQLite backup before clearing provider thread IDs and context
+counters. Use repeated `--conversation ID` arguments instead of `--all` for a selective reset.
 
 ## Requirements
 
@@ -355,7 +373,10 @@ ignored by Git.
 
 For private development, `COMMAND_SCOPE=guild` synchronizes commands to each connected server.
 It also removes stale global commands for the same application so users do not see old and new
-commands together. Use `global` only when global publication is intended. Message Content is the
+commands together. Each scope has a durable canonical manifest hash: an unchanged restart makes
+no Discord command API write, while a changed local manifest is compared with the fetched remote
+manifest and only a real difference is synchronized. Use `global` only when global publication is
+intended. Message Content is the
 documented minimum and is always requested because mentions, prefix commands, message inspection,
 and automatic read-aloud need bodies. Server Members and Presence are opt-in with
 `DISCORD_MEMBERS_INTENT_ENABLED` and `DISCORD_PRESENCE_INTENT_ENABLED`; enable each matching

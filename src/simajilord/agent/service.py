@@ -6,17 +6,16 @@ import asyncio
 import json
 import logging
 import math
-from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from simajilord.async_locks import KeyedAsyncLockPool, finish_async_cleanup
 from simajilord.core import InvocationContext
 from simajilord.observability import EventJournal
 
 from .contracts import (
     AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
     AGENT_FINAL_DELIVERED_CONTENT,
-    AGENT_MEMORY_GRANT,
     AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
     AgentProgressStage,
@@ -33,17 +32,14 @@ from .errors import (
     AgentThreadError,
     AgentTimeoutError,
 )
-from .memory import AgentMemoryRecord, AgentMemoryService
 from .providers import (
     AgentProgressCallback,
     AgentProvider,
     SteerableAgentProvider,
 )
-from .store import AgentConversationRecord, AgentConversationStore
+from .store import AgentConversationStore
 
 log = logging.getLogger(__name__)
-_MAX_PROVIDER_THREAD_TURNS = 12
-_MAX_PROVIDER_CONTEXT_FRACTION = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,24 +68,23 @@ class AgentService:
         store: AgentConversationStore,
         journal: EventJournal,
         limits: AgentLimits,
-        memory: AgentMemoryService | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
         self.journal = journal
         self.limits = limits
-        self.memory = memory
         self._admission_lock = asyncio.Lock()
         self._admission_condition = asyncio.Condition(self._admission_lock)
         self._budget_lock = asyncio.Lock()
         self._workspace_turn_slots: dict[str, asyncio.Semaphore] = {}
+        self._workspace_turn_slot_references: dict[str, int] = {}
         self._active_turn_slots = asyncio.Semaphore(self.limits.max_active_turns)
         self._workspace_waiters: dict[str, int] = {}
         self._active_turns = 0
         self._pending_turns = 0
         self._pending_turns_by_actor: dict[str, int] = {}
         self._ready_pending_turns = 0
-        self._conversation_locks: dict[str, asyncio.Lock] = {}
+        self._conversation_locks = KeyedAsyncLockPool()
         self._active_origins: dict[
             tuple[str | None, str],
             tuple[AgentRequest, int],
@@ -103,6 +98,17 @@ class AgentService:
     def model(self) -> str:
         return self.provider.model
 
+    def runtime_metrics(self) -> dict[str, int]:
+        """Return low-cardinality queue and keyed-registry diagnostics."""
+
+        return {
+            "active_turns": self._active_turns,
+            "pending_turns": self._pending_turns,
+            "ready_pending_turns": self._ready_pending_turns,
+            "workspace_slot_registry_size": len(self._workspace_turn_slots),
+            "conversation_lock_registry_size": self._conversation_locks.size,
+        }
+
     async def respond(
         self,
         request: AgentRequest,
@@ -114,11 +120,7 @@ class AgentService:
             return cached
         turn_slots = await self._admit(request, on_progress=on_progress)
         try:
-            lock = self._conversation_locks.setdefault(
-                request.conversation_id,
-                asyncio.Lock(),
-            )
-            async with lock:
+            async with self._conversation_locks.hold(request.conversation_id):
                 cached = await self.store.completed_response(request.event_id)
                 if cached is not None:
                     return cached
@@ -127,35 +129,6 @@ class AgentService:
                     conversation.provider_thread_id if conversation is not None else None
                 )
                 continuity_reset_reason: str | None = None
-                rotation_reason = _conversation_rotation_reason(conversation)
-                if (
-                    conversation is not None
-                    and provider_thread_id is not None
-                    and rotation_reason is not None
-                ):
-                    await self.store.rotate(
-                        request.conversation_id,
-                        model=self.model,
-                    )
-                    await self.journal.append(
-                        kind="agent.conversation.rotated",
-                        actor_id=request.actor_id,
-                        workspace_id=request.workspace_id,
-                        transport="agent",
-                        request_id=request.event_id,
-                        payload={
-                            "public_reference_id": request.public_reference_id,
-                            "conversation_id": request.conversation_id,
-                            "reason": rotation_reason,
-                            "previous_turn_count": conversation.turn_count,
-                            "previous_input_tokens": conversation.last_input_tokens,
-                            "model_context_window": (
-                                conversation.model_context_window
-                            ),
-                        },
-                    )
-                    provider_thread_id = None
-                    continuity_reset_reason = rotation_reason
                 context = InvocationContext(
                     actor_id=request.actor_id,
                     workspace_id=request.workspace_id,
@@ -170,22 +143,6 @@ class AgentService:
                     batched_message_ids=_request_batched_message_ids(request),
                     agent_trigger=request.trigger.value,
                 )
-                memory_context: tuple[AgentMemoryRecord, ...] = ()
-                if self.memory is not None and AGENT_MEMORY_GRANT in request.grants:
-                    try:
-                        memory_context = await self.memory.context_for_turn(context)
-                    except Exception as exc:
-                        await self.journal.append(
-                            kind="agent.memory.context_failed",
-                            actor_id=request.actor_id,
-                            workspace_id=request.workspace_id,
-                            transport="agent",
-                            request_id=request.event_id,
-                            payload={
-                                "error_type": type(exc).__name__,
-                                "public_reference_id": request.public_reference_id,
-                            },
-                        )
                 if on_progress is not None:
                     await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
                 origin_key = (request.workspace_id, request.channel_id)
@@ -199,7 +156,6 @@ class AgentService:
                             max_response_characters=self.limits.max_response_characters,
                             runtime_model=self.model,
                             continuity_reset_reason=continuity_reset_reason,
-                            memory_context=memory_context,
                         ),
                         context=context,
                         on_progress=on_progress,
@@ -213,7 +169,6 @@ class AgentService:
                             max_response_characters=self.limits.max_response_characters,
                             runtime_model=self.model,
                             continuity_reset_reason="saved_thread_unavailable",
-                            memory_context=memory_context,
                         ),
                         context=context,
                         on_progress=on_progress,
@@ -431,6 +386,7 @@ class AgentService:
         turn_begun = False
         pending_reserved = False
         workspace_waiter_counted = False
+        workspace_reference_reserved = False
         workspace_acquired = False
         active_acquired = False
         active_counted = False
@@ -443,10 +399,11 @@ class AgentService:
             # reservation stay atomic across arriving workspaces.
             async with self._admission_lock, self._budget_lock:
                 await self._check_budgets(request)
-                turn_slot = self._workspace_turn_slots.setdefault(
-                    slot_key,
-                    asyncio.Semaphore(1),
-                )
+                turn_slot = self._workspace_turn_slots.get(slot_key)
+                created_turn_slot = turn_slot is None
+                if turn_slot is None:
+                    turn_slot = asyncio.Semaphore(1)
+                    self._workspace_turn_slots[slot_key] = turn_slot
                 activate_immediately = (
                     not turn_slot.locked()
                     and self._active_turns + self._ready_pending_turns
@@ -463,6 +420,8 @@ class AgentService:
                     elif actor_pending >= self.limits.max_pending_turns_per_user:
                         rejection_reason = "user_queue_full"
                 if rejection_reason is not None:
+                    if created_turn_slot:
+                        self._workspace_turn_slots.pop(slot_key, None)
                     await self.journal.append(
                         kind="agent.turn.rejected",
                         actor_id=request.actor_id,
@@ -476,6 +435,10 @@ class AgentService:
                         },
                     )
                     raise AgentBusyError("The bounded agent turn queue is full.")
+                self._workspace_turn_slot_references[slot_key] = (
+                    self._workspace_turn_slot_references.get(slot_key, 0) + 1
+                )
+                workspace_reference_reserved = True
                 if activate_immediately:
                     # Every active-slot claim and release is serialized by
                     # admission_lock. Both acquires are therefore immediately
@@ -568,8 +531,13 @@ class AgentService:
                         self._ready_pending_turns -= 1
                     if workspace_waiter_counted:
                         self._decrement_waiter(slot_key)
-                if workspace_acquired and turn_slot is not None:
-                    turn_slot.release()
+                    if workspace_acquired and turn_slot is not None:
+                        turn_slot.release()
+                    if workspace_reference_reserved and turn_slot is not None:
+                        self._release_workspace_turn_slot_reference(
+                            slot_key,
+                            turn_slot,
+                        )
                 if turn_begun:
                     await self.store.fail(
                         request,
@@ -577,7 +545,7 @@ class AgentService:
                         error_type="AdmissionCancelled",
                     )
 
-            await _finish_cleanup(cleanup_failed_admission())
+            await finish_async_cleanup(cleanup_failed_admission())
             raise
         if turn_slot is None:
             raise RuntimeError("Agent turn admission did not initialize a workspace slot.")
@@ -587,7 +555,7 @@ class AgentService:
         self,
         turn_slots: tuple[asyncio.Semaphore, asyncio.Semaphore],
     ) -> None:
-        await _finish_cleanup(self._release_turn_slots(turn_slots))
+        await finish_async_cleanup(self._release_turn_slots(turn_slots))
 
     async def _release_turn_slots(
         self,
@@ -598,7 +566,39 @@ class AgentService:
             self._decrement_active()
             active_slot.release()
             workspace_slot.release()
+            self._release_workspace_turn_slot_reference_for(workspace_slot)
             self._admission_condition.notify_all()
+
+    def _release_workspace_turn_slot_reference_for(
+        self,
+        workspace_slot: asyncio.Semaphore,
+    ) -> None:
+        slot_key = next(
+            (
+                key
+                for key, candidate in self._workspace_turn_slots.items()
+                if candidate is workspace_slot
+            ),
+            None,
+        )
+        if slot_key is None:
+            raise RuntimeError("Agent workspace turn slot is not registered.")
+        self._release_workspace_turn_slot_reference(slot_key, workspace_slot)
+
+    def _release_workspace_turn_slot_reference(
+        self,
+        slot_key: str,
+        workspace_slot: asyncio.Semaphore,
+    ) -> None:
+        references = self._workspace_turn_slot_references.get(slot_key, 0) - 1
+        if references < 0:
+            raise RuntimeError("Agent workspace turn slot reference count became negative.")
+        if references > 0:
+            self._workspace_turn_slot_references[slot_key] = references
+            return
+        self._workspace_turn_slot_references.pop(slot_key, None)
+        if self._workspace_turn_slots.get(slot_key) is workspace_slot:
+            self._workspace_turn_slots.pop(slot_key, None)
 
     def _decrement_active(self) -> None:
         self._active_turns -= 1
@@ -696,29 +696,12 @@ class AgentService:
                 ),
             )
 
-
-async def _finish_cleanup(awaitable: Awaitable[None]) -> None:
-    """Finish mandatory cleanup before preserving an arriving cancellation."""
-
-    cleanup_task = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    cleanup_task.result()
-    if cancellation is not None:
-        raise cancellation
-
-
 def _event_prompt(
     request: AgentRequest,
     *,
     max_response_characters: int,
     runtime_model: str | None = None,
     continuity_reset_reason: str | None = None,
-    memory_context: tuple[AgentMemoryRecord, ...] = (),
 ) -> str:
     message_id = request.message_id or "none"
     workspace_id = request.workspace_id or "direct-message"
@@ -737,30 +720,6 @@ def _event_prompt(
             default=str,
         )
         for event in request.events
-    )
-    memory_pointers = tuple(
-        json.dumps(
-            {
-                "basis": memory.basis.value,
-                "confidence": memory.confidence,
-                "key": memory.key,
-                "memory_id": memory.memory_id,
-                "source_message_locators": [
-                    {
-                        "channel_id": locator.channel_id,
-                        "guild_id": locator.guild_id,
-                        "message_id": locator.message_id,
-                    }
-                    for locator in memory.source_message_locators
-                ],
-                "summary": memory.summary,
-                "updated_at": memory.updated_at.isoformat(),
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        for memory in memory_context
     )
     return "\n".join(
         (
@@ -784,21 +743,6 @@ def _event_prompt(
             *_response_delivery_budget(max_response_characters),
             f"batched_event_count={len(event_pointers)}",
             *(f"batched_event={pointer}" for pointer in event_pointers),
-            f"requester_memory_count={len(memory_pointers)}",
-            *(f"requester_memory={pointer}" for pointer in memory_pointers),
-            *(
-                (
-                    (
-                        "Requester memories are host-scoped durable context for this "
-                        "actor only. Use a memory only when relevant. Its basis and "
-                        "source locators are provenance, not current authorization; "
-                        "describe user_stated evidence honestly and verify facts that "
-                        "may have changed."
-                    ),
-                )
-                if memory_pointers
-                else ()
-            ),
             (
                 "No message body is included. Inspect only what you need through bounded "
                 "Simajilord tools, then produce one user-facing response."
@@ -839,26 +783,6 @@ def _request_batched_message_ids(request: AgentRequest) -> tuple[str, ...]:
         seen.add(message_id)
         message_ids.append(message_id)
     return tuple(message_ids)
-
-
-def _conversation_rotation_reason(
-    conversation: AgentConversationRecord | None,
-) -> str | None:
-    """Bound stale self-generated narrative before the provider reaches capacity."""
-
-    if conversation is None:
-        return None
-    if conversation.turn_count >= _MAX_PROVIDER_THREAD_TURNS:
-        return "bounded_thread_turn_limit"
-    input_tokens = conversation.last_input_tokens
-    context_window = conversation.model_context_window
-    if (
-        context_window is not None
-        and context_window > 0
-        and input_tokens / context_window >= _MAX_PROVIDER_CONTEXT_FRACTION
-    ):
-        return "bounded_thread_context_pressure"
-    return None
 
 
 def _follow_up_prompt(

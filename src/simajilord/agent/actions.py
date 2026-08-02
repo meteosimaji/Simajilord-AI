@@ -52,6 +52,16 @@ class ActionStatus(StrEnum):
     UNDONE = "undone"
 
 
+class ExternalEffectStatus(StrEnum):
+    """Durable lifecycle for a write crossing the local process boundary."""
+
+    PLANNED = "planned"
+    DISPATCHED = "dispatched"
+    CONFIRMED = "confirmed"
+    UNKNOWN = "unknown"
+    RECONCILED = "reconciled"
+
+
 @dataclass(frozen=True, slots=True)
 class ActionReceipt:
     """Small model-facing proof that a write succeeded."""
@@ -127,6 +137,26 @@ class ActionRecord:
     expires_at: datetime
     undone_at: datetime | None = None
     undo_action_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalEffectRecord:
+    """Body-free replay barrier for one provider tool call."""
+
+    effect_id: str
+    capability: str
+    actor_id: str
+    workspace_id: str | None
+    transport: str
+    request_id: str
+    provider_thread_id: str | None
+    provider_turn_id: str | None
+    tool_call_id: str
+    status: ExternalEffectStatus
+    action_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,6 +884,107 @@ class ActionReceiptStore:
         async with self._lock:
             return await asyncio.to_thread(self._add, record)
 
+    async def plan_external_effect(
+        self,
+        *,
+        capability: str,
+        context: InvocationContext,
+    ) -> ExternalEffectRecord:
+        """Persist intent before a write is eligible to reach its handler."""
+
+        record = _external_effect_record(
+            capability=capability,
+            context=context,
+            ttl=self.ttl,
+        )
+        async with self._lock:
+            return await asyncio.to_thread(self._plan_external_effect, record)
+
+    async def dispatch_external_effect(
+        self,
+        effect_id: str,
+    ) -> ExternalEffectRecord:
+        """Cross the replay barrier immediately before external dispatch."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._transition_external_effect,
+                effect_id,
+                frozenset({ExternalEffectStatus.PLANNED}),
+                ExternalEffectStatus.DISPATCHED,
+                None,
+            )
+
+    async def mark_external_effect_unknown(
+        self,
+        effect_id: str,
+    ) -> ExternalEffectRecord:
+        """Record that a dispatched write did not return definite evidence."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._transition_external_effect,
+                effect_id,
+                frozenset({ExternalEffectStatus.DISPATCHED}),
+                ExternalEffectStatus.UNKNOWN,
+                None,
+            )
+
+    async def confirm_external_effect(
+        self,
+        effect_id: str,
+        *,
+        action_id: str | None,
+    ) -> ExternalEffectRecord:
+        """Attach positive result evidence to a dispatched effect."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._transition_external_effect,
+                effect_id,
+                frozenset(
+                    {
+                        ExternalEffectStatus.DISPATCHED,
+                        ExternalEffectStatus.UNKNOWN,
+                    }
+                ),
+                ExternalEffectStatus.CONFIRMED,
+                action_id,
+            )
+
+    async def reconcile_external_effect(
+        self,
+        effect_id: str,
+        *,
+        action_id: str | None = None,
+    ) -> ExternalEffectRecord:
+        """Close an operator-verified uncertain effect without replaying it."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._transition_external_effect,
+                effect_id,
+                frozenset({ExternalEffectStatus.UNKNOWN}),
+                ExternalEffectStatus.RECONCILED,
+                action_id,
+            )
+
+    async def external_effect(
+        self,
+        effect_id: str,
+    ) -> ExternalEffectRecord | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._external_effect, effect_id)
+
+    async def request_has_replay_barrier(self, request_id: str) -> bool:
+        """Return whether recovery must not repeat the model turn automatically."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._request_has_replay_barrier,
+                request_id,
+            )
+
     async def claim_latest_or_id(
         self,
         *,
@@ -908,6 +1039,27 @@ class ActionReceiptStore:
                 ON agent_actions(actor_id, workspace_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS agent_actions_expiry
                 ON agent_actions(expires_at);
+
+                CREATE TABLE IF NOT EXISTS agent_external_effects (
+                    effect_id TEXT PRIMARY KEY,
+                    capability TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    workspace_id TEXT,
+                    transport TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    provider_thread_id TEXT,
+                    provider_turn_id TEXT,
+                    tool_call_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    action_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS agent_external_effects_request
+                ON agent_external_effects(request_id, status);
+                CREATE INDEX IF NOT EXISTS agent_external_effects_expiry
+                ON agent_external_effects(expires_at);
                 """
             )
             columns = {
@@ -928,6 +1080,10 @@ class ActionReceiptStore:
                 (datetime.now(UTC).isoformat(),),
             )
             connection.execute(
+                "DELETE FROM agent_external_effects WHERE expires_at <= ?",
+                (datetime.now(UTC).isoformat(),),
+            )
+            connection.execute(
                 """
                 UPDATE agent_actions
                 SET status = ?
@@ -936,6 +1092,18 @@ class ActionReceiptStore:
                 (
                     ActionStatus.SUCCEEDED.value,
                     ActionStatus.UNDOING.value,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE agent_external_effects
+                SET status = ?, updated_at = ?
+                WHERE status = ?
+                """,
+                (
+                    ExternalEffectStatus.UNKNOWN.value,
+                    datetime.now(UTC).isoformat(),
+                    ExternalEffectStatus.DISPATCHED.value,
                 ),
             )
         os.chmod(self.path, 0o600)
@@ -1053,6 +1221,160 @@ class ActionReceiptStore:
             )
             connection.commit()
             return persisted
+
+    def _plan_external_effect(
+        self,
+        record: ExternalEffectRecord,
+    ) -> ExternalEffectRecord:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "DELETE FROM agent_external_effects WHERE expires_at <= ?",
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_external_effects(
+                    effect_id, capability, actor_id, workspace_id, transport,
+                    request_id, provider_thread_id, provider_turn_id,
+                    tool_call_id, status, action_id, created_at, updated_at,
+                    expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(effect_id) DO NOTHING
+                """,
+                (
+                    record.effect_id,
+                    record.capability,
+                    record.actor_id,
+                    record.workspace_id,
+                    record.transport,
+                    record.request_id,
+                    record.provider_thread_id,
+                    record.provider_turn_id,
+                    record.tool_call_id,
+                    record.status.value,
+                    record.action_id,
+                    record.created_at.isoformat(),
+                    record.updated_at.isoformat(),
+                    record.expires_at.isoformat(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM agent_external_effects WHERE effect_id = ?",
+                (record.effect_id,),
+            ).fetchone()
+            assert row is not None
+            persisted = _row_external_effect(row)
+            if _external_effect_identity(persisted) != _external_effect_identity(record):
+                raise ValueError("external effect ID belongs to a different tool call")
+            if persisted.status is not ExternalEffectStatus.PLANNED:
+                raise ValueError("external effect already crossed the replay barrier")
+            connection.execute(
+                """
+                DELETE FROM agent_external_effects
+                WHERE effect_id IN (
+                    SELECT effect_id FROM agent_external_effects
+                    WHERE actor_id = ?
+                    ORDER BY created_at DESC, effect_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (record.actor_id, self.max_records_per_actor),
+            )
+            connection.execute(
+                """
+                DELETE FROM agent_external_effects
+                WHERE effect_id IN (
+                    SELECT effect_id FROM agent_external_effects
+                    ORDER BY created_at DESC, effect_id DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (self.max_records,),
+            )
+            connection.commit()
+            return persisted
+
+    def _transition_external_effect(
+        self,
+        effect_id: str,
+        expected: frozenset[ExternalEffectStatus],
+        target: ExternalEffectStatus,
+        action_id: str | None,
+    ) -> ExternalEffectRecord:
+        normalized_effect_id = effect_id.strip()
+        if not normalized_effect_id:
+            raise ValueError("external effect ID must not be empty")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM agent_external_effects WHERE effect_id = ?",
+                (normalized_effect_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("external effect does not exist")
+            record = _row_external_effect(row)
+            if (
+                record.action_id is not None
+                and action_id is not None
+                and record.action_id != action_id
+            ):
+                raise ValueError("external effect action evidence conflicts")
+            if record.status is target:
+                connection.commit()
+                return record
+            if record.status not in expected:
+                raise ValueError(
+                    "external effect transition is invalid: "
+                    f"{record.status.value} -> {target.value}"
+                )
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                """
+                UPDATE agent_external_effects
+                SET status = ?, action_id = COALESCE(?, action_id), updated_at = ?
+                WHERE effect_id = ?
+                """,
+                (target.value, action_id, now, normalized_effect_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM agent_external_effects WHERE effect_id = ?",
+                (normalized_effect_id,),
+            ).fetchone()
+            assert updated is not None
+            connection.commit()
+            return _row_external_effect(updated)
+
+    def _external_effect(
+        self,
+        effect_id: str,
+    ) -> ExternalEffectRecord | None:
+        normalized_effect_id = effect_id.strip()
+        if not normalized_effect_id:
+            raise ValueError("external effect ID must not be empty")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_external_effects WHERE effect_id = ?",
+                (normalized_effect_id,),
+            ).fetchone()
+        return _row_external_effect(row) if row is not None else None
+
+    def _request_has_replay_barrier(self, request_id: str) -> bool:
+        normalized_request_id = request_id.strip()
+        if not normalized_request_id:
+            raise ValueError("request ID must not be empty")
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM agent_external_effects
+                WHERE request_id = ? AND status != ?
+                LIMIT 1
+                """,
+                (normalized_request_id, ExternalEffectStatus.PLANNED.value),
+            ).fetchone()
+        return row is not None
 
     def _claim_latest_or_id(
         self,
@@ -1235,6 +1557,48 @@ class ActionReceiptService:
             or capability in NON_UNDOABLE_ACTION_CAPABILITIES
         )
 
+    async def begin_external_effect(
+        self,
+        *,
+        capability: str,
+        context: InvocationContext,
+    ) -> str:
+        """Persist planned and dispatched states before invoking a write."""
+
+        planned = await self.store.plan_external_effect(
+            capability=capability,
+            context=context,
+        )
+        await self._append_external_effect_journal(planned, context=context)
+        dispatched = await self.store.dispatch_external_effect(planned.effect_id)
+        await self._append_external_effect_journal(dispatched, context=context)
+        return dispatched.effect_id
+
+    async def mark_external_effect_unknown(
+        self,
+        effect_id: str,
+        *,
+        context: InvocationContext,
+    ) -> None:
+        effect = await self.store.mark_external_effect_unknown(effect_id)
+        await self._append_external_effect_journal(effect, context=context)
+
+    async def confirm_external_effect(
+        self,
+        effect_id: str,
+        *,
+        context: InvocationContext,
+        action_id: str | None,
+    ) -> None:
+        effect = await self.store.confirm_external_effect(
+            effect_id,
+            action_id=action_id,
+        )
+        await self._append_external_effect_journal(effect, context=context)
+
+    async def request_has_replay_barrier(self, request_id: str) -> bool:
+        return await self.store.request_has_replay_barrier(request_id)
+
     async def record_posted_message(
         self,
         *,
@@ -1328,6 +1692,7 @@ class ActionReceiptService:
         context: InvocationContext,
         host_delivery: bool = False,
         action_id: str | None = None,
+        effect_id: str | None = None,
     ) -> ActionReceipt | None:
         """Record one successful write without changing the write's own result."""
 
@@ -1368,6 +1733,12 @@ class ActionReceiptService:
                 undo_arguments=undo_arguments,
                 host_delivery=host_delivery,
             )
+            if effect_id is not None:
+                await self.confirm_external_effect(
+                    effect_id,
+                    context=context,
+                    action_id=action_id,
+                )
             tracked = True
         except Exception:
             tracked = False
@@ -1377,6 +1748,19 @@ class ActionReceiptService:
                 capability,
                 context.request_id,
             )
+            if effect_id is not None:
+                try:
+                    await self.mark_external_effect_unknown(
+                        effect_id,
+                        context=context,
+                    )
+                except Exception:
+                    log.critical(
+                        "External effect could not be marked unknown effect=%s request=%s",
+                        effect_id,
+                        context.request_id,
+                        exc_info=True,
+                    )
         receipt = ActionReceipt(
             action_id=action_id if tracked else None,
             capability=capability,
@@ -1516,6 +1900,28 @@ class ActionReceiptService:
                 context.request_id,
             )
 
+    async def _append_external_effect_journal(
+        self,
+        effect: ExternalEffectRecord,
+        *,
+        context: InvocationContext,
+    ) -> None:
+        await self._append_journal(
+            kind=f"agent.external_effect.{effect.status.value}",
+            context=context,
+            payload={
+                "schema_version": 1,
+                "public_reference_id": context.public_reference_id,
+                "effect_id": effect.effect_id,
+                "capability": effect.capability,
+                "status": effect.status.value,
+                "provider_thread_id": effect.provider_thread_id,
+                "provider_turn_id": effect.provider_turn_id,
+                "tool_call_id": effect.tool_call_id,
+                "action_id": effect.action_id,
+            },
+        )
+
 
 def build_action_undo_endpoint(service: ActionReceiptService) -> CapabilityEndpoint:
     """Expose recent-action Undo without exposing the inverse endpoints themselves."""
@@ -1629,6 +2035,89 @@ def _build_inverse_request(
         return request_type(**dict(arguments))
     except (TypeError, ValueError) as exc:
         raise CapabilityError("Undo policy produced invalid inverse arguments.") from exc
+
+
+def _external_effect_record(
+    *,
+    capability: str,
+    context: InvocationContext,
+    ttl: timedelta,
+) -> ExternalEffectRecord:
+    normalized_capability = capability.strip()
+    tool_call_id = context.tool_call_id.strip() if context.tool_call_id else ""
+    if not normalized_capability or not tool_call_id:
+        raise ValueError("external effects require a capability and provider tool call ID")
+    identity = "\0".join(
+        (
+            context.request_id,
+            context.actor_id,
+            context.workspace_id or "",
+            context.provider_thread_id or "",
+            context.provider_turn_id or "",
+            tool_call_id,
+            normalized_capability,
+        )
+    )
+    now = datetime.now(UTC)
+    return ExternalEffectRecord(
+        effect_id="eff_" + hashlib.sha256(identity.encode()).hexdigest()[:32],
+        capability=normalized_capability,
+        actor_id=context.actor_id,
+        workspace_id=context.workspace_id,
+        transport=context.transport,
+        request_id=context.request_id,
+        provider_thread_id=context.provider_thread_id,
+        provider_turn_id=context.provider_turn_id,
+        tool_call_id=tool_call_id,
+        status=ExternalEffectStatus.PLANNED,
+        action_id=None,
+        created_at=now,
+        updated_at=now,
+        expires_at=now + ttl,
+    )
+
+
+def _external_effect_identity(record: ExternalEffectRecord) -> tuple[object, ...]:
+    return (
+        record.effect_id,
+        record.capability,
+        record.actor_id,
+        record.workspace_id,
+        record.transport,
+        record.request_id,
+        record.provider_thread_id,
+        record.provider_turn_id,
+        record.tool_call_id,
+    )
+
+
+def _row_external_effect(row: sqlite3.Row) -> ExternalEffectRecord:
+    return ExternalEffectRecord(
+        effect_id=str(row["effect_id"]),
+        capability=str(row["capability"]),
+        actor_id=str(row["actor_id"]),
+        workspace_id=(
+            str(row["workspace_id"]) if row["workspace_id"] is not None else None
+        ),
+        transport=str(row["transport"]),
+        request_id=str(row["request_id"]),
+        provider_thread_id=(
+            str(row["provider_thread_id"])
+            if row["provider_thread_id"] is not None
+            else None
+        ),
+        provider_turn_id=(
+            str(row["provider_turn_id"])
+            if row["provider_turn_id"] is not None
+            else None
+        ),
+        tool_call_id=str(row["tool_call_id"]),
+        status=ExternalEffectStatus(str(row["status"])),
+        action_id=(str(row["action_id"]) if row["action_id"] is not None else None),
+        created_at=datetime.fromisoformat(str(row["created_at"])).astimezone(UTC),
+        updated_at=datetime.fromisoformat(str(row["updated_at"])).astimezone(UTC),
+        expires_at=datetime.fromisoformat(str(row["expires_at"])).astimezone(UTC),
+    )
 
 
 def _row_record(row: sqlite3.Row) -> ActionRecord:

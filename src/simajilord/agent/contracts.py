@@ -204,6 +204,7 @@ class AgentProgressStage(StrEnum):
     READING_DISCORD = "reading_discord"
     SEARCHING_WEB = "searching_web"
     COMPUTING = "computing"
+    COMPACTING_CONTEXT = "compacting_context"
     ANALYZING_MEDIA = "analyzing_media"
     GENERATING_IMAGE = "generating_image"
     USING_AUDIO = "using_audio"

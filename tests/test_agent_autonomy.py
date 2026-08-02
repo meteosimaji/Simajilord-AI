@@ -1048,6 +1048,48 @@ async def test_agent_recovers_prior_process_mention_as_a_fresh_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_does_not_replay_interrupted_mention_after_external_write() -> None:
+    now = datetime.now(UTC)
+    interrupted = AgentInterruptedMention(
+        event_id="discord:message:41",
+        public_reference_id="agt_1123456789abcdef0123",
+        channel_id="20",
+        source_message_id="41",
+        occurred_at=now - timedelta(minutes=1),
+        started_at=now - timedelta(seconds=30),
+    )
+    store = SimpleNamespace(
+        interrupted_mentions=AsyncMock(return_value=(interrupted,)),
+        fail_interrupted_mention=AsyncMock(return_value=True),
+    )
+    receipts = SimpleNamespace(
+        request_has_replay_barrier=AsyncMock(return_value=True),
+    )
+    journal = SimpleNamespace(append=AsyncMock(return_value=1))
+    bot = SimpleNamespace(wait_until_ready=AsyncMock())
+    cog = AgentCog(
+        bot,
+        SimpleNamespace(
+            action_receipts=receipts,
+            agent_store=store,
+            journal=journal,
+        ),
+    )
+    cog._started_at = now
+    cog._handle_mention = AsyncMock()  # type: ignore[method-assign]
+
+    await cog._recover_interrupted_mentions()
+
+    receipts.request_has_replay_barrier.assert_awaited_once_with(interrupted.event_id)
+    cog._handle_mention.assert_not_awaited()
+    store.fail_interrupted_mention.assert_awaited_once_with(
+        interrupted.event_id,
+        error_type="RecoveryBlockedByExternalEffect",
+    )
+    assert journal.append.await_args.kwargs["kind"] == "agent.turn.recovery_blocked"
+
+
+@pytest.mark.asyncio
 async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1526,14 +1568,23 @@ async def test_mention_recovery_does_not_reuse_saved_identical_chunk() -> None:
         SimpleNamespace(agent_store=store),
     )
 
+    recovery_candidates: dict[str, tuple[discord.Message, ...]] = {}
     reconciled = await cog._reconcile_host_messages(
         channel,
         pending,
         records,
+        recovery_candidates=recovery_candidates,
+    )
+    await cog._reconcile_host_messages(
+        channel,
+        pending,
+        records,
+        recovery_candidates=recovery_candidates,
     )
 
     assert tuple(record.message_id for record in reconciled) == ("301", "302")
-    store.record_host_delivery_message.assert_awaited_once()
+    assert channel.history.call_count == 1
+    assert store.record_host_delivery_message.await_count == 2
     assert (
         store.record_host_delivery_message.await_args.kwargs["message_id"]
         == "302"

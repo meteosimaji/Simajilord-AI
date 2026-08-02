@@ -904,24 +904,82 @@ class AgentToolCatalog:
         request = _build_dataclass(endpoint.request_type, arguments)
         if before_invoke is not None:
             before_invoke()
-        result = await self._registry.invoke(capability_name, request, context)
-        receipt: ActionReceipt | None = None
-        if (
+        effect_id: str | None = None
+        tracks_external_effect = (
             self._action_receipts is not None
             and capability_name in self._write_capabilities
-        ):
+        )
+        if tracks_external_effect:
+            assert self._action_receipts is not None
+            try:
+                effect_id = await self._action_receipts.begin_external_effect(
+                    capability=capability_name,
+                    context=context,
+                )
+            except Exception as exc:
+                raise AgentToolError(
+                    "The external effect ledger is unavailable; the write was not dispatched."
+                ) from exc
+        try:
+            result = await self._registry.invoke(capability_name, request, context)
+        except BaseException:
+            if effect_id is not None:
+                assert self._action_receipts is not None
+                try:
+                    await self._action_receipts.mark_external_effect_unknown(
+                        effect_id,
+                        context=context,
+                    )
+                except Exception:
+                    log.critical(
+                        "External effect state could not be closed effect=%s request_id=%s",
+                        effect_id,
+                        context.request_id,
+                        exc_info=True,
+                    )
+            raise
+        receipt: ActionReceipt | None = None
+        if tracks_external_effect:
+            assert self._action_receipts is not None
             try:
                 receipt = await self._action_receipts.record(
                     capability=capability_name,
                     request=request,
                     response=result,
                     context=context,
+                    effect_id=effect_id,
                 )
             except Exception:
                 log.exception(
                     "Action receipt recording failed capability=%s request_id=%s",
                     capability_name,
                     context.request_id,
+                )
+                if effect_id is not None:
+                    try:
+                        await self._action_receipts.mark_external_effect_unknown(
+                            effect_id,
+                            context=context,
+                        )
+                    except Exception:
+                        log.critical(
+                            "External effect state could not be marked unknown "
+                            "effect=%s request_id=%s",
+                            effect_id,
+                            context.request_id,
+                            exc_info=True,
+                        )
+            if (
+                receipt is None
+                and effect_id is not None
+                and capability_name == "action.undo"
+            ):
+                # action.undo owns its inverse receipt internally; the positive
+                # endpoint result still confirms this provider effect.
+                await self._action_receipts.confirm_external_effect(
+                    effect_id,
+                    context=context,
+                    action_id=None,
                 )
         if capability_name in self._image_output_capabilities:
             if not dataclasses.is_dataclass(result):

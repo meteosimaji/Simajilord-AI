@@ -323,6 +323,31 @@ class AgentConversationStore:
         async with self._lock:
             await asyncio.to_thread(self._rotate, conversation_id, model)
 
+    async def reset_provider_continuity(
+        self,
+        conversation_ids: tuple[str, ...] | None = None,
+    ) -> int:
+        """Clear provider bindings only, preserving requests and delivery evidence."""
+
+        normalized_ids: tuple[str, ...] | None = None
+        if conversation_ids is not None:
+            normalized_ids = tuple(
+                dict.fromkeys(
+                    conversation_id.strip()
+                    for conversation_id in conversation_ids
+                    if conversation_id.strip()
+                )
+            )
+            if not normalized_ids:
+                raise ValueError("at least one conversation ID is required")
+            if any(len(conversation_id) > 500 for conversation_id in normalized_ids):
+                raise ValueError("conversation IDs must be bounded")
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._reset_provider_continuity,
+                normalized_ids,
+            )
+
     async def prune(self, *, before: datetime) -> tuple[int, int]:
         """Remove old request accounting and then unreferenced old conversations."""
 
@@ -1229,6 +1254,38 @@ class AgentConversationStore:
                 (model, now, conversation_id),
             )
             connection.commit()
+        finally:
+            connection.close()
+
+    def _reset_provider_continuity(
+        self,
+        conversation_ids: tuple[str, ...] | None,
+    ) -> int:
+        now = datetime.now(UTC).isoformat()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            where = (
+                "(provider_thread_id IS NOT NULL OR turn_count != 0 "
+                "OR last_input_tokens != 0 OR model_context_window IS NOT NULL)"
+            )
+            values: tuple[object, ...] = ()
+            if conversation_ids is not None:
+                placeholders = ", ".join("?" for _ in conversation_ids)
+                where += f" AND conversation_id IN ({placeholders})"
+                values = tuple(conversation_ids)
+            cursor = connection.execute(
+                f"""
+                UPDATE agent_conversations
+                SET provider_thread_id = NULL, generation = generation + 1,
+                    turn_count = 0, last_input_tokens = 0,
+                    model_context_window = NULL, updated_at = ?
+                WHERE {where}
+                """,
+                (now, *values),
+            )
+            connection.commit()
+            return cursor.rowcount
         finally:
             connection.close()
 

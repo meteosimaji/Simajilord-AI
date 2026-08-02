@@ -66,6 +66,7 @@ from simajilord.agent.store import (
     AgentHostDeliveryRecord,
     AgentPendingHostDelivery,
 )
+from simajilord.async_locks import KeyedAsyncLockPool
 from simajilord.capabilities.audio import (
     AudioAction,
     AudioAutoLeaveRequest,
@@ -3587,6 +3588,18 @@ class SystemCog(commands.Cog):
                         "Status: "
                         f"**{'Ready' if response.web_search_ready else 'Limited'}**\n"
                         f"Backend: **{response.web_search_backend}**",
+                    ),
+                    EmbedField(
+                        "AI queues",
+                        (
+                            f"Active: **{response.agent_active_turn_count}**"
+                            f" · Pending: **{response.agent_pending_turn_count}**"
+                            f" · Ready: **{response.agent_ready_pending_turn_count}**"
+                            "\nKeyed registries: "
+                            f"workspace **{response.agent_workspace_slot_registry_size}**"
+                            " · conversation "
+                            f"**{response.agent_conversation_lock_registry_size}**"
+                        ),
                     ),
                     EmbedField(
                         "Storage",
@@ -8372,7 +8385,7 @@ class AgentCog(commands.Cog):
         self.runtime = runtime
         self._started_at = datetime.now(UTC)
         self._active_progress: dict[str, AgentProgressMessage] = {}
-        self._host_delivery_locks: dict[str, asyncio.Lock] = {}
+        self._host_delivery_locks = KeyedAsyncLockPool()
         self._host_delivery_wakeup = asyncio.Event()
         self._host_delivery_task: asyncio.Task[None] | None = None
         self._interrupted_recovery_task: asyncio.Task[None] | None = None
@@ -8613,6 +8626,33 @@ class AgentCog(commands.Cog):
         )
         for request in interrupted:
             try:
+                replay_barrier = await _agent_request_replay_barrier_reason(
+                    self.runtime,
+                    request.event_id,
+                )
+                if replay_barrier is not None:
+                    await self.runtime.agent_store.fail_interrupted_mention(
+                        request.event_id,
+                        error_type="RecoveryBlockedByExternalEffect",
+                    )
+                    await self.runtime.journal.append(
+                        kind="agent.turn.recovery_blocked",
+                        actor_id=None,
+                        workspace_id=None,
+                        transport="agent",
+                        request_id=request.event_id,
+                        payload={
+                            "public_reference_id": request.public_reference_id,
+                            "reason": replay_barrier,
+                        },
+                    )
+                    log.error(
+                        "Interrupted mention was not replayed after an external "
+                        "write request=%s reason=%s",
+                        request.event_id,
+                        replay_barrier,
+                    )
+                    continue
                 channel = await self._agent_host_channel(request.channel_id)
                 source = await self._agent_source_message(
                     channel,
@@ -8663,7 +8703,6 @@ class AgentCog(commands.Cog):
                     request.event_id,
                     request.channel_id,
                 )
-
     async def _host_delivery_loop(self) -> None:
         """Reconcile completed mention responses without rerunning the model."""
 
@@ -8676,9 +8715,16 @@ class AgentCog(commands.Cog):
                 pending = await self.runtime.agent_store.pending_host_deliveries(
                     limit=100
                 )
+                recovery_candidates: dict[
+                    str,
+                    tuple[discord.Message, ...],
+                ] = {}
                 for delivery in pending:
                     try:
-                        await self._deliver_host_response(delivery)
+                        await self._deliver_host_response(
+                            delivery,
+                            recovery_candidates=recovery_candidates,
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -8711,12 +8757,9 @@ class AgentCog(commands.Cog):
         *,
         source: discord.Message | None = None,
         expected_chunks: tuple[str, ...] | None = None,
+        recovery_candidates: dict[str, tuple[discord.Message, ...]] | None = None,
     ) -> None:
-        lock = self._host_delivery_locks.setdefault(
-            pending.event_id,
-            asyncio.Lock(),
-        )
-        async with lock:
+        async with self._host_delivery_locks.hold(pending.event_id):
             chunks = agent_message_groups(pending.response_content)
             if pending.response_content.strip() in {
                 AGENT_FINAL_DELIVERED_CONTENT,
@@ -8730,7 +8773,6 @@ class AgentCog(commands.Cog):
                     pending.event_id,
                     allow_empty=True,
                 )
-                self._host_delivery_locks.pop(pending.event_id, None)
                 return
 
             records = await self.runtime.agent_store.plan_host_delivery(
@@ -8748,6 +8790,7 @@ class AgentCog(commands.Cog):
                 channel,
                 pending,
                 records,
+                recovery_candidates=recovery_candidates,
             )
             context = InvocationContext(
                 actor_id=pending.actor_id,
@@ -8809,7 +8852,6 @@ class AgentCog(commands.Cog):
                 pending.event_id
             ):
                 raise RuntimeError("agent host delivery did not reach terminal state")
-            self._host_delivery_locks.pop(pending.event_id, None)
 
     async def _agent_host_channel(
         self,
@@ -8843,23 +8885,34 @@ class AgentCog(commands.Cog):
         channel: discord.abc.Messageable,
         pending: AgentPendingHostDelivery,
         records: tuple[AgentHostDeliveryRecord, ...],
+        *,
+        recovery_candidates: dict[str, tuple[discord.Message, ...]] | None = None,
     ) -> tuple[AgentHostDeliveryRecord, ...]:
         missing = [record for record in records if record.message_id is None]
         bot_user = self.bot.user
         if not missing or bot_user is None:
             return records
-        candidates: list[discord.Message] = []
-        after = pending.completed_at - timedelta(minutes=1)
-        try:
-            async for candidate in channel.history(
-                limit=1_000,
-                after=after,
-                oldest_first=True,
-            ):
-                if candidate.author.id == bot_user.id:
-                    candidates.append(candidate)
-        except (discord.Forbidden, discord.NotFound):
+        candidates = (
+            list(recovery_candidates[pending.channel_id])
+            if recovery_candidates is not None
+            and pending.channel_id in recovery_candidates
+            else None
+        )
+        if candidates is None:
             candidates = []
+            after = pending.completed_at - timedelta(minutes=1)
+            try:
+                async for candidate in channel.history(
+                    limit=1_000,
+                    after=after,
+                    oldest_first=True,
+                ):
+                    if candidate.author.id == bot_user.id:
+                        candidates.append(candidate)
+            except (discord.Forbidden, discord.NotFound):
+                candidates = []
+            if recovery_candidates is not None:
+                recovery_candidates[pending.channel_id] = tuple(candidates)
 
         # Identical chunks are valid. Never let hash fallback reuse a message
         # that is already durable evidence for another chunk.
@@ -8928,6 +8981,30 @@ class AgentCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
         )
+
+
+async def _agent_request_replay_barrier_reason(
+    runtime: SimajilordRuntime,
+    request_id: str,
+) -> str | None:
+    """Conservatively refuse whole-turn replay after any durable write attempt."""
+
+    action_receipts = getattr(runtime, "action_receipts", None)
+    if (
+        action_receipts is not None
+        and await action_receipts.request_has_replay_barrier(request_id)
+    ):
+        return "external_effect_ledger"
+    journal = getattr(runtime, "journal", None)
+    if journal is None:
+        return None
+    trace = await journal.agent_trace(request_id=request_id, limit=1_000)
+    for record in trace:
+        if record.kind not in {"agent.tool.started", "agent.app_tool.started"}:
+            continue
+        if record.payload.get("write") is True:
+            return "legacy_write_trace"
+    return None
 
 
 class ObservationCog(commands.Cog):

@@ -732,7 +732,6 @@ class SimajilordRuntime:
                         settings.agent_rate_limit_exempt_user_ids
                     ),
                 ),
-                memory=memory,
             )
         maintenance = DataMaintenanceService(
             data_dir=settings.data_dir,
@@ -825,6 +824,7 @@ class SimajilordRuntime:
                 web,
                 maintenance,
                 agent_enabled=settings.agent_enabled,
+                agent_metrics=agent.runtime_metrics if agent is not None else None,
                 speech_provider=settings.tts_provider,
                 speech_voice=(
                     f"style {settings.voicevox_speaker_id}"

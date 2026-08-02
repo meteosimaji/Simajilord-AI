@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from simajilord.core import (
@@ -51,6 +52,11 @@ class StatusResponse:
     audit_last_failure_at_epoch: int | None
     audit_last_failure_type: str | None
     audit_writer_state: str
+    agent_active_turn_count: int
+    agent_pending_turn_count: int
+    agent_ready_pending_turn_count: int
+    agent_workspace_slot_registry_size: int
+    agent_conversation_lock_registry_size: int
 
 
 def build_status_endpoint(
@@ -61,6 +67,7 @@ def build_status_endpoint(
     maintenance: DataMaintenanceService,
     *,
     agent_enabled: bool,
+    agent_metrics: Callable[[], Mapping[str, int]] | None = None,
     speech_provider: str,
     speech_voice: str,
 ) -> CapabilityEndpoint:
@@ -69,6 +76,7 @@ def build_status_endpoint(
         maintenance_report = maintenance.last_report
         diagnostics = await journal.operation_diagnostics()
         audit = await journal.audit_health()
+        current_agent_metrics = dict(agent_metrics()) if agent_metrics else {}
         return StatusResponse(
             status="ok",
             capability_count=len(registry.all()),
@@ -108,6 +116,20 @@ def build_status_endpoint(
             ),
             audit_last_failure_type=audit.last_failure_type,
             audit_writer_state=audit.writer_state,
+            agent_active_turn_count=current_agent_metrics.get("active_turns", 0),
+            agent_pending_turn_count=current_agent_metrics.get("pending_turns", 0),
+            agent_ready_pending_turn_count=current_agent_metrics.get(
+                "ready_pending_turns",
+                0,
+            ),
+            agent_workspace_slot_registry_size=current_agent_metrics.get(
+                "workspace_slot_registry_size",
+                0,
+            ),
+            agent_conversation_lock_registry_size=current_agent_metrics.get(
+                "conversation_lock_registry_size",
+                0,
+            ),
         )
 
     return endpoint(

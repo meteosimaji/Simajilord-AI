@@ -21,6 +21,12 @@ from .application_emojis import ApplicationEmojiCatalog
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import DiscordMessageChannel, build_discord_endpoints
 from .cogs import error_message, handle_interaction_error, setup_cogs
+from .command_sync import (
+    CommandManifestStore,
+    DiscordCommandSynchronizer,
+    local_command_payloads,
+    remote_command_payloads,
+)
 from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
@@ -73,6 +79,11 @@ class SimajilordDiscordBot(commands.Bot):
         self._commands_synchronized = False
         self._audio_restored = False
         self._command_sync_lock = asyncio.Lock()
+        self._command_synchronizer = DiscordCommandSynchronizer(
+            CommandManifestStore(
+                runtime.settings.data_dir / "discord_command_manifests.sqlite3"
+            )
+        )
 
     async def setup_hook(self) -> None:
         await verify_ffmpeg_opus()
@@ -181,15 +192,19 @@ class SimajilordDiscordBot(commands.Bot):
         ):
             return
         async with self._command_sync_lock:
+            desired = local_command_payloads(self._command_templates, self.tree)
             self._restore_global_templates()
             self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
+            synced = await self._sync_prepared_command_scope(
+                guild=guild,
+                desired=desired,
+            )
             self.tree.clear_commands(guild=None)
-            await self.tree.sync()
+            await self._sync_prepared_command_scope(guild=None, desired=())
             self._restore_global_templates()
         log.info(
-            "Synchronized %s commands to newly joined guild %s",
+            "Published %s changed commands to newly joined guild %s",
             len(synced),
             guild.id,
         )
@@ -200,21 +215,92 @@ class SimajilordDiscordBot(commands.Bot):
         async with self._command_sync_lock:
             if self._commands_synchronized:
                 return
+            desired = local_command_payloads(self._command_templates, self.tree)
             if self.runtime.settings.command_scope is CommandScope.GUILD:
                 self._restore_global_templates()
                 for guild in self.guilds:
                     self.tree.clear_commands(guild=guild)
                     self.tree.copy_global_to(guild=guild)
-                    synced = await self.tree.sync(guild=guild)
-                    log.info("Synchronized %s commands to guild %s", len(synced), guild.id)
+                    synced = await self._sync_prepared_command_scope(
+                        guild=guild,
+                        desired=desired,
+                    )
+                    if synced:
+                        log.info(
+                            "Published %s changed commands to guild %s",
+                            len(synced),
+                            guild.id,
+                        )
                 self.tree.clear_commands(guild=None)
-                await self.tree.sync()
+                removed = await self._sync_prepared_command_scope(
+                    guild=None,
+                    desired=(),
+                )
                 self._restore_global_templates()
-                log.info("Removed stale global commands while using guild command scope")
+                if removed:
+                    log.info(
+                        "Removed stale global commands while using guild command scope"
+                    )
             else:
-                synced = await self.tree.sync()
-                log.info("Synchronized %s global commands", len(synced))
+                synced = await self._sync_prepared_command_scope(
+                    guild=None,
+                    desired=desired,
+                )
+                if synced:
+                    log.info("Published %s changed global commands", len(synced))
+            await self._command_synchronizer.store.retain_scopes(
+                frozenset(
+                    {
+                        self._command_manifest_scope(None),
+                        *(
+                            self._command_manifest_scope(guild)
+                            for guild in self.guilds
+                            if self.runtime.settings.command_scope is CommandScope.GUILD
+                        ),
+                    }
+                )
+            )
             self._commands_synchronized = True
+
+    async def _sync_prepared_command_scope(
+        self,
+        *,
+        guild: discord.abc.Snowflake | None,
+        desired: tuple[dict[str, object], ...],
+    ) -> list[app_commands.AppCommand]:
+        scope = self._command_manifest_scope(guild)
+
+        async def fetch_remote() -> tuple[dict[str, object], ...]:
+            fetched = await self.tree.fetch_commands(guild=guild)
+            return remote_command_payloads(fetched)
+
+        decision = await self._command_synchronizer.assess(
+            scope=scope,
+            desired=desired,
+            fetch_remote=fetch_remote,
+        )
+        if not decision.needs_sync:
+            log.info(
+                "Discord command scope unchanged scope=%s reason=%s manifest=%s",
+                scope,
+                decision.reason,
+                decision.manifest_hash[:12],
+            )
+            return []
+        synced = await self.tree.sync(guild=guild)
+        await self._command_synchronizer.mark_applied(
+            scope,
+            decision.manifest_hash,
+        )
+        return synced
+
+    def _command_manifest_scope(
+        self,
+        guild: discord.abc.Snowflake | None,
+    ) -> str:
+        application_id = self.runtime.settings.application_id
+        suffix = "global" if guild is None else f"guild:{guild.id}"
+        return f"application:{application_id}:{suffix}"
 
     async def _restore_audio_sessions(self) -> None:
         """Restore durable state without turning process startup into a voice action."""

@@ -14,6 +14,7 @@ import pytest
 from simajilord.agent import (
     AGENT_FINAL_DELIVERED_CONTENT,
     AGENT_IMAGE_GRANT,
+    AGENT_MEMORY_GRANT,
     AGENT_NO_ACTION_CONTENT,
     AGENT_WEB_GRANT,
     AgentBusyError,
@@ -2165,7 +2166,8 @@ async def test_agent_cancellation_while_release_waits_for_lock_does_not_leak_slo
     assert service._active_turns == 0
     assert service._pending_turns == 0
     assert not service._active_turn_slots.locked()
-    assert not service._workspace_turn_slots["1"].locked()
+    assert service._workspace_turn_slots == {}
+    assert service._workspace_turn_slot_references == {}
 
 
 @pytest.mark.asyncio
@@ -2240,7 +2242,8 @@ async def test_agent_admission_error_releases_direct_active_reservation(
     assert service._active_turns == 0
     assert service._pending_turns == 0
     assert not service._active_turn_slots.locked()
-    assert not service._workspace_turn_slots["1"].locked()
+    assert service._workspace_turn_slots == {}
+    assert service._workspace_turn_slot_references == {}
 
     service.store.begin = original_begin
     response = await service.respond(
@@ -2300,7 +2303,8 @@ async def test_agent_cancellation_during_admission_error_cleanup_does_not_leak(
     assert service._pending_turns == 0
     assert service._ready_pending_turns == 0
     assert not service._active_turn_slots.locked()
-    assert not service._workspace_turn_slots["1"].locked()
+    assert service._workspace_turn_slots == {}
+    assert service._workspace_turn_slot_references == {}
 
 
 @pytest.mark.asyncio
@@ -2427,19 +2431,67 @@ async def test_agent_preserves_provider_thread_without_preemptive_rotation(
         provider=provider,
         store=store,
         journal=EventJournal(tmp_path / "events.sqlite3"),
-        limits=_limits(),
+        limits=_limits(per_user_requests=20, per_workspace_requests=20),
     )
 
-    await service.respond(_request("event-1"))
-    await service.respond(_request("event-2"))
+    for index in range(14):
+        await service.respond(_request(f"event-{index}"))
 
     assert provider.calls[0][0] is None
-    assert provider.calls[1][0] == "thread-1"
+    assert all(call[0] == "thread-1" for call in provider.calls[1:])
     assert "continuity_reset_reason=" not in provider.calls[0][1]
     assert "continuity_reset_reason=" not in provider.calls[1][1]
     conversation = await store.conversation("discord:guild:1:channel:2")
     assert conversation is not None
     assert conversation.generation == 0
+    assert conversation.turn_count == 14
+
+
+@pytest.mark.asyncio
+async def test_agent_does_not_eagerly_inject_recent_memory(tmp_path: Path) -> None:
+    provider = FakeProvider()
+    service = AgentService(
+        provider=provider,
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+
+    await service.respond(
+        _request(
+            "memory-event",
+            grants=frozenset({AGENT_MEMORY_GRANT}),
+        )
+    )
+
+    assert "requester_memory" not in provider.calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_agent_evicts_inactive_workspace_and_conversation_locks(
+    tmp_path: Path,
+) -> None:
+    service = AgentService(
+        provider=FakeProvider(),
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(rate_limit_exempt_actor_ids=frozenset({"admin"})),
+    )
+
+    for index in range(50):
+        await service.respond(
+            _request(
+                f"bounded-lock-{index}",
+                actor_id="admin",
+                conversation_id=f"conversation-{index}",
+                workspace_id=f"workspace-{index}",
+                channel_id=f"channel-{index}",
+            )
+        )
+
+    assert service._workspace_turn_slots == {}
+    assert service._workspace_turn_slot_references == {}
+    assert service._conversation_locks.size == 0
 
 
 def test_event_prompt_marks_saved_thread_recovery_without_inventing_context() -> None:
@@ -5887,6 +5939,7 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    journal = EventJournal(tmp_path / "events.sqlite3")
     provider = CodexAppServerProvider(
         executable="codex",
         model="test",
@@ -5896,6 +5949,7 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
         tools=AgentToolCatalog(CapabilityRegistry(), ()),
         max_tool_calls=4,
         max_tool_output_characters=4_000,
+        trace_sink=journal,
     )
     provider._thread_by_turn["turn"] = "thread"
     turn = asyncio.create_task(provider._await_turn("thread", "turn"))
@@ -5903,6 +5957,14 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
 
     await asyncio.sleep(0.025)
     with caplog.at_level("INFO", logger="simajilord.agent.providers.codex"):
+        await provider._handle_notification(
+            "item/started",
+            {
+                "threadId": "thread",
+                "turnId": "turn",
+                "item": {"type": "contextCompaction"},
+            },
+        )
         await provider._handle_notification(
             "item/completed",
             {
@@ -5931,6 +5993,12 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
 
     assert (await asyncio.wait_for(turn, timeout=1))[0] == "finished after compaction"
     assert "Codex compacted retained agent context thread=thread" in caplog.text
+    records = await journal.recent(limit=20)
+    assert [record.kind for record in records] == [
+        "agent.context_compaction.started",
+        "agent.context_compaction.completed",
+    ]
+    await journal.close()
 
 
 @pytest.mark.asyncio

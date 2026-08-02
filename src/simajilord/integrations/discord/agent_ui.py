@@ -176,6 +176,7 @@ _PROGRESS_MESSAGES = {
     AgentProgressStage.READING_DISCORD: "Reading the relevant Discord conversation…",
     AgentProgressStage.SEARCHING_WEB: "Searching the web…",
     AgentProgressStage.COMPUTING: "Running the calculation…",
+    AgentProgressStage.COMPACTING_CONTEXT: "Compacting retained context…",
     AgentProgressStage.ANALYZING_MEDIA: "Analyzing the attachment…",
     AgentProgressStage.GENERATING_IMAGE: "Generating image…",
     AgentProgressStage.USING_AUDIO: "Preparing the server audio controls…",

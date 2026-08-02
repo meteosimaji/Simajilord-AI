@@ -30,6 +30,7 @@ simajilord-offline-preview = "simajilord.diagnostics.offline_discord:main"
 simajilord-web-doctor = "simajilord.diagnostics.web:main"
 simajilord-translation-doctor = "simajilord.diagnostics.translation:main"
 simajilord-agent-reference = "simajilord.diagnostics.agent_reference:main"
+simajilord-agent-reset = "simajilord.diagnostics.agent_reset:main"
 simajilord-feedback = "simajilord.diagnostics.feedback:main"
 
 [dependency-groups]

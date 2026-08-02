@@ -11,6 +11,8 @@ from .actions import (
     ActionStatus,
     ActionUndoRequest,
     ActionUndoResponse,
+    ExternalEffectRecord,
+    ExternalEffectStatus,
     action_policy,
     build_action_undo_endpoint,
 )
@@ -190,6 +192,8 @@ __all__ = [
     "CuratedWorkflowSearchRequest",
     "CuratedWorkflowSearchResponse",
     "CuratedWorkflowStep",
+    "ExternalEffectRecord",
+    "ExternalEffectStatus",
     "action_policy",
     "build_action_undo_endpoint",
     "build_curated_workflow_endpoint",

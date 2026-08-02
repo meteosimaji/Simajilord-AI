@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import fields
-from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,8 +14,6 @@ from simajilord.agent.providers.codex import (
     _ToolTurnBudget,
     _write_readiness_failure,
 )
-from simajilord.agent.service import _conversation_rotation_reason
-from simajilord.agent.store import AgentConversationRecord
 from simajilord.capabilities.source_inspection import (
     EvidencePlanRequest,
     EvidencePlanResponse,
@@ -144,55 +141,6 @@ def test_context_evidence_requires_a_fresh_semantic_plan() -> None:
     assert budget.source_inspection_satisfied is False
     assert budget.capability_discovery_searches == 0
     assert budget.capability_discovery_catalog_id is None
-
-
-def test_provider_thread_rotation_bounds_stale_self_history() -> None:
-    now = datetime.now(UTC)
-    base = AgentConversationRecord(
-        conversation_id="conversation",
-        provider_thread_id="thread",
-        model="model",
-        generation=1,
-        turn_count=11,
-        last_input_tokens=34_999,
-        model_context_window=100_000,
-        created_at=now,
-        updated_at=now,
-    )
-
-    assert _conversation_rotation_reason(base) is None
-    assert (
-        _conversation_rotation_reason(
-            AgentConversationRecord(
-                conversation_id=base.conversation_id,
-                provider_thread_id=base.provider_thread_id,
-                model=base.model,
-                generation=base.generation,
-                turn_count=12,
-                last_input_tokens=base.last_input_tokens,
-                model_context_window=base.model_context_window,
-                created_at=base.created_at,
-                updated_at=base.updated_at,
-            )
-        )
-        == "bounded_thread_turn_limit"
-    )
-    assert (
-        _conversation_rotation_reason(
-            AgentConversationRecord(
-                conversation_id=base.conversation_id,
-                provider_thread_id=base.provider_thread_id,
-                model=base.model,
-                generation=base.generation,
-                turn_count=1,
-                last_input_tokens=35_000,
-                model_context_window=100_000,
-                created_at=base.created_at,
-                updated_at=base.updated_at,
-            )
-        )
-        == "bounded_thread_context_pressure"
-    )
 
 
 @pytest.mark.asyncio

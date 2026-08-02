@@ -2189,6 +2189,15 @@ class CodexAppServerProvider:
                         budget,
                         AgentProgressStage.SEARCHING_WEB,
                     )
+                elif item_type == "contextCompaction":
+                    await self._emit_progress(
+                        budget,
+                        AgentProgressStage.COMPACTING_CONTEXT,
+                    )
+                    await self._record_context_compaction_safely(
+                        "agent.context_compaction.started",
+                        params,
+                    )
                 elif item_type == "agentMessage":
                     await self._emit_progress(
                         budget,
@@ -2225,11 +2234,19 @@ class CodexAppServerProvider:
             return
         if method == "thread/compacted":
             log.info("Codex compacted retained agent context thread=%s", thread_id)
+            await self._record_context_compaction_safely(
+                "agent.context_compaction.completed",
+                params,
+            )
             return
         if method == "item/completed":
             item = params.get("item")
             if isinstance(item, dict) and item.get("type") == "contextCompaction":
                 log.info("Codex compacted retained agent context thread=%s", thread_id)
+                await self._record_context_compaction_safely(
+                    "agent.context_compaction.completed",
+                    params,
+                )
                 return
             if isinstance(item, dict) and item.get("type") == "mcpToolCall":
                 await self._handle_mcp_tool_notification(
@@ -2355,6 +2372,43 @@ class CodexAppServerProvider:
             else:
                 budget.write_failures.append((capability, "app.tool_failed"))
         await self._record_mcp_tool_trace_safely(kind, item, params, write=write)
+
+    async def _record_context_compaction_safely(
+        self,
+        kind: str,
+        params: dict[str, object],
+    ) -> None:
+        """Persist body-free native compaction lifecycle evidence."""
+
+        if self.trace_sink is None:
+            return
+        budget = self._tool_budget(params)
+        context = budget.context if budget is not None else None
+        try:
+            await self.trace_sink.append(
+                kind=kind,
+                payload={
+                    "schema_version": 1,
+                    "public_reference_id": (
+                        context.public_reference_id if context is not None else None
+                    ),
+                    "agent_request_id": (
+                        context.request_id if context is not None else None
+                    ),
+                    "provider_thread_id": self._notification_thread_id(params),
+                    "provider_turn_id": _notification_turn_id(params),
+                },
+                actor_id=context.actor_id if context is not None else None,
+                workspace_id=context.workspace_id if context is not None else None,
+                transport=context.transport if context is not None else "agent",
+                request_id=context.request_id if context is not None else None,
+            )
+        except Exception:
+            log.exception(
+                "Context compaction trace persistence failed kind=%s thread=%s",
+                kind,
+                self._notification_thread_id(params),
+            )
 
     async def _record_mcp_tool_trace_safely(
         self,
