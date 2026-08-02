@@ -84,13 +84,13 @@ def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
         context: InvocationContext,
     ) -> IsolatedShellResponse:
         _validate_request(request)
-        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
-            raise UserError("shell.isolation_unavailable")
         workspace = discord_workspace_for_context(workspace_root, context)
         working_directory = _resolve_working_directory(
             workspace,
             request.working_directory,
         )
+        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+            raise UserError("shell.isolation_unavailable")
         temporary_directory = workspace / ".tmp"
         temporary_directory.mkdir(mode=0o700, exist_ok=True)
         profile = _macos_sandbox_profile(workspace)
