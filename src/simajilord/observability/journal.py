@@ -128,6 +128,7 @@ class EventJournal:
             "outcome": "failed" if error else "succeeded",
             "duration_ms": round(duration_ms, 3),
             "public_reference_id": context.public_reference_id,
+            "task_id": context.agent_task_id,
             "provider_thread_id": context.provider_thread_id,
             "provider_turn_id": context.provider_turn_id,
             "tool_call_id": context.tool_call_id,
@@ -215,22 +216,26 @@ class EventJournal:
         *,
         request_id: str | None = None,
         public_reference_id: str | None = None,
+        task_id: str | None = None,
         limit: int = 500,
     ) -> tuple[EventRecord, ...]:
         """Return one bounded, chronological agent trace without body search."""
 
-        if request_id is None and public_reference_id is None:
-            raise ValueError("request_id or public_reference_id is required")
+        if request_id is None and public_reference_id is None and task_id is None:
+            raise ValueError("request_id, public_reference_id, or task_id is required")
         if request_id is not None and not request_id.strip():
             raise ValueError("request_id must not be empty")
         if public_reference_id is not None and not public_reference_id.strip():
             raise ValueError("public_reference_id must not be empty")
+        if task_id is not None and not task_id.strip():
+            raise ValueError("task_id must not be empty")
         bounded_limit = min(max(limit, 1), 1_000)
         await self._flush_audit_queue()
         return await asyncio.to_thread(
             self._select_agent_trace,
             request_id,
             public_reference_id,
+            task_id,
             bounded_limit,
         )
 
@@ -547,6 +552,16 @@ class EventJournal:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS events_agent_task_sequence
+                ON events(
+                    json_extract(payload_json, '$.task_id'),
+                    sequence
+                )
+                WHERE json_valid(payload_json)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS operation_diagnostics (
                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                     last_radio_failure_at TEXT,
@@ -747,6 +762,7 @@ class EventJournal:
         self,
         request_id: str | None,
         public_reference_id: str | None,
+        task_id: str | None,
         limit: int,
     ) -> tuple[EventRecord, ...]:
         connection = sqlite3.connect(self.path)
@@ -770,6 +786,16 @@ class EventJournal:
                     """
                 )
                 values.append(public_reference_id)
+            if task_id is not None:
+                clauses.append(
+                    """
+                    (
+                        json_valid(payload_json)
+                        AND json_extract(payload_json, '$.task_id') = ?
+                    )
+                    """
+                )
+                values.append(task_id)
             rows = connection.execute(
                 f"""
                 SELECT *

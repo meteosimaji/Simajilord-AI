@@ -3,17 +3,19 @@
 from .base import (
     AgentProgressCallback,
     AgentProvider,
+    AgentProviderThreadBindingSink,
     AgentToolTraceSink,
     ProviderTurnResult,
-    SteerableAgentProvider,
+    SemanticRoutingAgentProvider,
 )
 from .codex import CodexAppServerProvider
 
 __all__ = [
     "AgentProgressCallback",
     "AgentProvider",
+    "AgentProviderThreadBindingSink",
     "AgentToolTraceSink",
     "CodexAppServerProvider",
     "ProviderTurnResult",
-    "SteerableAgentProvider",
+    "SemanticRoutingAgentProvider",
 ]

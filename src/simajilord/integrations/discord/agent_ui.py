@@ -25,7 +25,7 @@ from simajilord.agent import (
     is_agent_public_reference_id,
 )
 
-from .presenter import EmbedTone, command_embed
+from .presenter import EmbedField, EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
 
@@ -209,6 +209,11 @@ class AgentProgressMessage:
         typing_lease_seconds: float = 12.0,
         on_posted: Callable[[discord.Message], Awaitable[None]] | None = None,
         delivery_key: str | None = None,
+        task_id: str | None = None,
+        reference_id: str | None = None,
+        requester: str | None = None,
+        quota_text: str | None = None,
+        view: discord.ui.View | None = None,
     ) -> None:
         self.source = source
         self.initial_delay_seconds = initial_delay_seconds
@@ -217,6 +222,11 @@ class AgentProgressMessage:
         self.typing_lease_seconds = typing_lease_seconds
         self.on_posted = on_posted
         self.delivery_key = delivery_key or f"discord:message:{source.id}"
+        self.task_id = task_id
+        self.reference_id = reference_id
+        self.requester = requester
+        self.quota_text = quota_text
+        self.view = view
         self.message: discord.Message | None = None
         self._latest: AgentProgressUpdate | None = None
         self._published: AgentProgressUpdate | None = None
@@ -273,6 +283,9 @@ class AgentProgressMessage:
         """Close temporary UI and return final chunks without posting them."""
 
         self._closed = True
+        if self.view is not None:
+            self.view.stop()
+            self.view = None
         await self._cancel_pending()
         await self._delete_temporary_messages()
         if content.strip() in {
@@ -284,6 +297,9 @@ class AgentProgressMessage:
 
     async def fail(self, content: str) -> None:
         self._closed = True
+        if self.view is not None:
+            self.view.stop()
+            self.view = None
         await self._cancel_pending()
         await self._delete_temporary_messages()
         await self.source.reply(
@@ -296,6 +312,50 @@ class AgentProgressMessage:
             mention_author=False,
             allowed_mentions=discord.AllowedMentions.none(),
             suppress_embeds=True,
+        )
+
+    async def cancelled(self) -> None:
+        """Close active UI while leaving one explicit cancellation result."""
+
+        self._closed = True
+        if self.view is not None:
+            self.view.stop()
+            self.view = None
+        await self._cancel_pending()
+        async with self._lock:
+            temporary = list(self._temporary_messages.values())
+            self._temporary_messages.clear()
+            progress_message = self.message
+            self.message = None
+        for message in temporary:
+            await self._delete_message(message, kind="follow-up")
+        embed = command_embed(
+            "AI task cancelled",
+            description=(
+                "The active model turn was interrupted. External effects already "
+                "confirmed before cancellation are not undone automatically."
+            ),
+            fields=self._identity_fields(),
+            tone=EmbedTone.WARNING,
+        )
+        if progress_message is not None:
+            try:
+                await progress_message.edit(content=None, embed=embed, view=None)
+                return
+            except discord.DiscordException:
+                log.exception(
+                    "Failed to edit cancelled AI progress source_message_id=%s",
+                    self.source.id,
+                )
+        await self.source.reply(
+            embed=embed,
+            nonce=agent_delivery_nonce(
+                self.delivery_key,
+                0,
+                purpose="cancelled",
+            ),
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     async def add_temporary_message(self, message: discord.Message) -> None:
@@ -332,24 +392,42 @@ class AgentProgressMessage:
             embed = command_embed(
                 "Working",
                 description=description,
+                fields=self._identity_fields(),
                 tone=EmbedTone.INFO,
             )
             async with self._lock:
                 if self._closed:
                     return
                 if self.message is None:
-                    self.message = await self.source.reply(
-                        embed=embed,
-                        nonce=agent_delivery_nonce(
-                            self.delivery_key,
-                            0,
-                            purpose="progress",
-                        ),
-                        mention_author=False,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
+                    if self.view is None:
+                        self.message = await self.source.reply(
+                            embed=embed,
+                            nonce=agent_delivery_nonce(
+                                self.delivery_key,
+                                0,
+                                purpose="progress",
+                            ),
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    else:
+                        self.message = await self.source.reply(
+                            embed=embed,
+                            nonce=agent_delivery_nonce(
+                                self.delivery_key,
+                                0,
+                                purpose="progress",
+                            ),
+                            mention_author=False,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                            view=self.view,
+                        )
                 else:
-                    await self.message.edit(content=None, embed=embed)
+                    await self.message.edit(
+                        content=None,
+                        embed=embed,
+                        view=self.view,
+                    )
                 self._published = update
                 self._last_update = time.monotonic()
         except asyncio.CancelledError:
@@ -373,6 +451,51 @@ class AgentProgressMessage:
                     self._flush_later(),
                     name=f"simajilord-agent-progress-{self.source.id}",
                 )
+
+    def _identity_fields(self) -> tuple[EmbedField, ...]:
+        fields: list[EmbedField] = []
+        if self.task_id is not None or self.reference_id is not None:
+            identity: list[str] = []
+            if self.task_id is not None:
+                identity.append(f"Task `{self.task_id}`")
+            if self.reference_id is not None:
+                identity.append(f"Support reference `{self.reference_id}`")
+            fields.append(
+                EmbedField(
+                    "Task",
+                    "\n".join(identity),
+                    inline=False,
+                )
+            )
+        if self.requester is not None:
+            fields.append(EmbedField("Requester", self.requester, inline=True))
+        if self.quota_text is not None:
+            fields.append(EmbedField("Capacity now", self.quota_text, inline=False))
+        if self.task_id is not None:
+            fields.append(
+                EmbedField(
+                    "Follow-up routing",
+                    (
+                        "A new mention in this channel is read as its exact Discord "
+                        "event, then the active AI chooses typed `attach`, `separate`, "
+                        "or `finish`. Edits and resends stay distinct."
+                    ),
+                    inline=False,
+                )
+            )
+        if self.view is not None:
+            fields.append(
+                EmbedField(
+                    "Control",
+                    (
+                        "Use **Cancel** only to interrupt unfinished work. The AI may "
+                        "post useful progress directly; confirmed external effects are "
+                        "not undone automatically."
+                    ),
+                    inline=False,
+                )
+            )
+        return tuple(fields)
 
     async def _cancel_pending(self) -> None:
         tasks = tuple(

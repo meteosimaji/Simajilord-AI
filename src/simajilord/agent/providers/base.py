@@ -8,7 +8,7 @@ from typing import Protocol, runtime_checkable
 
 from simajilord.core import InvocationContext
 
-from ..contracts import AgentProgressUpdate, AgentTokenUsage
+from ..contracts import AgentProgressUpdate, AgentTaskRouteDecision, AgentTokenUsage
 
 AgentProgressCallback = Callable[[AgentProgressUpdate], Awaitable[None]]
 
@@ -40,15 +40,27 @@ class AgentProvider(Protocol):
 
 
 @runtime_checkable
-class SteerableAgentProvider(Protocol):
-    """Optional provider extension for same-turn Discord follow-ups."""
+class SemanticRoutingAgentProvider(Protocol):
+    """Optional provider extension for typed same-turn task routing."""
 
-    async def steer(
+    async def route_candidate(
         self,
         *,
         event_prompt: str,
         context: InvocationContext,
-    ) -> bool: ...
+    ) -> AgentTaskRouteDecision | None: ...
+
+    async def confirm_candidate_route(
+        self,
+        *,
+        event_id: str,
+        decision: AgentTaskRouteDecision,
+        committed: bool,
+        context: InvocationContext,
+    ) -> bool:
+        """Release the model tool call only after the host commits its route."""
+
+        ...
 
 
 class AgentToolTraceSink(Protocol):
@@ -64,3 +76,17 @@ class AgentToolTraceSink(Protocol):
         transport: str | None = None,
         request_id: str | None = None,
     ) -> int: ...
+
+
+class AgentProviderThreadBindingSink(Protocol):
+    """Durable task/thread binding written before a provider turn begins."""
+
+    async def bind_provider_thread(
+        self,
+        *,
+        event_id: str,
+        task_id: str,
+        conversation_id: str,
+        provider_thread_id: str,
+        model: str,
+    ) -> bool: ...

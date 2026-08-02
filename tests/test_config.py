@@ -30,6 +30,8 @@ _AGENT_ENVIRONMENT_NAMES = (
     "MAX_ACTIVE_AGENT_TURNS",
     "MAX_PENDING_AGENT_TURNS",
     "MAX_PENDING_AGENT_TURNS_PER_USER",
+    "AGENT_INTERACTIVE_RESERVE_PERCENT",
+    "AGENT_CONVERSATION_COMPATIBILITY_EPOCH",
     "AGENT_AUTONOMY_ENABLED",
     "AGENT_AUTONOMY_GUILD_IDS",
     "AGENT_AUTONOMY_MODE",
@@ -120,7 +122,9 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_max_active_turns == 4
     assert settings.agent_max_pending_turns == 20
     assert settings.agent_max_pending_turns_per_user == 2
-    assert settings.agent_autonomy_enabled is True
+    assert settings.agent_interactive_reserve_percent == 25
+    assert settings.agent_conversation_compatibility_epoch == 4
+    assert settings.agent_autonomy_enabled is False
     assert settings.agent_autonomy_mode is AgentAutonomyMode.ACT
     assert settings.agent_autonomy_batch_seconds == 10
     assert settings.agent_autonomy_max_runs == 0
@@ -236,6 +240,7 @@ def test_autonomy_mode_batching_and_unbounded_runs_are_typed(
     monkeypatch.setenv("AGENT_ALLOWED_GUILD_IDS", "10")
     monkeypatch.setenv("AGENT_AUTONOMY_GUILD_IDS", "10")
     monkeypatch.setenv("AGENT_AUTONOMY_MODE", "assist")
+    monkeypatch.setenv("AGENT_AUTONOMY_ENABLED", "true")
     monkeypatch.setenv("AGENT_AUTONOMY_BATCH_SECONDS", "5")
     monkeypatch.setenv("AGENT_AUTONOMY_MAX_RUNS", "0")
 

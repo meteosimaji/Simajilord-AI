@@ -219,21 +219,29 @@ with Discord's generic “interaction failed” banner.
   turns from the same server to overtake each other. Codex notifications, inactivity watchdogs,
   and tool budgets are routed per thread/turn, so concurrent servers cannot consume each other's
   completion events.
-  Mentions posted in the same channel while a turn is active are delivered with `turn/steer`
-  as pointer-only follow-ups; the AI must fetch the exact Discord message, and actor ID/name
-  remain attached. Each accepted follow-up receives a bounded evidence allowance that only its
-  exact message read and the following semantic evidence plan can use; if that allowance cannot
-  be reserved, the message stays a separate turn instead of being accepted into an unreadable
-  parent turn. An accepted contributor may request a write only through that follow-up's
-  opaque host authorization and the contributor's own grants and Discord permissions; it cannot
-  borrow the original requester's authority. Rate limits are checked before admission, while
+  A mention posted in the same channel while a turn is active is persisted first as an independent
+  task candidate, then delivered with `turn/steer` as a pointer only. It is not authoritative until
+  the AI fetches the exact current Discord revision and calls the typed `turn.route_task_event`
+  capability with `attach`, `separate`, or `finish`. The host never classifies message text with
+  keyword rules. Edits and resends retain independent event IDs; a superseded revision cannot
+  silently reuse its earlier authorization. `attach` keeps the contributor's own grants and live
+  Discord permissions, every task receives its own provider-continuity key, and `finish`
+  lets the AI conclude when a typo correction or resend adds no work. Missing, timed-out, or
+  crash-interrupted decisions default to a recoverable separate task, so no mention disappears.
+  Each candidate receives a bounded evidence allowance for its exact read, route decision, and
+  any required refreshed semantic evidence plan. Rate limits are checked before admission, while
   `MAX_ACTIVE_AGENT_TURNS`, `MAX_PENDING_AGENT_TURNS`, and
   `MAX_PENDING_AGENT_TURNS_PER_USER` independently bound active provider work, waiting work,
-  and one actor's share of waiting work. Active turns do not consume either pending allowance,
+  and one actor's share of waiting work. `AGENT_INTERACTIVE_RESERVE_PERCENT` (25 by default)
+  prevents autonomous turns from consuming the final active, pending, and rolling-token capacity
+  reserved for explicit mentions. Active turns do not consume either pending allowance,
   so the main queue can hold up to the active limit plus the waiting limit. Queue and host
   execution progress uses short English status
-  messages. The temporary `Working` embed is
-  deleted before the final answer is posted as a new reply, preserving the order of visible
+  messages. The temporary `Working` embed includes task/reference identity, requester, live quota,
+  typed follow-up behaviour, and one emergency Cancel control. The AI can post useful progress
+  directly; task, route, receipt, delivery, and audit evidence remains in the local ledgers instead
+  of adding short-lived inspection commands or panels. The Working message is deleted before the
+  final answer is posted as a new reply, preserving the order of visible
   milestone updates. Accepted-follow-up acknowledgements are tied to the parent turn and removed
   on either completion or failure. Discord typing is renewed only while a model notification or
   an actually running capability keeps the activity lease alive; a quiet app-server does not
@@ -321,14 +329,19 @@ One independent audio session is created per Discord server. Different servers m
 concurrently up to the configured process limit; one server never owns multiple Discord voice
 connections.
 
-The optional agent is default-off. Event autonomy is inert until the agent is enabled and
+The optional agent and event autonomy are both default-off. Event autonomy is inert until the agent
+is enabled, `AGENT_AUTONOMY_ENABLED=true`, and
 `AGENT_AUTONOMY_GUILD_IDS` contains an allowed server, even though its mode defaults to `act`
 and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex runtime has
 browser control, shell execution,
 personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
 The default runtime profile is `gpt-5.6-luna` with `medium` reasoning. Codex keeps one durable
-provider thread in its stable `legacy` history mode and compacts retained context natively; the
-host automatically resets it only when the saved thread is genuinely unavailable. Existing
+provider thread per task in its stable `legacy` history mode and compacts retained context natively; the
+host automatically resets it only when the saved thread is genuinely unavailable. An explicit
+`AGENT_CONVERSATION_COMPATIBILITY_EPOCH` is persisted with the local store; operators bump it
+only for an intentionally incompatible prompt/tool/permission protocol, which clears only saved
+provider continuity while preserving tasks, deliveries, receipts, memory, and audit evidence.
+Model or capability-list changes do not silently fingerprint-reset every conversation. Existing
 conversations are never proactively rotated at a fixed host threshold. Agent turns have no wall-clock
 deadline. A turn is stopped only after its configured inactivity window, while a running
 capability receives its own declared timeout. Conversation and image generation share one

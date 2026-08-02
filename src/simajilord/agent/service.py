@@ -23,6 +23,8 @@ from .contracts import (
     AgentRequest,
     AgentResponse,
     AgentResponseStatus,
+    AgentTaskRouteDecision,
+    AgentTaskRouteResult,
     AgentTrigger,
 )
 from .errors import (
@@ -35,9 +37,9 @@ from .errors import (
 from .providers import (
     AgentProgressCallback,
     AgentProvider,
-    SteerableAgentProvider,
+    SemanticRoutingAgentProvider,
 )
-from .store import AgentConversationStore
+from .store import AgentConversationStore, AgentTaskRouteUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +57,26 @@ class AgentLimits:
     max_active_turns: int
     max_pending_turns: int
     max_pending_turns_per_user: int
+    interactive_reserve_percent: int = 25
     rate_limit_exempt_actor_ids: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.interactive_reserve_percent <= 90:
+            raise ValueError("interactive reserve percent must be between 0 and 90")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentQuotaSnapshot:
+    """Bounded live accounting suitable for progress and diagnostics UI."""
+
+    user_requests_remaining: int | None
+    workspace_requests_remaining: int | None
+    tokens_remaining: int
+    active_turns: int
+    max_active_turns: int
+    pending_turns: int
+    max_pending_turns: int
+    interactive_reserve_percent: int
 
 
 class AgentService:
@@ -75,6 +96,7 @@ class AgentService:
         self.limits = limits
         self._admission_lock = asyncio.Lock()
         self._admission_condition = asyncio.Condition(self._admission_lock)
+        self._running_tasks_lock = asyncio.Lock()
         self._budget_lock = asyncio.Lock()
         self._workspace_turn_slots: dict[str, asyncio.Semaphore] = {}
         self._workspace_turn_slot_references: dict[str, int] = {}
@@ -85,6 +107,7 @@ class AgentService:
         self._pending_turns_by_actor: dict[str, int] = {}
         self._ready_pending_turns = 0
         self._conversation_locks = KeyedAsyncLockPool()
+        self._candidate_route_locks = KeyedAsyncLockPool()
         self._active_origins: dict[
             tuple[str | None, str],
             tuple[AgentRequest, int],
@@ -93,6 +116,11 @@ class AgentService:
             tuple[str | None, str, str, str],
             int,
         ] = {}
+        self._running_tasks: dict[
+            str,
+            tuple[AgentRequest, asyncio.Task[object]],
+        ] = {}
+        self._explicit_cancellations: set[str] = set()
 
     @property
     def model(self) -> str:
@@ -107,7 +135,97 @@ class AgentService:
             "ready_pending_turns": self._ready_pending_turns,
             "workspace_slot_registry_size": len(self._workspace_turn_slots),
             "conversation_lock_registry_size": self._conversation_locks.size,
+            "candidate_route_lock_registry_size": self._candidate_route_locks.size,
+            "interactive_reserve_percent": self.limits.interactive_reserve_percent,
+            "interactive_reserved_active_turns": self._interactive_reserved_capacity(
+                self.limits.max_active_turns
+            ),
+            "interactive_reserved_pending_turns": self._interactive_reserved_capacity(
+                self.limits.max_pending_turns
+            ),
         }
+
+    async def quota_snapshot(self, request: AgentRequest) -> AgentQuotaSnapshot:
+        """Return the same durable windows used by admission without reserving work."""
+
+        return await self.quota_snapshot_for(
+            actor_id=request.actor_id,
+            workspace_id=request.workspace_id,
+            trigger=request.trigger,
+        )
+
+    async def quota_snapshot_for(
+        self,
+        *,
+        actor_id: str,
+        workspace_id: str | None,
+        trigger: AgentTrigger,
+    ) -> AgentQuotaSnapshot:
+        """Inspect current admission capacity for task and operations UI."""
+
+        now = datetime.now(UTC)
+        exempt = actor_id in self.limits.rate_limit_exempt_actor_ids
+        if exempt:
+            user_remaining: int | None = None
+        else:
+            user_count, _ = await self.store.request_window(
+                actor_id=actor_id,
+                workspace_id=None,
+                since=now - timedelta(seconds=self.limits.per_user_window_seconds),
+            )
+            user_remaining = max(0, self.limits.per_user_requests - user_count)
+        workspace_remaining: int | None = None
+        if workspace_id is not None:
+            workspace_count, _ = await self.store.request_window(
+                actor_id=None,
+                workspace_id=workspace_id,
+                since=now
+                - timedelta(seconds=self.limits.per_workspace_window_seconds),
+                excluded_actor_ids=self.limits.rate_limit_exempt_actor_ids,
+                included_triggers=frozenset({trigger}),
+            )
+            workspace_remaining = max(
+                0,
+                self.limits.per_workspace_requests - workspace_count,
+            )
+        usage, _ = await self.store.token_budget_window(
+            now - timedelta(hours=24),
+            limit=self.limits.max_tokens_per_24_hours,
+            excluded_actor_ids=self.limits.rate_limit_exempt_actor_ids,
+        )
+        return AgentQuotaSnapshot(
+            user_requests_remaining=user_remaining,
+            workspace_requests_remaining=workspace_remaining,
+            tokens_remaining=max(0, self.limits.max_tokens_per_24_hours - usage),
+            active_turns=self._active_turns,
+            max_active_turns=self.limits.max_active_turns,
+            pending_turns=self._pending_turns,
+            max_pending_turns=self.limits.max_pending_turns,
+            interactive_reserve_percent=self.limits.interactive_reserve_percent,
+        )
+
+    def _interactive_reserved_capacity(self, total: int) -> int:
+        if self.limits.interactive_reserve_percent == 0:
+            return 0
+        return math.ceil(total * self.limits.interactive_reserve_percent / 100)
+
+    def _active_capacity_for(self, request: AgentRequest) -> int:
+        if request.trigger is not AgentTrigger.AUTONOMOUS:
+            return self.limits.max_active_turns
+        return max(
+            0,
+            self.limits.max_active_turns
+            - self._interactive_reserved_capacity(self.limits.max_active_turns),
+        )
+
+    def _pending_capacity_for(self, request: AgentRequest) -> int:
+        if request.trigger is not AgentTrigger.AUTONOMOUS:
+            return self.limits.max_pending_turns
+        return max(
+            0,
+            self.limits.max_pending_turns
+            - self._interactive_reserved_capacity(self.limits.max_pending_turns),
+        )
 
     async def respond(
         self,
@@ -118,182 +236,311 @@ class AgentService:
         cached = await self.store.completed_response(request.event_id)
         if cached is not None:
             return cached
-        turn_slots = await self._admit(request, on_progress=on_progress)
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("Agent response requires an active asyncio task.")
+        async with self._running_tasks_lock:
+            existing = self._running_tasks.get(request.task_id)
+            if existing is not None and existing[1] is not current_task:
+                raise AgentBusyError("This agent task is already running.")
+            self._running_tasks[request.task_id] = (request, current_task)
         try:
-            async with self._conversation_locks.hold(request.conversation_id):
-                cached = await self.store.completed_response(request.event_id)
-                if cached is not None:
-                    return cached
-                conversation = await self.store.conversation(request.conversation_id)
-                provider_thread_id = (
-                    conversation.provider_thread_id if conversation is not None else None
-                )
-                continuity_reset_reason: str | None = None
-                context = InvocationContext(
-                    actor_id=request.actor_id,
-                    workspace_id=request.workspace_id,
-                    transport="agent",
-                    request_id=request.event_id,
-                    resource_ids=request.resource_ids,
-                    grants=request.grants,
-                    origin_resource_id=request.channel_id,
-                    approvals=request.approvals,
-                    public_reference_id=request.public_reference_id,
-                    active_message_id=request.message_id,
-                    batched_message_ids=_request_batched_message_ids(request),
-                    agent_trigger=request.trigger.value,
-                )
-                if on_progress is not None:
-                    await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
-                origin_key = (request.workspace_id, request.channel_id)
-                async with self._admission_lock:
-                    self._active_origins[origin_key] = (request, 0)
-                try:
-                    result = await self.provider.respond(
-                        provider_thread_id=provider_thread_id,
-                        event_prompt=_event_prompt(
-                            request,
-                            max_response_characters=self.limits.max_response_characters,
-                            runtime_model=self.model,
-                            continuity_reset_reason=continuity_reset_reason,
-                        ),
-                        context=context,
-                        on_progress=on_progress,
+            try:
+                turn_slots = await self._admit(request, on_progress=on_progress)
+            except asyncio.CancelledError:
+                await self._persist_explicit_cancellation(request)
+                raise
+            try:
+                async with self._conversation_locks.hold(request.conversation_id):
+                    cached = await self.store.completed_response(request.event_id)
+                    if cached is not None:
+                        return cached
+                    conversation = await self.store.conversation(request.conversation_id)
+                    provider_thread_id = (
+                        conversation.provider_thread_id
+                        if conversation is not None
+                        else None
                     )
-                except AgentThreadError:
-                    await self.store.rotate(request.conversation_id, model=self.model)
-                    result = await self.provider.respond(
-                        provider_thread_id=None,
-                        event_prompt=_event_prompt(
-                            request,
-                            max_response_characters=self.limits.max_response_characters,
-                            runtime_model=self.model,
-                            continuity_reset_reason="saved_thread_unavailable",
+                    context = InvocationContext(
+                        actor_id=request.actor_id,
+                        workspace_id=request.workspace_id,
+                        transport="agent",
+                        request_id=request.event_id,
+                        resource_ids=request.resource_ids,
+                        grants=request.grants,
+                        origin_resource_id=request.channel_id,
+                        approvals=request.approvals,
+                        public_reference_id=request.public_reference_id,
+                        agent_task_id=request.task_id,
+                        agent_conversation_id=request.conversation_id,
+                        active_message_id=request.message_id,
+                        active_message_edited_at=(
+                            request.message_edited_at.isoformat()
+                            if request.message_edited_at is not None
+                            else None
                         ),
-                        context=context,
-                        on_progress=on_progress,
+                        batched_message_ids=_request_batched_message_ids(request),
+                        agent_trigger=request.trigger.value,
                     )
-                finally:
+                    if on_progress is not None:
+                        await on_progress(
+                            AgentProgressUpdate(AgentProgressStage.STARTING)
+                        )
+                    origin_key = (request.workspace_id, request.channel_id)
                     async with self._admission_lock:
-                        active = self._active_origins.get(origin_key)
-                        if active is not None and active[0].event_id == request.event_id:
-                            self._active_origins.pop(origin_key, None)
-                            self._clear_follow_up_counts(
-                                origin_key,
-                                original_event_id=request.event_id,
-                            )
-                provider_content = result.content.strip()
-                response_truncated = (
-                    len(provider_content) > self.limits.max_response_characters
-                )
-                content = _bounded_text(
-                    provider_content,
-                    self.limits.max_response_characters,
-                )
-                if response_truncated:
-                    log.warning(
-                        "Agent response exceeded the declared character budget "
-                        "request=%s provider_characters=%d budget=%d",
-                        request.event_id,
-                        len(provider_content),
+                        self._active_origins[origin_key] = (request, 0)
+                    try:
+                        result = await self.provider.respond(
+                            provider_thread_id=provider_thread_id,
+                            event_prompt=_event_prompt(
+                                request,
+                                max_response_characters=(
+                                    self.limits.max_response_characters
+                                ),
+                                runtime_model=self.model,
+                            ),
+                            context=context,
+                            on_progress=on_progress,
+                        )
+                    except AgentThreadError:
+                        await self.store.rotate(
+                            request.conversation_id,
+                            model=self.model,
+                        )
+                        result = await self.provider.respond(
+                            provider_thread_id=None,
+                            event_prompt=_event_prompt(
+                                request,
+                                max_response_characters=(
+                                    self.limits.max_response_characters
+                                ),
+                                runtime_model=self.model,
+                                continuity_reset_reason="saved_thread_unavailable",
+                            ),
+                            context=context,
+                            on_progress=on_progress,
+                        )
+                    finally:
+                        async with self._admission_lock:
+                            active = self._active_origins.get(origin_key)
+                            if (
+                                active is not None
+                                and active[0].event_id == request.event_id
+                            ):
+                                self._active_origins.pop(origin_key, None)
+                                self._clear_follow_up_counts(
+                                    origin_key,
+                                    original_event_id=request.event_id,
+                                )
+                    provider_content = result.content.strip()
+                    response_truncated = (
+                        len(provider_content) > self.limits.max_response_characters
+                    )
+                    content = _bounded_text(
+                        provider_content,
                         self.limits.max_response_characters,
                     )
-                response = AgentResponse(
-                    status=AgentResponseStatus.COMPLETED,
-                    conversation_id=request.conversation_id,
-                    provider_thread_id=result.thread_id,
-                    model=result.model,
-                    content=content,
-                    usage=result.usage,
+                    if response_truncated:
+                        log.warning(
+                            "Agent response exceeded the declared character budget "
+                            "request=%s provider_characters=%d budget=%d",
+                            request.event_id,
+                            len(provider_content),
+                            self.limits.max_response_characters,
+                        )
+                    response = AgentResponse(
+                        status=AgentResponseStatus.COMPLETED,
+                        conversation_id=request.conversation_id,
+                        provider_thread_id=result.thread_id,
+                        model=result.model,
+                        content=content,
+                        usage=result.usage,
+                    )
+                    if not await self.store.complete(request, response):
+                        terminal = await self.store.completed_response(request.event_id)
+                        if terminal is not None:
+                            return terminal
+                        raise RuntimeError(
+                            "Agent turn could not enter a durable completed state."
+                        )
+                    await self.journal.append(
+                        kind="agent.turn.completed",
+                        actor_id=request.actor_id,
+                        workspace_id=request.workspace_id,
+                        transport="agent",
+                        request_id=request.event_id,
+                        payload={
+                            "public_reference_id": request.public_reference_id,
+                            "task_id": request.task_id,
+                            "conversation_id": request.conversation_id,
+                            "trigger": request.trigger.value,
+                            "model": result.model,
+                            "provider_response_characters": len(provider_content),
+                            "response_characters": len(content),
+                            "response_character_budget": (
+                                self.limits.max_response_characters
+                            ),
+                            "response_truncated": response_truncated,
+                            "delivery_disposition": (
+                                "agent_tool"
+                                if content == AGENT_FINAL_DELIVERED_CONTENT
+                                else (
+                                    "intentional_silence"
+                                    if content == AGENT_NO_ACTION_CONTENT
+                                    else "host_reply"
+                                )
+                            ),
+                            "usage": {
+                                "input_tokens": result.usage.input_tokens,
+                                "cached_input_tokens": (
+                                    result.usage.cached_input_tokens
+                                ),
+                                "output_tokens": result.usage.output_tokens,
+                                "reasoning_output_tokens": (
+                                    result.usage.reasoning_output_tokens
+                                ),
+                                "total_tokens": result.usage.total_tokens,
+                                "model_context_window": (
+                                    result.usage.model_context_window
+                                ),
+                            },
+                        },
+                    )
+                    return response
+            except asyncio.CancelledError:
+                await self._persist_explicit_cancellation(request)
+                raise
+            except Exception as exc:
+                failure_payload: dict[str, object] = {
+                    "public_reference_id": request.public_reference_id,
+                    "task_id": request.task_id,
+                    "conversation_id": request.conversation_id,
+                    "trigger": request.trigger.value,
+                    "model": self.model,
+                    "error_type": type(exc).__name__,
+                }
+                if isinstance(exc, AgentTimeoutError):
+                    failure_payload["inactivity_timeout"] = {
+                        "seconds": exc.timeout_seconds,
+                        "automatic_retry_attempted": exc.auto_retry_attempted,
+                        "runtime_restarted": exc.runtime_restarted,
+                        "non_idempotent_write_attempted": exc.write_attempted,
+                        "diagnostic": exc.diagnostic,
+                    }
+                elif isinstance(exc, AgentProviderError) and exc.diagnostic:
+                    failure_payload["provider_diagnostic"] = exc.diagnostic
+                await self.store.fail(
+                    request,
+                    model=self.model,
+                    error_type=type(exc).__name__,
                 )
-                await self.store.complete(request, response)
+                log.error(
+                    "Agent turn failed request=%s reference=%s error=%s",
+                    request.event_id,
+                    request.public_reference_id,
+                    type(exc).__name__,
+                    exc_info=True,
+                )
                 await self.journal.append(
-                    kind="agent.turn.completed",
+                    kind="agent.turn.failed",
                     actor_id=request.actor_id,
                     workspace_id=request.workspace_id,
                     transport="agent",
                     request_id=request.event_id,
-                    payload={
-                        "public_reference_id": request.public_reference_id,
-                        "conversation_id": request.conversation_id,
-                        "trigger": request.trigger.value,
-                        "model": result.model,
-                        "provider_response_characters": len(provider_content),
-                        "response_characters": len(content),
-                        "response_character_budget": (
-                            self.limits.max_response_characters
-                        ),
-                        "response_truncated": response_truncated,
-                        "delivery_disposition": (
-                            "agent_tool"
-                            if content == AGENT_FINAL_DELIVERED_CONTENT
-                            else (
-                                "intentional_silence"
-                                if content == AGENT_NO_ACTION_CONTENT
-                                else "host_reply"
-                            )
-                        ),
-                        "usage": {
-                            "input_tokens": result.usage.input_tokens,
-                            "cached_input_tokens": result.usage.cached_input_tokens,
-                            "output_tokens": result.usage.output_tokens,
-                            "reasoning_output_tokens": result.usage.reasoning_output_tokens,
-                            "total_tokens": result.usage.total_tokens,
-                            "model_context_window": result.usage.model_context_window,
-                        },
-                    },
+                    payload=failure_payload,
                 )
-                return response
-        except Exception as exc:
-            failure_payload: dict[str, object] = {
-                "public_reference_id": request.public_reference_id,
-                "conversation_id": request.conversation_id,
-                "trigger": request.trigger.value,
-                "model": self.model,
-                "error_type": type(exc).__name__,
-            }
-            if isinstance(exc, AgentTimeoutError):
-                failure_payload["inactivity_timeout"] = {
-                    "seconds": exc.timeout_seconds,
-                    "automatic_retry_attempted": exc.auto_retry_attempted,
-                    "runtime_restarted": exc.runtime_restarted,
-                    "non_idempotent_write_attempted": exc.write_attempted,
-                    "diagnostic": exc.diagnostic,
-                }
-            elif isinstance(exc, AgentProviderError) and exc.diagnostic:
-                failure_payload["provider_diagnostic"] = exc.diagnostic
-            await self.store.fail(
-                request,
-                model=self.model,
-                error_type=type(exc).__name__,
-            )
-            log.error(
-                "Agent turn failed request=%s reference=%s error=%s",
-                request.event_id,
-                request.public_reference_id,
-                type(exc).__name__,
-                exc_info=True,
-            )
-            await self.journal.append(
-                kind="agent.turn.failed",
-                actor_id=request.actor_id,
-                workspace_id=request.workspace_id,
-                transport="agent",
-                request_id=request.event_id,
-                payload=failure_payload,
-            )
-            raise
+                raise
+            finally:
+                await self._release(turn_slots)
         finally:
-            await self._release(turn_slots)
+            async with self._running_tasks_lock:
+                running = self._running_tasks.get(request.task_id)
+                if running is not None and running[1] is current_task:
+                    self._running_tasks.pop(request.task_id, None)
+                self._explicit_cancellations.discard(request.task_id)
 
     async def close(self) -> None:
         await self.provider.close()
 
-    async def try_follow_up(self, request: AgentRequest) -> str | None:
-        """Steer a turn and return its original event ID when accepted."""
+    async def cancel_task(
+        self,
+        task_id: str,
+        *,
+        actor_id: str,
+        administrator: bool = False,
+    ) -> bool:
+        """Cancel one in-process task only for its requester or an administrator."""
 
-        if not isinstance(self.provider, SteerableAgentProvider):
+        cancelled_request: AgentRequest | None = None
+        async with self._running_tasks_lock:
+            running = self._running_tasks.get(task_id)
+            if running is None:
+                return False
+            request, task = running
+            if request.actor_id != actor_id and not administrator:
+                raise PermissionError(
+                    "Only the requester or an administrator may cancel this task."
+                )
+            if task.done():
+                return False
+            if not await self.store.cancel(request, model=self.model):
+                return False
+            self._explicit_cancellations.add(task_id)
+            task.cancel()
+            cancelled_request = request
+        assert cancelled_request is not None
+        try:
+            await self._journal_explicit_cancellation(cancelled_request)
+        except Exception:
+            log.exception(
+                "Agent task was cancelled but cancellation audit append failed task=%s",
+                task_id,
+            )
+        return True
+
+    async def _persist_explicit_cancellation(self, request: AgentRequest) -> None:
+        async with self._running_tasks_lock:
+            explicit = request.task_id in self._explicit_cancellations
+        if not explicit:
+            # Shutdown cancellation remains in progress for startup recovery.
+            return
+        if not await self.store.cancel(request, model=self.model):
+            return
+        await self._journal_explicit_cancellation(request)
+
+    async def _journal_explicit_cancellation(self, request: AgentRequest) -> None:
+        await self.journal.append(
+            kind="agent.turn.cancelled",
+            actor_id=request.actor_id,
+            workspace_id=request.workspace_id,
+            transport="agent",
+            request_id=request.event_id,
+            payload={
+                "public_reference_id": request.public_reference_id,
+                "task_id": request.task_id,
+                "reason": "user_requested",
+            },
+        )
+
+    async def route_candidate(
+        self,
+        request: AgentRequest,
+    ) -> AgentTaskRouteResult | None:
+        async with self._candidate_route_locks.hold(request.event_id):
+            return await self._route_candidate_locked(request)
+
+    async def _route_candidate_locked(
+        self,
+        request: AgentRequest,
+    ) -> AgentTaskRouteResult | None:
+        """Ask the active model for a typed attach/separate/finish decision."""
+
+        persisted_route = await self.store.attached_task_route(request.event_id)
+        if persisted_route is not None:
+            return persisted_route
+        if not isinstance(self.provider, SemanticRoutingAgentProvider):
             return None
+        routing_provider = self.provider
         origin_key = (request.workspace_id, request.channel_id)
         async with self._admission_lock:
             active = self._active_origins.get(origin_key)
@@ -304,13 +551,8 @@ class AgentService:
                 # An explicit user request must never disappear into an
                 # autonomous observation that is allowed to return NO_ACTION.
                 return None
-            if request.grants != original.grants or request.approvals != original.approvals:
-                # The active provider thread exposes the original capability
-                # profile. Queue a separate turn so a stronger or different
-                # contributor receives exactly their own tool surface.
-                return None
             if follow_up_count >= self.limits.max_pending_turns:
-                raise AgentBusyError("The bounded agent follow-up queue is full.")
+                raise AgentBusyError("The bounded agent candidate queue is full.")
             actor_key = (
                 *origin_key,
                 original.event_id,
@@ -318,54 +560,178 @@ class AgentService:
             )
             actor_follow_ups = self._active_follow_ups_by_actor.get(actor_key, 0)
             if actor_follow_ups >= self.limits.max_pending_turns_per_user:
-                raise AgentBusyError("The bounded per-user follow-up queue is full.")
+                raise AgentBusyError("The bounded per-user candidate queue is full.")
             self._active_origins[origin_key] = (original, follow_up_count + 1)
             self._active_follow_ups_by_actor[actor_key] = actor_follow_ups + 1
-        accepted = False
+        decision = AgentTaskRouteDecision.SEPARATE
+        route_reason = "provider_route_unavailable"
+        keep_attached_count = False
+        route_context: InvocationContext | None = None
+        selected: AgentTaskRouteDecision | None = None
         try:
-            context = InvocationContext(
-                actor_id=request.actor_id,
-                workspace_id=request.workspace_id,
-                transport="agent",
-                request_id=request.event_id,
-                resource_ids=request.resource_ids,
-                grants=request.grants,
-                origin_resource_id=request.channel_id,
-                approvals=request.approvals,
-                # A steered message contributes its own actor and event identity,
-                # but it remains part of the original provider turn. Keep the
-                # turn's durable public reference so traces and feedback can be
-                # resolved after restart.
-                public_reference_id=original.public_reference_id,
-                active_message_id=request.message_id,
-                agent_trigger=request.trigger.value,
-            )
-            accepted = await self.provider.steer(
-                event_prompt=_follow_up_prompt(
-                    request,
-                    original_actor_id=original.actor_id,
-                    max_response_characters=self.limits.max_response_characters,
-                ),
-                context=context,
-            )
-            if accepted:
-                await self.journal.append(
-                    kind="agent.turn.steered",
+            recorded = await self.store.record_task_candidate(original, request)
+            if not recorded:
+                # The provider turn finished between the in-memory origin check
+                # and the durable transaction. Let the transport run this event
+                # as a normal independent task instead of dropping it.
+                return None
+            persisted_route = await self.store.attached_task_route(request.event_id)
+            if persisted_route is not None:
+                return persisted_route
+            if request.grants != original.grants or request.approvals != original.approvals:
+                route_reason = "authorization_profile_mismatch"
+            else:
+                route_context = InvocationContext(
                     actor_id=request.actor_id,
                     workspace_id=request.workspace_id,
                     transport="agent",
                     request_id=request.event_id,
-                    payload={
-                        "public_reference_id": original.public_reference_id,
-                        "conversation_id": original.conversation_id,
-                        "original_actor_id": original.actor_id,
-                        "follow_up_actor_id": request.actor_id,
-                        "same_actor": request.actor_id == original.actor_id,
-                    },
+                    resource_ids=request.resource_ids,
+                    grants=request.grants,
+                    origin_resource_id=request.channel_id,
+                    approvals=request.approvals,
+                    public_reference_id=original.public_reference_id,
+                    agent_task_id=original.task_id,
+                    agent_conversation_id=original.conversation_id,
+                    active_message_id=request.message_id,
+                    active_message_edited_at=(
+                        request.message_edited_at.isoformat()
+                        if request.message_edited_at is not None
+                        else None
+                    ),
+                    agent_trigger=request.trigger.value,
                 )
-            return original.event_id if accepted else None
+                try:
+                    selected = await routing_provider.route_candidate(
+                        event_prompt=_task_candidate_prompt(
+                            request,
+                            active_task_id=original.task_id,
+                            original_actor_id=original.actor_id,
+                            max_response_characters=(
+                                self.limits.max_response_characters
+                            ),
+                        ),
+                        context=route_context,
+                    )
+                except Exception:
+                    log.exception(
+                        "Agent candidate semantic route failed; preserving separate task "
+                        "candidate=%s active_task=%s",
+                        request.event_id,
+                        original.task_id,
+                    )
+                    selected = None
+                    route_reason = "provider_route_failed"
+                if selected is not None:
+                    decision = selected
+                    route_reason = f"model_selected_{selected.value}"
+            try:
+                await self.store.route_task_candidate(
+                    request.event_id,
+                    decision=decision,
+                    active_task_id=original.task_id,
+                    reason=route_reason,
+                )
+            except AgentTaskRouteUnavailableError:
+                if selected is not None and route_context is not None:
+                    try:
+                        await routing_provider.confirm_candidate_route(
+                            event_id=request.event_id,
+                            decision=selected,
+                            committed=False,
+                            context=route_context,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Provider route rejection acknowledgement failed "
+                            "candidate=%s",
+                            request.event_id,
+                        )
+                decision = AgentTaskRouteDecision.SEPARATE
+                route_reason = "active_task_became_terminal"
+                selected = None
+                route_context = None
+                await self.store.route_task_candidate(
+                    request.event_id,
+                    decision=decision,
+                    active_task_id=original.task_id,
+                    reason=route_reason,
+                )
+            except BaseException:
+                if selected is not None and route_context is not None:
+                    async def reject_uncommitted_route() -> None:
+                        await routing_provider.confirm_candidate_route(
+                            event_id=request.event_id,
+                            decision=selected,
+                            committed=False,
+                            context=route_context,
+                        )
+
+                    await finish_async_cleanup(
+                        reject_uncommitted_route()
+                    )
+                raise
+            if selected is not None and route_context is not None:
+                confirmed = await routing_provider.confirm_candidate_route(
+                    event_id=request.event_id,
+                    decision=selected,
+                    committed=True,
+                    context=route_context,
+                )
+                if decision in {
+                    AgentTaskRouteDecision.ATTACH,
+                    AgentTaskRouteDecision.FINISH,
+                }:
+                    if not confirmed:
+                        recovered = await self.store.default_task_candidate_to_separate(
+                            request.event_id,
+                            reason="provider_application_unconfirmed",
+                        )
+                        if not recovered:
+                            raise AgentProviderError(
+                                "The active provider turn ended before its task route "
+                                "could be recovered safely."
+                            )
+                        decision = AgentTaskRouteDecision.SEPARATE
+                        route_reason = "provider_application_unconfirmed"
+                    elif not await self.store.mark_task_candidate_provider_applied(
+                        request.event_id,
+                        decision=decision,
+                        active_task_id=original.task_id,
+                    ):
+                        raise AgentProviderError(
+                            "The applied provider task route could not be marked durable."
+                        )
+            keep_attached_count = decision in {
+                AgentTaskRouteDecision.ATTACH,
+                AgentTaskRouteDecision.FINISH,
+            }
+            await self.journal.append(
+                kind="agent.task.candidate_routed",
+                actor_id=request.actor_id,
+                workspace_id=request.workspace_id,
+                transport="agent",
+                request_id=request.event_id,
+                payload={
+                    "public_reference_id": original.public_reference_id,
+                    "candidate_public_reference_id": request.public_reference_id,
+                    "task_id": original.task_id,
+                    "candidate_task_id": request.task_id,
+                    "decision": decision.value,
+                    "route_reason": route_reason,
+                    "original_actor_id": original.actor_id,
+                    "candidate_actor_id": request.actor_id,
+                    "same_actor": request.actor_id == original.actor_id,
+                },
+            )
+            return AgentTaskRouteResult(
+                decision=decision,
+                active_event_id=original.event_id,
+                active_task_id=original.task_id,
+                active_public_reference_id=original.public_reference_id,
+            )
         finally:
-            if not accepted:
+            if not keep_attached_count:
                 async with self._admission_lock:
                     active = self._active_origins.get(origin_key)
                     if active is not None and active[0].event_id == original.event_id:
@@ -399,6 +765,8 @@ class AgentService:
             # reservation stay atomic across arriving workspaces.
             async with self._admission_lock, self._budget_lock:
                 await self._check_budgets(request)
+                active_limit = self._active_capacity_for(request)
+                pending_limit = self._pending_capacity_for(request)
                 turn_slot = self._workspace_turn_slots.get(slot_key)
                 created_turn_slot = turn_slot is None
                 if turn_slot is None:
@@ -407,7 +775,7 @@ class AgentService:
                 activate_immediately = (
                     not turn_slot.locked()
                     and self._active_turns + self._ready_pending_turns
-                    < self.limits.max_active_turns
+                    < active_limit
                 )
                 actor_pending = self._pending_turns_by_actor.get(
                     request.actor_id,
@@ -415,7 +783,9 @@ class AgentService:
                 )
                 rejection_reason: str | None = None
                 if not activate_immediately:
-                    if self._pending_turns >= self.limits.max_pending_turns:
+                    if active_limit <= 0:
+                        rejection_reason = "interactive_reserve"
+                    elif self._pending_turns >= pending_limit:
                         rejection_reason = "queue_full"
                     elif actor_pending >= self.limits.max_pending_turns_per_user:
                         rejection_reason = "user_queue_full"
@@ -430,6 +800,7 @@ class AgentService:
                         request_id=request.event_id,
                         payload={
                             "public_reference_id": request.public_reference_id,
+                            "task_id": request.task_id,
                             "reason": rejection_reason,
                             "trigger": request.trigger.value,
                         },
@@ -469,6 +840,7 @@ class AgentService:
                         request_id=request.event_id,
                         payload={
                             "public_reference_id": request.public_reference_id,
+                            "task_id": request.task_id,
                             "conversation_id": request.conversation_id,
                             "promoted_from": promoted_from,
                             "reason": "capability_grant_expansion",
@@ -484,6 +856,7 @@ class AgentService:
                     request_id=request.event_id,
                     payload={
                         "public_reference_id": request.public_reference_id,
+                        "task_id": request.task_id,
                         "conversation_id": request.conversation_id,
                         "trigger": request.trigger.value,
                         "model": self.model,
@@ -506,7 +879,8 @@ class AgentService:
                         workspace_waiter_counted = False
                     self._ready_pending_turns += 1
                     ready_pending_counted = True
-                    while self._active_turns >= self.limits.max_active_turns:
+                    active_limit = self._active_capacity_for(request)
+                    while self._active_turns >= active_limit:
                         await self._admission_condition.wait()
                     self._decrement_pending(request.actor_id)
                     pending_reserved = False
@@ -516,7 +890,11 @@ class AgentService:
                     active_counted = True
                     await self._active_turn_slots.acquire()
                     active_acquired = True
-        except BaseException:
+        except BaseException as admission_error:
+            admission_was_cancelled = isinstance(
+                admission_error,
+                asyncio.CancelledError,
+            )
 
             async def cleanup_failed_admission() -> None:
                 async with self._admission_condition:
@@ -538,7 +916,7 @@ class AgentService:
                             slot_key,
                             turn_slot,
                         )
-                if turn_begun:
+                if turn_begun and not admission_was_cancelled:
                     await self.store.fail(
                         request,
                         model=self.model,
@@ -681,14 +1059,27 @@ class AgentService:
                         self.limits.per_workspace_window_seconds,
                     ),
                 )
+        token_limit = self.limits.max_tokens_per_24_hours
+        if request.trigger is AgentTrigger.AUTONOMOUS:
+            token_limit = max(
+                1,
+                token_limit
+                - self._interactive_reserved_capacity(
+                    self.limits.max_tokens_per_24_hours
+                ),
+            )
         usage, token_release_anchor = await self.store.token_budget_window(
             now - timedelta(hours=24),
-            limit=self.limits.max_tokens_per_24_hours,
+            limit=token_limit,
             excluded_actor_ids=self.limits.rate_limit_exempt_actor_ids,
         )
-        if usage >= self.limits.max_tokens_per_24_hours:
+        if usage >= token_limit:
             raise AgentRateLimitError(
-                "The rolling agent token budget is exhausted.",
+                (
+                    "The autonomous token lane is preserving interactive capacity."
+                    if request.trigger is AgentTrigger.AUTONOMOUS
+                    else "The rolling agent token budget is exhausted."
+                ),
                 retry_after_seconds=_retry_after_seconds(
                     now,
                     token_release_anchor,
@@ -726,6 +1117,7 @@ def _event_prompt(
             "SIMAJILORD_EVENT_V1",
             f"trigger={request.trigger.value}",
             f"event_id={request.event_id}",
+            f"task_id={request.task_id}",
             f"conversation_id={request.conversation_id}",
             f"workspace_id={workspace_id}",
             f"channel_id={request.channel_id}",
@@ -785,9 +1177,10 @@ def _request_batched_message_ids(request: AgentRequest) -> tuple[str, ...]:
     return tuple(message_ids)
 
 
-def _follow_up_prompt(
+def _task_candidate_prompt(
     request: AgentRequest,
     *,
+    active_task_id: str,
     original_actor_id: str,
     max_response_characters: int,
 ) -> str:
@@ -795,8 +1188,10 @@ def _follow_up_prompt(
     same_actor = request.actor_id == original_actor_id
     return "\n".join(
         (
-            "SIMAJILORD_FOLLOW_UP_V1",
-            f"event_id={request.event_id}",
+            "SIMAJILORD_TASK_CANDIDATE_V1",
+            f"candidate_event_id={request.event_id}",
+            f"candidate_task_id={request.task_id}",
+            f"active_task_id={active_task_id}",
             f"workspace_id={request.workspace_id or 'direct-message'}",
             f"channel_id={request.channel_id}",
             f"message_id={message_id}",
@@ -805,16 +1200,21 @@ def _follow_up_prompt(
             f"same_actor_as_original={'true' if same_actor else 'false'}",
             *_response_delivery_budget(max_response_characters),
             (
-                "A user sent this while the current task was running. Read the exact "
-                "Discord message through the bounded message tool and incorporate it "
-                "before finishing."
+                "A user sent this while the current task was running. This pointer is "
+                "not instruction-authoritative yet. Read the exact current Discord "
+                "message revision with discord.get_message, then call the typed "
+                "turn.route_task_event capability exactly once for this candidate."
             ),
             (
-                "This pointer contains no message body. If same_actor_as_original is "
-                "false, identify the contributor separately. They may authorize actions "
-                "only through this accepted follow-up's host-issued authorization handle "
-                "and their own Discord permissions; never borrow the original actor's "
-                "authority."
+                "Choose attach only when it adds or corrects instructions for the active "
+                "task. Choose separate for an independent objective. Choose finish when "
+                "an edit, typo correction, resend, or clarification adds no remaining "
+                "work and the active task can conclude. Do not classify from keywords."
+            ),
+            (
+                "Only an attach decision makes this event instruction-authoritative and "
+                "write-authorizing. A contributor always retains their own Discord "
+                "identity, grants, approvals, and live permissions."
             ),
         )
     )

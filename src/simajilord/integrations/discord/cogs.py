@@ -49,11 +49,14 @@ from simajilord.agent import (
     AgentEvent,
     AgentRateLimitError,
     AgentRequest,
+    AgentTaskRouteDecision,
     AgentTrigger,
     AutonomyEnqueueResult,
     AutonomyEventBatch,
     AutonomyEventKind,
     new_agent_public_reference_id,
+    new_agent_task_id,
+    task_scoped_conversation_id,
 )
 from simajilord.agent.autonomy import (
     AutonomyDeliveryConflictError,
@@ -62,6 +65,7 @@ from simajilord.agent.autonomy import (
     AutonomyDeliverySpec,
     AutonomyLeaseLostError,
 )
+from simajilord.agent.service import AgentQuotaSnapshot
 from simajilord.agent.store import (
     AgentHostDeliveryRecord,
     AgentPendingHostDelivery,
@@ -952,7 +956,7 @@ def music_details_embed(response: AudioQueueResponse) -> discord.Embed:
     embed = command_embed(
         "Audio details",
         description=f"### {_media_title_link(current.title, current.page_url, maximum=120)}",
-        fields=fields,
+        fields=tuple(fields),
     )
     embed.timestamp = None
     if current.thumbnail_url:
@@ -1529,7 +1533,7 @@ def music_search_embed(response: AudioSearchResponse) -> discord.Embed:
             f"**{discord.utils.escape_markdown(response.query)}**. "
             "Your selection is saved in playback history to improve future matches."
         ),
-        fields=fields,
+        fields=tuple(fields),
         tone=EmbedTone.WARNING,
     )
     if response.candidates and response.candidates[0].thumbnail_url:
@@ -8140,21 +8144,21 @@ class QuoteComposerView(SafeView):
         self.stop()
 
 
-_AGENT_CONVERSATION_COMPATIBILITY_VERSION = 3
-
-
 def discord_conversation_id(
     *,
     guild_id: int | None,
     channel_id: int,
     actor_id: int | str,
     grants: frozenset[str] = frozenset(),
+    compatibility_epoch: int = 4,
 ) -> str:
     """Map one actor, channel, and capability profile to one private conversation."""
 
+    if not 1 <= compatibility_epoch <= 10_000:
+        raise ValueError("compatibility epoch must be between 1 and 10000")
     scope = f"guild:{guild_id}" if guild_id is not None else "direct"
     base = (
-        f"discord:v{_AGENT_CONVERSATION_COMPATIBILITY_VERSION}:"
+        f"discord:v{compatibility_epoch}:"
         f"{scope}:channel:{channel_id}:actor:{actor_id}"
     )
     if not grants:
@@ -8377,6 +8381,101 @@ def _agent_response_uses_host_delivery(content: str) -> bool:
     }
 
 
+def _agent_task_administrator(
+    runtime: SimajilordRuntime,
+    interaction: discord.Interaction,
+) -> bool:
+    actor_id = str(interaction.user.id)
+    if actor_id in runtime.settings.agent_admin_user_ids:
+        return True
+    member = interaction.user
+    return isinstance(member, discord.Member) and (
+        permission_enabled(member.guild_permissions, "administrator")
+        or permission_enabled(member.guild_permissions, "manage_guild")
+    )
+
+
+def _agent_quota_text(quota: AgentQuotaSnapshot) -> str:
+    user_remaining = quota.user_requests_remaining
+    workspace_remaining = quota.workspace_requests_remaining
+    user_text = "exempt" if user_remaining is None else str(user_remaining)
+    workspace_text = (
+        "n/a" if workspace_remaining is None else str(workspace_remaining)
+    )
+    return (
+        f"user {user_text} · server {workspace_text} · "
+        f"tokens {quota.tokens_remaining:,}\n"
+        f"active {quota.active_turns}/{quota.max_active_turns} · "
+        f"pending {quota.pending_turns}/{quota.max_pending_turns} · "
+        f"interactive reserve {quota.interactive_reserve_percent}%"
+    )
+
+
+class AgentTaskView(SafeView):
+    """Owner-scoped controls attached to one temporary Working panel."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        task_id: str,
+        requester_id: str,
+        workspace_id: str | None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.runtime = runtime
+        self.task_id = task_id
+        self.requester_id = requester_id
+        self.workspace_id = workspace_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        same_workspace = (
+            interaction.guild_id is None
+            and self.workspace_id is None
+        ) or (
+            interaction.guild_id is not None
+            and str(interaction.guild_id) == self.workspace_id
+        )
+        allowed = (
+            str(interaction.user.id) == self.requester_id
+            or _agent_task_administrator(self.runtime, interaction)
+        )
+        if same_workspace and allowed:
+            return True
+        await interaction.response.send_message(
+            "Only the task requester or a server administrator can use these controls.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[AgentTaskView],
+    ) -> None:
+        agent = self.runtime.agent
+        if agent is None:
+            await interaction.response.send_message(
+                "The AI runtime is not active.",
+                ephemeral=True,
+            )
+            return
+        cancelled = await agent.cancel_task(
+            self.task_id,
+            actor_id=str(interaction.user.id),
+            administrator=_agent_task_administrator(self.runtime, interaction),
+        )
+        await interaction.response.send_message(
+            (
+                "Cancellation requested. The native provider turn is being interrupted."
+                if cancelled
+                else "This task is no longer running."
+            ),
+            ephemeral=True,
+        )
+
+
 class AgentCog(commands.Cog):
     """Wake one shared agent conversation only for explicit mentions."""
 
@@ -8427,6 +8526,7 @@ class AgentCog(commands.Cog):
             message,
             event_id=f"discord:message:{message.id}",
             occurred_at=message.created_at,
+            message_edited_at=message.edited_at,
         )
 
     @commands.Cog.listener()
@@ -8447,6 +8547,7 @@ class AgentCog(commands.Cog):
                 f"{edited_at.isoformat()}"
             ),
             occurred_at=edited_at,
+            message_edited_at=edited_at,
         )
 
     async def _handle_mention(
@@ -8455,7 +8556,8 @@ class AgentCog(commands.Cog):
         *,
         event_id: str,
         occurred_at: datetime,
-        allow_follow_up: bool = True,
+        message_edited_at: datetime | None = None,
+        allow_routing: bool = True,
     ) -> None:
         agent = self.runtime.agent
         bot_user = self.bot.user
@@ -8501,12 +8603,34 @@ class AgentCog(commands.Cog):
             await self.runtime.agent_store.public_reference_id_for_event(event_id)
             or new_agent_public_reference_id()
         )
+        existing_request = await self.runtime.agent_store.request_by_public_reference_id(
+            public_reference_id
+        )
+        if existing_request is not None and existing_request.event_id != event_id:
+            raise RuntimeError("agent event reference resolved to another request")
+        task_id = (
+            existing_request.task_id
+            if existing_request is not None
+            else await self.runtime.agent_store.task_id_for_event(event_id)
+            or new_agent_task_id()
+        )
+        conversation_id = discord_conversation_id(
+            guild_id=message.guild.id if message.guild else None,
+            channel_id=message.channel.id,
+            actor_id=actor_id,
+            grants=grants,
+            compatibility_epoch=(
+                self.runtime.settings.agent_conversation_compatibility_epoch
+            ),
+        )
         request = AgentRequest(
-            conversation_id=discord_conversation_id(
-                guild_id=message.guild.id if message.guild else None,
-                channel_id=message.channel.id,
-                actor_id=actor_id,
-                grants=grants,
+            conversation_id=(
+                existing_request.conversation_id
+                if existing_request is not None
+                else task_scoped_conversation_id(
+                    conversation_id,
+                    task_id,
+                )
             ),
             event_id=event_id,
             trigger=AgentTrigger.MENTION,
@@ -8518,12 +8642,14 @@ class AgentCog(commands.Cog):
             occurred_at=occurred_at,
             resource_ids=resource_ids,
             public_reference_id=public_reference_id,
+            task_id=task_id,
+            message_edited_at=message_edited_at,
             grants=grants,
             approvals=approvals,
         )
-        if allow_follow_up:
+        if allow_routing:
             try:
-                followed_event_id = await agent.try_follow_up(request)
+                route = await agent.route_candidate(request)
             except AgentBusyError as exc:
                 await message.reply(
                     _agent_error_text(exc),
@@ -8531,29 +8657,74 @@ class AgentCog(commands.Cog):
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return
-            if followed_event_id is not None:
+            except Exception as exc:
+                log.exception(
+                    "AI task candidate routing failed message=%s reference=%s",
+                    message.id,
+                    request.public_reference_id,
+                )
+                await message.reply(
+                    _agent_error_text(exc, reference_id=request.public_reference_id),
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            if route is not None and route.decision is not AgentTaskRouteDecision.SEPARATE:
+                attached = route.decision is AgentTaskRouteDecision.ATTACH
                 acknowledgement = await message.reply(
                     embed=command_embed(
-                        "Added to the active AI request",
+                        (
+                            "Added to the active AI task"
+                            if attached
+                            else "AI task is finishing"
+                        ),
                         description=(
-                            "The AI will read this message before it finishes. "
-                            "Your Discord identity remains attached to the follow-up."
+                            (
+                                "The AI read this exact message and attached it to the "
+                                "active task. Your Discord identity and permissions remain "
+                                "independent."
+                            )
+                            if attached
+                            else (
+                                "The AI classified this correction, edit, or resend as "
+                                "no new remaining work and will conclude the active task."
+                            )
                         ),
                         tone=EmbedTone.INFO,
                     ),
                     mention_author=False,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
-                progress = self._active_progress.get(followed_event_id)
+                progress = self._active_progress.get(route.active_event_id)
                 if progress is None:
                     with suppress(discord.DiscordException):
                         await acknowledgement.delete()
                 else:
                     await progress.add_temporary_message(acknowledgement)
                 return
+        try:
+            quota = await agent.quota_snapshot(request)
+            quota_text = _agent_quota_text(quota)
+        except Exception:
+            log.exception(
+                "Could not build AI quota snapshot request=%s",
+                request.event_id,
+            )
+            quota_text = "temporarily unavailable"
+        task_view = AgentTaskView(
+            self.runtime,
+            task_id=request.task_id,
+            requester_id=request.actor_id,
+            workspace_id=request.workspace_id,
+        )
         progress = _AgentProgressMessage(
             message,
             delivery_key=request.event_id,
+            task_id=request.task_id,
+            reference_id=request.public_reference_id,
+            requester=f"{message.author.mention} · `{request.actor_id}`",
+            quota_text=quota_text,
+            view=task_view,
         )
         self._active_progress[request.event_id] = progress
         try:
@@ -8561,6 +8732,16 @@ class AgentCog(commands.Cog):
                 request,
                 on_progress=progress.update,
             )
+        except asyncio.CancelledError:
+            snapshot = (
+                await self.runtime.agent_store.task_snapshot_by_public_reference_id(
+                    request.public_reference_id
+                )
+            )
+            if snapshot is not None and snapshot.state == "cancelled":
+                await progress.cancelled()
+                return
+            raise
         except Exception as exc:
             log.exception(
                 "Mention agent turn failed message=%s reference=%s",
@@ -8629,6 +8810,7 @@ class AgentCog(commands.Cog):
                 replay_barrier = await _agent_request_replay_barrier_reason(
                     self.runtime,
                     request.event_id,
+                    task_id=request.task_id,
                 )
                 if replay_barrier is not None:
                     await self.runtime.agent_store.fail_interrupted_mention(
@@ -8681,7 +8863,8 @@ class AgentCog(commands.Cog):
                     source,
                     event_id=request.event_id,
                     occurred_at=request.occurred_at,
-                    allow_follow_up=False,
+                    message_edited_at=source.edited_at,
+                    allow_routing=False,
                 )
                 skipped = await self.runtime.agent_store.fail_interrupted_mention(
                     request.event_id,
@@ -8703,6 +8886,92 @@ class AgentCog(commands.Cog):
                     request.event_id,
                     request.channel_id,
                 )
+
+        await self._recover_unrouted_task_candidates()
+
+    async def _recover_unrouted_task_candidates(self) -> None:
+        """Default crash-interrupted semantic decisions to isolated tasks."""
+
+        candidates = await self.runtime.agent_store.unrouted_task_candidates(
+            created_before=self._started_at,
+        )
+        for candidate in candidates:
+            try:
+                defaulted = await self.runtime.agent_store.default_task_candidate_to_separate(
+                    candidate.event_id,
+                    reason="startup_default_separate",
+                )
+                if not defaulted:
+                    continue
+                replay_barrier = await _agent_request_replay_barrier_reason(
+                    self.runtime,
+                    candidate.event_id,
+                )
+                if replay_barrier is not None:
+                    await self.runtime.agent_store.fail_unrouted_task_candidate(
+                        candidate.event_id,
+                        error_type="RecoveryBlockedByExternalEffect",
+                    )
+                    await self.runtime.journal.append(
+                        kind="agent.task.recovery_blocked",
+                        actor_id=None,
+                        workspace_id=None,
+                        transport="agent",
+                        request_id=candidate.event_id,
+                        payload={
+                            "public_reference_id": candidate.public_reference_id,
+                            "task_id": candidate.task_id,
+                            "reason": replay_barrier,
+                        },
+                    )
+                    continue
+                channel = await self._agent_host_channel(candidate.channel_id)
+                source = await self._agent_source_message(
+                    channel,
+                    candidate.source_message_id,
+                )
+                if source is None:
+                    await self.runtime.agent_store.fail_unrouted_task_candidate(
+                        candidate.event_id,
+                        error_type="RecoverySourceUnavailable",
+                    )
+                    log.warning(
+                        "Task candidate source is unavailable event=%s channel=%s "
+                        "message=%s",
+                        candidate.event_id,
+                        candidate.channel_id,
+                        candidate.source_message_id,
+                    )
+                    continue
+                log.info(
+                    "Recovering task candidate as separate event=%s task=%s",
+                    candidate.event_id,
+                    candidate.task_id,
+                )
+                await self._handle_mention(
+                    source,
+                    event_id=candidate.event_id,
+                    occurred_at=candidate.occurred_at,
+                    message_edited_at=source.edited_at,
+                    allow_routing=False,
+                )
+                recovered = await self.runtime.agent_store.request_by_public_reference_id(
+                    candidate.public_reference_id
+                )
+                if recovered is None:
+                    await self.runtime.agent_store.fail_unrouted_task_candidate(
+                        candidate.event_id,
+                        error_type="RecoverySkipped",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Task candidate recovery failed event=%s task=%s",
+                    candidate.event_id,
+                    candidate.task_id,
+                )
+
     async def _host_delivery_loop(self) -> None:
         """Reconcile completed mention responses without rerunning the model."""
 
@@ -8986,6 +9255,8 @@ class AgentCog(commands.Cog):
 async def _agent_request_replay_barrier_reason(
     runtime: SimajilordRuntime,
     request_id: str,
+    *,
+    task_id: str | None = None,
 ) -> str | None:
     """Conservatively refuse whole-turn replay after any durable write attempt."""
 
@@ -8998,7 +9269,11 @@ async def _agent_request_replay_barrier_reason(
     journal = getattr(runtime, "journal", None)
     if journal is None:
         return None
-    trace = await journal.agent_trace(request_id=request_id, limit=1_000)
+    trace = await journal.agent_trace(
+        request_id=None if task_id is not None else request_id,
+        task_id=task_id,
+        limit=1_000,
+    )
     for record in trace:
         if record.kind not in {"agent.tool.started", "agent.app_tool.started"}:
             continue
@@ -10058,12 +10333,27 @@ class AgentAutonomyCog(commands.Cog):
             )
             for event in batch.events
         )
+        public_reference_id = (
+            await self.runtime.agent_store.public_reference_id_for_event(batch.batch_id)
+            or new_agent_public_reference_id()
+        )
+        task_id = (
+            await self.runtime.agent_store.task_id_for_event(batch.batch_id)
+            or new_agent_task_id()
+        )
+        conversation_id = discord_conversation_id(
+            guild_id=int(workspace_id) if workspace_id else None,
+            channel_id=int(channel_id),
+            actor_id=autonomy_actor_id,
+            grants=grants,
+            compatibility_epoch=(
+                self.runtime.settings.agent_conversation_compatibility_epoch
+            ),
+        )
         request = AgentRequest(
-            conversation_id=discord_conversation_id(
-                guild_id=int(workspace_id) if workspace_id else None,
-                channel_id=int(channel_id),
-                actor_id=autonomy_actor_id,
-                grants=grants,
+            conversation_id=task_scoped_conversation_id(
+                conversation_id,
+                task_id,
             ),
             event_id=batch.batch_id,
             trigger=AgentTrigger.AUTONOMOUS,
@@ -10074,12 +10364,8 @@ class AgentAutonomyCog(commands.Cog):
             message_id=message_id,
             occurred_at=max(event.occurred_at for event in batch.events),
             resource_ids=resource_ids,
-            public_reference_id=(
-                await self.runtime.agent_store.public_reference_id_for_event(
-                    batch.batch_id
-                )
-                or new_agent_public_reference_id()
-            ),
+            public_reference_id=public_reference_id,
+            task_id=task_id,
             grants=grants,
             approvals=approvals,
             events=event_pointers,

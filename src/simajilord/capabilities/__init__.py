@@ -1,5 +1,10 @@
 """Independent application endpoints available to every adapter."""
 
+from .agent_task import (
+    TaskRouteRequest,
+    TaskRouteResponse,
+    build_task_route_endpoint,
+)
 from .audio import (
     AudioAutoLeaveRequest,
     AudioControlRequest,
@@ -195,6 +200,8 @@ __all__ = [
     "SpeechSpeakResponse",
     "SyntheticMediaAnalyzeRequest",
     "SyntheticMediaAnalyzeResponse",
+    "TaskRouteRequest",
+    "TaskRouteResponse",
     "TranslationDetectRequest",
     "TranslationDetectResponse",
     "TranslationLanguageItem",
@@ -228,6 +235,7 @@ __all__ = [
     "build_source_inspection_endpoints",
     "build_speech_endpoint",
     "build_system_endpoints",
+    "build_task_route_endpoint",
     "build_translation_endpoints",
     "build_utility_endpoints",
     "build_web_endpoints",

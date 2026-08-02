@@ -34,6 +34,7 @@ from simajilord.agent import (
     AgentProviderLimitError,
     AgentRateLimitError,
     AgentTimeoutError,
+    new_agent_task_id,
 )
 from simajilord.capabilities.audio import (
     AudioAction,
@@ -99,6 +100,7 @@ from simajilord.integrations.discord.capabilities import (
 from simajilord.integrations.discord.cogs import (
     _QUOTE_CONTEXT_MENU_NAME,
     _TRANSLATE_CONTEXT_MENU_NAME,
+    AgentTaskView,
     FocusTimerCog,
     HelpCog,
     InfoCog,
@@ -465,6 +467,111 @@ async def test_agent_tool_final_sentinel_is_never_published() -> None:
     published.delete.assert_awaited_once_with()
     source.reply.assert_not_awaited()
     assert progress.message is None
+
+
+def test_agent_working_panel_exposes_task_quota_and_inspection_reference() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    task_id = new_agent_task_id()
+    progress = _AgentProgressMessage(
+        source,
+        task_id=task_id,
+        reference_id="agt_0123456789abcdef0123",
+        requester="<@3> · `3`",
+        quota_text="user 2 · server 9 · tokens 10,000",
+        view=Mock(spec=discord.ui.View),
+    )
+
+    fields = {field.name: field.value for field in progress._identity_fields()}
+
+    assert f"Task `{task_id}`" in fields["Task"]
+    assert "Support reference `agt_0123456789abcdef0123`" in fields["Task"]
+    assert fields["Requester"] == "<@3> · `3`"
+    assert "tokens 10,000" in fields["Capacity now"]
+    assert "typed `attach`, `separate`, or `finish`" in fields["Follow-up routing"]
+    assert "Use **Cancel**" in fields["Control"]
+    assert "/ai inspect" not in "\n".join(fields.values())
+
+
+@pytest.mark.asyncio
+async def test_agent_task_view_is_bound_to_its_exact_workspace() -> None:
+    runtime = SimpleNamespace()
+    view = AgentTaskView(
+        runtime,
+        task_id=new_agent_task_id(),
+        requester_id="3",
+        workspace_id="1",
+    )
+    wrong_workspace = SimpleNamespace(
+        guild_id=9,
+        user=SimpleNamespace(id=3),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    correct_workspace = SimpleNamespace(
+        guild_id=1,
+        user=SimpleNamespace(id=3),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    assert not await view.interaction_check(wrong_workspace)
+    assert await view.interaction_check(correct_workspace)
+    wrong_workspace.response.send_message.assert_awaited_once_with(
+        "Only the task requester or a server administrator can use these controls.",
+        ephemeral=True,
+    )
+    correct_workspace.response.send_message.assert_not_awaited()
+    assert [getattr(item, "label", None) for item in view.children] == ["Cancel"]
+    view.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_task_view_allows_its_requester_in_a_direct_message() -> None:
+    runtime = SimpleNamespace()
+    view = AgentTaskView(
+        runtime,
+        task_id=new_agent_task_id(),
+        requester_id="3",
+        workspace_id=None,
+    )
+    direct_message = SimpleNamespace(
+        guild_id=None,
+        user=SimpleNamespace(id=3),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    assert await view.interaction_check(direct_message)
+    direct_message.response.send_message.assert_not_awaited()
+    view.stop()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancellation_replaces_working_and_removes_dead_control() -> None:
+    source = Mock(spec=discord.Message)
+    source.id = 42
+    source.reply = AsyncMock()
+    published = Mock(spec=discord.Message)
+    published.id = 43
+    published.edit = AsyncMock()
+    control = Mock(spec=discord.ui.View)
+    progress = _AgentProgressMessage(
+        source,
+        task_id=new_agent_task_id(),
+        reference_id="agt_0123456789abcdef0123",
+        requester="<@3>",
+        quota_text="tokens 10,000",
+        view=control,
+    )
+    progress.message = published
+
+    await progress.cancelled()
+
+    control.stop.assert_called_once_with()
+    published.edit.assert_awaited_once()
+    assert published.edit.await_args.kwargs["view"] is None
+    embed = published.edit.await_args.kwargs["embed"]
+    assert embed.title == "AI task cancelled"
+    assert "Control" not in {field.name for field in embed.fields}
+    source.reply.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2866,10 +2973,10 @@ async def test_music_search_selection_updates_the_component_message(
 
 def test_agent_conversation_key_is_private_per_actor_and_channel() -> None:
     assert discord_conversation_id(guild_id=1, channel_id=2, actor_id=3) == (
-        "discord:v3:guild:1:channel:2:actor:3"
+        "discord:v4:guild:1:channel:2:actor:3"
     )
     assert discord_conversation_id(guild_id=None, channel_id=2, actor_id=3) == (
-        "discord:v3:direct:channel:2:actor:3"
+        "discord:v4:direct:channel:2:actor:3"
     )
     assert (
         discord_conversation_id(
@@ -2878,7 +2985,7 @@ def test_agent_conversation_key_is_private_per_actor_and_channel() -> None:
             actor_id=3,
             grants=frozenset({AGENT_WEB_GRANT}),
         )
-        == "discord:v3:guild:1:channel:2:actor:3:profile:web"
+        == "discord:v4:guild:1:channel:2:actor:3:profile:web"
     )
     assert discord_conversation_id(guild_id=1, channel_id=2, actor_id=4) != (
         discord_conversation_id(guild_id=1, channel_id=2, actor_id=3)

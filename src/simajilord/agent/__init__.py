@@ -65,10 +65,15 @@ from .contracts import (
     AgentRequest,
     AgentResponse,
     AgentResponseStatus,
+    AgentTaskRouteDecision,
+    AgentTaskRouteResult,
     AgentTokenUsage,
     AgentTrigger,
     is_agent_public_reference_id,
+    is_agent_task_id,
     new_agent_public_reference_id,
+    new_agent_task_id,
+    task_scoped_conversation_id,
 )
 from .errors import (
     AgentBusyError,
@@ -171,6 +176,8 @@ __all__ = [
     "AgentRequest",
     "AgentResponse",
     "AgentResponseStatus",
+    "AgentTaskRouteDecision",
+    "AgentTaskRouteResult",
     "AgentThreadError",
     "AgentTimeoutError",
     "AgentTokenUsage",
@@ -199,5 +206,8 @@ __all__ = [
     "build_curated_workflow_endpoint",
     "build_memory_endpoints",
     "is_agent_public_reference_id",
+    "is_agent_task_id",
     "new_agent_public_reference_id",
+    "new_agent_task_id",
+    "task_scoped_conversation_id",
 ]

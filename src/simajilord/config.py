@@ -126,6 +126,8 @@ class Settings:
     agent_max_active_turns: int
     agent_max_pending_turns: int
     agent_max_pending_turns_per_user: int
+    agent_interactive_reserve_percent: int
+    agent_conversation_compatibility_epoch: int
     agent_autonomy_enabled: bool
     agent_autonomy_guild_ids: frozenset[str]
     agent_autonomy_mode: AgentAutonomyMode
@@ -851,7 +853,18 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             2,
             maximum=20,
         ),
-        agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", True),
+        agent_interactive_reserve_percent=_bounded_int(
+            "AGENT_INTERACTIVE_RESERVE_PERCENT",
+            25,
+            minimum=0,
+            maximum=90,
+        ),
+        agent_conversation_compatibility_epoch=_positive_int(
+            "AGENT_CONVERSATION_COMPATIBILITY_EPOCH",
+            4,
+            maximum=10_000,
+        ),
+        agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", False),
         agent_autonomy_guild_ids=agent_autonomy_guild_ids,
         agent_autonomy_mode=_autonomy_mode(
             "AGENT_AUTONOMY_MODE",

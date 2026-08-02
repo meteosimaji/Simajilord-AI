@@ -59,10 +59,13 @@ class InvocationContext:
     origin_resource_id: str | None = None
     approvals: frozenset[str] = frozenset()
     public_reference_id: str | None = None
+    agent_task_id: str | None = None
+    agent_conversation_id: str | None = None
     provider_thread_id: str | None = None
     provider_turn_id: str | None = None
     tool_call_id: str | None = None
     active_message_id: str | None = None
+    active_message_edited_at: str | None = None
     batched_message_ids: tuple[str, ...] = ()
     agent_trigger: Literal["mention", "autonomous"] | None = None
 

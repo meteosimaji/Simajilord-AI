@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
@@ -120,6 +120,7 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     "feedback.create",
 )
 _AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS = 20
+_AGENT_TASK_ID_HEX_CHARACTERS = 20
 
 
 def new_agent_public_reference_id() -> str:
@@ -138,6 +139,52 @@ def is_agent_public_reference_id(value: str) -> bool:
     return len(suffix) == _AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS and all(
         character in "0123456789abcdef" for character in suffix
     )
+
+
+def new_agent_task_id() -> str:
+    """Return an opaque identifier for one durable unit of agent work."""
+
+    return f"tsk_{secrets.token_hex(_AGENT_TASK_ID_HEX_CHARACTERS // 2)}"
+
+
+def is_agent_task_id(value: str) -> bool:
+    """Validate the public task format without decoding transport identity."""
+
+    prefix = "tsk_"
+    if not value.startswith(prefix):
+        return False
+    suffix = value[len(prefix) :]
+    return len(suffix) == _AGENT_TASK_ID_HEX_CHARACTERS and all(
+        character in "0123456789abcdef" for character in suffix
+    )
+
+
+def task_scoped_conversation_id(conversation_id: str, task_id: str) -> str:
+    """Derive a provider-continuity key that cannot bleed into another task."""
+
+    normalized_conversation_id = conversation_id.strip()
+    if not normalized_conversation_id or len(normalized_conversation_id) > 500:
+        raise ValueError("conversation ID must contain 1 to 500 characters")
+    if not is_agent_task_id(task_id):
+        raise ValueError("invalid agent task ID")
+    suffix = f":task:{task_id}"
+    profile_marker = ":profile:"
+    if profile_marker in normalized_conversation_id:
+        base, profile = normalized_conversation_id.rsplit(profile_marker, 1)
+        scoped_conversation_id = (
+            normalized_conversation_id
+            if base.endswith(suffix)
+            else f"{base}{suffix}{profile_marker}{profile}"
+        )
+    else:
+        scoped_conversation_id = (
+            normalized_conversation_id
+            if normalized_conversation_id.endswith(suffix)
+            else f"{normalized_conversation_id}{suffix}"
+        )
+    if len(scoped_conversation_id) > 500:
+        raise ValueError("task-scoped conversation ID exceeds 500 characters")
+    return scoped_conversation_id
 
 
 class GoalState(StrEnum):
@@ -194,6 +241,25 @@ class AgentResponseStatus(StrEnum):
     REJECTED = "rejected"
     UNAVAILABLE = "unavailable"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AgentTaskRouteDecision(StrEnum):
+    """Model-selected relationship between a new event and an active task."""
+
+    ATTACH = "attach"
+    SEPARATE = "separate"
+    FINISH = "finish"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTaskRouteResult:
+    """Typed host result for a candidate routed against one active task."""
+
+    decision: AgentTaskRouteDecision
+    active_event_id: str
+    active_task_id: str
+    active_public_reference_id: str
 
 
 class AgentProgressStage(StrEnum):
@@ -238,6 +304,8 @@ class AgentRequest:
     occurred_at: datetime
     resource_ids: tuple[str, ...]
     public_reference_id: str
+    task_id: str = field(default_factory=new_agent_task_id)
+    message_edited_at: datetime | None = None
     grants: frozenset[str] = frozenset()
     approvals: frozenset[str] = frozenset()
     events: tuple[AgentEvent, ...] = ()

@@ -33,6 +33,7 @@ from simajilord.agent.store import (
     AgentHostDeliveryRecord,
     AgentInterruptedMention,
     AgentPendingHostDelivery,
+    AgentUnroutedTaskCandidate,
 )
 from simajilord.config import AgentFeatureAccess
 from simajilord.core import ApprovalMode, InvocationContext
@@ -41,6 +42,7 @@ from simajilord.integrations.discord.cogs import (
     AgentCog,
     ObservationCog,
     _agent_delivery_nonce,
+    _agent_request_replay_barrier_reason,
 )
 
 
@@ -1006,6 +1008,7 @@ async def test_agent_routes_edited_bot_mention_as_explicit_turn() -> None:
         current,
         event_id=f"discord:message-edit:40:{edited_at}",
         occurred_at=datetime.fromisoformat(edited_at),
+        message_edited_at=datetime.fromisoformat(edited_at),
     )
 
 
@@ -1015,13 +1018,16 @@ async def test_agent_recovers_prior_process_mention_as_a_fresh_turn() -> None:
     interrupted = AgentInterruptedMention(
         event_id="discord:message:40",
         public_reference_id="agt_0123456789abcdef0123",
+        task_id="tsk_0123456789abcdef0123",
         channel_id="20",
         source_message_id="40",
         occurred_at=now - timedelta(minutes=1),
         started_at=now - timedelta(seconds=30),
     )
     source = Mock(spec=discord.Message)
+    source.edited_at = None
     store = SimpleNamespace(
+        unrouted_task_candidates=AsyncMock(return_value=()),
         interrupted_mentions=AsyncMock(return_value=(interrupted,)),
         fail_interrupted_mention=AsyncMock(return_value=False),
     )
@@ -1039,7 +1045,8 @@ async def test_agent_recovers_prior_process_mention_as_a_fresh_turn() -> None:
         source,
         event_id=interrupted.event_id,
         occurred_at=interrupted.occurred_at,
-        allow_follow_up=False,
+        message_edited_at=None,
+        allow_routing=False,
     )
     store.fail_interrupted_mention.assert_awaited_once_with(
         interrupted.event_id,
@@ -1053,12 +1060,14 @@ async def test_agent_does_not_replay_interrupted_mention_after_external_write() 
     interrupted = AgentInterruptedMention(
         event_id="discord:message:41",
         public_reference_id="agt_1123456789abcdef0123",
+        task_id="tsk_1123456789abcdef0123",
         channel_id="20",
         source_message_id="41",
         occurred_at=now - timedelta(minutes=1),
         started_at=now - timedelta(seconds=30),
     )
     store = SimpleNamespace(
+        unrouted_task_candidates=AsyncMock(return_value=()),
         interrupted_mentions=AsyncMock(return_value=(interrupted,)),
         fail_interrupted_mention=AsyncMock(return_value=True),
     )
@@ -1087,6 +1096,112 @@ async def test_agent_does_not_replay_interrupted_mention_after_external_write() 
         error_type="RecoveryBlockedByExternalEffect",
     )
     assert journal.append.await_args.kwargs["kind"] == "agent.turn.recovery_blocked"
+
+
+@pytest.mark.asyncio
+async def test_interrupted_replay_barrier_scans_the_whole_task_trace() -> None:
+    task_id = "tsk_2123456789abcdef0123"
+    receipts = SimpleNamespace(
+        request_has_replay_barrier=AsyncMock(return_value=False),
+    )
+    journal = SimpleNamespace(
+        agent_trace=AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    kind="agent.tool.started",
+                    payload={"write": True},
+                ),
+            )
+        )
+    )
+    runtime = SimpleNamespace(action_receipts=receipts, journal=journal)
+
+    reason = await _agent_request_replay_barrier_reason(
+        runtime,
+        "discord:message:root",
+        task_id=task_id,
+    )
+
+    assert reason == "legacy_write_trace"
+    journal.agent_trace.assert_awaited_once_with(
+        request_id=None,
+        task_id=task_id,
+        limit=1_000,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_recovers_unrouted_candidate_as_task_isolated_separate_work() -> None:
+    now = datetime.now(UTC)
+    candidate = AgentUnroutedTaskCandidate(
+        event_id="discord:message:42",
+        task_id="tsk_0123456789abcdef0123",
+        public_reference_id="agt_0123456789abcdef0123",
+        channel_id="20",
+        source_message_id="42",
+        occurred_at=now - timedelta(minutes=1),
+        created_at=now - timedelta(seconds=30),
+    )
+    source = Mock(spec=discord.Message)
+    source.edited_at = now - timedelta(seconds=20)
+    store = SimpleNamespace(
+        unrouted_task_candidates=AsyncMock(return_value=(candidate,)),
+        default_task_candidate_to_separate=AsyncMock(return_value=True),
+        request_by_public_reference_id=AsyncMock(return_value=SimpleNamespace()),
+        fail_unrouted_task_candidate=AsyncMock(return_value=False),
+    )
+    cog = AgentCog(SimpleNamespace(), SimpleNamespace(agent_store=store))
+    cog._started_at = now
+    cog._agent_host_channel = AsyncMock(return_value=object())  # type: ignore[method-assign]
+    cog._agent_source_message = AsyncMock(return_value=source)  # type: ignore[method-assign]
+    cog._handle_mention = AsyncMock()  # type: ignore[method-assign]
+
+    await cog._recover_unrouted_task_candidates()
+
+    store.default_task_candidate_to_separate.assert_awaited_once_with(
+        candidate.event_id,
+        reason="startup_default_separate",
+    )
+    cog._handle_mention.assert_awaited_once_with(
+        source,
+        event_id=candidate.event_id,
+        occurred_at=candidate.occurred_at,
+        message_edited_at=source.edited_at,
+        allow_routing=False,
+    )
+    store.fail_unrouted_task_candidate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_terminalizes_unrecoverable_unrouted_candidate() -> None:
+    now = datetime.now(UTC)
+    candidate = AgentUnroutedTaskCandidate(
+        event_id="discord:message:43",
+        task_id="tsk_1123456789abcdef0123",
+        public_reference_id="agt_1123456789abcdef0123",
+        channel_id="20",
+        source_message_id="43",
+        occurred_at=now - timedelta(minutes=1),
+        created_at=now - timedelta(seconds=30),
+    )
+    store = SimpleNamespace(
+        unrouted_task_candidates=AsyncMock(return_value=(candidate,)),
+        default_task_candidate_to_separate=AsyncMock(return_value=True),
+        fail_unrouted_task_candidate=AsyncMock(return_value=True),
+    )
+    cog = AgentCog(SimpleNamespace(), SimpleNamespace(agent_store=store))
+    cog._started_at = now
+    cog._agent_host_channel = AsyncMock(return_value=object())  # type: ignore[method-assign]
+    cog._agent_source_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    cog._handle_mention = AsyncMock()  # type: ignore[method-assign]
+
+    await cog._recover_unrouted_task_candidates()
+
+    store.fail_unrouted_task_candidate.assert_awaited_once_with(
+        candidate.event_id,
+        error_type="RecoverySourceUnavailable",
+    )
+    cog._handle_mention.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1243,8 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
     runtime = SimpleNamespace(
         agent=agent,
         agent_store=SimpleNamespace(
-            public_reference_id_for_event=AsyncMock(return_value=None)
+            public_reference_id_for_event=AsyncMock(return_value=None),
+            task_id_for_event=AsyncMock(return_value=None),
         ),
         settings=SimpleNamespace(
             agent_autonomy_mode=AgentAutonomyMode.ACT,
@@ -1136,8 +1252,9 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
             agent_file_sandbox_enabled=False,
             agent_web_search_access=AgentFeatureAccess.DISABLED,
             agent_safe_compute_access=AgentFeatureAccess.DISABLED,
-            agent_admin_user_ids=frozenset(),
-            image_generation_access=AgentFeatureAccess.DISABLED,
+                agent_admin_user_ids=frozenset(),
+                agent_conversation_compatibility_epoch=4,
+                image_generation_access=AgentFeatureAccess.DISABLED,
         ),
         files=None,
         compute=None,
@@ -1174,6 +1291,10 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
 
     request = agent.respond.await_args.args[0]
     assert request.actor_id == "999"
+    assert f":task:{request.task_id}" in request.conversation_id
+    assert request.conversation_id.index(f":task:{request.task_id}") < (
+        request.conversation_id.index(":profile:")
+    )
     assert len(request.events) == 5
     assert {event.payload["source_actor_id"] for event in request.events} == {
         "100",
@@ -1297,7 +1418,8 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
     runtime = SimpleNamespace(
         agent=agent,
         agent_store=SimpleNamespace(
-            public_reference_id_for_event=AsyncMock(return_value=None)
+            public_reference_id_for_event=AsyncMock(return_value=None),
+            task_id_for_event=AsyncMock(return_value=None),
         ),
         action_receipts=receipts,
         autonomy_events=autonomy_events,
@@ -1307,8 +1429,9 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
             agent_file_sandbox_enabled=False,
             agent_web_search_access=AgentFeatureAccess.DISABLED,
             agent_safe_compute_access=AgentFeatureAccess.DISABLED,
-            agent_admin_user_ids=frozenset(),
-            image_generation_access=AgentFeatureAccess.DISABLED,
+                agent_admin_user_ids=frozenset(),
+                agent_conversation_compatibility_epoch=4,
+                image_generation_access=AgentFeatureAccess.DISABLED,
         ),
         files=None,
         compute=None,

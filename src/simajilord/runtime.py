@@ -63,6 +63,7 @@ from simajilord.capabilities import (
     build_source_inspection_endpoints,
     build_speech_endpoint,
     build_system_endpoints,
+    build_task_route_endpoint,
     build_translation_endpoints,
     build_utility_endpoints,
     build_web_endpoints,
@@ -155,7 +156,8 @@ class SimajilordRuntime:
             ),
         )
         agent_store = AgentConversationStore(
-            settings.data_dir / "agent_conversations.sqlite3"
+            settings.data_dir / "agent_conversations.sqlite3",
+            compatibility_epoch=settings.agent_conversation_compatibility_epoch,
         )
         memory_store = AgentMemoryStore(
             settings.data_dir / "agent_memory.sqlite3"
@@ -497,6 +499,7 @@ class SimajilordRuntime:
                 "timer.list",
                 "timer.cancel",
                 "turn.evidence_plan",
+                "turn.route_task_event",
                 "source.search",
                 "source.read",
                 "feedback.create",
@@ -636,6 +639,7 @@ class SimajilordRuntime:
                     "discord.get_message",
                     "discord.read_messages",
                     "turn.evidence_plan",
+                    "turn.route_task_event",
                     "memory.search",
                     "web.search",
                 ),
@@ -709,6 +713,7 @@ class SimajilordRuntime:
                 allow_image_generation=shared_image_provider is not None,
                 image_timeout_seconds=settings.image_timeout_seconds,
                 trace_sink=journal,
+                thread_binding_sink=agent_store,
             )
             if shared_image_provider is not None:
                 shared_image_provider.bind(codex_provider)
@@ -727,6 +732,9 @@ class SimajilordRuntime:
                     max_pending_turns=settings.agent_max_pending_turns,
                     max_pending_turns_per_user=(
                         settings.agent_max_pending_turns_per_user
+                    ),
+                    interactive_reserve_percent=(
+                        settings.agent_interactive_reserve_percent
                     ),
                     rate_limit_exempt_actor_ids=(
                         settings.agent_rate_limit_exempt_user_ids
@@ -808,6 +816,7 @@ class SimajilordRuntime:
             *build_memory_endpoints(memory),
             build_feedback_endpoint(feedback),
             *build_source_inspection_endpoints(source_inspection),
+            build_task_route_endpoint(),
             *((curated_workflow_endpoint,) if curated_workflow_endpoint else ()),
             *(
                 (build_action_undo_endpoint(action_receipts),)
