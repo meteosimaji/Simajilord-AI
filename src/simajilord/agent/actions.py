@@ -731,6 +731,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "audio.move",
         "audio.clear_mine",
         "compute.run",
+        "connector.write",
         "files.download_url",
         "files.write_text",
         "files.replace_text",
@@ -1981,6 +1982,7 @@ def _target_ids(request: object, response: object) -> tuple[tuple[str, str], ...
     names = {
         "audio_destination_id",
         "channel_id",
+        "connector_id",
         "delivery_target_id",
         "destination_channel_id",
         "job_id",
@@ -1993,6 +1995,7 @@ def _target_ids(request: object, response: object) -> tuple[tuple[str, str], ...
         "source_message_id",
         "thread_id",
         "timer_id",
+        "tool",
         "user_id",
     }
     selected: dict[str, str] = {}

@@ -161,6 +161,16 @@ with Discord's generic “interaction failed” banner.
   host-enforced.
   Validated output files are committed through the existing file quota, while failed or
   over-limit runs discard the staging directory. No general shell capability is exposed
+- Optional `AGENT_ISOLATED_SHELL_ACCESS` is a separate, higher-risk host capability for explicit
+  mention turns only. It is disabled by default, can be scoped to administrators, requires
+  per-event write approval, and uses a Seatbelt-confined workspace isolated by Discord actor and
+  durable task. Autonomous turns never receive this grant
+- Optional `AGENT_CONNECTOR_ACCESS` keeps Figma, Canva, Adobe, Adobe Express, and BioRender usable
+  through Simajilord's existing capability, authorization, effect-ledger, and audit boundary.
+  Native model-facing Codex Apps and plugin MCP servers remain disabled. The broker reads the live
+  tool inventory for every operation, omits unknown/unclassified tools, separates read and write
+  endpoints, and requires a current actor/request/thread/schema-bound contract; connector writes
+  are approved and receipted as non-idempotent external effects
 - Optional `AGENT_CURATED_SKILLS_ENABLED` adds a small package-owned `workflow.search`
   catalog for community research, long web/PDF reading, file plus safe-compute transforms,
   generic media saving, selective memory, and Action Receipt/Undo flows. These are typed
@@ -222,12 +232,15 @@ with Discord's generic “interaction failed” banner.
   A mention posted in the same channel while a turn is active is persisted first as an independent
   task candidate, then delivered with `turn/steer` as a pointer only. It is not authoritative until
   the AI fetches the exact current Discord revision and calls the typed `turn.route_task_event`
-  capability with `attach`, `separate`, or `finish`. The host never classifies message text with
-  keyword rules. Edits and resends retain independent event IDs; a superseded revision cannot
+  capability with `attach`, `separate`, `finish`, or `cancel`. The host never classifies message
+  text with keyword or fixed-phrase rules—including natural corrections such as “やっぱりいい”.
+  Edits and resends retain independent event IDs; a superseded revision cannot
   silently reuse its earlier authorization. `attach` keeps the contributor's own grants and live
   Discord permissions, every task receives its own provider-continuity key, and `finish`
-  lets the AI conclude when a typo correction or resend adds no work. Missing, timed-out, or
-  crash-interrupted decisions default to a recoverable separate task, so no mention disappears.
+  lets the AI conclude when a typo correction or resend adds no work. An authorized `cancel`
+  interrupts the unfinished original model turn without pretending to undo already-confirmed
+  external effects. Missing, timed-out, or crash-interrupted decisions default to a recoverable
+  separate task, so no mention disappears.
   Each candidate receives a bounded evidence allowance for its exact read, route decision, and
   any required refreshed semantic evidence plan. Rate limits are checked before admission, while
   `MAX_ACTIVE_AGENT_TURNS`, `MAX_PENDING_AGENT_TURNS`, and
@@ -236,14 +249,14 @@ with Discord's generic “interaction failed” banner.
   prevents autonomous turns from consuming the final active, pending, and rolling-token capacity
   reserved for explicit mentions. Active turns do not consume either pending allowance,
   so the main queue can hold up to the active limit plus the waiting limit. Queue and host
-  execution progress uses short English status
-  messages. The temporary `Working` embed includes task/reference identity, requester, live quota,
-  typed follow-up behaviour, and one emergency Cancel control. The AI can post useful progress
-  directly; task, route, receipt, delivery, and audit evidence remains in the local ledgers instead
-  of adding short-lived inspection commands or panels. The Working message is deleted before the
+  execution progress uses short English status messages. The temporary `Working` embed contains
+  only the current progress and active duration—no internal task/reference IDs, quota diagnostics,
+  routing manual, or Cancel button. Accepted follow-ups do not add acknowledgement embeds. The AI
+  can post useful progress directly; task, route, receipt, delivery, and audit evidence remains in
+  the local ledgers instead of adding short-lived inspection commands or panels. The Working
+  message is deleted before the
   final answer is posted as a new reply, preserving the order of visible
-  milestone updates. Accepted-follow-up acknowledgements are tied to the parent turn and removed
-  on either completion or failure. Discord typing is renewed only while a model notification or
+  milestone updates. Discord typing is renewed only while a model notification or
   an actually running capability keeps the activity lease alive; a quiet app-server does not
   leave the BOT typing indefinitely. Multi-step work also posts task-specific progress in the
   conversation language, naming checked evidence and the next step without exposing private
@@ -332,15 +345,18 @@ connections.
 The optional agent and event autonomy are both default-off. Event autonomy is inert until the agent
 is enabled, `AGENT_AUTONOMY_ENABLED=true`, and
 `AGENT_AUTONOMY_GUILD_IDS` contains an allowed server, even though its mode defaults to `act`
-and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its Codex runtime has
-browser control, shell execution,
-personal-file access, plugins, sub-agents, and automatic browser-cookie extraction disabled.
-The default runtime profile is `gpt-5.6-luna` with `medium` reasoning. Codex keeps one durable
+and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its native Codex runtime has
+browser control, model-facing Apps, plugin MCP servers, internal shell execution, personal-file
+access, remote plugin installation, sub-agents, and automatic browser-cookie extraction disabled.
+Optional host-brokered shell and design connector grants are independent of those native paths and
+are never given to autonomous turns. The default runtime profile is `gpt-5.6-luna` with `high`
+reasoning. Codex keeps one durable
 provider thread per task in its stable `legacy` history mode and compacts retained context natively; the
 host automatically resets it only when the saved thread is genuinely unavailable. An explicit
 `AGENT_CONVERSATION_COMPATIBILITY_EPOCH` is persisted with the local store; operators bump it
 only for an intentionally incompatible prompt/tool/permission protocol, which clears only saved
 provider continuity while preserving tasks, deliveries, receipts, memory, and audit evidence.
+The current single-broker authority and actor/task workspace protocol uses epoch `5`.
 Model or capability-list changes do not silently fingerprint-reset every conversation. Existing
 conversations are never proactively rotated at a fixed host threshold. Agent turns have no wall-clock
 deadline. A turn is stopped only after its configured inactivity window, while a running

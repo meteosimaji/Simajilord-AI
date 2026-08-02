@@ -13,6 +13,7 @@ from simajilord.async_locks import KeyedAsyncLockPool, finish_async_cleanup
 from simajilord.core import InvocationContext
 from simajilord.observability import EventJournal
 
+from .actions import ACTION_UNDO_ANY_GRANT
 from .contracts import (
     AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS,
     AGENT_FINAL_DELIVERED_CONTENT,
@@ -533,9 +534,9 @@ class AgentService:
         self,
         request: AgentRequest,
     ) -> AgentTaskRouteResult | None:
-        """Ask the active model for a typed attach/separate/finish decision."""
+        """Ask the active model for a typed attach/separate/finish/cancel decision."""
 
-        persisted_route = await self.store.attached_task_route(request.event_id)
+        persisted_route = await self.store.route_for_event(request.event_id)
         if persisted_route is not None:
             return persisted_route
         if not isinstance(self.provider, SemanticRoutingAgentProvider):
@@ -575,7 +576,7 @@ class AgentService:
                 # and the durable transaction. Let the transport run this event
                 # as a normal independent task instead of dropping it.
                 return None
-            persisted_route = await self.store.attached_task_route(request.event_id)
+            persisted_route = await self.store.route_for_event(request.event_id)
             if persisted_route is not None:
                 return persisted_route
             if request.grants != original.grants or request.approvals != original.approvals:
@@ -625,6 +626,28 @@ class AgentService:
                 if selected is not None:
                     decision = selected
                     route_reason = f"model_selected_{selected.value}"
+            if decision is AgentTaskRouteDecision.CANCEL and not (
+                request.actor_id == original.actor_id
+                or ACTION_UNDO_ANY_GRANT in request.grants
+            ):
+                if selected is not None and route_context is not None:
+                    try:
+                        await routing_provider.confirm_candidate_route(
+                            event_id=request.event_id,
+                            decision=selected,
+                            committed=False,
+                            context=route_context,
+                        )
+                    except Exception:
+                        log.exception(
+                            "Provider unauthorized cancel rejection failed "
+                            "candidate=%s",
+                            request.event_id,
+                        )
+                decision = AgentTaskRouteDecision.SEPARATE
+                route_reason = "cancel_actor_not_authorized"
+                selected = None
+                route_context = None
             try:
                 await self.store.route_task_candidate(
                     request.event_id,
@@ -681,6 +704,7 @@ class AgentService:
                 if decision in {
                     AgentTaskRouteDecision.ATTACH,
                     AgentTaskRouteDecision.FINISH,
+                    AgentTaskRouteDecision.CANCEL,
                 }:
                     if not confirmed:
                         recovered = await self.store.default_task_candidate_to_separate(
@@ -694,6 +718,23 @@ class AgentService:
                             )
                         decision = AgentTaskRouteDecision.SEPARATE
                         route_reason = "provider_application_unconfirmed"
+                    elif decision is AgentTaskRouteDecision.CANCEL:
+                        if not await self._cancel_semantically_routed_task(
+                            request,
+                            original=original,
+                        ):
+                            recovered = (
+                                await self.store.default_task_candidate_to_separate(
+                                    request.event_id,
+                                    reason="active_task_cancel_race",
+                                )
+                            )
+                            if not recovered:
+                                raise AgentProviderError(
+                                    "The cancellation route could not be recovered safely."
+                                )
+                            decision = AgentTaskRouteDecision.SEPARATE
+                            route_reason = "active_task_cancel_race"
                     elif not await self.store.mark_task_candidate_provider_applied(
                         request.event_id,
                         decision=decision,
@@ -724,6 +765,13 @@ class AgentService:
                     "same_actor": request.actor_id == original.actor_id,
                 },
             )
+            if decision is AgentTaskRouteDecision.SEPARATE:
+                return AgentTaskRouteResult(
+                    decision=decision,
+                    active_event_id=request.event_id,
+                    active_task_id=request.task_id,
+                    active_public_reference_id=request.public_reference_id,
+                )
             return AgentTaskRouteResult(
                 decision=decision,
                 active_event_id=original.event_id,
@@ -740,6 +788,54 @@ class AgentService:
                             max(0, active[1] - 1),
                         )
                         self._decrement_follow_up_actor(actor_key)
+
+    async def _cancel_semantically_routed_task(
+        self,
+        candidate: AgentRequest,
+        *,
+        original: AgentRequest,
+    ) -> bool:
+        """Authorize, persist, and interrupt one AI-selected cancellation."""
+
+        async with self._running_tasks_lock:
+            running = self._running_tasks.get(original.task_id)
+            if running is None or running[0].event_id != original.event_id:
+                return False
+            active_request, task = running
+            if task.done():
+                return False
+            committed = await self.store.cancel_routed_task(
+                candidate.event_id,
+                active_request=active_request,
+                model=self.model,
+            )
+            if not committed:
+                return False
+            self._explicit_cancellations.add(original.task_id)
+            task.cancel()
+        try:
+            await self.journal.append(
+                kind="agent.turn.cancelled",
+                actor_id=candidate.actor_id,
+                workspace_id=candidate.workspace_id,
+                transport="agent",
+                request_id=original.event_id,
+                payload={
+                    "public_reference_id": original.public_reference_id,
+                    "task_id": original.task_id,
+                    "reason": "follow_up_cancelled",
+                    "candidate_event_id": candidate.event_id,
+                    "candidate_public_reference_id": (
+                        candidate.public_reference_id
+                    ),
+                },
+            )
+        except Exception:
+            log.exception(
+                "Semantically routed cancellation audit append failed task=%s",
+                original.task_id,
+            )
+        return True
 
     async def _admit(
         self,
@@ -1209,7 +1305,9 @@ def _task_candidate_prompt(
                 "Choose attach only when it adds or corrects instructions for the active "
                 "task. Choose separate for an independent objective. Choose finish when "
                 "an edit, typo correction, resend, or clarification adds no remaining "
-                "work and the active task can conclude. Do not classify from keywords."
+                "work and the active task can conclude normally. Choose cancel only when "
+                "the authorized requester is withdrawing unfinished active work. Do not "
+                "classify from keywords or fixed phrases."
             ),
             (
                 "Only an attach decision makes this event instruction-authoritative and "

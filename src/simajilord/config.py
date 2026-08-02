@@ -109,12 +109,15 @@ class Settings:
     agent_rate_limit_exempt_user_ids: frozenset[str]
     agent_web_search_access: AgentFeatureAccess
     agent_safe_compute_access: AgentFeatureAccess
+    agent_isolated_shell_access: AgentFeatureAccess
+    agent_connector_access: AgentFeatureAccess
     agent_file_sandbox_enabled: bool
     agent_curated_skills_enabled: bool
     agent_provider: str
     agent_model: str
     agent_escalation_model: str
     codex_executable: str
+    codex_expected_version_prefix: str
     agent_idle_timeout_seconds: float
     agent_reasoning_effort: str
     agent_per_user_requests: int
@@ -511,6 +514,14 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         "AGENT_SAFE_COMPUTE_ACCESS",
         AgentFeatureAccess.DISABLED,
     )
+    agent_isolated_shell_access = _feature_access(
+        "AGENT_ISOLATED_SHELL_ACCESS",
+        AgentFeatureAccess.DISABLED,
+    )
+    agent_connector_access = _feature_access(
+        "AGENT_CONNECTOR_ACCESS",
+        AgentFeatureAccess.DISABLED,
+    )
     agent_file_sandbox_enabled = _boolean(
         "AGENT_FILE_SANDBOX_ENABLED",
         False,
@@ -529,7 +540,12 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     )
     if (
         AgentFeatureAccess.ADMINS
-        in {agent_web_search_access, agent_safe_compute_access}
+        in {
+            agent_web_search_access,
+            agent_safe_compute_access,
+            agent_isolated_shell_access,
+            agent_connector_access,
+        }
         and not agent_admin_user_ids
     ):
         raise ConfigurationError(
@@ -787,6 +803,8 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_rate_limit_exempt_user_ids=agent_rate_limit_exempt_user_ids,
         agent_web_search_access=agent_web_search_access,
         agent_safe_compute_access=agent_safe_compute_access,
+        agent_isolated_shell_access=agent_isolated_shell_access,
+        agent_connector_access=agent_connector_access,
         agent_file_sandbox_enabled=agent_file_sandbox_enabled,
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
@@ -796,6 +814,10 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             "gpt-5.6-terra",
         ),
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
+        codex_expected_version_prefix=_text(
+            "CODEX_EXPECTED_VERSION_PREFIX",
+            "0.146.",
+        ),
         agent_idle_timeout_seconds=_positive_float_with_legacy_name(
             "AGENT_IDLE_TIMEOUT_SECONDS",
             "AGENT_TIMEOUT_SECONDS",
@@ -861,7 +883,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         agent_conversation_compatibility_epoch=_positive_int(
             "AGENT_CONVERSATION_COMPATIBILITY_EPOCH",
-            4,
+            5,
             maximum=10_000,
         ),
         agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", False),

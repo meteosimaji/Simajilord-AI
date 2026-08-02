@@ -219,18 +219,18 @@ class AgentConversationStore:
                 public_reference_id,
             )
 
-    async def attached_task_route(
+    async def route_for_event(
         self,
         event_id: str,
     ) -> AgentTaskRouteResult | None:
-        """Return an already committed attach/finish result for event idempotency."""
+        """Return every committed route once its required provider apply completed."""
 
         normalized_event_id = event_id.strip()
         if not normalized_event_id or len(normalized_event_id) > 500:
             raise ValueError("agent event ID must be bounded and non-empty")
         async with self._lock:
             return await asyncio.to_thread(
-                self._attached_task_route,
+                self._route_for_event,
                 normalized_event_id,
             )
 
@@ -301,6 +301,23 @@ class AgentConversationStore:
                 candidate_event_id,
                 decision,
                 active_task_id,
+            )
+
+    async def cancel_routed_task(
+        self,
+        candidate_event_id: str,
+        *,
+        active_request: AgentRequest,
+        model: str,
+    ) -> bool:
+        """Atomically apply a typed cancel route and close its active request."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._cancel_routed_task,
+                candidate_event_id,
+                active_request,
+                model,
             )
 
     async def default_task_candidate_to_separate(
@@ -1002,7 +1019,7 @@ class AgentConversationStore:
         finally:
             connection.close()
 
-    def _attached_task_route(
+    def _route_for_event(
         self,
         event_id: str,
     ) -> AgentTaskRouteResult | None:
@@ -1015,7 +1032,7 @@ class AgentConversationStore:
                 FROM agent_task_events events
                 JOIN agent_tasks routed ON routed.task_id = events.routed_task_id
                 WHERE events.event_id = ?
-                  AND events.route_decision IN ('attach', 'finish')
+                  AND events.route_decision IN ('attach', 'separate', 'finish', 'cancel')
                   AND events.provider_applied_at IS NOT NULL
                 """,
                 (event_id,),
@@ -1156,7 +1173,7 @@ class AgentConversationStore:
                 WHERE (
                         events.route_decision = 'candidate'
                         OR (
-                            events.route_decision IN ('attach', 'finish')
+                            events.route_decision IN ('attach', 'finish', 'cancel')
                             AND events.provider_applied_at IS NULL
                         )
                         OR (
@@ -1954,8 +1971,9 @@ class AgentConversationStore:
         if decision not in {
             AgentTaskRouteDecision.ATTACH,
             AgentTaskRouteDecision.FINISH,
+            AgentTaskRouteDecision.CANCEL,
         }:
-            raise ValueError("only attached or finishing routes require provider apply state")
+            raise ValueError("only active-task routes require provider apply state")
         if not is_agent_task_id(active_task_id):
             raise ValueError("invalid active task ID")
         now = datetime.now(UTC).isoformat()
@@ -1990,6 +2008,134 @@ class AgentConversationStore:
             )
             connection.commit()
             return cursor.rowcount == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _cancel_routed_task(
+        self,
+        candidate_event_id: str,
+        active_request: AgentRequest,
+        model: str,
+    ) -> bool:
+        """Commit provider-applied semantic cancellation as one transaction."""
+
+        if not is_agent_task_id(active_request.task_id):
+            raise ValueError("invalid active task ID")
+        now = datetime.now(UTC).isoformat()
+        connection = _connection(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            route = connection.execute(
+                """
+                SELECT route_decision, routed_task_id, provider_applied_at
+                FROM agent_task_events
+                WHERE event_id = ?
+                """,
+                (candidate_event_id,),
+            ).fetchone()
+            if (
+                route is None
+                or str(route["route_decision"])
+                != AgentTaskRouteDecision.CANCEL.value
+                or _optional_text(route["routed_task_id"])
+                != active_request.task_id
+            ):
+                connection.rollback()
+                return False
+
+            request = connection.execute(
+                """
+                SELECT status, task_id
+                FROM agent_requests
+                WHERE event_id = ?
+                """,
+                (active_request.event_id,),
+            ).fetchone()
+            task = connection.execute(
+                """
+                SELECT state, root_event_id
+                FROM agent_tasks
+                WHERE task_id = ?
+                """,
+                (active_request.task_id,),
+            ).fetchone()
+            if (
+                request is None
+                or str(request["task_id"]) != active_request.task_id
+                or task is None
+                or str(task["root_event_id"]) != active_request.event_id
+            ):
+                connection.rollback()
+                return False
+            if (
+                route["provider_applied_at"] is not None
+                and str(request["status"])
+                == AgentResponseStatus.CANCELLED.value
+                and str(task["state"]) == "cancelled"
+            ):
+                connection.rollback()
+                return True
+            if (
+                route["provider_applied_at"] is not None
+                or str(request["status"]) != _IN_PROGRESS_STATUS
+                or str(task["state"]) not in {"active", "finishing"}
+            ):
+                connection.rollback()
+                return False
+
+            request_cursor = connection.execute(
+                """
+                UPDATE agent_requests
+                SET status = ?, model = ?, error_type = ?, completed_at = ?
+                WHERE event_id = ? AND task_id = ? AND status = ?
+                """,
+                (
+                    AgentResponseStatus.CANCELLED.value,
+                    model,
+                    "AgentTaskCancelled",
+                    now,
+                    active_request.event_id,
+                    active_request.task_id,
+                    _IN_PROGRESS_STATUS,
+                ),
+            )
+            task_cursor = connection.execute(
+                """
+                UPDATE agent_tasks
+                SET state = 'cancelled', updated_at = ?, completed_at = ?,
+                    completion_reason = 'follow_up_cancelled'
+                WHERE task_id = ? AND root_event_id = ?
+                  AND state IN ('active', 'finishing')
+                """,
+                (
+                    now,
+                    now,
+                    active_request.task_id,
+                    active_request.event_id,
+                ),
+            )
+            route_cursor = connection.execute(
+                """
+                UPDATE agent_task_events
+                SET provider_applied_at = ?
+                WHERE event_id = ? AND route_decision = 'cancel'
+                  AND routed_task_id = ? AND provider_applied_at IS NULL
+                """,
+                (now, candidate_event_id, active_request.task_id),
+            )
+            if (
+                request_cursor.rowcount != 1
+                or task_cursor.rowcount != 1
+                or route_cursor.rowcount != 1
+            ):
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -2039,6 +2185,7 @@ class AgentConversationStore:
                 "candidate",
                 AgentTaskRouteDecision.ATTACH.value,
                 AgentTaskRouteDecision.FINISH.value,
+                AgentTaskRouteDecision.CANCEL.value,
             } or (
                 previous_decision != "candidate"
                 and row["provider_applied_at"] is not None

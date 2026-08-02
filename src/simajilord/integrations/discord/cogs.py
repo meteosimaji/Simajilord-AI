@@ -28,6 +28,7 @@ from simajilord.agent import (
     ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
     AGENT_COMPUTE_GRANT,
+    AGENT_CONNECTOR_GRANT,
     AGENT_FEEDBACK_GRANT,
     AGENT_FILE_GRANT,
     AGENT_FINAL_DELIVERED_CONTENT,
@@ -42,6 +43,7 @@ from simajilord.agent import (
     AGENT_REACTION_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_SHELL_GRANT,
     AGENT_TIMER_WRITE_CAPABILITIES,
     AGENT_WEB_GRANT,
     AgentAutonomyMode,
@@ -65,7 +67,6 @@ from simajilord.agent.autonomy import (
     AutonomyDeliverySpec,
     AutonomyLeaseLostError,
 )
-from simajilord.agent.service import AgentQuotaSnapshot
 from simajilord.agent.store import (
     AgentHostDeliveryRecord,
     AgentPendingHostDelivery,
@@ -8280,6 +8281,24 @@ def _agent_grants(
         )
     ):
         grants.add(AGENT_COMPUTE_GRANT)
+    if not autonomous:
+        # Autonomous batches never inherit interactive host escape hatches,
+        # regardless of their configured mode or the BOT principal's admin ID.
+        shell_access = settings.agent_isolated_shell_access
+        if shell_access is AgentFeatureAccess.EVERYONE or (
+            shell_access is AgentFeatureAccess.ADMINS
+            and actor_id in settings.agent_admin_user_ids
+        ):
+            grants.add(AGENT_SHELL_GRANT)
+        connector_access = settings.agent_connector_access
+        if runtime.connectors is not None and (
+            connector_access is AgentFeatureAccess.EVERYONE
+            or (
+                connector_access is AgentFeatureAccess.ADMINS
+                and actor_id in settings.agent_admin_user_ids
+            )
+        ):
+            grants.add(AGENT_CONNECTOR_GRANT)
     if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
         grants.add(AGENT_MODERATION_GRANT)
     if runtime.moderation.provider is not None:
@@ -8379,101 +8398,6 @@ def _agent_response_uses_host_delivery(content: str) -> bool:
         AGENT_FINAL_DELIVERED_CONTENT,
         AGENT_NO_ACTION_CONTENT,
     }
-
-
-def _agent_task_administrator(
-    runtime: SimajilordRuntime,
-    interaction: discord.Interaction,
-) -> bool:
-    actor_id = str(interaction.user.id)
-    if actor_id in runtime.settings.agent_admin_user_ids:
-        return True
-    member = interaction.user
-    return isinstance(member, discord.Member) and (
-        permission_enabled(member.guild_permissions, "administrator")
-        or permission_enabled(member.guild_permissions, "manage_guild")
-    )
-
-
-def _agent_quota_text(quota: AgentQuotaSnapshot) -> str:
-    user_remaining = quota.user_requests_remaining
-    workspace_remaining = quota.workspace_requests_remaining
-    user_text = "exempt" if user_remaining is None else str(user_remaining)
-    workspace_text = (
-        "n/a" if workspace_remaining is None else str(workspace_remaining)
-    )
-    return (
-        f"user {user_text} · server {workspace_text} · "
-        f"tokens {quota.tokens_remaining:,}\n"
-        f"active {quota.active_turns}/{quota.max_active_turns} · "
-        f"pending {quota.pending_turns}/{quota.max_pending_turns} · "
-        f"interactive reserve {quota.interactive_reserve_percent}%"
-    )
-
-
-class AgentTaskView(SafeView):
-    """Owner-scoped controls attached to one temporary Working panel."""
-
-    def __init__(
-        self,
-        runtime: SimajilordRuntime,
-        *,
-        task_id: str,
-        requester_id: str,
-        workspace_id: str | None,
-    ) -> None:
-        super().__init__(timeout=None)
-        self.runtime = runtime
-        self.task_id = task_id
-        self.requester_id = requester_id
-        self.workspace_id = workspace_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        same_workspace = (
-            interaction.guild_id is None
-            and self.workspace_id is None
-        ) or (
-            interaction.guild_id is not None
-            and str(interaction.guild_id) == self.workspace_id
-        )
-        allowed = (
-            str(interaction.user.id) == self.requester_id
-            or _agent_task_administrator(self.runtime, interaction)
-        )
-        if same_workspace and allowed:
-            return True
-        await interaction.response.send_message(
-            "Only the task requester or a server administrator can use these controls.",
-            ephemeral=True,
-        )
-        return False
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button[AgentTaskView],
-    ) -> None:
-        agent = self.runtime.agent
-        if agent is None:
-            await interaction.response.send_message(
-                "The AI runtime is not active.",
-                ephemeral=True,
-            )
-            return
-        cancelled = await agent.cancel_task(
-            self.task_id,
-            actor_id=str(interaction.user.id),
-            administrator=_agent_task_administrator(self.runtime, interaction),
-        )
-        await interaction.response.send_message(
-            (
-                "Cancellation requested. The native provider turn is being interrupted."
-                if cancelled
-                else "This task is no longer running."
-            ),
-            ephemeral=True,
-        )
 
 
 class AgentCog(commands.Cog):
@@ -8670,61 +8594,10 @@ class AgentCog(commands.Cog):
                 )
                 return
             if route is not None and route.decision is not AgentTaskRouteDecision.SEPARATE:
-                attached = route.decision is AgentTaskRouteDecision.ATTACH
-                acknowledgement = await message.reply(
-                    embed=command_embed(
-                        (
-                            "Added to the active AI task"
-                            if attached
-                            else "AI task is finishing"
-                        ),
-                        description=(
-                            (
-                                "The AI read this exact message and attached it to the "
-                                "active task. Your Discord identity and permissions remain "
-                                "independent."
-                            )
-                            if attached
-                            else (
-                                "The AI classified this correction, edit, or resend as "
-                                "no new remaining work and will conclude the active task."
-                            )
-                        ),
-                        tone=EmbedTone.INFO,
-                    ),
-                    mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                progress = self._active_progress.get(route.active_event_id)
-                if progress is None:
-                    with suppress(discord.DiscordException):
-                        await acknowledgement.delete()
-                else:
-                    await progress.add_temporary_message(acknowledgement)
                 return
-        try:
-            quota = await agent.quota_snapshot(request)
-            quota_text = _agent_quota_text(quota)
-        except Exception:
-            log.exception(
-                "Could not build AI quota snapshot request=%s",
-                request.event_id,
-            )
-            quota_text = "temporarily unavailable"
-        task_view = AgentTaskView(
-            self.runtime,
-            task_id=request.task_id,
-            requester_id=request.actor_id,
-            workspace_id=request.workspace_id,
-        )
         progress = _AgentProgressMessage(
             message,
             delivery_key=request.event_id,
-            task_id=request.task_id,
-            reference_id=request.public_reference_id,
-            requester=f"{message.author.mention} · `{request.actor_id}`",
-            quota_text=quota_text,
-            view=task_view,
         )
         self._active_progress[request.event_id] = progress
         try:

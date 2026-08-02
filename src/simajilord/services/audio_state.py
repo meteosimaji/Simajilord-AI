@@ -11,6 +11,8 @@ from typing import Any
 
 from simajilord.domain.audio import AudioQueueLane, LoopMode
 
+_WRITE_RETRY_DELAYS_SECONDS = (0.05, 0.2)
+
 
 @dataclass(frozen=True, slots=True)
 class StoredAudioItem:
@@ -65,6 +67,7 @@ class AudioStateStore:
         self._lock = asyncio.Lock()
         self._sessions = self._load()
         self._dirty = False
+        self._revision = 0
         self._write_task: asyncio.Task[None] | None = None
         self._flush_event = asyncio.Event()
 
@@ -75,12 +78,14 @@ class AudioStateStore:
         async with self._lock:
             self._sessions[state.workspace_id] = state
             self._dirty = True
+            self._revision += 1
             self._ensure_writer_locked()
 
     async def remove(self, workspace_id: str) -> None:
         async with self._lock:
             if self._sessions.pop(workspace_id, None) is not None:
                 self._dirty = True
+                self._revision += 1
                 self._ensure_writer_locked()
 
     async def flush(self) -> None:
@@ -103,27 +108,60 @@ class AudioStateStore:
             )
 
     async def _debounced_writer(self) -> None:
-        while True:
-            forced = False
-            try:
-                await asyncio.wait_for(
-                    self._flush_event.wait(),
-                    timeout=self.debounce_seconds,
-                )
-                forced = True
-            except TimeoutError:
-                pass
+        current_task = asyncio.current_task()
+        force = False
+        try:
+            while True:
+                if not force:
+                    try:
+                        await asyncio.wait_for(
+                            self._flush_event.wait(),
+                            timeout=self.debounce_seconds,
+                        )
+                        force = True
+                    except TimeoutError:
+                        pass
+                async with self._lock:
+                    if force:
+                        self._flush_event.clear()
+                    if not self._dirty:
+                        if self._write_task is current_task:
+                            self._write_task = None
+                        return
+                    revision = self._revision
+                    sessions = tuple(self._sessions.values())
+                error: Exception | None = None
+                for attempt in range(len(_WRITE_RETRY_DELAYS_SECONDS) + 1):
+                    try:
+                        await asyncio.to_thread(
+                            self._write_snapshot,
+                            sessions,
+                        )
+                        error = None
+                        break
+                    except Exception as exc:
+                        error = exc
+                        if attempt >= len(_WRITE_RETRY_DELAYS_SECONDS):
+                            break
+                        await asyncio.sleep(_WRITE_RETRY_DELAYS_SECONDS[attempt])
+                if error is not None:
+                    async with self._lock:
+                        self._dirty = True
+                    raise error
+                async with self._lock:
+                    if self._revision == revision:
+                        self._dirty = False
+                    if not self._dirty:
+                        if self._write_task is current_task:
+                            self._write_task = None
+                        return
+                # A mutation arrived during the disk write. Persist its newer
+                # snapshot immediately, especially when flush() is waiting.
+                force = True
+        finally:
             async with self._lock:
-                if forced:
-                    self._flush_event.clear()
-                if not self._dirty:
+                if self._write_task is current_task:
                     self._write_task = None
-                    return
-                self._dirty = False
-                await asyncio.to_thread(self._write)
-                if forced:
-                    self._write_task = None
-                    return
 
     def _load(self) -> dict[str, StoredAudioSession]:
         if not self.path.exists():
@@ -144,7 +182,10 @@ class AudioStateStore:
         except (OSError, ValueError, TypeError):
             return {}
 
-    def _write(self) -> None:
+    def _write_snapshot(
+        self,
+        sessions: tuple[StoredAudioSession, ...],
+    ) -> None:
         payload = {
             "version": 1,
             "sessions": [
@@ -153,7 +194,7 @@ class AudioStateStore:
                     "loop_mode": state.loop_mode.value,
                     "items": [asdict(item) for item in state.items],
                 }
-                for state in self._sessions.values()
+                for state in sessions
             ],
         }
         temporary = self.path.with_suffix(f"{self.path.suffix}.tmp")

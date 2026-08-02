@@ -1,14 +1,18 @@
 """Discord-only Codex app-server policy overrides.
 
 These settings are passed on the embedded app-server command line. They never
-write the user's global ``~/.codex/config.toml``. Unknown apps stay disabled;
-restricted apps expose an exact, audited tool allowlist.
+write the user's global ``~/.codex/config.toml``. Native model-facing Apps and
+plugin MCP servers stay disabled; reviewed design tools are reached only through
+Simajilord's capability and effect broker.
 """
 
 from __future__ import annotations
 
 import json
+import re
+import tomllib
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 
@@ -23,6 +27,14 @@ class DiscordCodexAppPolicy:
 
 
 DISCORD_CODEX_PERMISSION_PROFILE = "simajilord_discord"
+
+
+class DiscordCodexAppActionClass(StrEnum):
+    """Conservative native-app classification retained for breach telemetry."""
+
+    READ = "read"
+    MUTATING = "mutating"
+    UNKNOWN = "unknown"
 
 
 _GITHUB_READ_TOOLS = (
@@ -94,10 +106,8 @@ _PLUGIN_MANAGEMENT_READ_TOOLS = (
     "get_plugin_dependencies",
 )
 
-# ``enabled_tools=None`` means all current tools are enabled. Destructive tools
-# still fail closed, so a future delete-like action cannot silently become
-# automatic. The user explicitly approved current non-destructive creative
-# writes for Figma, Adobe Express, Canva, and Codex Document Control.
+# This list now describes reviewed connector identities for the host broker.
+# Every native model-facing app is disabled below, including these entries.
 DISCORD_CODEX_APP_POLICIES = (
     DiscordCodexAppPolicy(
         "asdk_app_6938a94a61d881918ef32cb999ff937c",
@@ -153,6 +163,14 @@ DISCORD_CODEX_APP_POLICIES = (
     ),
 )
 
+DISCORD_CODEX_BROKER_CONNECTORS = {
+    policy.app_id: policy.name
+    for policy in DISCORD_CODEX_APP_POLICIES
+    if policy.name in {"Adobe", "Adobe Express", "BioRender", "Canva", "Figma"}
+}
+if len(DISCORD_CODEX_BROKER_CONNECTORS) != 5:
+    raise RuntimeError("Discord connector broker identities collided")
+
 DISCORD_CODEX_ENABLED_PLUGINS = (
     "build-ios-apps@openai-curated",
     "build-macos-apps@openai-curated",
@@ -198,6 +216,14 @@ _DISCORD_CODEX_DISABLED_MCP_SERVERS = (
     "dataAnalyticsWidgets",
     "event-stream",
     "openai-api-key-local-confirmation",
+)
+_DISCORD_CODEX_ALWAYS_DISABLED_MCP_SERVERS = frozenset(
+    {
+        "computer-use",
+        "node_repl",
+        "openaiDeveloperDocs",
+        "playwright",
+    }
 )
 
 _APP_WRITE_TOOLS: dict[str, frozenset[str]] = {
@@ -291,12 +317,33 @@ _APP_WRITE_TOOLS: dict[str, frozenset[str]] = {
 }
 
 
-def discord_codex_app_tool_is_write(app_id: str | None, tool: str | None) -> bool:
-    """Return the reviewed side-effect classification used by retry and audit."""
+def discord_codex_app_tool_action_class(
+    app_id: str | None,
+    tool: str | None,
+) -> DiscordCodexAppActionClass:
+    """Classify only statically reviewed native actions; unknown fails closed."""
 
     if app_id is None or tool is None:
-        return False
-    return tool in _APP_WRITE_TOOLS.get(app_id, frozenset())
+        return DiscordCodexAppActionClass.UNKNOWN
+    action = tool.rsplit(".", 1)[-1]
+    if action in _APP_WRITE_TOOLS.get(app_id, frozenset()):
+        return DiscordCodexAppActionClass.MUTATING
+    policy = next(
+        (candidate for candidate in DISCORD_CODEX_APP_POLICIES if candidate.app_id == app_id),
+        None,
+    )
+    if policy is not None and policy.enabled_tools is not None and action in policy.enabled_tools:
+        return DiscordCodexAppActionClass.READ
+    return DiscordCodexAppActionClass.UNKNOWN
+
+
+def discord_codex_app_tool_is_write(app_id: str | None, tool: str | None) -> bool:
+    """Treat unknown native app actions as writes for retry and audit safety."""
+
+    return (
+        discord_codex_app_tool_action_class(app_id, tool)
+        is not DiscordCodexAppActionClass.READ
+    )
 
 _DISABLED_SKILL_NAMES = frozenset(
     {
@@ -364,12 +411,8 @@ def discord_codex_policy_arguments(*, codex_home: Path) -> tuple[str, ...]:
     settings: list[tuple[str, str]] = [
         ("apps._default.enabled", "false"),
         ("apps._default.destructive_enabled", "false"),
-        ("apps._default.open_world_enabled", "true"),
+        ("apps._default.open_world_enabled", "false"),
         ("apps._default.default_tools_approval_mode", _toml_string("approve")),
-        ("mcp_servers.playwright.enabled", "false"),
-        ("mcp_servers.node_repl.enabled", "false"),
-        ("mcp_servers.computer-use.enabled", "false"),
-        ("mcp_servers.openaiDeveloperDocs.enabled", "true"),
         ("shell_environment_policy.inherit", _toml_string("none")),
         ("shell_environment_policy.ignore_default_excludes", "false"),
         (
@@ -389,32 +432,32 @@ def discord_codex_policy_arguments(*, codex_home: Path) -> tuple[str, ...]:
             "}",
         ),
     ]
-    for server in _DISCORD_CODEX_DISABLED_MCP_SERVERS:
+    configured_mcp_servers = _configured_mcp_server_names(codex_home)
+    plugin_mcp_servers = _plugin_mcp_server_names(codex_home)
+    disabled_mcp_servers = (
+        configured_mcp_servers
+        | plugin_mcp_servers
+        | _DISCORD_CODEX_ALWAYS_DISABLED_MCP_SERVERS
+    )
+    for server in sorted(disabled_mcp_servers):
+        settings.append((f"mcp_servers.{server}.enabled", "false"))
+    for server in sorted(plugin_mcp_servers - configured_mcp_servers):
         settings.extend(
             (
                 (f"mcp_servers.{server}.command", _toml_string("/usr/bin/false")),
-                (f"mcp_servers.{server}.enabled", "false"),
             )
         )
     for policy in DISCORD_CODEX_APP_POLICIES:
         prefix = f"apps.{policy.app_id}"
         settings.extend(
             (
-                (f"{prefix}.enabled", "true"),
+                (f"{prefix}.enabled", "false"),
                 (f"{prefix}.destructive_enabled", "false"),
-                (f"{prefix}.open_world_enabled", "true"),
-                (f"{prefix}.default_tools_enabled", (
-                    "true" if policy.enabled_tools is None else "false"
-                )),
-                (f"{prefix}.default_tools_approval_mode", _toml_string("approve")),
+                (f"{prefix}.open_world_enabled", "false"),
+                (f"{prefix}.default_tools_enabled", "false"),
+                (f"{prefix}.default_tools_approval_mode", _toml_string("prompt")),
             )
         )
-        for tool in policy.enabled_tools or ():
-            settings.append((f"{prefix}.tools.{tool}.enabled", "true"))
-        for tool in policy.prompt_tools:
-            settings.append(
-                (f"{prefix}.tools.{tool}.approval_mode", _toml_string("prompt"))
-            )
     # The CLI override parser does not apply quoted segments inside a dotted
     # key (``plugins."name@market".enabled``). Replace the whole process-local
     # table instead, which also prevents values from the user's global table
@@ -471,6 +514,63 @@ def _disabled_skill_paths(codex_home: Path) -> tuple[Path, ...]:
             if disabled_names is None or skill_name in disabled_names:
                 disabled.add(skill_file.resolve())
     return tuple(sorted(disabled))
+
+
+_MCP_SERVER_NAME = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
+
+
+def _configured_mcp_server_names(codex_home: Path) -> set[str]:
+    """Discover every user-configured MCP so the Discord process can disable it."""
+
+    config = codex_home / "config.toml"
+    if not config.is_file():
+        return set()
+    try:
+        if config.stat().st_size > 2_000_000:
+            raise RuntimeError("Codex config is too large to validate safely")
+        raw = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError("Codex MCP configuration could not be validated") from exc
+    servers = raw.get("mcp_servers")
+    if servers is None:
+        return set()
+    if not isinstance(servers, dict):
+        raise RuntimeError("Codex mcp_servers configuration is invalid")
+    return _validated_mcp_server_names(servers, source="Codex config")
+
+
+def _plugin_mcp_server_names(codex_home: Path) -> set[str]:
+    """Discover every cached plugin MCP while retaining its instruction skills."""
+
+    names = set(_DISCORD_CODEX_DISABLED_MCP_SERVERS)
+    plugin_cache = codex_home / "plugins" / "cache"
+    if not plugin_cache.is_dir():
+        return names
+    for manifest in plugin_cache.rglob(".mcp.json"):
+        try:
+            if manifest.stat().st_size > 1_000_000:
+                raise RuntimeError(f"Plugin MCP manifest is too large: {manifest}")
+            raw = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Plugin MCP manifest is invalid: {manifest}") from exc
+        servers = raw.get("mcpServers") if isinstance(raw, dict) else None
+        if not isinstance(servers, dict):
+            raise RuntimeError(f"Plugin MCP manifest has no valid mcpServers: {manifest}")
+        names.update(_validated_mcp_server_names(servers, source=str(manifest)))
+    return names
+
+
+def _validated_mcp_server_names(
+    servers: dict[object, object],
+    *,
+    source: str,
+) -> set[str]:
+    names: set[str] = set()
+    for name in servers:
+        if not isinstance(name, str) or _MCP_SERVER_NAME.fullmatch(name) is None:
+            raise RuntimeError(f"MCP server name in {source} cannot be disabled safely")
+        names.add(name)
+    return names
 
 
 def _toml_string(value: str) -> str:

@@ -18,10 +18,13 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_RATE_LIMIT_EXEMPT_USER_IDS",
     "AGENT_WEB_SEARCH_ACCESS",
     "AGENT_SAFE_COMPUTE_ACCESS",
+    "AGENT_ISOLATED_SHELL_ACCESS",
+    "AGENT_CONNECTOR_ACCESS",
     "AGENT_FILE_SANDBOX_ENABLED",
     "AGENT_CURATED_SKILLS_ENABLED",
     "AGENT_MODEL",
     "AGENT_ESCALATION_MODEL",
+    "CODEX_EXPECTED_VERSION_PREFIX",
     "AGENT_REASONING_EFFORT",
     "AGENT_IDLE_TIMEOUT_SECONDS",
     "AGENT_TIMEOUT_SECONDS",
@@ -123,12 +126,15 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_max_pending_turns == 20
     assert settings.agent_max_pending_turns_per_user == 2
     assert settings.agent_interactive_reserve_percent == 25
-    assert settings.agent_conversation_compatibility_epoch == 4
+    assert settings.agent_conversation_compatibility_epoch == 5
     assert settings.agent_autonomy_enabled is False
     assert settings.agent_autonomy_mode is AgentAutonomyMode.ACT
     assert settings.agent_autonomy_batch_seconds == 10
     assert settings.agent_autonomy_max_runs == 0
     assert settings.agent_autonomy_max_pending_events_per_actor == 50
+    assert settings.agent_isolated_shell_access is AgentFeatureAccess.DISABLED
+    assert settings.agent_connector_access is AgentFeatureAccess.DISABLED
+    assert settings.codex_expected_version_prefix == "0.146."
     assert settings.discord_members_intent_enabled is False
     assert settings.discord_presence_intent_enabled is False
 
@@ -182,6 +188,8 @@ def test_agent_security_policies_are_explicit_and_typed(
     monkeypatch.setenv("AGENT_RATE_LIMIT_EXEMPT_USER_IDS", "40")
     monkeypatch.setenv("AGENT_WEB_SEARCH_ACCESS", "everyone")
     monkeypatch.setenv("AGENT_SAFE_COMPUTE_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_ISOLATED_SHELL_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_CONNECTOR_ACCESS", "admins")
     monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "true")
 
     settings = load_settings(dotenv_path=dotenv_path)
@@ -192,6 +200,8 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.agent_rate_limit_exempt_user_ids == frozenset({"40"})
     assert settings.agent_web_search_access is AgentFeatureAccess.EVERYONE
     assert settings.agent_safe_compute_access is AgentFeatureAccess.ADMINS
+    assert settings.agent_isolated_shell_access is AgentFeatureAccess.ADMINS
+    assert settings.agent_connector_access is AgentFeatureAccess.ADMINS
     assert settings.agent_file_sandbox_enabled is True
     assert settings.agent_curated_skills_enabled is False
     assert settings.web_search_base_url == "http://127.0.0.1:8888"

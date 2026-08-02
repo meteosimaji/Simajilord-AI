@@ -103,6 +103,7 @@ class EventJournal:
             _PendingEvent | _FlushAuditQueue | _CloseAuditQueue
         ] = asyncio.Queue(maxsize=_AUDIT_QUEUE_MAX_EVENTS)
         self._audit_writer_task: asyncio.Task[None] | None = None
+        self._audit_inflight_event_count = 0
         self._overflow_tasks: set[asyncio.Task[None]] = set()
         self._retried_event_count = 0
         self._lost_event_count = 0
@@ -267,7 +268,9 @@ class EventJournal:
         else:
             writer_state = "running"
         return AuditHealth(
-            pending_events=self._audit_queue.qsize(),
+            pending_events=(
+                self._audit_queue.qsize() + self._audit_inflight_event_count
+            ),
             retried_event_count=self._retried_event_count,
             outbox_event_count=outbox_count,
             lost_event_count=self._lost_event_count,
@@ -293,8 +296,10 @@ class EventJournal:
         loop = asyncio.get_running_loop()
         completed = loop.create_future()
         await self._audit_queue.put(_CloseAuditQueue(completed))
-        await completed
-        await task
+        await self._await_audit_control(completed)
+        task = self._audit_writer_task
+        if task is not None:
+            await task
         self._audit_writer_task = None
 
     def _schedule_overflow_spool(self, event: _PendingEvent) -> None:
@@ -361,52 +366,200 @@ class EventJournal:
                 self._consume_writer_result(task)
                 self._audit_writer_task = None
             return
-        if self._closed and (task is None or task.done()):
-            return
         self._ensure_audit_writer()
+        task = self._audit_writer_task
+        assert task is not None
         loop = asyncio.get_running_loop()
         completed = loop.create_future()
         await self._audit_queue.put(_FlushAuditQueue(completed))
+        await self._await_audit_control(completed)
+
+    async def _await_audit_control(
+        self,
+        completed: asyncio.Future[None],
+    ) -> None:
+        """Wait without hanging when a recovered writer exits before control."""
+
+        while not completed.done():
+            task = self._audit_writer_task
+            if task is None or task.done():
+                if task is not None:
+                    self._consume_writer_result(task)
+                    if self._audit_writer_task is task:
+                        self._audit_writer_task = None
+                if self._audit_queue.empty():
+                    raise RuntimeError(
+                        "Capability audit writer lost a flush control message."
+                    )
+                self._ensure_audit_writer()
+                task = self._audit_writer_task
+                assert task is not None
+            done, _ = await asyncio.wait(
+                {completed, task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if completed in done:
+                break
         await completed
 
     async def _audit_writer(self) -> None:
-        await self._replay_outbox_safely()
-        while True:
-            item = await self._audit_queue.get()
-            if isinstance(item, _PendingEvent):
-                batch = [item]
-                control: _FlushAuditQueue | _CloseAuditQueue | None = None
-                while len(batch) < _AUDIT_BATCH_MAX_EVENTS:
-                    try:
-                        queued = self._audit_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if isinstance(queued, _PendingEvent):
-                        batch.append(queued)
+        batch: tuple[_PendingEvent, ...] = ()
+        control: _FlushAuditQueue | _CloseAuditQueue | None = None
+        try:
+            await self._replay_outbox_safely()
+            while True:
+                item = await self._audit_queue.get()
+                if isinstance(item, _PendingEvent):
+                    pending = [item]
+                    while len(pending) < _AUDIT_BATCH_MAX_EVENTS:
+                        try:
+                            queued = self._audit_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if isinstance(queued, _PendingEvent):
+                            pending.append(queued)
+                        else:
+                            control = queued
+                            break
+                    batch = tuple(pending)
+                    self._audit_inflight_event_count = len(batch)
+                    await self._write_audit_batch_safely(batch)
+                    for _ in batch:
+                        self._audit_queue.task_done()
+                    batch = ()
+                    self._audit_inflight_event_count = 0
+                    if control is not None:
+                        await self._replay_outbox_safely(drain=True)
+                        should_close = isinstance(control, _CloseAuditQueue)
+                        if not control.completed.done():
+                            control.completed.set_result(None)
+                        self._audit_queue.task_done()
+                        control = None
+                        if should_close:
+                            return
                     else:
-                        control = queued
-                        break
-                await self._write_audit_batch_safely(tuple(batch))
-                for _ in batch:
-                    self._audit_queue.task_done()
-                if control is not None:
-                    await self._replay_outbox_safely(drain=True)
-                    should_close = isinstance(control, _CloseAuditQueue)
-                    if not control.completed.done():
-                        control.completed.set_result(None)
-                    self._audit_queue.task_done()
-                    if should_close:
-                        return
-                else:
-                    await self._replay_outbox_safely()
-                continue
-            await self._replay_outbox_safely(drain=True)
-            should_close = isinstance(item, _CloseAuditQueue)
-            if not item.completed.done():
-                item.completed.set_result(None)
-            self._audit_queue.task_done()
-            if should_close:
+                        await self._replay_outbox_safely()
+                    continue
+                control = item
+                await self._replay_outbox_safely(drain=True)
+                should_close = isinstance(control, _CloseAuditQueue)
+                if not control.completed.done():
+                    control.completed.set_result(None)
+                self._audit_queue.task_done()
+                control = None
+                if should_close:
+                    return
+        except BaseException as exc:
+            await asyncio.shield(
+                self._recover_failed_audit_writer(
+                    batch=batch,
+                    control=control,
+                    error=exc,
+                )
+            )
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+
+    async def _recover_failed_audit_writer(
+        self,
+        *,
+        batch: tuple[_PendingEvent, ...],
+        control: _FlushAuditQueue | _CloseAuditQueue | None,
+        error: BaseException,
+    ) -> None:
+        """Spool every dequeued or queued event and release control waiters."""
+
+        if (
+            isinstance(error, asyncio.CancelledError)
+            and not batch
+            and control is None
+            and self._audit_queue.empty()
+        ):
+            self._audit_inflight_event_count = 0
+            return
+        if isinstance(error, Exception):
+            self._record_audit_failure(error)
+        else:
+            self._last_audit_failure_at = datetime.now(UTC)
+            self._last_audit_failure_type = type(error).__name__
+        if isinstance(error, asyncio.CancelledError):
+            log.warning(
+                "Capability audit writer was cancelled with pending work; "
+                "recovering to outbox"
+            )
+        else:
+            log.error(
+                "Capability audit writer stopped unexpectedly; recovering to outbox "
+                "error=%s",
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        durable = True
+        recovered_controls: list[_FlushAuditQueue | _CloseAuditQueue] = []
+
+        async def spool(events: tuple[_PendingEvent, ...]) -> None:
+            nonlocal durable
+            if not events:
                 return
+            persisted = await self._spool_batch_safely(events)
+            if not persisted:
+                durable = False
+                self._lost_event_count += len(events)
+
+        await spool(batch)
+        for _ in batch:
+            self._audit_queue.task_done()
+        self._audit_inflight_event_count = 0
+
+        if control is not None:
+            recovered_controls.append(control)
+            self._audit_queue.task_done()
+
+        pending: list[_PendingEvent] = []
+        while True:
+            try:
+                queued = self._audit_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(queued, _PendingEvent):
+                pending.append(queued)
+                if len(pending) >= _AUDIT_BATCH_MAX_EVENTS:
+                    await spool(tuple(pending))
+                    for _ in pending:
+                        self._audit_queue.task_done()
+                    pending.clear()
+                continue
+            await spool(tuple(pending))
+            for _ in pending:
+                self._audit_queue.task_done()
+            pending.clear()
+            recovered_controls.append(queued)
+            self._audit_queue.task_done()
+        await spool(tuple(pending))
+        for _ in pending:
+            self._audit_queue.task_done()
+        if durable:
+            await self._replay_outbox_safely(drain=True)
+        for recovered_control in recovered_controls:
+            self._complete_recovered_control(
+                recovered_control,
+                durable=durable,
+            )
+
+    @staticmethod
+    def _complete_recovered_control(
+        control: _FlushAuditQueue | _CloseAuditQueue,
+        *,
+        durable: bool,
+    ) -> None:
+        if control.completed.done():
+            return
+        if durable:
+            control.completed.set_result(None)
+        else:
+            control.completed.set_exception(
+                RuntimeError("Capability audit events could not be recovered.")
+            )
 
     async def _write_audit_batch_safely(
         self,

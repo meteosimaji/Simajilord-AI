@@ -13,6 +13,7 @@ from simajilord.agent import (
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_COMPUTE_GRANT,
+    AGENT_CONNECTOR_GRANT,
     AGENT_FILE_GRANT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
@@ -21,6 +22,7 @@ from simajilord.agent import (
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_SHELL_GRANT,
     AGENT_WEB_GRANT,
     NON_UNDOABLE_ACTION_CAPABILITIES,
     action_policy,
@@ -118,6 +120,77 @@ def test_agent_and_image_queue_share_the_primary_codex_provider(
         )
     finally:
         asyncio.run(runtime.close())
+
+
+def test_host_shell_and_connectors_are_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+
+    try:
+        names = {endpoint.descriptor.name for endpoint in runtime.registry.all()}
+        assert runtime.connectors is None
+        assert "system.shell" not in names
+        assert not {name for name in names if name.startswith("connector.")}
+    finally:
+        asyncio.run(runtime.close())
+
+
+def test_admin_host_shell_and_design_connectors_use_agent_capability_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "7")
+    monkeypatch.setenv("AGENT_ISOLATED_SHELL_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_CONNECTOR_ACCESS", "admins")
+
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+    assert runtime.agent is not None
+    provider = cast(CodexAppServerProvider, runtime.agent.provider)
+    denied = InvocationContext("8", "1", "agent", "denied")
+    granted = InvocationContext(
+        "7",
+        "1",
+        "agent",
+        "granted",
+        grants=frozenset({AGENT_CONNECTOR_GRANT, AGENT_SHELL_GRANT}),
+        approvals=frozenset({"connector.write", "system.shell"}),
+    )
+
+    async def run() -> None:
+        denied_names = await _listed_capability_names(provider, denied)
+        granted_names = await _listed_capability_names(provider, granted)
+        assert {
+            "connector.search",
+            "connector.describe",
+            "connector.read",
+            "connector.write",
+            "system.shell",
+        }.isdisjoint(denied_names)
+        assert {
+            "connector.search",
+            "connector.describe",
+            "connector.read",
+            "connector.write",
+            "system.shell",
+        } <= granted_names
+        assert runtime.connectors is not None
+        assert provider.expected_version_prefix == settings.codex_expected_version_prefix
+        await runtime.close()
+
+    asyncio.run(run())
 
 
 def test_max_feature_runtime_keeps_only_six_full_eager_schemas(

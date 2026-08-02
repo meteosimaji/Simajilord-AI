@@ -51,8 +51,32 @@ jobs:
           }
           missing = required - names
           if missing:
-              raise SystemExit(f"Wheel is missing: {sorted(missing)}")
+            raise SystemExit(f"Wheel is missing: {sorted(missing)}")
           PY
+
+  python-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups --python "${{ matrix.python-version }}"
+      - name: Test declared Python compatibility
+        run: uv run --python "${{ matrix.python-version }}" pytest
+      - name: Compile
+        run: uv run --python "${{ matrix.python-version }}" python -m compileall -q src
 
   macos:
     runs-on: macos-latest

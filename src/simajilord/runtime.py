@@ -13,6 +13,7 @@ from simajilord.agent import (
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_COMPUTE_GRANT,
+    AGENT_CONNECTOR_GRANT,
     AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
     AGENT_DISCORD_MODERATION_CAPABILITIES,
     AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
@@ -29,6 +30,7 @@ from simajilord.agent import (
     AGENT_REACTION_GRANT,
     AGENT_REPOST_GRANT,
     AGENT_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_SHELL_GRANT,
     AGENT_WEB_GRANT,
     ActionReceiptService,
     ActionReceiptStore,
@@ -47,6 +49,7 @@ from simajilord.agent.service import AgentLimits, AgentService
 from simajilord.agent.store import AgentConversationStore
 from simajilord.agent.tools import AgentToolCatalog
 from simajilord.capabilities import (
+    ConnectorBroker,
     build_audio_endpoints,
     build_compute_endpoints,
     build_download_endpoint,
@@ -74,6 +77,9 @@ from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
 from simajilord.observability import EventJournal
+from simajilord.providers.discord_codex_policy import (
+    DISCORD_CODEX_BROKER_CONNECTORS,
+)
 from simajilord.providers.image import (
     CodexImageProvider,
     SharedCodexImageProvider,
@@ -130,6 +136,7 @@ class SimajilordRuntime:
     translation: TranslationService
     files: AgentFileSandbox | None
     compute: WorkspaceComputeService | None
+    connectors: ConnectorBroker | None
     memory: AgentMemoryService
     feedback: FeedbackService
     source_inspection: SourceInspectionService
@@ -426,6 +433,14 @@ class SimajilordRuntime:
             )
             else None
         )
+        connectors = (
+            ConnectorBroker(DISCORD_CODEX_BROKER_CONNECTORS)
+            if (
+                settings.agent_enabled
+                and settings.agent_connector_access is not AgentFeatureAccess.DISABLED
+            )
+            else None
+        )
         registry = CapabilityRegistry(journal=journal)
         action_receipts: ActionReceiptService | None = None
         agent: AgentService | None = None
@@ -508,7 +523,6 @@ class SimajilordRuntime:
                 "moderation.status",
                 "system.ping",
                 "system.status",
-                "system.shell",
                 "system.uptime",
                 "translation.detect",
                 "translation.languages",
@@ -571,7 +585,6 @@ class SimajilordRuntime:
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
                 "discord.create_quote_image": AGENT_QUOTE_GRANT,
                 "discord.view_image_attachment": AGENT_MESSAGE_GRANT,
-                "system.shell": AGENT_MESSAGE_GRANT,
                 "timer.create": AGENT_MESSAGE_GRANT,
                 "timer.list": AGENT_MESSAGE_GRANT,
                 "timer.cancel": AGENT_MESSAGE_GRANT,
@@ -579,6 +592,20 @@ class SimajilordRuntime:
                 "web.fetch": AGENT_WEB_GRANT,
                 "web.find": AGENT_WEB_GRANT,
             }
+            if settings.agent_isolated_shell_access is not AgentFeatureAccess.DISABLED:
+                agent_capabilities.append("system.shell")
+                required_grants["system.shell"] = AGENT_SHELL_GRANT
+            if connectors is not None:
+                connector_capabilities = (
+                    "connector.search",
+                    "connector.describe",
+                    "connector.read",
+                    "connector.write",
+                )
+                agent_capabilities.extend(connector_capabilities)
+                required_grants.update(
+                    {name: AGENT_CONNECTOR_GRANT for name in connector_capabilities}
+                )
             if settings.hive_api_key is not None:
                 capability_name = "discord.analyze_attachment"
                 agent_capabilities.append(capability_name)
@@ -655,11 +682,20 @@ class SimajilordRuntime:
                         "discord.create_quote_image",
                         "timer.create",
                         "timer.cancel",
-                        "system.shell",
                         *discord_requested_write_capabilities,
                         *AGENT_MEMORY_WRITE_CAPABILITIES,
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                         "feedback.create",
+                    )
+                    + (
+                        ("system.shell",)
+                        if "system.shell" in agent_capabilities
+                        else ()
+                    )
+                    + (
+                        ("connector.write",)
+                        if "connector.write" in agent_capabilities
+                        else ()
                     )
                     + (
                         ("image.generate",)
@@ -712,11 +748,14 @@ class SimajilordRuntime:
                 escalation_model=settings.agent_escalation_model,
                 allow_image_generation=shared_image_provider is not None,
                 image_timeout_seconds=settings.image_timeout_seconds,
+                expected_version_prefix=settings.codex_expected_version_prefix,
                 trace_sink=journal,
                 thread_binding_sink=agent_store,
             )
             if shared_image_provider is not None:
                 shared_image_provider.bind(codex_provider)
+            if connectors is not None:
+                connectors.bind(codex_provider)
             agent = AgentService(
                 provider=codex_provider,
                 store=agent_store,
@@ -773,6 +812,7 @@ class SimajilordRuntime:
             translation=translation,
             files=files,
             compute=compute,
+            connectors=connectors,
             memory=memory,
             feedback=feedback,
             source_inspection=source_inspection,
@@ -791,8 +831,15 @@ class SimajilordRuntime:
                 started_at=started_at,
                 started_monotonic=started_monotonic,
             ),
-            build_isolated_shell_endpoint(
-                settings.discord_agent_workspace_dir
+            *(
+                (
+                    build_isolated_shell_endpoint(
+                        settings.discord_agent_workspace_dir
+                    ),
+                )
+                if settings.agent_isolated_shell_access
+                is not AgentFeatureAccess.DISABLED
+                else ()
             ),
             *build_translation_endpoints(translation),
             *build_utility_endpoints(),
@@ -817,6 +864,7 @@ class SimajilordRuntime:
             build_feedback_endpoint(feedback),
             *build_source_inspection_endpoints(source_inspection),
             build_task_route_endpoint(),
+            *(connectors.endpoints() if connectors is not None else ()),
             *((curated_workflow_endpoint,) if curated_workflow_endpoint else ()),
             *(
                 (build_action_undo_endpoint(action_receipts),)

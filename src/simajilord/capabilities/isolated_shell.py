@@ -1,4 +1,4 @@
-"""A non-interactive shell confined to one Discord server workspace."""
+"""A non-interactive shell confined to one Discord actor-and-task workspace."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from simajilord.core.capabilities import (
+    ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
     InvocationContext,
@@ -60,13 +61,15 @@ def discord_workspace_for_context(
     workspace_root: Path,
     context: InvocationContext,
 ) -> Path:
-    """Return the shared opaque path used by the provider and shell endpoint."""
+    """Return one actor-and-task-owned path used by provider and shell."""
 
-    scope = (
+    task_scope = context.agent_task_id or context.request_id
+    transport_scope = (
         f"guild:{context.workspace_id}"
         if context.workspace_id is not None
-        else f"direct:{context.actor_id}"
+        else "direct"
     )
+    scope = f"{transport_scope}:actor:{context.actor_id}:task:{task_scope}"
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
     root = workspace_root.expanduser().resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -153,12 +156,13 @@ def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
             name="system.shell",
             summary=(
                 "Run one non-interactive command with no network and filesystem access "
-                "limited to this Discord server's dedicated workspace."
+                "limited to this Discord actor and task's dedicated workspace."
             ),
             risk=RiskLevel.WRITE,
+            approval=ApprovalMode.WHEN_REQUESTED,
             keywords=("shell", "command", "terminal", "script", "build", "test"),
             side_effects=(
-                "May create or modify files only inside the dedicated Discord workspace.",
+                "May create or modify files only inside the actor-and-task workspace.",
             ),
             requires_workspace=True,
             idempotency="non_idempotent_write",

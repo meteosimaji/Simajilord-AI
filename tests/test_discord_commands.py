@@ -18,6 +18,7 @@ from simajilord.agent import (
     ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
     AGENT_COMPUTE_GRANT,
+    AGENT_CONNECTOR_GRANT,
     AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
     AGENT_FILE_GRANT,
     AGENT_HIVE_GRANT,
@@ -26,6 +27,7 @@ from simajilord.agent import (
     AGENT_MODERATION_GRANT,
     AGENT_REACTION_GRANT,
     AGENT_REPOST_GRANT,
+    AGENT_SHELL_GRANT,
     AGENT_WEB_GRANT,
     AgentAutonomyMode,
     AgentBusyError,
@@ -34,7 +36,6 @@ from simajilord.agent import (
     AgentProviderLimitError,
     AgentRateLimitError,
     AgentTimeoutError,
-    new_agent_task_id,
 )
 from simajilord.capabilities.audio import (
     AudioAction,
@@ -100,7 +101,6 @@ from simajilord.integrations.discord.capabilities import (
 from simajilord.integrations.discord.cogs import (
     _QUOTE_CONTEXT_MENU_NAME,
     _TRANSLATE_CONTEXT_MENU_NAME,
-    AgentTaskView,
     FocusTimerCog,
     HelpCog,
     InfoCog,
@@ -469,79 +469,30 @@ async def test_agent_tool_final_sentinel_is_never_published() -> None:
     assert progress.message is None
 
 
-def test_agent_working_panel_exposes_task_quota_and_inspection_reference() -> None:
+@pytest.mark.asyncio
+async def test_agent_working_panel_contains_only_live_progress() -> None:
     source = Mock(spec=discord.Message)
     source.id = 42
-    task_id = new_agent_task_id()
+    source.reply = AsyncMock(return_value=Mock(spec=discord.Message))
+    source.channel = Mock()
+    source.channel.typing = AsyncMock()
     progress = _AgentProgressMessage(
         source,
-        task_id=task_id,
-        reference_id="agt_0123456789abcdef0123",
-        requester="<@3> · `3`",
-        quota_text="user 2 · server 9 · tokens 10,000",
-        view=Mock(spec=discord.ui.View),
+        initial_delay_seconds=0,
     )
 
-    fields = {field.name: field.value for field in progress._identity_fields()}
+    await progress.update(AgentProgressUpdate(AgentProgressStage.STARTING))
+    assert progress._task is not None
+    await progress._task
 
-    assert f"Task `{task_id}`" in fields["Task"]
-    assert "Support reference `agt_0123456789abcdef0123`" in fields["Task"]
-    assert fields["Requester"] == "<@3> · `3`"
-    assert "tokens 10,000" in fields["Capacity now"]
-    assert "typed `attach`, `separate`, or `finish`" in fields["Follow-up routing"]
-    assert "Use **Cancel**" in fields["Control"]
-    assert "/ai inspect" not in "\n".join(fields.values())
-
-
-@pytest.mark.asyncio
-async def test_agent_task_view_is_bound_to_its_exact_workspace() -> None:
-    runtime = SimpleNamespace()
-    view = AgentTaskView(
-        runtime,
-        task_id=new_agent_task_id(),
-        requester_id="3",
-        workspace_id="1",
-    )
-    wrong_workspace = SimpleNamespace(
-        guild_id=9,
-        user=SimpleNamespace(id=3),
-        response=SimpleNamespace(send_message=AsyncMock()),
-    )
-    correct_workspace = SimpleNamespace(
-        guild_id=1,
-        user=SimpleNamespace(id=3),
-        response=SimpleNamespace(send_message=AsyncMock()),
-    )
-
-    assert not await view.interaction_check(wrong_workspace)
-    assert await view.interaction_check(correct_workspace)
-    wrong_workspace.response.send_message.assert_awaited_once_with(
-        "Only the task requester or a server administrator can use these controls.",
-        ephemeral=True,
-    )
-    correct_workspace.response.send_message.assert_not_awaited()
-    assert [getattr(item, "label", None) for item in view.children] == ["Cancel"]
-    view.stop()
-
-
-@pytest.mark.asyncio
-async def test_agent_task_view_allows_its_requester_in_a_direct_message() -> None:
-    runtime = SimpleNamespace()
-    view = AgentTaskView(
-        runtime,
-        task_id=new_agent_task_id(),
-        requester_id="3",
-        workspace_id=None,
-    )
-    direct_message = SimpleNamespace(
-        guild_id=None,
-        user=SimpleNamespace(id=3),
-        response=SimpleNamespace(send_message=AsyncMock()),
-    )
-
-    assert await view.interaction_check(direct_message)
-    direct_message.response.send_message.assert_not_awaited()
-    view.stop()
+    source.reply.assert_awaited_once()
+    kwargs = source.reply.await_args.kwargs
+    embed = kwargs["embed"]
+    assert embed.title == "Working"
+    assert "Checking your request" in embed.description
+    assert embed.fields == []
+    assert "view" not in kwargs
+    await progress.prepare("done")
 
 
 @pytest.mark.asyncio
@@ -552,25 +503,18 @@ async def test_agent_cancellation_replaces_working_and_removes_dead_control() ->
     published = Mock(spec=discord.Message)
     published.id = 43
     published.edit = AsyncMock()
-    control = Mock(spec=discord.ui.View)
     progress = _AgentProgressMessage(
         source,
-        task_id=new_agent_task_id(),
-        reference_id="agt_0123456789abcdef0123",
-        requester="<@3>",
-        quota_text="tokens 10,000",
-        view=control,
     )
     progress.message = published
 
     await progress.cancelled()
 
-    control.stop.assert_called_once_with()
     published.edit.assert_awaited_once()
-    assert published.edit.await_args.kwargs["view"] is None
+    assert "view" not in published.edit.await_args.kwargs
     embed = published.edit.await_args.kwargs["embed"]
     assert embed.title == "AI task cancelled"
-    assert "Control" not in {field.name for field in embed.fields}
+    assert embed.fields == []
     source.reply.assert_not_awaited()
 
 
@@ -675,54 +619,6 @@ async def test_agent_failure_replaces_working_with_a_new_reply() -> None:
     assert progress.message is None
 
 
-@pytest.mark.asyncio
-async def test_agent_finish_deletes_follow_up_acknowledgements_before_final() -> None:
-    order: list[str] = []
-    source = Mock(spec=discord.Message)
-    source.id = 42
-    source.channel = Mock()
-    source.channel.send = AsyncMock()
-
-    async def reply(*args: object, **kwargs: object) -> Mock:
-        del args, kwargs
-        order.append("final")
-        return Mock(spec=discord.Message)
-
-    source.reply = AsyncMock(side_effect=reply)
-    acknowledgement = Mock(spec=discord.Message)
-    acknowledgement.id = 44
-
-    async def delete() -> None:
-        order.append("delete-follow-up")
-
-    acknowledgement.delete = AsyncMock(side_effect=delete)
-    progress = _AgentProgressMessage(source)
-    await progress.add_temporary_message(acknowledgement)
-
-    await progress.finish("Final answer")
-
-    assert order == ["delete-follow-up", "final"]
-    acknowledgement.delete.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_late_follow_up_acknowledgement_is_deleted_immediately() -> None:
-    source = Mock(spec=discord.Message)
-    source.id = 42
-    source.reply = AsyncMock(return_value=Mock(spec=discord.Message))
-    source.channel = Mock()
-    source.channel.send = AsyncMock()
-    acknowledgement = Mock(spec=discord.Message)
-    acknowledgement.id = 44
-    acknowledgement.delete = AsyncMock()
-    progress = _AgentProgressMessage(source)
-
-    await progress.finish("Final answer")
-    await progress.add_temporary_message(acknowledgement)
-
-    acknowledgement.delete.assert_awaited_once_with()
-
-
 def test_agent_queue_progress_shows_same_server_wait_position() -> None:
     text = _agent_progress_text(
         AgentProgressUpdate(
@@ -802,10 +698,13 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     runtime.settings.agent_file_sandbox_enabled = True
     runtime.settings.agent_web_search_access = AgentFeatureAccess.EVERYONE
     runtime.settings.agent_safe_compute_access = AgentFeatureAccess.EVERYONE
+    runtime.settings.agent_isolated_shell_access = AgentFeatureAccess.ADMINS
+    runtime.settings.agent_connector_access = AgentFeatureAccess.ADMINS
     runtime.settings.agent_admin_user_ids = frozenset({"7"})
     runtime.settings.image_generation_access = AgentFeatureAccess.EVERYONE
     runtime.files = object()
     runtime.compute = object()
+    runtime.connectors = object()
     runtime.moderation.provider = object()
     runtime.image.provider = object()
 
@@ -828,6 +727,8 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
         AGENT_REACTION_GRANT,
         AGENT_FILE_GRANT,
         AGENT_IMAGE_GRANT,
+        AGENT_CONNECTOR_GRANT,
+        AGENT_SHELL_GRANT,
     } <= requested
     assert not {AGENT_FILE_GRANT, AGENT_IMAGE_GRANT} & assist
     assert {
@@ -839,6 +740,7 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     } <= act
     assert AGENT_COMPUTE_GRANT in requested
     assert AGENT_COMPUTE_GRANT not in assist
+    assert not {AGENT_CONNECTOR_GRANT, AGENT_SHELL_GRANT} & (assist | act)
     assert ACTION_UNDO_ANY_GRANT in requested
     assert ACTION_UNDO_ANY_GRANT not in assist
 
@@ -848,11 +750,14 @@ def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:
     runtime.settings.agent_file_sandbox_enabled = False
     runtime.settings.agent_web_search_access = AgentFeatureAccess.DISABLED
     runtime.settings.agent_safe_compute_access = AgentFeatureAccess.DISABLED
+    runtime.settings.agent_isolated_shell_access = AgentFeatureAccess.DISABLED
+    runtime.settings.agent_connector_access = AgentFeatureAccess.DISABLED
     runtime.settings.agent_admin_user_ids = frozenset()
     runtime.settings.image_generation_access = AgentFeatureAccess.DISABLED
     runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ACT
     runtime.files = None
     runtime.compute = None
+    runtime.connectors = None
     runtime.moderation.provider = None
     runtime.image.provider = None
 

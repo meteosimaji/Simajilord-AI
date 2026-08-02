@@ -2056,6 +2056,150 @@ async def test_agent_finish_route_marks_active_task_finishing_until_turn_closes(
 
 
 @pytest.mark.asyncio
+async def test_requester_can_semantically_cancel_active_task(tmp_path: Path) -> None:
+    entered = asyncio.Event()
+
+    class CancelRoutingProvider(FakeProvider):
+        async def respond(
+            self,
+            *,
+            provider_thread_id: str | None,
+            event_prompt: str,
+            context: InvocationContext,
+            on_progress: object = None,
+        ) -> ProviderTurnResult:
+            del provider_thread_id, event_prompt, context, on_progress
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("cancelled provider turn resumed")
+
+        async def route_candidate(
+            self,
+            *,
+            event_prompt: str,
+            context: InvocationContext,
+        ) -> AgentTaskRouteDecision | None:
+            del event_prompt, context
+            return AgentTaskRouteDecision.CANCEL
+
+    store = AgentConversationStore(tmp_path / "agent.sqlite3")
+    journal = EventJournal(tmp_path / "events.sqlite3")
+    service = AgentService(
+        provider=CancelRoutingProvider(),
+        store=store,
+        journal=journal,
+        limits=_limits(),
+    )
+    original = _request("cancel-original")
+    active = asyncio.create_task(service.respond(original))
+    await entered.wait()
+    withdrawal = _request(
+        "cancel-withdrawal",
+        actor_id=original.actor_id,
+        message_id="cancel-message",
+    )
+
+    route = await service.route_candidate(withdrawal)
+
+    assert route is not None
+    assert route.decision is AgentTaskRouteDecision.CANCEL
+    assert route.active_event_id == original.event_id
+    with pytest.raises(asyncio.CancelledError):
+        await active
+    snapshot = await store.task_snapshot_by_public_reference_id(
+        original.public_reference_id
+    )
+    candidate_snapshot = await store.task_snapshot_by_public_reference_id(
+        withdrawal.public_reference_id
+    )
+    assert snapshot is not None
+    assert snapshot.state == "cancelled"
+    assert snapshot.completion_reason == "follow_up_cancelled"
+    assert candidate_snapshot is not None
+    assert candidate_snapshot.state == "routed"
+    assert candidate_snapshot.route_decision == "cancel"
+    assert await service.route_candidate(withdrawal) == route
+    records = await journal.agent_trace(task_id=original.task_id)
+    assert [record.kind for record in records].count("agent.turn.cancelled") == 1
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_other_actor_cancel_decision_is_preserved_as_separate(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    confirmations: list[tuple[AgentTaskRouteDecision, bool]] = []
+
+    class CancelRoutingProvider(FakeProvider):
+        async def respond(
+            self,
+            *,
+            provider_thread_id: str | None,
+            event_prompt: str,
+            context: InvocationContext,
+            on_progress: object = None,
+        ) -> ProviderTurnResult:
+            entered.set()
+            await release.wait()
+            return await super().respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+            )
+
+        async def route_candidate(
+            self,
+            *,
+            event_prompt: str,
+            context: InvocationContext,
+        ) -> AgentTaskRouteDecision | None:
+            del event_prompt, context
+            return AgentTaskRouteDecision.CANCEL
+
+        async def confirm_candidate_route(
+            self,
+            *,
+            event_id: str,
+            decision: AgentTaskRouteDecision,
+            committed: bool,
+            context: InvocationContext,
+        ) -> bool:
+            del event_id, context
+            confirmations.append((decision, committed))
+            return True
+
+    service = AgentService(
+        provider=CancelRoutingProvider(),
+        store=AgentConversationStore(tmp_path / "agent.sqlite3"),
+        journal=EventJournal(tmp_path / "events.sqlite3"),
+        limits=_limits(),
+    )
+    original = _request("protected-original")
+    active = asyncio.create_task(service.respond(original))
+    await entered.wait()
+    candidate = _request(
+        "other-actor-cancel",
+        actor_id="other-user",
+        message_id="other-cancel-message",
+    )
+
+    route = await service.route_candidate(candidate)
+
+    assert route is not None
+    assert route.decision is AgentTaskRouteDecision.SEPARATE
+    assert route.active_event_id == candidate.event_id
+    assert route.active_task_id == candidate.task_id
+    assert route.active_public_reference_id == candidate.public_reference_id
+    assert confirmations == [(AgentTaskRouteDecision.CANCEL, False)]
+    assert await service.route_candidate(candidate) == route
+    release.set()
+    await active
+
+
+@pytest.mark.asyncio
 async def test_agent_never_steers_explicit_mention_into_autonomous_turn(
     tmp_path: Path,
 ) -> None:
@@ -3249,6 +3393,10 @@ async def test_autonomy_saturation_preserves_an_interactive_active_slot(
     )
     interactive = asyncio.create_task(service.respond(interactive_request))
     await _wait_for_turn_counts(service, active=4, pending=1)
+    for _ in range(100):
+        if interactive_request.event_id in entered:
+            break
+        await asyncio.sleep(0)
 
     assert interactive_request.event_id in entered
     assert "autonomous-reserve-3" not in entered
@@ -7205,7 +7353,7 @@ async def test_stale_candidate_revision_can_only_be_routed_separately() -> None:
         },
     )
 
-    for decision in ("attach", "finish"):
+    for decision in ("attach", "finish", "cancel"):
         failure = _task_route_readiness_failure(
             budget,
             {

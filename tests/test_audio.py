@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -1097,14 +1099,14 @@ async def test_audio_state_store_coalesces_burst_writes(
         debounce_seconds=60.0,
     )
     writes = 0
-    original_write = store._write
+    original_write = store._write_snapshot
 
-    def counted_write() -> None:
+    def counted_write(sessions: tuple[StoredAudioSession, ...]) -> None:
         nonlocal writes
         writes += 1
-        original_write()
+        original_write(sessions)
 
-    monkeypatch.setattr(store, "_write", counted_write)
+    monkeypatch.setattr(store, "_write_snapshot", counted_write)
     first = StoredAudioSession(
         workspace_id="guild",
         destination_id=None,
@@ -1138,6 +1140,93 @@ async def test_audio_state_store_coalesces_burst_writes(
     persisted = json.loads(store.path.read_text(encoding="utf-8"))
     assert "voice_activation_required" in persisted["sessions"][0]
     assert "resume_confirmation_required" not in persisted["sessions"][0]
+
+
+@pytest.mark.asyncio
+async def test_audio_state_store_keeps_dirty_state_after_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = AudioStateStore(
+        tmp_path / "audio_sessions.json",
+        debounce_seconds=60.0,
+    )
+    original_write = store._write_snapshot
+    attempts = 0
+
+    def failed_write(_sessions: tuple[StoredAudioSession, ...]) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("injected disk failure")
+
+    monkeypatch.setattr(store, "_write_snapshot", failed_write)
+    state = StoredAudioSession(
+        workspace_id="guild",
+        destination_id="voice",
+        waiting_actor_ids=(),
+        loop_mode=LoopMode.NONE,
+        auto_leave=True,
+        speed=1.0,
+        pitch=1.0,
+        items=(),
+        history=(),
+    )
+    await store.put(state)
+
+    with pytest.raises(OSError, match="injected"):
+        await store.flush()
+    assert attempts == 3
+    assert store._dirty is True
+
+    monkeypatch.setattr(store, "_write_snapshot", original_write)
+    await store.flush()
+    assert AudioStateStore(store.path).all() == (state,)
+
+
+@pytest.mark.asyncio
+async def test_audio_state_store_persists_mutation_arriving_during_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = AudioStateStore(
+        tmp_path / "audio_sessions.json",
+        debounce_seconds=0.0,
+    )
+    original_write = store._write_snapshot
+    write_started = threading.Event()
+    release_write = threading.Event()
+    writes = 0
+
+    def blocked_first_write(sessions: tuple[StoredAudioSession, ...]) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            write_started.set()
+            assert release_write.wait(timeout=1)
+        original_write(sessions)
+
+    monkeypatch.setattr(store, "_write_snapshot", blocked_first_write)
+    initial = StoredAudioSession(
+        workspace_id="guild",
+        destination_id="voice-a",
+        waiting_actor_ids=(),
+        loop_mode=LoopMode.NONE,
+        auto_leave=True,
+        speed=1.0,
+        pitch=1.0,
+        items=(),
+        history=(),
+    )
+    updated = replace(initial, destination_id="voice-b")
+    await store.put(initial)
+    assert await asyncio.to_thread(write_started.wait, 1)
+    await store.put(updated)
+    release_write.set()
+
+    await store.flush()
+
+    assert writes == 2
+    assert AudioStateStore(store.path).all() == (updated,)
 
 
 def test_audio_state_store_migrates_legacy_resume_confirmation(

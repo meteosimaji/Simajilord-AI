@@ -10,12 +10,14 @@ import os
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import sysconfig
 import tempfile
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from time import monotonic
 from typing import Protocol
@@ -30,6 +32,17 @@ from .files import (
 )
 
 _MACOS_SANDBOX_EXECUTABLE = Path("/usr/bin/sandbox-exec")
+_MACOS_OTOOL_EXECUTABLE = Path("/usr/bin/otool")
+_MACOS_PRIVATE_READ_ROOTS = (
+    Path("/Users"),
+    Path("/Volumes"),
+    Path("/Network"),
+    Path("/private"),
+    Path("/opt"),
+    Path("/srv"),
+)
+_MAX_RUNTIME_MACHO_FILES = 2_048
+_OTOOL_BATCH_SIZE = 128
 _MAX_ARGUMENTS = 32
 _MAX_ARGUMENT_CHARACTERS = 8_192
 _MAX_SINGLE_ARGUMENT_CHARACTERS = 1_024
@@ -131,6 +144,130 @@ class SandboxedProcessLauncher(Protocol):
     ) -> ComputeProcessResult: ...
 
 
+def _sandbox_read_metadata_ancestors(
+    paths: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Return exact private ancestors needed to resolve allowed paths."""
+
+    ancestors: list[Path] = []
+    for path in paths:
+        absolute_path = path.absolute()
+        for private_root in _MACOS_PRIVATE_READ_ROOTS:
+            try:
+                absolute_path.relative_to(private_root)
+            except ValueError:
+                continue
+            current = absolute_path.parent
+            while current != current.parent:
+                ancestors.append(current)
+                if current == private_root:
+                    break
+                current = current.parent
+            break
+    return tuple(dict.fromkeys(ancestors))
+
+
+def _parse_otool_dependencies(output: str) -> tuple[Path, ...]:
+    dependencies: list[Path] = []
+    for line in output.splitlines():
+        if not line[:1].isspace():
+            continue
+        dependency = line.strip().split(" (compatibility version", 1)[0]
+        path = Path(dependency)
+        if path.is_absolute():
+            dependencies.append(path)
+    return tuple(dict.fromkeys(dependencies))
+
+
+def _path_is_within(path: Path, roots: Sequence[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+@lru_cache(maxsize=8)
+def _macos_runtime_dependency_files(
+    python_executable: Path,
+    runtime_read_roots: tuple[Path, ...],
+    dependency_paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Discover exact external Mach-O files needed by the Python runtime."""
+
+    if (
+        sys.platform != "darwin"
+        or not _MACOS_OTOOL_EXECUTABLE.is_file()
+        or not os.access(_MACOS_OTOOL_EXECUTABLE, os.X_OK)
+    ):
+        return ()
+
+    candidates = {python_executable.resolve()}
+    for root in (*runtime_read_roots, *dependency_paths):
+        if not root.is_dir():
+            continue
+        for pattern in ("*.so", "*.dylib"):
+            for candidate in root.rglob(pattern):
+                if candidate.is_file():
+                    candidates.add(candidate.resolve())
+                    if len(candidates) > _MAX_RUNTIME_MACHO_FILES:
+                        return ()
+
+    allowed_roots = tuple(
+        dict.fromkeys((*runtime_read_roots, *dependency_paths))
+    )
+    pending = sorted(candidates, key=str)
+    examined: set[Path] = set()
+    external_files: list[Path] = []
+    external_file_set: set[Path] = set()
+    while pending:
+        batch: list[Path] = []
+        while pending and len(batch) < _OTOOL_BATCH_SIZE:
+            candidate = pending.pop()
+            if candidate in examined:
+                continue
+            examined.add(candidate)
+            batch.append(candidate)
+        if not batch:
+            continue
+        try:
+            result = subprocess.run(
+                (
+                    str(_MACOS_OTOOL_EXECUTABLE),
+                    "-L",
+                    *(str(path) for path in batch),
+                ),
+                check=False,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return tuple(external_files)
+        for dependency in _parse_otool_dependencies(result.stdout):
+            if _path_is_within(dependency, allowed_roots):
+                continue
+            try:
+                resolved_dependency = dependency.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved_dependency.is_file():
+                continue
+            for path in (dependency, resolved_dependency):
+                if path in external_file_set:
+                    continue
+                external_file_set.add(path)
+                external_files.append(path)
+                if len(external_files) > _MAX_RUNTIME_MACHO_FILES:
+                    return ()
+            if resolved_dependency not in examined:
+                pending.append(resolved_dependency)
+    return tuple(external_files)
+
+
 class MacOSSandboxedPythonLauncher:
     """Run one Python process under the macOS Seatbelt sandbox."""
 
@@ -160,6 +297,16 @@ class MacOSSandboxedPythonLauncher:
                 Path(value).resolve()
                 for name in ("purelib", "platlib")
                 if (value := interpreter_paths.get(name))
+            )
+        )
+        self._runtime_dependency_read_roots = tuple(
+            dict.fromkeys(
+                path.parent
+                for path in _macos_runtime_dependency_files(
+                    self._resolved_python_executable,
+                    self._runtime_read_roots,
+                    self._dependency_paths,
+                )
             )
         )
 
@@ -338,24 +485,24 @@ class MacOSSandboxedPythonLauncher:
         workspace: Path,
         temporary_directory: Path,
     ) -> str:
-        private_roots = (
-            Path("/Users"),
-            Path("/Volumes"),
-            Path("/Network"),
-            Path("/private"),
-            Path("/opt"),
-            Path("/srv"),
-        )
         read_denials = " ".join(
             f'(subpath "{_sandbox_string(path)}")'
-            for path in private_roots
+            for path in _MACOS_PRIVATE_READ_ROOTS
         )
-        read_exceptions = " ".join(
+        read_roots = (
+            workspace.resolve(),
+            temporary_directory.resolve(),
+            *self._runtime_read_roots,
+            *self._runtime_dependency_read_roots,
+        )
+        read_subpath_exceptions = " ".join(
             f'(subpath "{_sandbox_string(path)}")'
-            for path in (
-                workspace,
-                temporary_directory,
-                *self._runtime_read_roots,
+            for path in read_roots
+        )
+        metadata_exceptions = " ".join(
+            f'(literal "{_sandbox_string(path)}")'
+            for path in _sandbox_read_metadata_ancestors(
+                read_roots
             )
         )
         process_root = self._resolved_python_executable.parent.parent
@@ -370,7 +517,8 @@ class MacOSSandboxedPythonLauncher:
             f'(allow file-write* (subpath "{_sandbox_string(workspace)}") '
             f'(subpath "{_sandbox_string(temporary_directory)}"))'
             f"(deny file-read* {read_denials})"
-            f"(allow file-read* {read_exceptions})"
+            f"(allow file-read* {read_subpath_exceptions})"
+            f"(allow file-read-metadata {metadata_exceptions})"
         )
 
 

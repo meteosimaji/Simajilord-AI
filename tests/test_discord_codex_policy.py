@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, call
 
 import pytest
 
+from simajilord.agent import AgentProviderError, AgentUnavailableError
 from simajilord.agent.providers.codex import (
     CodexAppServerProvider,
+    _codex_app_server_environment,
     _ToolTurnBudget,
+    _verify_codex_version,
 )
 from simajilord.agent.tools import AgentToolCatalog
 from simajilord.core import CapabilityRegistry, InvocationContext
@@ -15,9 +20,12 @@ from simajilord.observability.journal import EventJournal
 from simajilord.providers.codex_features import codex_feature_arguments
 from simajilord.providers.discord_codex_policy import (
     DISCORD_CODEX_APP_POLICIES,
+    DISCORD_CODEX_BROKER_CONNECTORS,
     DISCORD_CODEX_DISABLED_PLUGINS,
     DISCORD_CODEX_ENABLED_PLUGINS,
     DISCORD_CODEX_PERMISSION_PROFILE,
+    DiscordCodexAppActionClass,
+    discord_codex_app_tool_action_class,
     discord_codex_app_tool_is_write,
     discord_codex_policy_arguments,
 )
@@ -40,7 +48,9 @@ def _provider(tmp_path: Path, *, trace_sink: EventJournal | None = None) -> Code
 def _config_overrides(arguments: tuple[str, ...]) -> dict[str, str]:
     pairs = tuple(zip(arguments[::2], arguments[1::2], strict=True))
     assert all(flag == "-c" for flag, _setting in pairs)
-    return dict(setting.split("=", 1) for _flag, setting in pairs)
+    settings = tuple(setting.split("=", 1) for _flag, setting in pairs)
+    assert len(settings) == len({key for key, _value in settings})
+    return dict(settings)
 
 
 def test_discord_app_and_plugin_policy_has_no_collisions() -> None:
@@ -67,6 +77,11 @@ def test_discord_app_and_plugin_policy_has_no_collisions() -> None:
 
 def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None:
     codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.personal_gateway]\nurl = "https://example.invalid/mcp"\n',
+        encoding="utf-8",
+    )
     disabled_skill = codex_home / "skills" / "playwright" / "SKILL.md"
     enabled_skill = codex_home / "skills" / "imagegen" / "SKILL.md"
     disabled_skill.parent.mkdir(parents=True)
@@ -89,11 +104,25 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
     enabled_plugin_skill.parent.mkdir(parents=True)
     disabled_plugin_skill.write_text("disabled", encoding="utf-8")
     enabled_plugin_skill.write_text("enabled", encoding="utf-8")
+    plugin_manifest = enabled_plugin_skill.parents[2] / ".mcp.json"
+    plugin_manifest.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "design_plugin_server": {
+                        "command": "unsafe-plugin-command",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     overrides = _config_overrides(discord_codex_policy_arguments(codex_home=codex_home))
 
     assert overrides["apps._default.enabled"] == "false"
     assert overrides["apps._default.destructive_enabled"] == "false"
+    assert overrides["apps._default.open_world_enabled"] == "false"
     assert overrides["mcp_servers.node_repl.enabled"] == "false"
     assert overrides["mcp_servers.playwright.enabled"] == "false"
     assert overrides["mcp_servers.computer-use.enabled"] == "false"
@@ -105,7 +134,11 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
     ):
         assert overrides[f"mcp_servers.{server}.command"] == '"/usr/bin/false"'
         assert overrides[f"mcp_servers.{server}.enabled"] == "false"
-    assert overrides["mcp_servers.openaiDeveloperDocs.enabled"] == "true"
+    assert overrides["mcp_servers.openaiDeveloperDocs.enabled"] == "false"
+    assert overrides["mcp_servers.design_plugin_server.command"] == '"/usr/bin/false"'
+    assert overrides["mcp_servers.design_plugin_server.enabled"] == "false"
+    assert overrides["mcp_servers.personal_gateway.enabled"] == "false"
+    assert "mcp_servers.personal_gateway.command" not in overrides
     assert overrides["shell_environment_policy.inherit"] == '"none"'
     assert overrides["shell_environment_policy.set.HOME"] == '"/nonexistent"'
     assert (
@@ -125,6 +158,30 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
     assert str(enabled_skill.resolve()) not in overrides["skills.config"]
     assert str(disabled_plugin_skill.resolve()) in overrides["skills.config"]
     assert str(enabled_plugin_skill.resolve()) not in overrides["skills.config"]
+    for policy in DISCORD_CODEX_APP_POLICIES:
+        prefix = f"apps.{policy.app_id}"
+        assert overrides[f"{prefix}.enabled"] == "false"
+        assert overrides[f"{prefix}.destructive_enabled"] == "false"
+        assert overrides[f"{prefix}.open_world_enabled"] == "false"
+        assert overrides[f"{prefix}.default_tools_enabled"] == "false"
+    assert set(DISCORD_CODEX_BROKER_CONNECTORS.values()) == {
+        "Adobe",
+        "Adobe Express",
+        "BioRender",
+        "Canva",
+        "Figma",
+    }
+
+
+def test_discord_policy_rejects_an_uninspectable_plugin_mcp_manifest(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "plugins" / "cache" / "vendor" / "plugin" / "1" / ".mcp.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Plugin MCP manifest is invalid"):
+        discord_codex_policy_arguments(codex_home=tmp_path)
 
 
 def test_discord_extensions_enable_only_reviewed_feature_families() -> None:
@@ -134,9 +191,7 @@ def test_discord_extensions_enable_only_reviewed_feature_families() -> None:
     for feature in (
         "apps",
         "plugins",
-        "remote_plugin",
         "skill_search",
-        "tool_suggest",
     ):
         assert ("--enable", feature) in pairs
         assert ("--disable", feature) not in pairs
@@ -146,7 +201,9 @@ def test_discord_extensions_enable_only_reviewed_feature_families() -> None:
         "computer_use",
         "goals",
         "multi_agent",
+        "remote_plugin",
         "shell_tool",
+        "tool_suggest",
         "unified_exec",
         "workspace_dependencies",
     ):
@@ -162,26 +219,191 @@ def test_app_write_classification_is_exact() -> None:
         "connector_76869538009648d5b282a4bb21c3d157",
         "fetch_file",
     )
-    assert not discord_codex_app_tool_is_write("unknown", "generate_figma_design")
+    assert discord_codex_app_tool_is_write("unknown", "generate_figma_design")
+    assert (
+        discord_codex_app_tool_action_class("unknown", "unknown")
+        is DiscordCodexAppActionClass.UNKNOWN
+    )
 
 
-def test_provider_uses_one_isolated_workspace_per_discord_scope(tmp_path: Path) -> None:
+def test_provider_uses_one_isolated_workspace_per_actor_and_task(tmp_path: Path) -> None:
     provider = _provider(tmp_path)
-    guild_a = InvocationContext("actor-a", "guild-a", "discord", "request-a")
-    guild_a_other_user = InvocationContext("actor-b", "guild-a", "discord", "request-b")
-    guild_b = InvocationContext("actor-a", "guild-b", "discord", "request-c")
-    direct = InvocationContext("actor-a", None, "discord", "request-d")
+    guild_a = InvocationContext(
+        "actor-a",
+        "guild-a",
+        "discord",
+        "request-a",
+        agent_task_id="tsk_aaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    guild_a_other_user = InvocationContext(
+        "actor-b",
+        "guild-a",
+        "discord",
+        "request-b",
+        agent_task_id="tsk_bbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    guild_a_other_task = InvocationContext(
+        "actor-a",
+        "guild-a",
+        "discord",
+        "request-c",
+        agent_task_id="tsk_cccccccccccccccccccccccc",
+    )
+    guild_b = InvocationContext("actor-a", "guild-b", "discord", "request-d")
+    direct = InvocationContext("actor-a", None, "discord", "request-e")
 
     workspace_a = provider._workspace_for_context(guild_a)
-    assert workspace_a == provider._workspace_for_context(guild_a_other_user)
+    assert workspace_a == provider._workspace_for_context(guild_a)
     workspaces = {
         workspace_a,
+        provider._workspace_for_context(guild_a_other_user),
+        provider._workspace_for_context(guild_a_other_task),
         provider._workspace_for_context(guild_b),
         provider._workspace_for_context(direct),
     }
-    assert len(workspaces) == 3
+    assert len(workspaces) == 5
     assert workspace_a.parent == provider.workspace_dir.resolve()
     assert workspace_a.stat().st_mode & 0o777 == 0o700
+
+
+def test_codex_app_server_environment_does_not_inherit_service_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "never-child")
+    monkeypatch.setenv("HIVE_API_KEY", "never-child")
+    monkeypatch.setenv("WEB_SEARCH_SHARED_SECRET", "never-child")
+    monkeypatch.setenv("OPENAI_API_KEY", "never-child")
+
+    environment = _codex_app_server_environment()
+
+    assert environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+    assert "CODEX_HOME" in environment
+    assert "HOME" in environment
+    assert "DISCORD_TOKEN" not in environment
+    assert "HIVE_API_KEY" not in environment
+    assert "WEB_SEARCH_SHARED_SECRET" not in environment
+    assert "OPENAI_API_KEY" not in environment
+
+
+@pytest.mark.asyncio
+async def test_codex_version_guard_accepts_only_configured_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"codex-cli 0.146.0-alpha.9.2\n", b""
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    environment = {"PATH": "/usr/bin:/bin"}
+
+    assert await _verify_codex_version(
+        "/resolved/codex",
+        expected_prefix="0.146.",
+        environment=environment,
+    ) == "0.146.0-alpha.9.2"
+    with pytest.raises(AgentUnavailableError, match="supported prefix"):
+        await _verify_codex_version(
+            "/resolved/codex",
+            expected_prefix="0.145.",
+            environment=environment,
+        )
+
+
+@pytest.mark.asyncio
+async def test_connector_broker_protocol_is_active_thread_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = _provider(tmp_path)
+    provider._active_threads.add("thread")
+    request = AsyncMock(
+        side_effect=(
+            {
+                "data": [
+                    {
+                        "name": "codex_apps",
+                        "tools": {
+                            "first": {
+                                "inputSchema": {"type": "object"},
+                            }
+                        },
+                    },
+                    {"name": "disabled", "tools": {}},
+                ],
+                "nextCursor": "next-page",
+            },
+            {
+                "data": [
+                    {
+                        "name": "codex_apps",
+                        "tools": {
+                            "inventory-key": {
+                                "name": "second",
+                                "inputSchema": {"type": "object"},
+                            }
+                        },
+                    }
+                ],
+                "nextCursor": None,
+            },
+            {
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": False,
+            },
+        )
+    )
+    monkeypatch.setattr(provider, "_request", request)
+
+    inventory = await provider.connector_tool_inventory(thread_id="thread")
+    result = await provider.call_connector_tool(
+        thread_id="thread",
+        server="codex_apps",
+        tool="second",
+        arguments={"id": "design"},
+    )
+
+    assert tuple(item["name"] for item in inventory) == ("first", "second")
+    assert result["isError"] is False
+    assert request.await_args_list == [
+        call(
+            "mcpServerStatus/list",
+            {"detail": "full", "limit": 100, "threadId": "thread"},
+        ),
+        call(
+            "mcpServerStatus/list",
+            {
+                "detail": "full",
+                "limit": 100,
+                "threadId": "thread",
+                "cursor": "next-page",
+            },
+        ),
+        call(
+            "mcpServer/tool/call",
+            {
+                "server": "codex_apps",
+                "threadId": "thread",
+                "tool": "second",
+                "arguments": {"id": "design"},
+            },
+        ),
+    ]
+
+    with pytest.raises(AgentProviderError, match="not active"):
+        await provider.connector_tool_inventory(thread_id="inactive")
+    with pytest.raises(AgentProviderError, match="not active"):
+        await provider.call_connector_tool(
+            thread_id="inactive",
+            server="codex_apps",
+            tool="second",
+            arguments={},
+        )
 
 
 @pytest.mark.asyncio

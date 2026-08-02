@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shlex
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import replace
 from time import monotonic
@@ -17,6 +18,11 @@ from simajilord.domain.audio import AudioItem, AudioKind
 
 log = logging.getLogger(__name__)
 _SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
+_SOURCE_PREFLIGHT_CLEANUP_SECONDS = 2.0
+_PLAYBACK_WATCHDOG_INTERVAL_SECONDS = 1.0
+_PLAYBACK_STOPPED_GRACE_SECONDS = 2.0
+_PLAYBACK_COMPLETION_GRACE_SECONDS = 30.0
+_PLAYBACK_MAX_ACTIVE_SECONDS = 6 * 60 * 60
 _EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
 _READ_ALOUD_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 _MUSIC_DUCK_GAIN = 0.25
@@ -110,6 +116,11 @@ class DiscordAudioOutput:
         self._voice: discord.VoiceClient | None = None
         self._source_lock = asyncio.Lock()
         self._intentional_stop_generation = 0
+        self._preflight_executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"simajilord-audio-preflight-{guild_id}",
+        )
+        self._preflight_poisoned = False
 
     @property
     def connected(self) -> bool:
@@ -187,12 +198,25 @@ class DiscordAudioOutput:
             # FFmpegOpusAudio reports is_opus=True, so discord.py sends the packets
             # directly instead of constructing its native libopus PCM encoder.
             voice.play(source, after=after)
-            await completed
-            elapsed = max(0.0, monotonic() - started_at)
             expected = max(
                 0.0,
-                (item.duration_seconds - item.start_seconds) / max(item.speed, 0.01),
+                (item.duration_seconds - item.start_seconds)
+                / max(item.speed, 0.01),
             )
+            try:
+                await self._await_playback_completion(
+                    completed,
+                    voice=voice,
+                    expected_seconds=expected,
+                )
+            except BaseException:
+                if not completed.done():
+                    completed.cancel()
+                self._intentional_stop_generation += 1
+                if voice.is_playing() or voice.is_paused():
+                    voice.stop()
+                raise
+            elapsed = max(0.0, monotonic() - started_at)
             tolerance = max(5.0, expected * 0.1)
             if (
                 item.kind is AudioKind.MUSIC
@@ -206,6 +230,58 @@ class DiscordAudioOutput:
                 )
         finally:
             source.cleanup()
+
+    async def _await_playback_completion(
+        self,
+        completed: asyncio.Future[None],
+        *,
+        voice: discord.VoiceClient,
+        expected_seconds: float,
+    ) -> None:
+        """Bound a missing callback without counting intentional pause time."""
+
+        active_seconds = 0.0
+        last_checked = monotonic()
+        stopped_since: float | None = None
+        maximum_active_seconds = min(
+            _PLAYBACK_MAX_ACTIVE_SECONDS,
+            (
+                expected_seconds
+                + max(
+                    _PLAYBACK_COMPLETION_GRACE_SECONDS,
+                    expected_seconds * 0.2,
+                )
+                if expected_seconds > 0
+                else _PLAYBACK_MAX_ACTIVE_SECONDS
+            ),
+        )
+        while True:
+            try:
+                async with asyncio.timeout(
+                    _PLAYBACK_WATCHDOG_INTERVAL_SECONDS
+                ):
+                    await asyncio.shield(completed)
+                return
+            except TimeoutError:
+                now = monotonic()
+                if not voice.is_paused():
+                    active_seconds += max(0.0, now - last_checked)
+                last_checked = now
+                if not voice.is_connected():
+                    raise UserError("audio.output_disconnected") from None
+                if not voice.is_playing() and not voice.is_paused():
+                    if stopped_since is None:
+                        stopped_since = now
+                    elif now - stopped_since >= _PLAYBACK_STOPPED_GRACE_SECONDS:
+                        raise ProviderError(
+                            "Discord stopped playback without reporting completion."
+                        ) from None
+                else:
+                    stopped_since = None
+                if active_seconds >= maximum_active_seconds:
+                    raise ProviderError(
+                        "Discord audio playback exceeded its bounded completion window."
+                    ) from None
 
     async def overlay_speech(
         self,
@@ -276,18 +352,45 @@ class DiscordAudioOutput:
             replacement = build_discord_audio_source(item)
             prepared: _PrefetchedAudioSource | None = None
             previous = voice.source
-            try:
-                first_packet = await asyncio.wait_for(
-                    asyncio.to_thread(replacement.read),
-                    timeout=_SOURCE_PREFLIGHT_TIMEOUT_SECONDS,
+            if self._preflight_poisoned:
+                replacement.cleanup()
+                raise ProviderError(
+                    "The Discord audio preflight worker is unavailable until reconnect."
                 )
+            executor = self._preflight_executor
+            if executor is None:
+                executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=(
+                        f"simajilord-audio-preflight-{self.guild_id}"
+                    ),
+                )
+                self._preflight_executor = executor
+            read_future = asyncio.get_running_loop().run_in_executor(
+                executor,
+                replacement.read,
+            )
+            try:
+                async with asyncio.timeout(_SOURCE_PREFLIGHT_TIMEOUT_SECONDS):
+                    first_packet = await asyncio.shield(read_future)
                 if not first_packet:
                     raise ProviderError(
                         "The replacement audio source produced no Opus packet."
                     )
                 prepared = _PrefetchedAudioSource(replacement, first_packet)
                 voice.source = prepared
-            except Exception:
+            except TimeoutError as exc:
+                await self._abort_preflight_reader(replacement, read_future)
+                raise ProviderError(
+                    "The replacement audio source preflight timed out."
+                ) from exc
+            except asyncio.CancelledError:
+                if prepared is None:
+                    await self._abort_preflight_reader(replacement, read_future)
+                else:
+                    prepared.cleanup()
+                raise
+            except BaseException:
                 if prepared is None:
                     replacement.cleanup()
                 else:
@@ -295,6 +398,28 @@ class DiscordAudioOutput:
                 raise
             if previous is not None and previous is not prepared:
                 previous.cleanup()
+
+    async def _abort_preflight_reader(
+        self,
+        replacement: discord.AudioSource,
+        read_future: asyncio.Future[bytes],
+    ) -> None:
+        """Close a timed-out source and bound the dedicated reader cleanup."""
+
+        try:
+            replacement.cleanup()
+        except Exception:
+            self._preflight_poisoned = True
+            log.exception("Discord replacement source cleanup failed")
+        try:
+            async with asyncio.timeout(_SOURCE_PREFLIGHT_CLEANUP_SECONDS):
+                await asyncio.shield(read_future)
+        except TimeoutError:
+            self._preflight_poisoned = True
+        except Exception:
+            # Closing FFmpeg's pipes commonly makes the outstanding read fail;
+            # the dedicated worker has still terminated and is reusable.
+            pass
 
     def pause(self) -> None:
         voice = self._adopt_voice_client()
@@ -320,6 +445,11 @@ class DiscordAudioOutput:
             await voice.disconnect(force=True)
         self._voice = None
         self.destination_id = None
+        executor = self._preflight_executor
+        self._preflight_executor = None
+        self._preflight_poisoned = False
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _adopt_voice_client(self) -> discord.VoiceClient | None:
         if self._voice is not None:

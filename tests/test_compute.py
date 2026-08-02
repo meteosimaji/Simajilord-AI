@@ -18,6 +18,8 @@ from simajilord.services.compute import (
     ComputeProcessResult,
     MacOSSandboxedPythonLauncher,
     WorkspaceComputeService,
+    _parse_otool_dependencies,
+    _sandbox_read_metadata_ancestors,
     _workspace_usage_violation,
 )
 from simajilord.services.files import AgentFileSandbox
@@ -105,6 +107,39 @@ class _FakeFetcher:
 
     async def close(self) -> None:
         pass
+
+
+def test_sandbox_metadata_exceptions_cover_only_exact_private_ancestors() -> None:
+    ancestors = _sandbox_read_metadata_ancestors(
+        (
+            Path("/opt/homebrew/Cellar/python/3.14/lib/python3.14"),
+            Path("/usr/lib/libSystem.B.dylib"),
+        )
+    )
+
+    assert ancestors == (
+        Path("/opt/homebrew/Cellar/python/3.14/lib"),
+        Path("/opt/homebrew/Cellar/python/3.14"),
+        Path("/opt/homebrew/Cellar/python"),
+        Path("/opt/homebrew/Cellar"),
+        Path("/opt/homebrew"),
+        Path("/opt"),
+    )
+
+
+def test_otool_dependency_parser_accepts_only_absolute_dependency_lines() -> None:
+    output = (
+        "/runtime/lib-dynload/_ssl.so:\n"
+        "\t/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib "
+        "(compatibility version 3.0.0, current version 3.0.0)\n"
+        "\t@rpath/libignored.dylib "
+        "(compatibility version 1.0.0, current version 1.0.0)\n"
+        "/not/an/indented/dependency\n"
+    )
+
+    assert _parse_otool_dependencies(output) == (
+        Path("/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib"),
+    )
 
 
 def test_workspace_monitor_counts_directories_against_inode_limit(
@@ -380,6 +415,10 @@ async def test_macos_launcher_denies_network_fork_and_host_project_reads(
     script = f"""
 import pathlib
 import pypdf
+import ssl
+import sqlite3
+import lzma
+import _decimal
 import socket
 import subprocess
 import os

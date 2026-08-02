@@ -14,6 +14,7 @@ AGENT_DISCORD_SAFE_MESSAGE_CHARACTERS = 1_900
 AGENT_AUTONOMY_ACTOR_ID = "simajilord:autonomy"
 AGENT_AUDIO_GRANT = "audio"
 AGENT_COMPUTE_GRANT = "safe_compute"
+AGENT_CONNECTOR_GRANT = "connectors"
 AGENT_FEEDBACK_GRANT = "feedback"
 AGENT_FILE_GRANT = "files"
 AGENT_HIVE_GRANT = "hive_analysis"
@@ -25,6 +26,7 @@ AGENT_MODERATION_GRANT = "moderation"
 AGENT_QUOTE_GRANT = "discord_quote"
 AGENT_REACTION_GRANT = "discord_reaction"
 AGENT_REPOST_GRANT = "discord_repost"
+AGENT_SHELL_GRANT = "shell_exec"
 AGENT_WEB_GRANT = "web"
 AGENT_TIMER_WRITE_CAPABILITIES = (
     "timer.create",
@@ -118,6 +120,8 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     *AGENT_TIMER_WRITE_CAPABILITIES,
     *AGENT_MEMORY_WRITE_CAPABILITIES,
     "feedback.create",
+    "connector.write",
+    "system.shell",
 )
 _AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS = 20
 _AGENT_TASK_ID_HEX_CHARACTERS = 20
@@ -250,6 +254,7 @@ class AgentTaskRouteDecision(StrEnum):
     ATTACH = "attach"
     SEPARATE = "separate"
     FINISH = "finish"
+    CANCEL = "cancel"
 
 
 @dataclass(frozen=True, slots=True)

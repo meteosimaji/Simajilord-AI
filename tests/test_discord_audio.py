@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import wave
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from simajilord.core.errors import ProviderError
 from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.integrations.discord.audio import (
+    DiscordAudioOutput,
     build_discord_audio_source,
     verify_ffmpeg_opus,
 )
@@ -139,3 +145,178 @@ def test_standalone_speech_is_loudness_normalized_before_user_volume(
         )
     finally:
         source.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_discord_playback_watchdog_stops_missing_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = SimpleNamespace(cleanup=Mock())
+
+    class Voice:
+        def __init__(self) -> None:
+            self.started = False
+            self.stopped = 0
+
+        def is_connected(self) -> bool:
+            return True
+
+        def is_playing(self) -> bool:
+            return self.started and self.stopped == 0
+
+        def is_paused(self) -> bool:
+            return False
+
+        def play(self, _source: object, *, after: object) -> None:
+            del _source, after
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped += 1
+
+        async def disconnect(self, *, force: bool) -> None:
+            assert force is True
+
+    voice = Voice()
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    output._voice = voice  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _item: source,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_WATCHDOG_INTERVAL_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_COMPLETION_GRACE_SECONDS",
+        0.01,
+    )
+
+    with pytest.raises(ProviderError, match="bounded completion"):
+        await asyncio.wait_for(
+            output.play(
+                AudioItem(
+                    "source",
+                    "Missing callback",
+                    "https://example.test/audio",
+                    duration_seconds=0.001,
+                )
+            ),
+            timeout=0.2,
+        )
+
+    assert voice.stopped == 1
+    source.cleanup.assert_called_once_with()
+    await output.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_audio_source_preflight_timeout_cleans_and_joins_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released = threading.Event()
+
+    class Replacement:
+        def __init__(self) -> None:
+            self.cleaned = 0
+
+        def read(self) -> bytes:
+            released.wait(timeout=1)
+            return b""
+
+        def cleanup(self) -> None:
+            self.cleaned += 1
+            released.set()
+
+    replacement = Replacement()
+
+    class Voice:
+        source = SimpleNamespace(cleanup=Mock())
+
+        def is_connected(self) -> bool:
+            return True
+
+        def is_playing(self) -> bool:
+            return True
+
+        async def disconnect(self, *, force: bool) -> None:
+            assert force is True
+
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    output._voice = Voice()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _item: replacement,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._SOURCE_PREFLIGHT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    with pytest.raises(ProviderError, match="preflight timed out"):
+        await output._swap_music_source(
+            AudioItem("source", "Replacement", "https://example.test/audio")
+        )
+
+    assert released.is_set()
+    assert replacement.cleaned >= 1
+    assert output._preflight_poisoned is False
+    await output.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_audio_source_preflight_cancellation_joins_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    read_started = threading.Event()
+    released = threading.Event()
+
+    class Replacement:
+        def __init__(self) -> None:
+            self.cleaned = 0
+
+        def read(self) -> bytes:
+            read_started.set()
+            released.wait(timeout=1)
+            return b""
+
+        def cleanup(self) -> None:
+            self.cleaned += 1
+            released.set()
+
+    replacement = Replacement()
+
+    class Voice:
+        source = SimpleNamespace(cleanup=Mock())
+
+        def is_connected(self) -> bool:
+            return True
+
+        def is_playing(self) -> bool:
+            return True
+
+        async def disconnect(self, *, force: bool) -> None:
+            assert force is True
+
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    output._voice = Voice()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _item: replacement,
+    )
+    task = asyncio.create_task(
+        output._swap_music_source(
+            AudioItem("source", "Replacement", "https://example.test/audio")
+        )
+    )
+    assert await asyncio.to_thread(read_started.wait, 1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert released.is_set()
+    assert replacement.cleaned >= 1
+    assert output._preflight_poisoned is False
+    await output.disconnect()

@@ -48,9 +48,7 @@ def codex_feature_arguments(
     enabled_features = {
         "apps",
         "plugins",
-        "remote_plugin",
         "skill_search",
-        "tool_suggest",
     } if allow_discord_extensions else set()
     if allow_image_generation:
         enabled_features.add("image_generation")

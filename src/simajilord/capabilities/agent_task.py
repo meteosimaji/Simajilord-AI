@@ -22,12 +22,13 @@ class TaskRouteRequest:
             "description": "Copy the pending candidate_event_id from the host pointer exactly."
         }
     )
-    decision: Literal["attach", "separate", "finish"] = field(
+    decision: Literal["attach", "separate", "finish", "cancel"] = field(
         metadata={
             "description": (
                 "attach adds a genuine instruction to the active task; separate preserves it "
                 "as independent work; finish resolves a correction, resend, or no-new-work "
-                "event and asks the active task to conclude."
+                "event and asks the active task to conclude; cancel interrupts unfinished "
+                "work when the user is withdrawing it."
             )
         }
     )
@@ -37,7 +38,7 @@ class TaskRouteRequest:
 @dataclass(frozen=True, slots=True)
 class TaskRouteResponse:
     candidate_event_id: str
-    decision: Literal["attach", "separate", "finish"]
+    decision: Literal["attach", "separate", "finish", "cancel"]
     reason: str
     validated: bool
 
@@ -67,14 +68,14 @@ def build_task_route_endpoint() -> CapabilityEndpoint:
             name="turn.route_task_event",
             summary=(
                 "After reading the exact pending Discord candidate, choose the typed "
-                "relationship to the active task: attach, separate, or finish. This is "
+                "relationship to the active task: attach, separate, finish, or cancel. This is "
                 "semantic model judgment; the host does not classify message text."
             ),
             risk=RiskLevel.READ,
             keywords=(
                 "task routing",
                 "follow-up decision",
-                "attach separate finish",
+                "attach separate finish cancel",
                 "タスク振り分け",
             ),
             idempotency="read",

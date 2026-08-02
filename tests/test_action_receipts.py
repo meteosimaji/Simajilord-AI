@@ -23,6 +23,10 @@ from simajilord.agent.actions import (
 from simajilord.agent.errors import AgentToolError
 from simajilord.agent.tools import AgentToolCatalog
 from simajilord.capabilities.audio import AudioControlResponse, AudioVolumeRequest
+from simajilord.capabilities.connectors import (
+    ConnectorInvokeRequest,
+    ConnectorInvokeResponse,
+)
 from simajilord.capabilities.focus_timer import (
     FocusTimerCancelRequest,
     FocusTimerCreateRequest,
@@ -441,6 +445,51 @@ async def test_receipt_persistence_failure_returns_untracked_without_fake_id(
             },
         )
     ]
+
+
+async def test_connector_receipt_keeps_service_and_tool_ids_only(
+    tmp_path: Path,
+) -> None:
+    journal = RecordingJournal()
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / "actions.sqlite3"),
+        registry=CapabilityRegistry(),
+        journal=journal,
+    )
+    request = ConnectorInvokeRequest(
+        connector_id="connector_figma",
+        tool="figma.generate_figma_design",
+        contract_id="con_secret_contract",
+        arguments={"prompt": "private design prompt"},
+    )
+    response = ConnectorInvokeResponse(
+        connector_id="connector_figma",
+        connector_name="Figma",
+        tool="figma.generate_figma_design",
+        action_class="write",
+        destructive_hint=True,
+        content='{"private":"result"}',
+        content_truncated=False,
+    )
+
+    receipt = await service.record(
+        capability="connector.write",
+        request=request,
+        response=response,
+        context=_context(),
+    )
+
+    assert receipt is not None
+    assert receipt.tracked is True
+    payload = journal.entries[-1][1]
+    assert payload["target_ids"] == {
+        "connector_id": "connector_figma",
+        "tool": "figma.generate_figma_design",
+    }
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "private design prompt" not in serialized
+    assert "con_secret_contract" not in serialized
+    assert '"private":"result"' not in serialized
 
 
 async def test_host_post_receipt_keeps_only_ids_and_deletes_the_bot_post(

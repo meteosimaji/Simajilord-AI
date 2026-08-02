@@ -372,3 +372,166 @@ async def test_full_audit_queue_spools_without_blocking_capability_result(
         "test.queued",
         "test.overflow",
     }
+
+
+@pytest.mark.asyncio
+async def test_unexpected_audit_writer_failure_recovers_inflight_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal = EventJournal(tmp_path / "events.sqlite3")
+    original_write = journal._write_audit_batch_safely
+    attempts = 0
+
+    async def crash_once(events: tuple[object, ...]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("injected writer crash")
+        await original_write(events)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(journal, "_write_audit_batch_safely", crash_once)
+    await journal.record_invocation(
+        capability_name="test.writer_crash",
+        context=InvocationContext("actor", "workspace", "test", "request"),
+        request={},
+        response={},
+        error=None,
+        duration_ms=1,
+    )
+
+    records = await asyncio.wait_for(journal.recent(), timeout=1)
+    health = await journal.audit_health()
+    assert len(records) == 1
+    assert records[0].payload["capability"] == "test.writer_crash"
+    assert health.lost_event_count == 0
+    assert health.last_failure_type == "RuntimeError"
+    await asyncio.wait_for(journal.close(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_close_recovers_queued_events_after_writer_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.sqlite3"
+    journal = EventJournal(path)
+
+    async def crash(_events: tuple[object, ...]) -> None:
+        raise RuntimeError("persistent injected writer crash")
+
+    monkeypatch.setattr(journal, "_write_audit_batch_safely", crash)
+    for index in range(3):
+        await journal.record_invocation(
+            capability_name=f"test.close_crash_{index}",
+            context=InvocationContext("actor", "workspace", "test", str(index)),
+            request={},
+            response={},
+            error=None,
+            duration_ms=1,
+        )
+
+    await asyncio.wait_for(journal.close(), timeout=1)
+    reopened = EventJournal(path)
+    records = await asyncio.wait_for(reopened.recent(limit=10), timeout=1)
+    assert {record.payload["capability"] for record in records} == {
+        "test.close_crash_0",
+        "test.close_crash_1",
+        "test.close_crash_2",
+    }
+    assert (await reopened.audit_health()).lost_event_count == 0
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_writer_preserves_all_event_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    journal = EventJournal(tmp_path / "events.sqlite3")
+    original_write = journal._write_audit_batch_safely
+    write_started = asyncio.Event()
+
+    async def blocked_write(_events: tuple[object, ...]) -> None:
+        write_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(journal, "_write_audit_batch_safely", blocked_write)
+    context = InvocationContext("actor", "workspace", "test", "request")
+    await journal.record_invocation(
+        capability_name="test.cancelled_writer_0",
+        context=context,
+        request={},
+        response={},
+        error=None,
+        duration_ms=1,
+    )
+    await asyncio.wait_for(write_started.wait(), timeout=1)
+    for index in (1, 2):
+        await journal.record_invocation(
+            capability_name=f"test.cancelled_writer_{index}",
+            context=context,
+            request={},
+            response={},
+            error=None,
+            duration_ms=1,
+        )
+
+    writer = journal._audit_writer_task
+    assert writer is not None
+    writer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await writer
+    monkeypatch.setattr(journal, "_write_audit_batch_safely", original_write)
+
+    records = await asyncio.wait_for(journal.recent(limit=10), timeout=1)
+    assert {record.payload["capability"] for record in records} == {
+        "test.cancelled_writer_0",
+        "test.cancelled_writer_1",
+        "test.cancelled_writer_2",
+    }
+    assert len({record.event_id for record in records}) == 3
+    assert (await journal.audit_health()).lost_event_count == 0
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_outbox_cleanup_failure_does_not_duplicate_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.sqlite3"
+    journal = EventJournal(path)
+
+    def unavailable_database(_events: tuple[object, ...]) -> None:
+        raise sqlite3.OperationalError("injected primary failure")
+
+    monkeypatch.setattr(journal, "_insert_batch", unavailable_database)
+    await journal.record_invocation(
+        capability_name="test.cleanup_idempotency",
+        context=InvocationContext("actor", "workspace", "test", "request"),
+        request={},
+        response={},
+        error=None,
+        duration_ms=1,
+    )
+    await journal.close()
+    assert (await journal.audit_health()).outbox_event_count == 1
+
+    replayed = EventJournal(path)
+    original_delete = replayed._outbox_delete
+
+    def cleanup_failure(_event_ids: tuple[str, ...]) -> None:
+        raise sqlite3.OperationalError("injected cleanup failure")
+
+    monkeypatch.setattr(replayed, "_outbox_delete", cleanup_failure)
+    first = await asyncio.wait_for(replayed.recent(limit=10), timeout=1)
+    assert len(first) == 1
+    assert (await replayed.audit_health()).outbox_event_count == 1
+
+    monkeypatch.setattr(replayed, "_outbox_delete", original_delete)
+    second = await asyncio.wait_for(replayed.recent(limit=10), timeout=1)
+    assert len(second) == 1
+    assert second[0].event_id == first[0].event_id
+    assert (await replayed.audit_health()).outbox_event_count == 0
+    await replayed.close()
