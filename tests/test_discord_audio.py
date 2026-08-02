@@ -27,12 +27,14 @@ def test_discord_source_is_preencoded_opus(tmp_path) -> None:
     source = build_discord_audio_source(
         AudioItem(str(path), "Silence", path.as_uri(), volume=0.75)
     )
+    stdout = source._stdout
     try:
         assert source.is_opus()
         arguments = " ".join(str(value) for value in source._process.args)
         assert "volume=0.750000" in arguments
     finally:
         source.cleanup()
+    assert stdout.closed
 
 
 def test_discord_source_uses_bounded_fades(tmp_path) -> None:
@@ -86,6 +88,7 @@ def test_discord_source_keeps_music_at_a_stable_duck_level_during_speech(
             speech_overlay_volume=1.25,
         )
     )
+    stdout = source._stdout
     try:
         arguments = " ".join(str(value) for value in source._process.args)
         assert "sidechaincompress=" not in arguments
@@ -106,6 +109,7 @@ def test_discord_source_keeps_music_at_a_stable_duck_level_during_speech(
         assert packets >= 40
     finally:
         source.cleanup()
+    assert stdout.closed
 
 
 def test_standalone_speech_is_loudness_normalized_before_user_volume(

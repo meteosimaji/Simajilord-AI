@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import hashlib
 import json
 import os
@@ -94,32 +95,50 @@ def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
         temporary_directory = workspace / ".tmp"
         temporary_directory.mkdir(mode=0o700, exist_ok=True)
         profile = _macos_sandbox_profile(workspace)
-        process = await asyncio.create_subprocess_exec(
-            "/usr/bin/sandbox-exec",
-            "-p",
-            profile,
-            "/usr/bin/env",
-            "-i",
-            f"PATH={_SYSTEM_PATH}",
-            f"HOME={workspace}",
-            f"TMPDIR={temporary_directory}",
-            *request.argv,
-            cwd=working_directory,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/sandbox-exec",
+                "-p",
+                profile,
+                "/usr/bin/env",
+                "-i",
+                f"PATH={_SYSTEM_PATH}",
+                f"HOME={workspace}",
+                f"TMPDIR={temporary_directory}",
+                *request.argv,
+                cwd=working_directory,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise UserError("shell.launch_failed") from exc
+        if process.stdout is None or process.stderr is None:
+            await _terminate_process_group(process)
+            raise UserError("shell.launch_failed")
+        stdout_task = asyncio.create_task(
+            _read_bounded_stream(process.stdout),
+            name="simajilord-shell-stdout",
+        )
+        stderr_task = asyncio.create_task(
+            _read_bounded_stream(process.stderr),
+            name="simajilord-shell-stderr",
         )
         timed_out = False
         try:
             async with asyncio.timeout(request.timeout_seconds):
-                stdout_bytes, stderr_bytes = await process.communicate()
+                await process.wait()
         except TimeoutError:
             timed_out = True
-            _kill_process_group(process)
-            stdout_bytes, stderr_bytes = await process.communicate()
-        stdout, stdout_truncated = _bounded_output(stdout_bytes)
-        stderr, stderr_truncated = _bounded_output(stderr_bytes)
+            await _terminate_process_group(process)
+        except BaseException:
+            await _terminate_process_group(process)
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            raise
+        stdout_result, stderr_result = await asyncio.gather(stdout_task, stderr_task)
+        stdout, stdout_truncated = stdout_result
+        stderr, stderr_truncated = stderr_result
         return IsolatedShellResponse(
             exit_code=process.returncode,
             stdout=stdout,
@@ -145,8 +164,11 @@ def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
             idempotency="non_idempotent_write",
             expected_errors=(
                 "shell.arguments_invalid",
+                "shell.timeout_invalid",
+                "shell.login_shell_forbidden",
                 "shell.working_directory_invalid",
                 "shell.isolation_unavailable",
+                "shell.launch_failed",
             ),
             timeout_seconds=_MAX_TIMEOUT_SECONDS + 5,
             audit_payload="metadata",
@@ -205,15 +227,33 @@ def _macos_sandbox_profile(workspace: Path) -> str:
     )
 
 
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
     with suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
+    await process.wait()
 
 
-def _bounded_output(value: bytes) -> tuple[str, bool]:
-    text = value.decode("utf-8", errors="replace")
-    if len(text) <= _MAX_OUTPUT_CHARACTERS:
-        return text, False
-    return text[:_MAX_OUTPUT_CHARACTERS], True
+async def _read_bounded_stream(stream: asyncio.StreamReader) -> tuple[str, bool]:
+    """Drain a child pipe while retaining only the bounded response prefix."""
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    chunks: list[str] = []
+    retained = 0
+    truncated = False
+
+    def accept(text: str) -> None:
+        nonlocal retained, truncated
+        remaining = max(0, _MAX_OUTPUT_CHARACTERS - retained)
+        accepted = text[:remaining]
+        if accepted:
+            chunks.append(accepted)
+            retained += len(accepted)
+        if len(accepted) != len(text):
+            truncated = True
+
+    while chunk := await stream.read(16 * 1024):
+        accept(decoder.decode(chunk))
+    accept(decoder.decode(b"", final=True))
+    return "".join(chunks), truncated

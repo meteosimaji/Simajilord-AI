@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shlex
 import shutil
+from contextlib import suppress
 from dataclasses import replace
 from time import monotonic
 
@@ -19,6 +20,22 @@ _SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
 _EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
 _READ_ALOUD_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 _MUSIC_DUCK_GAIN = 0.25
+
+
+class _ManagedFFmpegOpusAudio(discord.FFmpegOpusAudio):
+    """Close discord.py's child pipes even when FFmpeg already reached EOF."""
+
+    def cleanup(self) -> None:
+        streams = tuple(
+            getattr(self, name, None)
+            for name in ("_stdout", "_stdin", "_stderr")
+        )
+        super().cleanup()
+        for stream in streams:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                with suppress(OSError):
+                    close()
 
 
 class _PrefetchedAudioSource(discord.AudioSource):
@@ -370,7 +387,7 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
         options = ["-vn"]
         if filters:
             options.extend(("-filter:a", ",".join(filters)))
-    return discord.FFmpegOpusAudio(
+    return _ManagedFFmpegOpusAudio(
         item.source,
         before_options=shlex.join(before_parts),
         options=shlex.join(options),

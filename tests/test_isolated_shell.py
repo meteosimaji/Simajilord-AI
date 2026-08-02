@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -92,6 +94,93 @@ async def test_isolated_shell_rejects_directory_escape(tmp_path: Path) -> None:
             IsolatedShellRequest(argv=("/bin/pwd",), working_directory="../"),
             _context(),
         )
+
+
+@pytest.mark.asyncio
+async def test_isolated_shell_contract_lists_every_validation_error(tmp_path: Path) -> None:
+    endpoint = build_isolated_shell_endpoint(tmp_path / "workspaces")
+
+    assert set(endpoint.descriptor.expected_errors) == {
+        "shell.arguments_invalid",
+        "shell.timeout_invalid",
+        "shell.login_shell_forbidden",
+        "shell.working_directory_invalid",
+        "shell.isolation_unavailable",
+        "shell.launch_failed",
+    }
+    with pytest.raises(UserError, match=r"shell\.timeout_invalid"):
+        await endpoint.invoke(
+            IsolatedShellRequest(argv=("/bin/pwd",), timeout_seconds=0),
+            _context(),
+        )
+    with pytest.raises(UserError, match=r"shell\.login_shell_forbidden"):
+        await endpoint.invoke(
+            IsolatedShellRequest(argv=("/bin/sh", "-l")),
+            _context(),
+        )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt integration")
+@pytest.mark.asyncio
+async def test_isolated_shell_bounds_output_without_blocking_child(tmp_path: Path) -> None:
+    registry = CapabilityRegistry()
+    registry.register(build_isolated_shell_endpoint(tmp_path / "workspaces"))
+
+    response = await registry.invoke(
+        "system.shell",
+        IsolatedShellRequest(argv=("/usr/bin/printf", "%s", "x" * 20_000)),
+        _context(),
+    )
+
+    assert isinstance(response, IsolatedShellResponse)
+    assert response.exit_code == 0
+    assert response.stdout == "x" * 12_000
+    assert response.stdout_truncated is True
+    assert response.stderr_truncated is False
+
+    unicode_response = await registry.invoke(
+        "system.shell",
+        IsolatedShellRequest(argv=("/usr/bin/printf", "%s", "界" * 13_000)),
+        _context(),
+    )
+    assert isinstance(unicode_response, IsolatedShellResponse)
+    assert unicode_response.stdout == "界" * 12_000
+    assert unicode_response.stdout_truncated is True
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt integration")
+@pytest.mark.asyncio
+async def test_isolated_shell_cancellation_terminates_process_group(tmp_path: Path) -> None:
+    registry = CapabilityRegistry()
+    workspace_root = tmp_path / "workspaces"
+    registry.register(build_isolated_shell_endpoint(workspace_root))
+    workspace = discord_workspace_for_context(workspace_root, _context())
+    task = asyncio.create_task(
+        registry.invoke(
+            "system.shell",
+            IsolatedShellRequest(
+                argv=(
+                    "/bin/sh",
+                    "-c",
+                    "echo $$ > process.pid; exec /bin/sleep 60",
+                ),
+            ),
+            _context(),
+        )
+    )
+    pid_file = workspace / "process.pid"
+    for _ in range(100):
+        if pid_file.is_file():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.is_file()
+    pid = int(pid_file.read_text(encoding="utf-8").strip())
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS Seatbelt integration")
