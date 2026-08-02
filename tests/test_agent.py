@@ -3330,6 +3330,7 @@ async def test_autonomy_saturation_preserves_an_interactive_active_slot(
     tmp_path: Path,
 ) -> None:
     entered: list[str] = []
+    interactive_provider_entered = asyncio.Event()
     release = asyncio.Event()
 
     class BlockingProvider(FakeProvider):
@@ -3342,6 +3343,8 @@ async def test_autonomy_saturation_preserves_an_interactive_active_slot(
             on_progress: object = None,
         ) -> ProviderTurnResult:
             entered.append(context.request_id)
+            if context.request_id == "interactive-reserved-slot":
+                interactive_provider_entered.set()
             await release.wait()
             return await super().respond(
                 provider_thread_id=provider_thread_id,
@@ -3393,10 +3396,7 @@ async def test_autonomy_saturation_preserves_an_interactive_active_slot(
     )
     interactive = asyncio.create_task(service.respond(interactive_request))
     await _wait_for_turn_counts(service, active=4, pending=1)
-    for _ in range(100):
-        if interactive_request.event_id in entered:
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(interactive_provider_entered.wait(), timeout=1)
 
     assert interactive_request.event_id in entered
     assert "autonomous-reserve-3" not in entered
