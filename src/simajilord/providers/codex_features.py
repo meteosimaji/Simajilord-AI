@@ -41,19 +41,32 @@ _DISABLED_CODEX_FEATURES = (
 def codex_feature_arguments(
     *,
     allow_image_generation: bool = False,
+    allow_discord_extensions: bool = False,
 ) -> tuple[str, ...]:
     """Disable unrelated hosted features and opt into images explicitly."""
 
+    enabled_features = {
+        "apps",
+        "plugins",
+        "remote_plugin",
+        "skill_search",
+        "tool_suggest",
+    } if allow_discord_extensions else set()
+    if allow_image_generation:
+        enabled_features.add("image_generation")
     disabled = tuple(
         feature
         for feature in _DISABLED_CODEX_FEATURES
-        if not (allow_image_generation and feature == "image_generation")
+        if feature not in enabled_features
     )
-    arguments = tuple(
+    enabled_arguments = tuple(
+        argument
+        for feature in sorted(enabled_features)
+        for argument in ("--enable", feature)
+    )
+    disabled_arguments = tuple(
         argument
         for feature in disabled
         for argument in ("--disable", feature)
     )
-    if allow_image_generation:
-        return ("--enable", "image_generation", *arguments)
-    return arguments
+    return (*enabled_arguments, *disabled_arguments)

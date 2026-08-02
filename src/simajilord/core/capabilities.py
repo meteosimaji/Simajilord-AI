@@ -25,6 +25,7 @@ CapabilityIdempotency = Literal[
     "idempotent_write",
     "non_idempotent_write",
 ]
+CapabilityAuditPayload = Literal["full", "metadata"]
 log = logging.getLogger(__name__)
 
 
@@ -83,6 +84,7 @@ class CapabilityDescriptor:
     expected_errors: tuple[str, ...] = ()
     timeout_seconds: float | None = None
     user_visible_effect: str | None = None
+    audit_payload: CapabilityAuditPayload = "full"
 
     def __post_init__(self) -> None:
         """Reject metadata that would teach an agent contradictory behavior."""
@@ -252,6 +254,7 @@ class CapabilityRegistry:
         except Exception as exc:
             await self._record_invocation_safely(
                 capability_name=name,
+                audit_payload=selected.descriptor.audit_payload,
                 context=context,
                 request=request,
                 response=None,
@@ -261,6 +264,7 @@ class CapabilityRegistry:
             raise
         await self._record_invocation_safely(
             capability_name=name,
+            audit_payload=selected.descriptor.audit_payload,
             context=context,
             request=request,
             response=response,
@@ -273,6 +277,7 @@ class CapabilityRegistry:
         self,
         *,
         capability_name: str,
+        audit_payload: CapabilityAuditPayload,
         context: InvocationContext,
         request: object,
         response: object | None,
@@ -286,6 +291,7 @@ class CapabilityRegistry:
         try:
             await self._journal.record_invocation(
                 capability_name=capability_name,
+                audit_payload=audit_payload,
                 context=context,
                 request=request,
                 response=response,
@@ -330,6 +336,7 @@ class InvocationJournal(Protocol):
         self,
         *,
         capability_name: str,
+        audit_payload: CapabilityAuditPayload = "full",
         context: InvocationContext,
         request: object,
         response: object | None,

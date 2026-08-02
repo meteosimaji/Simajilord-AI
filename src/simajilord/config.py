@@ -52,6 +52,7 @@ class Settings:
     command_prefix: str
     log_level: str
     data_dir: Path
+    discord_agent_workspace_dir: Path
     data_retention_days: int
     max_data_size_bytes: int
     media_cookie_file: Path | None
@@ -422,6 +423,15 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with suppress(OSError):
         data_dir.chmod(0o700)
+    raw_discord_agent_workspace_dir = os.getenv(
+        "DISCORD_AGENT_WORKSPACE_DIR",
+        "",
+    ).strip()
+    discord_agent_workspace_dir = (
+        Path(raw_discord_agent_workspace_dir).expanduser().resolve()
+        if raw_discord_agent_workspace_dir
+        else data_dir / "discord_agent_workspaces"
+    )
 
     tts_provider = os.getenv("TTS_PROVIDER", "macos").strip().lower()
     if tts_provider not in {"macos", "voicevox"}:
@@ -620,6 +630,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         command_prefix=command_prefix,
         log_level=log_level,
         data_dir=data_dir,
+        discord_agent_workspace_dir=discord_agent_workspace_dir,
         data_retention_days=data_retention_days,
         max_data_size_bytes=max_data_size_bytes,
         media_cookie_file=_optional_private_file("MEDIA_COOKIE_FILE"),

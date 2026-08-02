@@ -237,6 +237,11 @@ async def test_provider_starts_new_threads_with_stable_history_mode(
     assert method == "thread/start"
     assert params["ephemeral"] is False
     assert params["historyMode"] == CODEX_THREAD_HISTORY_MODE == "legacy"
+    thread_workspace = provider._workspace_for_context(context)
+    assert params["cwd"] == str(thread_workspace)
+    assert params["permissions"] == "simajilord_discord"
+    assert "sandbox" not in params
+    assert params["runtimeWorkspaceRoots"] == [str(thread_workspace)]
     base_instructions = str(params["baseInstructions"])
     assert "https://github.com/meteosimaji/Simajilord-AI" in base_instructions
     assert "your own implementation and source code" in " ".join(base_instructions.split())

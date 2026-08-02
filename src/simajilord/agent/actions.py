@@ -722,6 +722,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "speech.read_aloud_dictionary_set",
         "speech.read_aloud_dictionary_remove",
         "speech.read_aloud_exclusion_set",
+        "system.shell",
         "discord.analyze_attachment",
         "discord.delete_own_message",
         "discord.delete_own_messages",

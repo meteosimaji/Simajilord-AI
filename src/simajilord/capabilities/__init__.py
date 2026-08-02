@@ -50,6 +50,12 @@ from .image import (
     ImageStatusResponse,
     build_image_endpoints,
 )
+from .isolated_shell import (
+    IsolatedShellRequest,
+    IsolatedShellResponse,
+    build_isolated_shell_endpoint,
+    discord_workspace_for_context,
+)
 from .media import (
     DownloadRequest,
     DownloadResponse,
@@ -168,6 +174,8 @@ __all__ = [
     "ImageGenerateResponse",
     "ImageStatusRequest",
     "ImageStatusResponse",
+    "IsolatedShellRequest",
+    "IsolatedShellResponse",
     "MediaSaveRequest",
     "MediaSaveResponse",
     "ModerationStatusRequest",
@@ -211,6 +219,7 @@ __all__ = [
     "build_file_endpoints",
     "build_focus_timer_endpoints",
     "build_image_endpoints",
+    "build_isolated_shell_endpoint",
     "build_media_save_endpoint",
     "build_moderation_endpoints",
     "build_read_aloud_endpoint",
@@ -222,4 +231,5 @@ __all__ = [
     "build_translation_endpoints",
     "build_utility_endpoints",
     "build_web_endpoints",
+    "discord_workspace_for_context",
 ]

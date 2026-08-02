@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from uuid import uuid4
 
-from simajilord.core.capabilities import InvocationContext
+from simajilord.core.capabilities import CapabilityAuditPayload, InvocationContext
 
 _SENSITIVE_PARTS = (
     "token",
@@ -116,6 +116,7 @@ class EventJournal:
         self,
         *,
         capability_name: str,
+        audit_payload: CapabilityAuditPayload = "full",
         context: InvocationContext,
         request: object,
         response: object | None,
@@ -130,13 +131,18 @@ class EventJournal:
             "provider_thread_id": context.provider_thread_id,
             "provider_turn_id": context.provider_turn_id,
             "tool_call_id": context.tool_call_id,
-            "request": _safe_value(request),
         }
-        if error is None:
-            payload["response"] = _safe_value(response)
+        if audit_payload == "full":
+            payload["request"] = _safe_value(request)
+            if error is None:
+                payload["response"] = _safe_value(response)
         else:
+            payload["request_fields"] = _value_field_names(request)
+            payload["response_fields"] = _value_field_names(response)
+        if error is not None:
             payload["error_type"] = type(error).__name__
-            payload["error_message"] = _bounded(str(error), 1_000)
+            if audit_payload == "full":
+                payload["error_message"] = _bounded(str(error), 1_000)
         if self._closed:
             raise RuntimeError("Event journal is closed.")
         self._ensure_audit_writer()
@@ -1034,6 +1040,16 @@ def _safe_value(value: object, *, key: str = "") -> object:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return _bounded(repr(value), 1_000)
+
+
+def _value_field_names(value: object | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return tuple(field.name for field in dataclasses.fields(value))
+    if isinstance(value, dict):
+        return tuple(sorted(_bounded(str(key), 200) for key in value))
+    return (type(value).__name__,)
 
 
 def _new_event_id() -> str:
