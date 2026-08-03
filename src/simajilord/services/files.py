@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import zipfile
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Literal, TypeAlias, cast
 
 from pypdf import PdfReader
 
@@ -49,6 +53,55 @@ _MEDIA_KINDS = {
     ".wav": "audio/wav",
     ".webm": "video/webm",
 }
+WorkspaceVisibility: TypeAlias = Literal[
+    "guild_public",
+    "restricted",
+    "uncertain",
+    "actor_private",
+]
+WorkspaceSourceVisibility: TypeAlias = Literal[
+    "guild_public",
+    "restricted",
+    "uncertain",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceFileProvenance:
+    """Bounded source label retained independently from file bytes."""
+
+    owner_actor_id: str
+    origin_guild_id: str | None = None
+    origin_channel_id: str | None = None
+    origin_message_id: str | None = None
+    origin_visibility: WorkspaceVisibility = "actor_private"
+    created_task_id: str | None = None
+    sensitivity: WorkspaceVisibility = "actor_private"
+    source_resources: tuple[
+        tuple[str, str, WorkspaceSourceVisibility], ...
+    ] = ()
+    declassified_at: str | None = None
+    declassified_by: str | None = None
+
+    def __post_init__(self) -> None:
+        scalar_values = (
+            self.owner_actor_id,
+            self.origin_guild_id,
+            self.origin_channel_id,
+            self.origin_message_id,
+            self.created_task_id,
+            self.declassified_at,
+            self.declassified_by,
+        )
+        if not self.owner_actor_id or any(
+            value is not None and len(value) > 200 for value in scalar_values
+        ):
+            raise ValueError("file provenance values must be bounded")
+        if len(self.source_resources) > 32 or any(
+            len(item) != 3 or any(not value or len(value) > 200 for value in item)
+            for item in self.source_resources
+        ):
+            raise ValueError("file provenance source resources must be bounded")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +110,7 @@ class WorkspaceFileRecord:
     size_bytes: int
     sha256: str
     kind: str
+    provenance: WorkspaceFileProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +126,7 @@ class WorkspaceReadResult:
     page_start: int | None = None
     next_page: int | None = None
     total_pages: int | None = None
+    provenance: WorkspaceFileProvenance | None = None
 
 
 class AgentFileSandbox:
@@ -90,9 +145,14 @@ class AgentFileSandbox:
         self.max_workspace_bytes = max_workspace_bytes
         self.max_files = max_files
         self._lock_guard = threading.Lock()
+        self._provenance_lock = threading.RLock()
         self._workspace_locks: dict[str, threading.RLock] = {}
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
+        self._provenance_path = self.root.with_name(
+            f"{self.root.name}.provenance.sqlite3"
+        )
+        self._initialize_provenance()
 
     def list(self, workspace_id: str) -> tuple[WorkspaceFileRecord, ...]:
         with self.locked_workspace(workspace_id):
@@ -109,7 +169,7 @@ class AgentFileSandbox:
                 raise UserError("files.symlink_forbidden")
             if not path.is_file():
                 continue
-            records.append(self._record(scope, path))
+            records.append(self._record(workspace_id, scope, path))
         return tuple(records)
 
     def import_bytes(
@@ -117,18 +177,23 @@ class AgentFileSandbox:
         workspace_id: str,
         relative_path: str,
         content: bytes,
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceFileRecord:
         with self.locked_workspace(workspace_id):
             return self._import_bytes_unlocked(
                 workspace_id,
                 relative_path,
                 content,
+                provenance=provenance,
             )
 
     def import_batch(
         self,
         workspace_id: str,
         files: Sequence[tuple[str, bytes]],
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> tuple[WorkspaceFileRecord, ...]:
         """Atomically validate and import a bounded group of generated files."""
 
@@ -148,11 +213,19 @@ class AgentFileSandbox:
                 if len(content) > self.max_file_bytes:
                     raise UserError("files.file_too_large")
                 destination = self._path(scope, relative_path)
+                current_record = current.get(relative_path)
                 prospective[relative_path] = WorkspaceFileRecord(
                     path=relative_path,
                     size_bytes=len(content),
                     sha256=hashlib.sha256(content).hexdigest(),
                     kind=workspace_file_kind(destination, content),
+                    provenance=(
+                        provenance
+                        if provenance is not None
+                        else current_record.provenance
+                        if current_record is not None
+                        else None
+                    ),
                 )
             if len(prospective) > self.max_files:
                 raise UserError("files.file_count_limit")
@@ -170,14 +243,24 @@ class AgentFileSandbox:
                 )
                 for relative_path in paths
             }
+            previous_provenance = {
+                relative_path: (
+                    current[relative_path].provenance
+                    if relative_path in current
+                    else None
+                )
+                for relative_path in paths
+            }
             committed: list[WorkspaceFileRecord] = []
             try:
                 for relative_path, content in files:
                     committed.append(
                         self._replace_bytes_unlocked(
                             scope,
+                            workspace_id,
                             relative_path,
                             content,
+                            provenance=provenance,
                         )
                     )
             except Exception:
@@ -186,11 +269,15 @@ class AgentFileSandbox:
                     destination = self._path(scope, relative_path)
                     if prior_content is None:
                         destination.unlink(missing_ok=True)
+                        self._delete_provenance(workspace_id, relative_path)
                     else:
                         self._replace_bytes_unlocked(
                             scope,
+                            workspace_id,
                             relative_path,
                             prior_content,
+                            provenance=previous_provenance[relative_path],
+                            replace_provenance=True,
                         )
                 raise
             return tuple(committed)
@@ -200,6 +287,8 @@ class AgentFileSandbox:
         workspace_id: str,
         relative_path: str,
         content: bytes,
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceFileRecord:
         if len(content) > self.max_file_bytes:
             raise UserError("files.file_too_large")
@@ -212,17 +301,36 @@ class AgentFileSandbox:
         used = sum(item.size_bytes for item in files)
         if used - existing_size + len(content) > self.max_workspace_bytes:
             raise UserError("files.workspace_quota")
-        return self._replace_bytes_unlocked(scope, relative_path, content)
+        return self._replace_bytes_unlocked(
+            scope,
+            workspace_id,
+            relative_path,
+            content,
+            provenance=provenance,
+        )
 
     def _replace_bytes_unlocked(
         self,
         scope: Path,
+        workspace_id: str,
         relative_path: str,
         content: bytes,
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
+        replace_provenance: bool = False,
     ) -> WorkspaceFileRecord:
         destination = self._path(scope, relative_path)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._assert_no_symlinks(scope, destination)
+        previous_provenance = self._load_provenance(workspace_id, relative_path)
+        next_provenance = previous_provenance
+        should_store_provenance = replace_provenance or provenance is not None
+        if replace_provenance:
+            next_provenance = provenance
+        elif provenance is not None:
+            next_provenance = merge_file_provenances(
+                (previous_provenance, provenance)
+            )
         with tempfile.NamedTemporaryFile(
             dir=destination.parent,
             prefix=".simajilord-",
@@ -232,11 +340,32 @@ class AgentFileSandbox:
             handle.write(content)
         try:
             temporary.chmod(0o600)
-            os.replace(temporary, destination)
-            destination.chmod(0o600)
+            # Persist the label first. A failed byte replacement can leave an
+            # over-restrictive label, while the inverse could expose unlabeled
+            # restricted bytes after a provenance database failure.
+            if should_store_provenance:
+                self._store_provenance(
+                    workspace_id,
+                    relative_path,
+                    next_provenance,
+                )
+            try:
+                os.replace(temporary, destination)
+                destination.chmod(0o600)
+            except Exception:
+                if should_store_provenance:
+                    # The retained label is at least as restrictive as the
+                    # attempted write if restoring the old label also fails.
+                    with suppress(Exception):
+                        self._store_provenance(
+                            workspace_id,
+                            relative_path,
+                            previous_provenance,
+                        )
+                raise
         finally:
             temporary.unlink(missing_ok=True)
-        return self._record(scope, destination)
+        return self._record(workspace_id, scope, destination)
 
     def write_text(
         self,
@@ -245,6 +374,7 @@ class AgentFileSandbox:
         content: str,
         *,
         expected_sha256: str | None = None,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceFileRecord:
         if "\x00" in content:
             raise UserError("files.text_invalid")
@@ -256,6 +386,7 @@ class AgentFileSandbox:
                 workspace_id,
                 relative_path,
                 content.encode("utf-8"),
+                provenance=provenance,
             )
 
     def replace_text(
@@ -266,6 +397,7 @@ class AgentFileSandbox:
         new: str,
         *,
         expected_sha256: str,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceFileRecord:
         if not old:
             raise UserError("files.replace_old_empty")
@@ -294,6 +426,7 @@ class AgentFileSandbox:
                 relative_path,
                 content.replace(old, new, 1),
                 expected_sha256=expected_sha256,
+                provenance=provenance,
             )
 
     @contextmanager
@@ -376,6 +509,7 @@ class AgentFileSandbox:
             page_start=selected_page_start,
             next_page=next_page,
             total_pages=total_pages,
+            provenance=self._load_provenance(workspace_id, relative_path),
         )
 
     def path_for_delivery(self, workspace_id: str, relative_path: str) -> Path:
@@ -394,6 +528,36 @@ class AgentFileSandbox:
         with self.locked_workspace(workspace_id):
             path = self.path_for_delivery(workspace_id, relative_path)
             return path.name, path.read_bytes()
+
+    def snapshot_for_delivery_with_provenance(
+        self,
+        workspace_id: str,
+        relative_path: str,
+    ) -> tuple[str, bytes, WorkspaceFileProvenance | None]:
+        """Read immutable delivery bytes and the corresponding source label."""
+
+        with self.locked_workspace(workspace_id):
+            path = self.path_for_delivery(workspace_id, relative_path)
+            return (
+                path.name,
+                path.read_bytes(),
+                self._load_provenance(workspace_id, relative_path),
+            )
+
+    def set_provenance(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        provenance: WorkspaceFileProvenance,
+    ) -> WorkspaceFileRecord:
+        """Attach a source label to one existing regular file."""
+
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            path = self._path(scope, relative_path)
+            self._assert_regular_file(path)
+            self._store_provenance(workspace_id, relative_path, provenance)
+            return self._record(workspace_id, scope, path)
 
     def validate_path(self, workspace_id: str, relative_path: str) -> None:
         """Validate a future workspace path without creating the target file."""
@@ -455,15 +619,234 @@ class AgentFileSandbox:
         if actual != expected:
             raise UserError("files.hash_conflict")
 
-    @staticmethod
-    def _record(scope: Path, path: Path) -> WorkspaceFileRecord:
+    def _record(
+        self,
+        workspace_id: str,
+        scope: Path,
+        path: Path,
+    ) -> WorkspaceFileRecord:
         data = path.read_bytes()
+        relative_path = path.relative_to(scope).as_posix()
         return WorkspaceFileRecord(
-            path=path.relative_to(scope).as_posix(),
+            path=relative_path,
             size_bytes=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
             kind=workspace_file_kind(path, data),
+            provenance=self._load_provenance(workspace_id, relative_path),
         )
+
+    def _initialize_provenance(self) -> None:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_provenance (
+                    workspace_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    owner_actor_id TEXT NOT NULL,
+                    origin_guild_id TEXT,
+                    origin_channel_id TEXT,
+                    origin_message_id TEXT,
+                    origin_visibility TEXT NOT NULL,
+                    created_task_id TEXT,
+                    sensitivity TEXT NOT NULL,
+                    source_resources_json TEXT NOT NULL,
+                    declassified_at TEXT,
+                    declassified_by TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, relative_path)
+                )
+                """
+            )
+        self._provenance_path.chmod(0o600)
+
+    def _load_provenance(
+        self,
+        workspace_id: str,
+        relative_path: str,
+    ) -> WorkspaceFileProvenance | None:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT owner_actor_id, origin_guild_id, origin_channel_id,
+                       origin_message_id, origin_visibility, created_task_id,
+                       sensitivity, source_resources_json, declassified_at,
+                       declassified_by
+                FROM file_provenance
+                WHERE workspace_id = ? AND relative_path = ?
+                """,
+                (workspace_id, relative_path),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw_resources = json.loads(str(row[7]))
+            source_resources = tuple(
+                (
+                    str(item[0]),
+                    str(item[1]),
+                    _source_visibility(str(item[2])),
+                )
+                for item in raw_resources
+            )
+            return WorkspaceFileProvenance(
+                owner_actor_id=str(row[0]),
+                origin_guild_id=str(row[1]) if row[1] is not None else None,
+                origin_channel_id=(
+                    str(row[2]) if row[2] is not None else None
+                ),
+                origin_message_id=(
+                    str(row[3]) if row[3] is not None else None
+                ),
+                origin_visibility=_provenance_visibility(str(row[4])),
+                created_task_id=str(row[5]) if row[5] is not None else None,
+                sensitivity=_provenance_visibility(str(row[6])),
+                source_resources=source_resources,
+                declassified_at=str(row[8]) if row[8] is not None else None,
+                declassified_by=str(row[9]) if row[9] is not None else None,
+            )
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise UserError("files.provenance_invalid") from exc
+
+    def _store_provenance(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        provenance: WorkspaceFileProvenance | None,
+    ) -> None:
+        if provenance is None:
+            self._delete_provenance(workspace_id, relative_path)
+            return
+        payload = asdict(provenance)
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.execute(
+                """
+                INSERT INTO file_provenance (
+                    workspace_id, relative_path, owner_actor_id,
+                    origin_guild_id, origin_channel_id, origin_message_id,
+                    origin_visibility, created_task_id, sensitivity,
+                    source_resources_json, declassified_at, declassified_by,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, relative_path) DO UPDATE SET
+                    owner_actor_id = excluded.owner_actor_id,
+                    origin_guild_id = excluded.origin_guild_id,
+                    origin_channel_id = excluded.origin_channel_id,
+                    origin_message_id = excluded.origin_message_id,
+                    origin_visibility = excluded.origin_visibility,
+                    created_task_id = excluded.created_task_id,
+                    sensitivity = excluded.sensitivity,
+                    source_resources_json = excluded.source_resources_json,
+                    declassified_at = excluded.declassified_at,
+                    declassified_by = excluded.declassified_by,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    workspace_id,
+                    relative_path,
+                    payload["owner_actor_id"],
+                    payload["origin_guild_id"],
+                    payload["origin_channel_id"],
+                    payload["origin_message_id"],
+                    payload["origin_visibility"],
+                    payload["created_task_id"],
+                    payload["sensitivity"],
+                    json.dumps(
+                        payload["source_resources"],
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                    payload["declassified_at"],
+                    payload["declassified_by"],
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def _delete_provenance(
+        self,
+        workspace_id: str,
+        relative_path: str,
+    ) -> None:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.execute(
+                "DELETE FROM file_provenance WHERE workspace_id = ? AND relative_path = ?",
+                (workspace_id, relative_path),
+            )
+
+
+def _provenance_visibility(value: str) -> WorkspaceVisibility:
+    if value not in {"guild_public", "restricted", "uncertain", "actor_private"}:
+        raise ValueError("invalid workspace provenance visibility")
+    return cast(WorkspaceVisibility, value)
+
+
+def _source_visibility(value: str) -> WorkspaceSourceVisibility:
+    if value not in {"guild_public", "restricted", "uncertain"}:
+        raise ValueError("invalid workspace provenance source visibility")
+    return cast(WorkspaceSourceVisibility, value)
+
+
+def _merge_file_provenance(
+    existing: WorkspaceFileProvenance | None,
+    incoming: WorkspaceFileProvenance,
+) -> WorkspaceFileProvenance:
+    if existing is None:
+        return incoming
+    source_resources = tuple(
+        dict.fromkeys((*existing.source_resources, *incoming.source_resources))
+    )[:32]
+    sensitivities = {existing.sensitivity, incoming.sensitivity}
+    if "uncertain" in sensitivities:
+        sensitivity: WorkspaceVisibility = "uncertain"
+    elif "actor_private" in sensitivities:
+        sensitivity = "actor_private"
+    elif "restricted" in sensitivities:
+        sensitivity = "restricted"
+    else:
+        sensitivity = "guild_public"
+    return WorkspaceFileProvenance(
+        owner_actor_id=existing.owner_actor_id,
+        origin_guild_id=existing.origin_guild_id or incoming.origin_guild_id,
+        origin_channel_id=(
+            existing.origin_channel_id or incoming.origin_channel_id
+        ),
+        origin_message_id=(
+            existing.origin_message_id or incoming.origin_message_id
+        ),
+        origin_visibility=existing.origin_visibility,
+        created_task_id=existing.created_task_id or incoming.created_task_id,
+        sensitivity=sensitivity,
+        source_resources=source_resources,
+    )
+
+
+def merge_file_provenances(
+    provenances: Iterable[WorkspaceFileProvenance | None],
+) -> WorkspaceFileProvenance | None:
+    """Conservatively combine every file source an arbitrary transform can read."""
+
+    merged: WorkspaceFileProvenance | None = None
+    for provenance in provenances:
+        if provenance is None:
+            continue
+        merged = (
+            provenance
+            if merged is None
+            else _merge_file_provenance(merged, provenance)
+        )
+    return merged
 
 
 def workspace_file_kind(path: Path, data: bytes) -> str:

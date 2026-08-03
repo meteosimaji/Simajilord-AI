@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 
 import discord
 
+from simajilord.capabilities.file_scope import file_workspace_id
 from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
@@ -19,10 +20,15 @@ from simajilord.core import (
 )
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.files import WorkspaceFileProvenance
 
 from .capabilities import (
     _audit_reason,
     _bounded_name,
+    _enforce_file_provenance_to_guild,
+    _enforce_file_provenance_to_unknown_audience,
+    _enforce_information_flow_to_guild,
+    _enforce_unknown_audience,
     _requested_guild,
     _require_guild_permission,
     _snowflake,
@@ -110,15 +116,27 @@ def build_discord_platform_asset_endpoints(
         context: InvocationContext,
     ) -> DiscordPlatformAssetResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         _require_asset_create_permission(request.kind, actor, bot)
         name = _bounded_name(request.name, "discord.expression_name_invalid")
-        content, filename = await _asset_bytes(
+        content, filename, provenance = await _asset_bytes(
             runtime,
             context,
             request.path,
             kind=request.kind,
         )
+        _enforce_file_provenance_to_guild(context, guild, provenance)
+        if request.kind == "application_emoji":
+            _enforce_unknown_audience(
+                context,
+                sink="global_application_emoji",
+            )
+            _enforce_file_provenance_to_unknown_audience(
+                context,
+                provenance,
+                sink="global_application_emoji",
+            )
         reason = _audit_reason(
             request.reason or f"Create {request.kind}",
             context,
@@ -171,6 +189,12 @@ def build_discord_platform_asset_endpoints(
         context: InvocationContext,
     ) -> DiscordPlatformAssetResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
+        if request.kind == "application_emoji":
+            _enforce_unknown_audience(
+                context,
+                sink="global_application_emoji",
+            )
         actor, bot = await _write_members(guild, context)
         _require_asset_manage_permission(request.kind, actor, bot)
         name = (
@@ -390,21 +414,21 @@ async def _asset_bytes(
     path: str,
     *,
     kind: DiscordPlatformAssetKind,
-) -> tuple[bytes, str]:
+) -> tuple[bytes, str, WorkspaceFileProvenance | None]:
     if "files" not in context.grants:
         raise UserError("files.grant_required")
     if runtime.files is None:
         raise UserError("files.disabled")
     if context.workspace_id is None:
         raise UserError("files.workspace_required")
-    filename, content = await asyncio.to_thread(
-        runtime.files.snapshot_for_delivery,
-        context.workspace_id,
+    filename, content, provenance = await asyncio.to_thread(
+        runtime.files.snapshot_for_delivery_with_provenance,
+        file_workspace_id(context),
         path,
     )
     if len(content) > _ASSET_SIZE_LIMITS[kind]:
         raise UserError("discord.expression_file_too_large")
-    return content, filename
+    return content, filename, provenance
 
 
 def _require_asset_create_permission(

@@ -21,6 +21,8 @@ from simajilord.domain.media import DownloadFormat
 from simajilord.services.files import AgentFileSandbox, WorkspaceFileRecord
 from simajilord.services.media import MediaPriority, MediaService
 
+from .file_scope import file_provenance, file_workspace_id
+
 
 @dataclass(frozen=True, slots=True)
 class DownloadRequest:
@@ -106,6 +108,7 @@ def build_media_save_endpoint(
         if not 1 <= request.max_items <= 4:
             raise UserError("media.item_limit_invalid")
         temporary = Path(tempfile.mkdtemp(prefix="simajilord-media-"))
+        scoped_workspace_id = file_workspace_id(context)
         try:
             batch = await media.download_many(
                 request.url,
@@ -126,8 +129,9 @@ def build_media_save_endpoint(
                 )
             records = await asyncio.to_thread(
                 files.import_batch,
-                context.workspace_id,
+                scoped_workspace_id,
                 tuple(pending_files),
+                provenance=file_provenance(context),
             )
             return MediaSaveResponse(
                 source_url=batch.artifacts[0].source_url,
@@ -143,7 +147,7 @@ def build_media_save_endpoint(
             name="media.save",
             summary=(
                 "Save video or audio from a supported public URL into the isolated "
-                "workspace for later file use or Discord delivery."
+                "actor/task workspace for later file use or Discord delivery."
             ),
             risk=RiskLevel.WRITE,
             keywords=(

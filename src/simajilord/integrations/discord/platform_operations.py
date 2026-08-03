@@ -23,6 +23,9 @@ from .capabilities import (
     _audit_reason,
     _bounded_name,
     _can_view_channel,
+    _enforce_information_flow_to_destination,
+    _enforce_source_to_destination,
+    _enforce_unknown_audience,
     _fetch_readable_message,
     _requested_guild,
     _require_channel_permissions,
@@ -162,6 +165,22 @@ def build_discord_platform_operation_endpoints(
         )
         if channel is None:
             raise UserError("discord.channel_unavailable")
+        if isinstance(
+            channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.ForumChannel,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            _enforce_information_flow_to_destination(
+                client,
+                context,
+                guild,
+                channel,
+            )
 
         if request.operation == "clone":
             if not isinstance(channel, discord.abc.GuildChannel):
@@ -192,6 +211,13 @@ def build_discord_platform_operation_endpoints(
             )
             if not isinstance(destination, discord.TextChannel):
                 raise UserError("discord.follow_destination_invalid")
+            _enforce_source_to_destination(
+                context,
+                guild,
+                channel,
+                guild,
+                destination,
+            )
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "read_message_history")
                 _require_channel_permissions(destination, member, "manage_webhooks")
@@ -351,7 +377,7 @@ def build_discord_platform_operation_endpoints(
             context,
             request.source_guild_id,
         )
-        _, message = await _fetch_readable_message(
+        source_channel, message = await _fetch_readable_message(
             source_guild,
             channel_id=request.source_channel_id,
             message_id=request.source_message_id,
@@ -363,6 +389,13 @@ def build_discord_platform_operation_endpoints(
             request.destination_channel_id,
             guild_id=request.destination_guild_id,
             required_permissions=("send_messages",),
+        )
+        _enforce_source_to_destination(
+            context,
+            source_guild,
+            source_channel,
+            destination_guild,
+            destination,
         )
         try:
             posted = await message.forward(destination)
@@ -410,6 +443,7 @@ def build_discord_platform_operation_endpoints(
         context: InvocationContext,
     ) -> DiscordSetBotPresenceResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_unknown_audience(context, sink="global_bot_presence")
         actor, _ = await _write_members(guild, context)
         await _require_global_application_permission(client, actor)
         activity_name = " ".join(request.activity_name.split())

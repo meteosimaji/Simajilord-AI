@@ -40,6 +40,10 @@ from typing import (
 
 import discord
 
+from simajilord.capabilities.file_scope import (
+    file_provenance,
+    file_workspace_id,
+)
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core import CapabilityEndpoint, InvocationContext
 from simajilord.core.errors import UserError
@@ -241,6 +245,7 @@ class _AuditSession:
                 }
             ),
             approvals=frozenset(self.endpoints),
+            agent_task_id="tsk_live_discord_capability_audit",
         )
 
     async def invoke(
@@ -637,15 +642,19 @@ class _AuditSession:
 
             if self.runtime.files is None:
                 raise RuntimeError("Temporary audit runtime has no file sandbox")
+            file_context = context()
+            file_workspace = file_workspace_id(file_context)
             self.runtime.files.import_bytes(
-                self.guild_id,
+                file_workspace,
                 "audit/probe.png",
                 _PNG_1X1,
+                provenance=file_provenance(file_context),
             )
             self.runtime.files.import_bytes(
-                self.guild_id,
+                file_workspace,
                 "audit/probe.txt",
                 b"Simajilord live audit attachment.\n",
+                provenance=file_provenance(file_context),
             )
             voice_channel = await self.invoke(
                 "discord.create_guild_resource",

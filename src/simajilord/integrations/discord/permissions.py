@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
 import discord
@@ -21,24 +22,66 @@ def permission_enabled(permissions: object, permission: str) -> bool:
 _permission_enabled = permission_enabled
 
 
-def agent_readable_channel_ids(
+@dataclass(frozen=True, slots=True)
+class RequesterPrincipal:
+    """A resolved human requester; absence is never a service identity."""
+
+    member: discord.Member
+
+    def __post_init__(self) -> None:
+        if self.member.bot:
+            raise ValueError("requester principal must be a human Discord member")
+
+
+@dataclass(frozen=True, slots=True)
+class ServicePrincipal:
+    """The Discord application member acting under a host policy."""
+
+    member: discord.Member
+
+    def __post_init__(self) -> None:
+        if not self.member.bot:
+            raise ValueError("service principal must be a Discord bot member")
+
+
+def readable_for_requester(
     guild: discord.Guild,
-    actor: discord.Member | None,
-    *,
-    trusted_guild: bool,
-    trigger_channel_id: int | None,
+    principal: RequesterPrincipal,
 ) -> tuple[str, ...]:
-    """Resolve channels readable by both the active requester and the bot.
+    """Resolve the live intersection of requester and BOT visibility."""
 
-    A trusted guild changes which agent capabilities may be exposed, but it must
-    never let the agent borrow the bot's wider message visibility.
-    """
-
-    del trigger_channel_id
     bot_member = guild.me
-    bot_principal = trusted_guild and actor is None
-    if bot_member is None or (actor is None and not bot_principal):
+    if bot_member is None:
         return ()
+    return _readable_channel_ids(
+        guild,
+        bot_member=bot_member,
+        requester=principal.member,
+    )
+
+
+def readable_for_service(
+    guild: discord.Guild,
+    principal: ServicePrincipal,
+) -> tuple[str, ...]:
+    """Resolve BOT visibility only for an explicitly typed service principal."""
+
+    bot_member = guild.me
+    if bot_member is None or principal.member.id != bot_member.id:
+        return ()
+    return _readable_channel_ids(
+        guild,
+        bot_member=bot_member,
+        requester=None,
+    )
+
+
+def _readable_channel_ids(
+    guild: discord.Guild,
+    *,
+    bot_member: discord.Member,
+    requester: discord.Member | None,
+) -> tuple[str, ...]:
     readable: list[str] = []
     forums = guild.forums
     if not isinstance(forums, (list, tuple)):
@@ -55,10 +98,10 @@ def agent_readable_channel_ids(
             continue
         if not can_read_private_thread(channel, bot_member):
             continue
-        if not bot_principal:
-            if actor is None or not can_read_messages(channel, actor):
+        if requester is not None:
+            if not can_read_messages(channel, requester):
                 continue
-            if not can_read_private_thread(channel, actor):
+            if not can_read_private_thread(channel, requester):
                 continue
         readable.append(str(channel.id))
     return tuple(sorted(readable, key=int))
@@ -93,7 +136,7 @@ def disclosure_audience_relation(
     destination_guild: discord.Guild,
     destination: DiscordReadableChannel,
 ) -> DiscordAudienceRelation:
-    """Compare actual effective audiences; reject only a provable mismatch."""
+    """Compare actual effective audiences without guessing incomplete membership."""
 
     if source_guild.id == destination_guild.id and source.id == destination.id:
         return "same_or_narrower"
@@ -107,6 +150,31 @@ def disclosure_audience_relation(
     if source_complete and destination_complete:
         return "same_or_narrower"
     return "uncertain"
+
+
+def read_aloud_audience_relation(
+    guild: discord.Guild,
+    source: DiscordReadableChannel,
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> DiscordAudienceRelation:
+    """Prove every current human voice listener can read the text source."""
+
+    member_count = guild.member_count
+    cache_complete = guild.chunked is True or (
+        isinstance(member_count, int)
+        and not isinstance(member_count, bool)
+        and len(guild.members) >= member_count
+    )
+    if not cache_complete:
+        return "uncertain"
+    listeners = tuple(member for member in destination.members if not member.bot)
+    if any(
+        not can_read_messages(source, listener)
+        or not can_read_private_thread(source, listener)
+        for listener in listeners
+    ):
+        return "broader"
+    return "same_or_narrower"
 
 
 def _effective_reader_ids(

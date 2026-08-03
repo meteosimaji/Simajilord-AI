@@ -20,6 +20,8 @@ from simajilord.services.compute import (
     WorkspaceDownloadResult,
 )
 
+from .file_scope import file_provenance, file_workspace_id
+
 
 @dataclass(frozen=True, slots=True)
 class ComputeRunRequest:
@@ -37,9 +39,12 @@ def build_compute_endpoints(
     service: WorkspaceComputeService,
 ) -> tuple[CapabilityEndpoint, ...]:
     def workspace(context: InvocationContext) -> str:
-        if context.workspace_id is None:
-            raise UserError("compute.workspace_required")
-        return context.workspace_id
+        try:
+            return file_workspace_id(context)
+        except UserError as exc:
+            if exc.code == "files.workspace_required":
+                raise UserError("compute.workspace_required") from exc
+            raise
 
     async def run(
         request: ComputeRunRequest,
@@ -49,6 +54,7 @@ def build_compute_endpoints(
             workspace(context),
             runtime=request.runtime,
             argv=request.argv,
+            provenance=file_provenance(context),
         )
 
     async def download_url(
@@ -59,6 +65,7 @@ def build_compute_endpoints(
             workspace(context),
             url=request.url,
             path=request.path,
+            provenance=file_provenance(context),
         )
 
     return (

@@ -30,6 +30,7 @@ from simajilord.agent import (
     AGENT_SHELL_GRANT,
     AGENT_WEB_GRANT,
     AgentAutonomyMode,
+    AgentAutonomyPolicyMode,
     AgentBusyError,
     AgentProgressStage,
     AgentProgressUpdate,
@@ -49,6 +50,7 @@ from simajilord.capabilities.audio import (
     AudioSearchReason,
     AudioSearchResponse,
 )
+from simajilord.capabilities.file_scope import file_provenance, file_workspace_id
 from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
     ReadAloudDictionarySetRequest,
@@ -93,7 +95,6 @@ from simajilord.integrations.discord.capabilities import (
     _message_preview,
     _prepare_discord_animated_media,
     _workspace_attachment_name,
-    agent_readable_channel_ids,
     build_discord_endpoints,
     discord_translation_segments,
     parse_discord_message_link,
@@ -157,6 +158,12 @@ from simajilord.integrations.discord.help_catalog import (
     PUBLIC_COMMAND_SPECS,
     PublicCommandSpec,
 )
+from simajilord.integrations.discord.permissions import (
+    RequesterPrincipal,
+    ServicePrincipal,
+    readable_for_requester,
+    readable_for_service,
+)
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox
 from simajilord.services.translation import TranslationPreference
@@ -195,9 +202,21 @@ async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
         return payload
 
     attachment.read = AsyncMock(side_effect=read)
+    source_guild = Mock(spec=discord.Guild)
+    source_guild.id = 10
+    source_channel = Mock(spec=discord.TextChannel)
+    source_channel.id = 1373866905357778984
+    source_message = Mock(spec=discord.Message)
+    source_message.id = 1531959431212961902
+    source_message.guild = source_guild
+    source_message.channel = source_channel
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._attachment",
-        AsyncMock(return_value=(Mock(spec=discord.Message), attachment)),
+        AsyncMock(return_value=(source_message, attachment)),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._channel_visibility",
+        lambda *_: "restricted",
     )
     runtime = Mock(spec=SimajilordRuntime)
     runtime.files = AgentFileSandbox(tmp_path / "agent-files")
@@ -227,7 +246,11 @@ async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
         "attachments/1531959431212961902/"
         "1531959430940201000-document.pdf"
     )
-    assert runtime.files.path_for_delivery("guild", response.path).read_bytes() == payload
+    assert runtime.files.path_for_delivery(
+        file_workspace_id(context), response.path
+    ).read_bytes() == payload
+    assert response.provenance is not None
+    assert response.provenance.origin_channel_id == "1373866905357778984"
     attachment.read.assert_awaited_once_with(use_cached=False)
 
 
@@ -278,10 +301,25 @@ async def test_agent_file_delivery_uses_the_guild_upload_limit(
 ) -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.files = AgentFileSandbox(tmp_path / "agent-files")
-    runtime.files.import_bytes("guild", "result.bin", b"12345")
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        resource_ids=("1",),
+        origin_resource_id="1",
+    )
+    runtime.files.import_bytes(
+        file_workspace_id(context),
+        "result.bin",
+        b"12345",
+        provenance=file_provenance(context),
+    )
     guild = Mock(spec=discord.Guild)
+    guild.id = "guild"
     guild.filesize_limit = 4
     channel = Mock(spec=discord.TextChannel)
+    channel.id = 1
     channel.send = AsyncMock()
     actor = Mock(spec=discord.Member)
     bot = Mock(spec=discord.Member)
@@ -300,14 +338,7 @@ async def test_agent_file_delivery_uses_the_guild_upload_limit(
     with pytest.raises(UserError, match=r"discord\.file_too_large"):
         await endpoints["discord.send_file"].invoke(
             DiscordSendFileRequest(channel_id="1", path="result.bin"),
-            InvocationContext(
-                actor_id="7",
-                workspace_id="guild",
-                transport="agent",
-                request_id="event",
-                resource_ids=("1",),
-                origin_resource_id="1",
-            ),
+            context,
         )
     channel.send.assert_not_awaited()
 
@@ -319,8 +350,23 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
 ) -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.files = AgentFileSandbox(tmp_path / "agent-files")
-    runtime.files.import_bytes("guild", "result.bin", b"authorized")
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        resource_ids=("1",),
+        origin_resource_id="1",
+    )
+    file_scope = file_workspace_id(context)
+    runtime.files.import_bytes(
+        file_scope,
+        "result.bin",
+        b"authorized",
+        provenance=file_provenance(context),
+    )
     guild = Mock(spec=discord.Guild)
+    guild.id = "guild"
     guild.filesize_limit = 100
     channel = Mock(spec=discord.TextChannel)
     channel.id = 1
@@ -341,7 +387,7 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
         assert suppress_embeds is True
         assert nonce.startswith("sla")
         assert len(nonce) == 25
-        runtime.files.import_bytes("guild", "result.bin", b"newer")
+        runtime.files.import_bytes(file_scope, "result.bin", b"newer")
         assert file.fp.read() == b"authorized"
         return sent
 
@@ -360,14 +406,7 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
 
     response = await endpoints["discord.send_file"].invoke(
         DiscordSendFileRequest(channel_id="1", path="result.bin"),
-        InvocationContext(
-            actor_id="7",
-            workspace_id="guild",
-            transport="agent",
-            request_id="event",
-            resource_ids=("1",),
-            origin_resource_id="1",
-        ),
+        context,
     )
 
     assert response.message_id == "99"
@@ -702,6 +741,7 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     runtime.settings.agent_connector_access = AgentFeatureAccess.ADMINS
     runtime.settings.agent_admin_user_ids = frozenset({"7"})
     runtime.settings.image_generation_access = AgentFeatureAccess.EVERYONE
+    runtime.settings.agent_autonomy_policy_mode = AgentAutonomyPolicyMode.STRICT
     runtime.files = object()
     runtime.compute = object()
     runtime.connectors = object()
@@ -731,13 +771,22 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
         AGENT_SHELL_GRANT,
     } <= requested
     assert not {AGENT_FILE_GRANT, AGENT_IMAGE_GRANT} & assist
+    assert not {
+        AGENT_FILE_GRANT,
+        AGENT_IMAGE_GRANT,
+        AGENT_COMPUTE_GRANT,
+        AGENT_MODERATION_GRANT,
+        AGENT_REPOST_GRANT,
+    } & act
+    runtime.settings.agent_autonomy_policy_mode = AgentAutonomyPolicyMode.LEGACY
+    legacy_act = _agent_grants(runtime, actor_id="99", autonomous=True)
     assert {
         AGENT_FILE_GRANT,
         AGENT_IMAGE_GRANT,
         AGENT_COMPUTE_GRANT,
         AGENT_MODERATION_GRANT,
         AGENT_REPOST_GRANT,
-    } <= act
+    } <= legacy_act
     assert AGENT_COMPUTE_GRANT in requested
     assert AGENT_COMPUTE_GRANT not in assist
     assert not {AGENT_CONNECTOR_GRANT, AGENT_SHELL_GRANT} & (assist | act)
@@ -755,6 +804,7 @@ def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:
     runtime.settings.agent_admin_user_ids = frozenset()
     runtime.settings.image_generation_access = AgentFeatureAccess.DISABLED
     runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ACT
+    runtime.settings.agent_autonomy_policy_mode = AgentAutonomyPolicyMode.STRICT
     runtime.files = None
     runtime.compute = None
     runtime.connectors = None
@@ -762,6 +812,12 @@ def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:
     runtime.image.provider = None
 
     assert AGENT_MODERATION_GRANT in _agent_grants(runtime, actor_id="7")
+    assert AGENT_MODERATION_GRANT not in _agent_grants(
+        runtime,
+        actor_id="99",
+        autonomous=True,
+    )
+    runtime.settings.agent_autonomy_policy_mode = AgentAutonomyPolicyMode.LEGACY
     assert AGENT_MODERATION_GRANT in _agent_grants(
         runtime,
         actor_id="99",
@@ -769,7 +825,7 @@ def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:
     )
 
 
-def test_destructive_approvals_are_exposed_only_to_act_autonomy() -> None:
+def test_destructive_autonomy_approvals_require_legacy_policy_mode() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.registry.all.return_value = tuple(
         SimpleNamespace(
@@ -781,11 +837,25 @@ def test_destructive_approvals_are_exposed_only_to_act_autonomy() -> None:
         for name in AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES
     )
 
-    assist = _autonomy_approvals(runtime, AgentAutonomyMode.ASSIST)
-    act = _autonomy_approvals(runtime, AgentAutonomyMode.ACT)
+    assist = _autonomy_approvals(
+        runtime,
+        AgentAutonomyMode.ASSIST,
+        policy_mode=AgentAutonomyPolicyMode.STRICT,
+    )
+    act = _autonomy_approvals(
+        runtime,
+        AgentAutonomyMode.ACT,
+        policy_mode=AgentAutonomyPolicyMode.STRICT,
+    )
+    legacy_act = _autonomy_approvals(
+        runtime,
+        AgentAutonomyMode.ACT,
+        policy_mode=AgentAutonomyPolicyMode.LEGACY,
+    )
 
     assert not set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) & assist
-    assert set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) <= act
+    assert not set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) & act
+    assert set(AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES) <= legacy_act
 
 
 def test_common_music_actions_have_short_top_level_commands() -> None:
@@ -3818,6 +3888,8 @@ def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
     guild = Mock(spec=discord.Guild)
     bot_member = Mock(spec=discord.Member)
     actor = Mock(spec=discord.Member)
+    bot_member.bot = True
+    actor.bot = False
     guild.me = bot_member
     allowed = Mock(spec=discord.TextChannel)
     hidden = Mock(spec=discord.TextChannel)
@@ -3834,18 +3906,15 @@ def test_regular_guild_scope_requires_both_bot_and_actor_visibility() -> None:
     )
     hidden.permissions_for.side_effect = lambda member: readable if member is bot_member else denied
 
-    assert agent_readable_channel_ids(
-        guild,
-        actor,
-        trusted_guild=False,
-        trigger_channel_id=10,
-    ) == ("10",)
+    assert readable_for_requester(guild, RequesterPrincipal(actor)) == ("10",)
 
 
 def test_trusted_guild_scope_never_borrows_the_bots_wider_visibility() -> None:
     guild = Mock(spec=discord.Guild)
     bot_member = Mock(spec=discord.Member)
     actor = Mock(spec=discord.Member)
+    bot_member.bot = True
+    actor.bot = False
     guild.me = bot_member
     channel = Mock(spec=discord.TextChannel)
     channel.id = 20
@@ -3859,17 +3928,14 @@ def test_trusted_guild_scope_never_borrows_the_bots_wider_visibility() -> None:
         readable if member is bot_member else denied
     )
 
-    assert agent_readable_channel_ids(
-        guild,
-        actor,
-        trusted_guild=True,
-        trigger_channel_id=10,
-    ) == ()
+    assert readable_for_requester(guild, RequesterPrincipal(actor)) == ()
 
 
-def test_trusted_autonomy_bot_principal_uses_only_bot_visibility() -> None:
+def test_explicit_service_principal_uses_only_bot_visibility() -> None:
     guild = Mock(spec=discord.Guild)
     bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
     guild.me = bot_member
     channel = Mock(spec=discord.TextChannel)
     channel.id = 20
@@ -3882,18 +3948,27 @@ def test_trusted_autonomy_bot_principal_uses_only_bot_visibility() -> None:
         read_message_history=True,
     )
 
-    assert agent_readable_channel_ids(
-        guild,
-        None,
-        trusted_guild=True,
-        trigger_channel_id=20,
-    ) == ("20",)
+    assert readable_for_service(guild, ServicePrincipal(bot_member)) == ("20",)
+
+
+def test_principal_types_reject_identity_confusion() -> None:
+    human = Mock(spec=discord.Member)
+    human.bot = False
+    bot = Mock(spec=discord.Member)
+    bot.bot = True
+
+    with pytest.raises(ValueError, match="requester principal"):
+        RequesterPrincipal(bot)
+    with pytest.raises(ValueError, match="service principal"):
+        ServicePrincipal(human)
 
 
 def test_voice_chat_requires_message_history_and_connect_permission() -> None:
     guild = Mock(spec=discord.Guild)
     bot_member = Mock(spec=discord.Member)
     actor = Mock(spec=discord.Member)
+    bot_member.bot = True
+    actor.bot = False
     guild.me = bot_member
     voice = Mock(spec=discord.VoiceChannel)
     voice.id = 30
@@ -3908,12 +3983,8 @@ def test_voice_chat_requires_message_history_and_connect_permission() -> None:
     )
     voice.permissions_for.return_value = readable
 
-    assert agent_readable_channel_ids(
-        guild,
-        actor,
-        trusted_guild=False,
-        trigger_channel_id=30,
-    ) == ("30",)
+    principal = RequesterPrincipal(actor)
+    assert readable_for_requester(guild, principal) == ("30",)
 
     voice.permissions_for.return_value = discord.Permissions(
         view_channel=True,
@@ -3921,12 +3992,7 @@ def test_voice_chat_requires_message_history_and_connect_permission() -> None:
         connect=False,
     )
     assert (
-        agent_readable_channel_ids(
-            guild,
-            actor,
-            trusted_guild=False,
-            trigger_channel_id=30,
-        )
+        readable_for_requester(guild, principal)
         == ()
     )
 

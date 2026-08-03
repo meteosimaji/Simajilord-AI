@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from simajilord.agent.tools import AgentToolCatalog
+from simajilord.capabilities.file_scope import file_workspace_id
 from simajilord.capabilities.media import (
     MediaSaveRequest,
     MediaSaveResponse,
@@ -520,18 +521,19 @@ async def test_media_save_creates_content_addressed_workspace_files(
 
     files = AgentFileSandbox(tmp_path / "files", max_file_bytes=100)
     capability = build_media_save_endpoint(FakeMedia(), files)  # type: ignore[arg-type]
+    context = InvocationContext("actor", "guild", "agent", "event")
     result = await capability.invoke(
         MediaSaveRequest("https://video.example/post"),
-        InvocationContext("actor", "guild", "agent", "event"),
+        context,
     )
 
     assert isinstance(result, MediaSaveResponse)
     assert len(result.files) == 2
     assert all(item.path.startswith("media/") for item in result.files)
     assert [item.size_bytes for item in result.files] == [11, 12]
-    assert files.path_for_delivery("guild", result.files[0].path).read_bytes() == (
-        b"first media"
-    )
+    assert files.path_for_delivery(
+        file_workspace_id(context), result.files[0].path
+    ).read_bytes() == b"first media"
 
 
 @pytest.mark.asyncio

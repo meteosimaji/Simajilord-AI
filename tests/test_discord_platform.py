@@ -10,10 +10,16 @@ from unittest.mock import AsyncMock, Mock
 import discord
 import pytest
 
-from simajilord.core import CapabilityEndpoint, InvocationContext
+from simajilord.capabilities.file_scope import file_workspace_id
+from simajilord.core import (
+    CapabilityEndpoint,
+    DisclosureObservation,
+    InvocationContext,
+)
 from simajilord.core.errors import UserError
 from simajilord.integrations.discord.capabilities import build_discord_endpoints
 from simajilord.integrations.discord.platform_actions import (
+    DiscordCreateGuildResourceRequest,
     DiscordSetChannelOverwriteRequest,
 )
 from simajilord.integrations.discord.platform_assets import (
@@ -36,6 +42,7 @@ from simajilord.integrations.discord.platform_operations import (
 )
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services import AgentFileSandbox
+from simajilord.services.files import WorkspaceFileProvenance
 
 
 def _context() -> InvocationContext:
@@ -938,7 +945,20 @@ async def test_platform_asset_creation_reads_only_the_workspace_snapshot(
 ) -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.files = AgentFileSandbox(tmp_path / "files")
-    runtime.files.import_bytes("1", "emoji.png", b"png")
+    context = _context()
+    runtime.files.import_bytes(
+        file_workspace_id(context),
+        "emoji.png",
+        b"png",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_id="7",
+            origin_guild_id="1",
+            origin_channel_id="10",
+            origin_visibility="guild_public",
+            sensitivity="guild_public",
+            source_resources=(("1", "10", "guild_public"),),
+        ),
+    )
     guild = Mock(spec=discord.Guild)
     guild.id = 1
     created = Mock(spec=discord.Emoji)
@@ -967,11 +987,109 @@ async def test_platform_asset_creation_reads_only_the_workspace_snapshot(
             name="simaji",
             path="emoji.png",
         ),
-        _context(),
+        context,
     )
 
     assert response.resource_id == "99"
     assert guild.create_custom_emoji.await_args.kwargs["image"] == b"png"
+
+
+@pytest.mark.asyncio
+async def test_application_emoji_rejects_undeclassified_workspace_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "files")
+    context = _context()
+    runtime.files.import_bytes(
+        file_workspace_id(context),
+        "emoji.png",
+        b"png",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_id="7",
+            origin_guild_id="1",
+            origin_channel_id="10",
+            origin_visibility="guild_public",
+            sensitivity="guild_public",
+            source_resources=(("1", "10", "guild_public"),),
+        ),
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    actor = _member_with_permissions(administrator=True)
+    bot = _member_with_permissions(administrator=True)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_assets._requested_guild",
+        lambda client, context, guild_id: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_assets._write_members",
+        AsyncMock(return_value=(actor, bot)),
+    )
+    client = Mock(spec=discord.Client)
+    client.create_application_emoji = AsyncMock()
+
+    with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
+        await _endpoints(
+            cast(discord.Client, client),
+            cast(SimajilordRuntime, runtime),
+        )["discord.create_platform_asset"].invoke(
+            DiscordCreatePlatformAssetRequest(
+                kind="application_emoji",
+                name="simaji",
+                path="emoji.png",
+            ),
+            context,
+        )
+
+    client.create_application_emoji.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_guild_template_rejects_unknown_target_audience(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_actions._requested_guild",
+        lambda client, context, guild_id: guild,
+    )
+    write_members = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.platform_actions._write_members",
+        write_members,
+    )
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="10",
+        disclosure_observations=(
+            DisclosureObservation(
+                source_workspace_id="1",
+                source_resource_id="10",
+                visibility="guild_public",
+                relation_to_origin="same_or_narrower",
+            ),
+        ),
+    )
+
+    with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
+        await _endpoints(
+            cast(discord.Client, Mock(spec=discord.Client)),
+            cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
+        )["discord.create_guild_resource"].invoke(
+            DiscordCreateGuildResourceRequest(
+                kind="template",
+                name="Public template",
+            ),
+            context,
+        )
+
+    write_members.assert_not_awaited()
 
 
 @pytest.mark.asyncio

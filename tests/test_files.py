@@ -4,13 +4,131 @@ import io
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pypdf import PdfWriter
 
+from simajilord.capabilities.file_scope import file_provenance, file_workspace_id
+from simajilord.core import DisclosureObservation, InvocationContext
 from simajilord.core.errors import UserError
-from simajilord.services.files import AgentFileSandbox
+from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
+
+
+def _agent_file_context(
+    *,
+    actor_id: str = "actor-a",
+    task_id: str = "task-a",
+    mode: Literal["actor_task", "actor", "guild_shared"] = "actor_task",
+) -> InvocationContext:
+    return InvocationContext(
+        actor_id=actor_id,
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="staff-channel",
+        active_message_id="message",
+        agent_task_id=task_id,
+        file_workspace_mode=mode,
+    )
+
+
+def test_agent_file_workspace_mode_isolates_actor_and_task() -> None:
+    context = _agent_file_context()
+    actor_scope = file_workspace_id(replace(context, file_workspace_mode="actor"))
+    task_scope = file_workspace_id(context)
+
+    assert task_scope != file_workspace_id(
+        _agent_file_context(actor_id="actor-b")
+    )
+    assert task_scope != file_workspace_id(
+        _agent_file_context(task_id="task-b")
+    )
+    assert actor_scope == file_workspace_id(
+        _agent_file_context(task_id="task-b", mode="actor")
+    )
+    assert file_workspace_id(
+        replace(context, file_workspace_mode="guild_shared")
+    ) == "guild"
+
+
+def test_file_provenance_persists_and_cannot_be_downgraded(
+    tmp_path: Path,
+) -> None:
+    context = replace(
+        _agent_file_context(),
+        disclosure_observations=(
+            DisclosureObservation(
+                source_workspace_id="guild",
+                source_resource_id="staff-channel",
+                visibility="restricted",
+                relation_to_origin="same_or_narrower",
+            ),
+        ),
+    )
+    workspace_id = file_workspace_id(context)
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    restricted = file_provenance(context)
+    sandbox.import_bytes(
+        workspace_id,
+        "notes.txt",
+        b"staff",
+        provenance=restricted,
+    )
+    public = WorkspaceFileProvenance(
+        owner_actor_id=context.actor_id,
+        origin_guild_id="guild",
+        origin_channel_id="public-channel",
+        origin_visibility="guild_public",
+        created_task_id=context.agent_task_id,
+        sensitivity="guild_public",
+        source_resources=(("guild", "public-channel", "guild_public"),),
+    )
+    sandbox.import_bytes(
+        workspace_id,
+        "notes.txt",
+        b"rewritten",
+        provenance=public,
+    )
+
+    restarted = AgentFileSandbox(tmp_path / "files")
+    record = restarted.list(workspace_id)[0]
+    assert record.provenance is not None
+    assert record.provenance.sensitivity == "restricted"
+    assert ("guild", "staff-channel", "restricted") in (
+        record.provenance.source_resources
+    )
+    assert ("guild", "public-channel", "guild_public") in (
+        record.provenance.source_resources
+    )
+
+
+def test_provenance_failure_does_not_commit_new_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    sandbox.import_bytes("scope", "notes.txt", b"old")
+    provenance = WorkspaceFileProvenance(
+        owner_actor_id="actor",
+        sensitivity="restricted",
+    )
+
+    def fail_store(*_args: object, **_kwargs: object) -> None:
+        raise OSError("provenance disk unavailable")
+
+    monkeypatch.setattr(sandbox, "_store_provenance", fail_store)
+    with pytest.raises(OSError, match="provenance disk unavailable"):
+        sandbox.import_bytes(
+            "scope",
+            "notes.txt",
+            b"restricted",
+            provenance=provenance,
+        )
+
+    assert sandbox.path_for_delivery("scope", "notes.txt").read_bytes() == b"old"
 
 
 def test_file_sandbox_write_read_replace_and_hash_conflict(tmp_path: Path) -> None:

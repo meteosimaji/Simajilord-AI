@@ -26,6 +26,7 @@ from simajilord.runtime import SimajilordRuntime
 
 from .capabilities import (
     _activity_record,
+    _assert_agent_channel_scope,
     _can_view_channel,
     _enabled_flag_names,
     _readable_message_channel,
@@ -497,6 +498,7 @@ def build_discord_platform_endpoints(
         request: DiscordInspectChannelRequest,
         context: InvocationContext,
     ) -> DiscordChannelDetailsResponse:
+        _assert_agent_channel_scope(context, request.channel_id)
         guild = _requested_guild(client, context, request.guild_id)
         actor = await _require_common_guild(guild, context)
         bot = guild.me
@@ -683,6 +685,7 @@ def build_discord_platform_endpoints(
         context: InvocationContext,
     ) -> DiscordListThreadMembersResponse:
         _validate_page(request.offset, request.limit, "thread_member")
+        _assert_agent_channel_scope(context, request.thread_id)
         guild = _requested_guild(client, context, request.guild_id)
         actor = await _require_common_guild(guild, context)
         bot = guild.me

@@ -8,7 +8,14 @@ import discord
 import pytest
 from discord.ext import commands
 
-from simajilord.integrations.discord.cogs import ReadAloudCog
+from simajilord.agent import ReadAloudAudienceMode
+from simajilord.integrations.discord.cogs import (
+    ReadAloudCog,
+    _read_aloud_audience_allowed,
+)
+from simajilord.integrations.discord.permissions import (
+    read_aloud_audience_relation,
+)
 from simajilord.integrations.discord.read_aloud import (
     ReadAloudMessageFormatter,
     ReadAloudMessageText,
@@ -21,6 +28,78 @@ from simajilord.services.read_aloud import (
     ReadAloudService,
 )
 from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
+
+
+def _read_permissions(*, readable: bool) -> discord.Permissions:
+    return discord.Permissions(
+        view_channel=readable,
+        read_message_history=readable,
+    )
+
+
+def test_read_aloud_audience_relation_requires_every_current_listener() -> None:
+    allowed = SimpleNamespace(id=10, bot=False)
+    denied = SimpleNamespace(id=11, bot=False)
+    bot = SimpleNamespace(id=12, bot=True)
+    guild = SimpleNamespace(
+        members=[allowed, denied, bot],
+        member_count=3,
+        chunked=True,
+    )
+    source = Mock(spec=discord.TextChannel)
+    source.permissions_for.side_effect = lambda member: _read_permissions(
+        readable=member is not denied
+    )
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.members = [allowed, denied, bot]
+
+    assert (
+        read_aloud_audience_relation(guild, source, destination) == "broader"
+    )
+
+    destination.members = [allowed, bot]
+    assert (
+        read_aloud_audience_relation(guild, source, destination)
+        == "same_or_narrower"
+    )
+
+
+def test_read_aloud_audience_relation_fails_closed_on_incomplete_cache() -> None:
+    guild = SimpleNamespace(members=[], member_count=2, chunked=False)
+    source = Mock(spec=discord.TextChannel)
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.members = []
+
+    assert read_aloud_audience_relation(guild, source, destination) == "uncertain"
+
+
+def test_read_aloud_audience_policy_is_reversible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Mock(spec=discord.TextChannel)
+    source.id = 2
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 3
+    guild = SimpleNamespace(id=1)
+    message = cast(
+        discord.Message,
+        SimpleNamespace(guild=guild, channel=source),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs.read_aloud_audience_relation",
+        lambda *_: "broader",
+    )
+
+    for mode, allowed in (
+        (ReadAloudAudienceMode.ENFORCE, False),
+        (ReadAloudAudienceMode.AUDIT, True),
+        (ReadAloudAudienceMode.DISABLED, True),
+    ):
+        runtime = cast(
+            SimajilordRuntime,
+            SimpleNamespace(settings=SimpleNamespace(read_aloud_audience_mode=mode)),
+        )
+        assert _read_aloud_audience_allowed(runtime, message, destination) is allowed
 
 
 def _message(

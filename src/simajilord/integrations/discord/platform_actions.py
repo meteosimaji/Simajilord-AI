@@ -26,6 +26,8 @@ from simajilord.core.errors import UserError
 from .capabilities import (
     _audit_reason,
     _bounded_name,
+    _enforce_information_flow_to_guild,
+    _enforce_unknown_audience,
     _fetch_message_for_write,
     _requested_guild,
     _require_channel_permissions,
@@ -223,6 +225,9 @@ def build_discord_platform_action_endpoints(
         context: InvocationContext,
     ) -> DiscordGuildResourceMutationResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
+        if request.kind == "template":
+            _enforce_unknown_audience(context, sink="public_guild_template")
         actor, bot = await _write_members(guild, context)
         reason = _audit_reason(request.reason or f"Create {request.kind}", context)
         if request.kind.endswith("_channel") or request.kind == "category":
@@ -426,6 +431,9 @@ def build_discord_platform_action_endpoints(
         context: InvocationContext,
     ) -> DiscordGuildResourceMutationResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
+        if request.kind == "template":
+            _enforce_unknown_audience(context, sink="public_guild_template")
         actor, bot = await _write_members(guild, context)
         reason = _audit_reason(request.reason or f"Update {request.kind}", context)
         if request.kind == "channel":
@@ -764,6 +772,7 @@ def build_discord_platform_action_endpoints(
         )
         message = await _fetch_message_for_write(channel, request.message_id)
         if request.action == "publish":
+            _enforce_unknown_audience(context, sink="announcement_followers")
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "send_messages")
                 _require_channel_permissions(channel, member, "manage_messages")
@@ -811,6 +820,7 @@ def build_discord_platform_action_endpoints(
         context: InvocationContext,
     ) -> DiscordSetChannelOverwriteResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         channel = _guild_channel(guild, request.channel_id)
         _require_both_channel_permission(channel, actor, bot, "manage_roles")

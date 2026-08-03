@@ -22,7 +22,7 @@ from simajilord.services.compute import (
     _sandbox_read_metadata_ancestors,
     _workspace_usage_violation,
 )
-from simajilord.services.files import AgentFileSandbox
+from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
 
 
 class _FakeLauncher:
@@ -199,7 +199,22 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
         create_content=b"42\n",
     )
     files, service = _service(tmp_path, launcher=launcher)
-    files.write_text("guild", "scripts/calculate.py", "print(6 * 7)")
+    restricted = WorkspaceFileProvenance(
+        owner_actor_id="actor",
+        origin_guild_id="guild",
+        origin_channel_id="staff",
+        origin_message_id="message",
+        origin_visibility="restricted",
+        created_task_id="task",
+        sensitivity="restricted",
+        source_resources=(("guild", "staff", "restricted"),),
+    )
+    files.write_text(
+        "guild",
+        "scripts/calculate.py",
+        "print(6 * 7)",
+        provenance=restricted,
+    )
 
     result = await service.run(
         "guild",
@@ -215,6 +230,10 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
     assert tuple(file.path for file in result.changed_files) == (
         "outputs/result.txt",
     )
+    assert result.provenance is not None
+    assert result.provenance.sensitivity == "restricted"
+    assert result.changed_files[0].provenance is not None
+    assert result.changed_files[0].provenance.sensitivity == "restricted"
     assert files.read(
         "guild",
         "outputs/result.txt",

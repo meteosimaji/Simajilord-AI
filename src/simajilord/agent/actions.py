@@ -73,6 +73,11 @@ class ActionReceipt:
     undo_available: bool
     undo_capability: str | None
     classification: ActionClassification
+    executor_principal_id: str | None = None
+    delegator_principal_id: str | None = None
+    trigger_actor_ids: tuple[str, ...] = ()
+    requester_principal_id: str | None = None
+    policy_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +132,11 @@ class ActionRecord:
     workspace_id: str | None
     transport: str
     request_id: str
+    executor_principal_id: str | None
+    delegator_principal_id: str | None
+    trigger_actor_ids: tuple[str, ...]
+    requester_principal_id: str | None
+    policy_id: str | None
     target_ids: tuple[tuple[str, str], ...]
     status: ActionStatus
     classification: ActionClassification
@@ -732,6 +742,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "audio.clear_mine",
         "compute.run",
         "connector.write",
+        "connector.destructive",
         "files.download_url",
         "files.write_text",
         "files.replace_text",
@@ -865,6 +876,7 @@ class ActionReceiptStore:
         undo_arguments: Mapping[str, object] | None,
         host_delivery: bool = False,
     ) -> ActionRecord:
+        _validate_action_identities(context)
         now = datetime.now(UTC)
         record = ActionRecord(
             action_id=action_id,
@@ -873,6 +885,11 @@ class ActionReceiptStore:
             workspace_id=context.workspace_id,
             transport=context.transport,
             request_id=context.request_id,
+            executor_principal_id=context.executor_principal_id,
+            delegator_principal_id=context.delegator_principal_id,
+            trigger_actor_ids=context.trigger_actor_ids,
+            requester_principal_id=context.requester_principal_id,
+            policy_id=context.policy_id,
             target_ids=target_ids,
             status=ActionStatus.SUCCEEDED,
             classification=classification,
@@ -1025,6 +1042,11 @@ class ActionReceiptStore:
                     workspace_id TEXT,
                     transport TEXT NOT NULL,
                     request_id TEXT NOT NULL,
+                    executor_principal_id TEXT,
+                    delegator_principal_id TEXT,
+                    trigger_actor_ids_json TEXT NOT NULL DEFAULT '[]',
+                    requester_principal_id TEXT,
+                    policy_id TEXT,
                     target_ids_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     classification TEXT NOT NULL,
@@ -1075,6 +1097,19 @@ class ActionReceiptStore:
                     ALTER TABLE agent_actions
                     ADD COLUMN host_delivery INTEGER NOT NULL DEFAULT 0
                     """
+                )
+            identity_columns = {
+                "executor_principal_id": "TEXT",
+                "delegator_principal_id": "TEXT",
+                "trigger_actor_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "requester_principal_id": "TEXT",
+                "policy_id": "TEXT",
+            }
+            for column, declaration in identity_columns.items():
+                if column in columns:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE agent_actions ADD COLUMN {column} {declaration}"
                 )
             connection.execute(
                 "DELETE FROM agent_actions WHERE expires_at <= ?",
@@ -1131,6 +1166,11 @@ class ActionReceiptStore:
             and len(undo_arguments_json) > _MAX_UNDO_ARGUMENT_CHARACTERS
         ):
             raise ValueError("undo arguments exceed the bounded action record size")
+        trigger_actor_ids_json = json.dumps(
+            record.trigger_actor_ids,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             now = datetime.now(UTC).isoformat()
@@ -1142,10 +1182,12 @@ class ActionReceiptStore:
                 """
                 INSERT INTO agent_actions(
                     action_id, capability, actor_id, workspace_id, transport,
-                    request_id, target_ids_json, status, classification,
+                    request_id, executor_principal_id, delegator_principal_id,
+                    trigger_actor_ids_json, requester_principal_id, policy_id,
+                    target_ids_json, status, classification,
                     undo_capability, undo_arguments_json, host_delivery,
                     created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(action_id) DO NOTHING
                 """,
                 (
@@ -1155,6 +1197,11 @@ class ActionReceiptStore:
                     record.workspace_id,
                     record.transport,
                     record.request_id,
+                    record.executor_principal_id,
+                    record.delegator_principal_id,
+                    trigger_actor_ids_json,
+                    record.requester_principal_id,
+                    record.policy_id,
                     target_ids_json,
                     record.status.value,
                     record.classification.value,
@@ -1177,6 +1224,11 @@ class ActionReceiptStore:
                 persisted.workspace_id,
                 persisted.transport,
                 persisted.request_id,
+                persisted.executor_principal_id,
+                persisted.delegator_principal_id,
+                persisted.trigger_actor_ids,
+                persisted.requester_principal_id,
+                persisted.policy_id,
                 persisted.target_ids,
                 persisted.classification,
                 persisted.undo_capability,
@@ -1189,6 +1241,11 @@ class ActionReceiptStore:
                 record.workspace_id,
                 record.transport,
                 record.request_id,
+                record.executor_principal_id,
+                record.delegator_principal_id,
+                record.trigger_actor_ids,
+                record.requester_principal_id,
+                record.policy_id,
                 record.target_ids,
                 record.classification,
                 record.undo_capability,
@@ -1770,6 +1827,11 @@ class ActionReceiptService:
             undo_available=tracked and undo_capability is not None,
             undo_capability=undo_capability,
             classification=policy.classification,
+            executor_principal_id=context.executor_principal_id,
+            delegator_principal_id=context.delegator_principal_id,
+            trigger_actor_ids=context.trigger_actor_ids,
+            requester_principal_id=context.requester_principal_id,
+            policy_id=context.policy_id,
         )
         await self._append_journal(
             kind="agent.action.recorded",
@@ -1888,7 +1950,7 @@ class ActionReceiptService:
         try:
             await self.journal.append(
                 kind=kind,
-                payload=payload,
+                payload={**payload, **_action_identity_payload(context)},
                 actor_id=context.actor_id,
                 workspace_id=context.workspace_id,
                 transport=context.transport,
@@ -1922,6 +1984,34 @@ class ActionReceiptService:
                 "action_id": effect.action_id,
             },
         )
+
+
+def _action_identity_payload(context: InvocationContext) -> dict[str, object]:
+    """Keep execution, delegation, trigger, and policy identities distinct."""
+
+    return {
+        "executor_principal_id": context.executor_principal_id,
+        "delegator_principal_id": context.delegator_principal_id,
+        "trigger_actor_ids": list(context.trigger_actor_ids),
+        "requester_principal_id": context.requester_principal_id,
+        "principal_kind": context.principal_kind,
+        "policy_id": context.policy_id,
+    }
+
+
+def _validate_action_identities(context: InvocationContext) -> None:
+    values = (
+        context.executor_principal_id,
+        context.delegator_principal_id,
+        context.requester_principal_id,
+        context.policy_id,
+    )
+    if any(value is not None and len(value) > 200 for value in values):
+        raise ValueError("action principal identities must be bounded")
+    if len(context.trigger_actor_ids) > 32 or any(
+        not value or len(value) > 200 for value in context.trigger_actor_ids
+    ):
+        raise ValueError("action trigger actor identities must be bounded")
 
 
 def build_action_undo_endpoint(service: ActionReceiptService) -> CapabilityEndpoint:
@@ -2125,6 +2215,7 @@ def _row_external_effect(row: sqlite3.Row) -> ExternalEffectRecord:
 
 def _row_record(row: sqlite3.Row) -> ActionRecord:
     target_ids_value = json.loads(str(row["target_ids_json"]))
+    trigger_actor_ids_value = json.loads(str(row["trigger_actor_ids_json"]))
     undo_arguments_value = (
         json.loads(str(row["undo_arguments_json"]))
         if row["undo_arguments_json"] is not None
@@ -2132,6 +2223,10 @@ def _row_record(row: sqlite3.Row) -> ActionRecord:
     )
     if not isinstance(target_ids_value, dict):
         raise RuntimeError("Invalid target ID record")
+    if not isinstance(trigger_actor_ids_value, list) or any(
+        not isinstance(value, str) for value in trigger_actor_ids_value
+    ):
+        raise RuntimeError("Invalid trigger actor ID record")
     if undo_arguments_value is not None and not isinstance(
         undo_arguments_value,
         dict,
@@ -2146,6 +2241,23 @@ def _row_record(row: sqlite3.Row) -> ActionRecord:
         ),
         transport=str(row["transport"]),
         request_id=str(row["request_id"]),
+        executor_principal_id=(
+            str(row["executor_principal_id"])
+            if row["executor_principal_id"] is not None
+            else None
+        ),
+        delegator_principal_id=(
+            str(row["delegator_principal_id"])
+            if row["delegator_principal_id"] is not None
+            else None
+        ),
+        trigger_actor_ids=tuple(trigger_actor_ids_value),
+        requester_principal_id=(
+            str(row["requester_principal_id"])
+            if row["requester_principal_id"] is not None
+            else None
+        ),
+        policy_id=(str(row["policy_id"]) if row["policy_id"] is not None else None),
         target_ids=tuple(
             sorted(
                 (str(name), str(value))

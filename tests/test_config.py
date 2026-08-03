@@ -5,7 +5,14 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from simajilord.agent import AgentAutonomyMode
+from simajilord.agent import (
+    AgentAutonomyMode,
+    AgentAutonomyPolicyMode,
+    AgentFileWorkspaceMode,
+    AgentHighRiskAuthorizationMode,
+    AgentInformationFlowMode,
+    ReadAloudAudienceMode,
+)
 from simajilord.config import AgentFeatureAccess, load_settings
 from simajilord.core.errors import ConfigurationError
 from simajilord.integrations.discord.bot import _gateway_intents
@@ -21,6 +28,10 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_ISOLATED_SHELL_ACCESS",
     "AGENT_CONNECTOR_ACCESS",
     "AGENT_FILE_SANDBOX_ENABLED",
+    "AGENT_FILE_WORKSPACE_MODE",
+    "AGENT_INFORMATION_FLOW_MODE",
+    "AGENT_HIGH_RISK_AUTHORIZATION_MODE",
+    "AGENT_HIGH_RISK_CONFIRMATION_TIMEOUT_SECONDS",
     "AGENT_CURATED_SKILLS_ENABLED",
     "AGENT_MODEL",
     "AGENT_ESCALATION_MODEL",
@@ -38,6 +49,7 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_AUTONOMY_ENABLED",
     "AGENT_AUTONOMY_GUILD_IDS",
     "AGENT_AUTONOMY_MODE",
+    "AGENT_AUTONOMY_POLICY_MODE",
     "AGENT_AUTONOMY_BATCH_SECONDS",
     "AGENT_AUTONOMY_INTERVAL_SECONDS",
     "AGENT_AUTONOMY_MAX_RUNS",
@@ -69,6 +81,7 @@ _AGENT_ENVIRONMENT_NAMES = (
     "VOICEVOX_READINESS_TTL_SECONDS",
     "TRANSLATION_HELPER_PATH",
     "READ_ALOUD_CHUNK_CHARACTERS",
+    "READ_ALOUD_AUDIENCE_MODE",
     "MAX_PENDING_MUSIC",
     "MAX_PENDING_MUSIC_PER_USER",
     "MAX_CONCURRENT_MEDIA",
@@ -126,11 +139,12 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_max_pending_turns == 20
     assert settings.agent_max_pending_turns_per_user == 2
     assert settings.agent_interactive_reserve_percent == 25
-    assert settings.agent_conversation_compatibility_epoch == 5
+    assert settings.agent_conversation_compatibility_epoch == 6
     assert settings.agent_autonomy_enabled is False
-    assert settings.agent_autonomy_mode is AgentAutonomyMode.ACT
+    assert settings.agent_autonomy_mode is AgentAutonomyMode.OBSERVE
+    assert settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
     assert settings.agent_autonomy_batch_seconds == 10
-    assert settings.agent_autonomy_max_runs == 0
+    assert settings.agent_autonomy_max_runs == 10
     assert settings.agent_autonomy_max_pending_events_per_actor == 50
     assert settings.agent_isolated_shell_access is AgentFeatureAccess.DISABLED
     assert settings.agent_connector_access is AgentFeatureAccess.DISABLED
@@ -203,6 +217,13 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.agent_isolated_shell_access is AgentFeatureAccess.ADMINS
     assert settings.agent_connector_access is AgentFeatureAccess.ADMINS
     assert settings.agent_file_sandbox_enabled is True
+    assert settings.agent_file_workspace_mode is AgentFileWorkspaceMode.ACTOR_TASK
+    assert settings.agent_information_flow_mode is AgentInformationFlowMode.ENFORCE
+    assert (
+        settings.agent_high_risk_authorization_mode
+        is AgentHighRiskAuthorizationMode.BOUND_ONCE
+    )
+    assert settings.agent_high_risk_confirmation_timeout_seconds == 120
     assert settings.agent_curated_skills_enabled is False
     assert settings.web_search_base_url == "http://127.0.0.1:8888"
     assert settings.web_search_shared_secret is None
@@ -210,6 +231,7 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.hive_daily_limit == 100
     assert settings.hive_threshold == 0.9
     assert settings.read_aloud_chunk_characters == 400
+    assert settings.read_aloud_audience_mode is ReadAloudAudienceMode.ENFORCE
     assert settings.voicevox_readiness_ttl_seconds == 5.0
     assert settings.max_pending_music == 100
     assert settings.max_pending_music_per_user == 20
@@ -258,12 +280,36 @@ def test_autonomy_mode_batching_and_unbounded_runs_are_typed(
 
     assert settings.agent_autonomy_enabled is True
     assert settings.agent_autonomy_mode is AgentAutonomyMode.ASSIST
+    assert settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
     assert settings.agent_autonomy_batch_seconds == 5
     assert settings.agent_autonomy_max_runs == 0
 
     monkeypatch.setenv("AGENT_AUTONOMY_MODE", "unrestricted")
     with pytest.raises(ConfigurationError, match="observe, assist, act"):
         load_settings(dotenv_path=dotenv_path)
+
+
+def test_security_policy_compatibility_modes_are_typed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("READ_ALOUD_AUDIENCE_MODE", "audit")
+    monkeypatch.setenv("AGENT_FILE_WORKSPACE_MODE", "guild_shared")
+    monkeypatch.setenv("AGENT_INFORMATION_FLOW_MODE", "disabled")
+    monkeypatch.setenv("AGENT_HIGH_RISK_AUTHORIZATION_MODE", "legacy_event")
+    monkeypatch.setenv("AGENT_AUTONOMY_POLICY_MODE", "legacy")
+
+    settings = load_settings(dotenv_path=dotenv_path)
+
+    assert settings.read_aloud_audience_mode is ReadAloudAudienceMode.AUDIT
+    assert settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED
+    assert settings.agent_information_flow_mode is AgentInformationFlowMode.DISABLED
+    assert (
+        settings.agent_high_risk_authorization_mode
+        is AgentHighRiskAuthorizationMode.LEGACY_EVENT
+    )
+    assert settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
 
 
 def test_autonomy_per_channel_queue_cannot_exceed_global_queue(

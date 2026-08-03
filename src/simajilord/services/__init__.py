@@ -16,7 +16,14 @@ from .feedback import (
     FeedbackService,
     FeedbackStatus,
 )
-from .files import AgentFileSandbox
+from .files import (
+    AgentFileSandbox,
+    WorkspaceFileProvenance,
+    WorkspaceFileRecord,
+    WorkspaceReadResult,
+    WorkspaceVisibility,
+    merge_file_provenances,
+)
 from .focus_timer import FocusTimer, FocusTimerService, FocusTimerStatus
 from .image import ImageGenerationService, ImageGenerationStore
 from .local_media import LOCAL_MEDIA_SCHEME, LocalMediaRecord, LocalMediaStore
@@ -124,4 +131,9 @@ __all__ = [
     "WebService",
     "WorkspaceComputeService",
     "WorkspaceDownloadResult",
+    "WorkspaceFileProvenance",
+    "WorkspaceFileRecord",
+    "WorkspaceReadResult",
+    "WorkspaceVisibility",
+    "merge_file_provenances",
 ]

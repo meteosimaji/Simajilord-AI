@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock
@@ -12,6 +13,7 @@ from simajilord.agent.tools import AgentToolCatalog
 from simajilord.core import CapabilityRegistry, InvocationContext, RiskLevel
 from simajilord.core.errors import UserError
 from simajilord.integrations.discord.capabilities import (
+    DiscordBulkDeleteRequest,
     DiscordChannelSettingRequest,
     DiscordCreatedChannelDeleteRequest,
     DiscordCreatedRoleDeleteRequest,
@@ -90,6 +92,58 @@ def test_act_capabilities_are_unique_discoverable_and_explicitly_classified() ->
         registry.endpoint("discord.delete_message").descriptor.risk
         is RiskLevel.DESTRUCTIVE
     )
+
+
+@pytest.mark.asyncio
+async def test_bulk_delete_rejects_mixed_age_batch_before_any_delete() -> None:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    guild.get_member.return_value = actor
+    guild.me = bot
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.permissions_for.return_value = SimpleNamespace(
+        administrator=False,
+        view_channel=True,
+        read_message_history=True,
+        manage_messages=True,
+    )
+    now = datetime.now(UTC)
+    messages = {
+        31: SimpleNamespace(id=31, created_at=now - timedelta(days=1)),
+        32: SimpleNamespace(id=32, created_at=now - timedelta(days=15)),
+    }
+    channel.fetch_message = AsyncMock(side_effect=lambda message_id: messages[message_id])
+    channel.delete_messages = AsyncMock()
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+
+    with pytest.raises(
+        UserError,
+        match=r"discord\.bulk_delete_message_too_old",
+    ):
+        await _endpoints(cast(discord.Client, client))[
+            "discord.bulk_delete_messages"
+        ].invoke(
+            DiscordBulkDeleteRequest(
+                channel_id="20",
+                message_ids=("31", "32"),
+                reason="Remove test spam",
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="discord:message:30",
+                resource_ids=("20",),
+                origin_resource_id="20",
+            ),
+        )
+
+    channel.delete_messages.assert_not_awaited()
 
 
 def test_reversible_act_receipts_store_only_ids_and_small_scalar_state() -> None:
@@ -199,7 +253,14 @@ async def test_destructive_moderation_is_searchable_only_with_explicit_policy() 
 
 
 @pytest.mark.asyncio
-async def test_pin_requires_actor_and_bot_effective_manage_messages() -> None:
+@pytest.mark.parametrize(
+    ("actor_pin", "bot_pin"),
+    ((False, True), (True, False)),
+)
+async def test_pin_requires_actor_and_bot_effective_pin_messages(
+    actor_pin: bool,
+    bot_pin: bool,
+) -> None:
     client = Mock(spec=discord.Client)
     guild = Mock(spec=discord.Guild)
     guild.id = 10
@@ -215,7 +276,7 @@ async def test_pin_requires_actor_and_bot_effective_manage_messages() -> None:
         return SimpleNamespace(
             view_channel=True,
             read_message_history=True,
-            manage_messages=member is bot,
+            pin_messages=bot_pin if member is bot else actor_pin,
         )
 
     channel.permissions_for.side_effect = permissions
@@ -230,7 +291,7 @@ async def test_pin_requires_actor_and_bot_effective_manage_messages() -> None:
         origin_resource_id="30",
     )
 
-    with pytest.raises(UserError, match=r"discord\.manage_messages_required"):
+    with pytest.raises(UserError, match=r"discord\.pin_messages_required"):
         await endpoints["discord.pin_message"].invoke(
             DiscordMessageWriteRequest(
                 channel_id="20",
@@ -258,7 +319,7 @@ async def test_pin_can_target_an_authorized_non_origin_channel() -> None:
     channel.permissions_for.return_value = SimpleNamespace(
         view_channel=True,
         read_message_history=True,
-        manage_messages=True,
+        pin_messages=True,
     )
     message = SimpleNamespace(
         id=31,
@@ -290,6 +351,47 @@ async def test_pin_can_target_an_authorized_non_origin_channel() -> None:
     assert response.changed is True
     message.pin.assert_awaited_once()
     assert "actor=7" in message.pin.await_args.kwargs["reason"]
+
+
+@pytest.mark.asyncio
+async def test_pin_allows_administrator_without_explicit_pin_messages() -> None:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    guild.get_member.return_value = actor
+    guild.me = bot
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.permissions_for.return_value = SimpleNamespace(
+        administrator=True,
+        view_channel=True,
+        pin_messages=False,
+    )
+    message = SimpleNamespace(id=31, pinned=False, pin=AsyncMock())
+    channel.fetch_message = AsyncMock(return_value=message)
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+
+    await _endpoints(cast(discord.Client, client))["discord.pin_message"].invoke(
+        DiscordMessageWriteRequest(
+            channel_id="20",
+            message_id="31",
+            reason="Keep the decision visible",
+            evidence_message_ids=("30",),
+        ),
+        InvocationContext(
+            actor_id="7",
+            workspace_id="10",
+            transport="agent",
+            request_id="discord:message:30",
+            resource_ids=("20", "30"),
+            origin_resource_id="30",
+        ),
+    )
+
+    message.pin.assert_awaited_once()
 
 
 @pytest.mark.asyncio

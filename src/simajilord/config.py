@@ -8,11 +8,19 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
-from .agent.contracts import AgentAutonomyMode
+from .agent.contracts import (
+    AgentAutonomyMode,
+    AgentAutonomyPolicyMode,
+    AgentFileWorkspaceMode,
+    AgentHighRiskAuthorizationMode,
+    AgentInformationFlowMode,
+    ReadAloudAudienceMode,
+)
 from .core.errors import ConfigurationError
 
 
@@ -29,6 +37,9 @@ class AgentFeatureAccess(StrEnum):
     DISABLED = "disabled"
     ADMINS = "admins"
     EVERYONE = "everyone"
+
+
+PolicyModeT = TypeVar("PolicyModeT", bound=StrEnum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +81,7 @@ class Settings:
     voicevox_timeout_seconds: float
     voicevox_readiness_ttl_seconds: float
     read_aloud_chunk_characters: int
+    read_aloud_audience_mode: ReadAloudAudienceMode
     max_pending_speech: int
     max_pending_music: int
     max_pending_music_per_user: int
@@ -112,6 +124,10 @@ class Settings:
     agent_isolated_shell_access: AgentFeatureAccess
     agent_connector_access: AgentFeatureAccess
     agent_file_sandbox_enabled: bool
+    agent_file_workspace_mode: AgentFileWorkspaceMode
+    agent_information_flow_mode: AgentInformationFlowMode
+    agent_high_risk_authorization_mode: AgentHighRiskAuthorizationMode
+    agent_high_risk_confirmation_timeout_seconds: int
     agent_curated_skills_enabled: bool
     agent_provider: str
     agent_model: str
@@ -134,6 +150,7 @@ class Settings:
     agent_autonomy_enabled: bool
     agent_autonomy_guild_ids: frozenset[str]
     agent_autonomy_mode: AgentAutonomyMode
+    agent_autonomy_policy_mode: AgentAutonomyPolicyMode
     agent_autonomy_batch_seconds: int
     agent_autonomy_max_runs: int
     agent_autonomy_candidate_limit: int
@@ -332,6 +349,19 @@ def _autonomy_mode(name: str, default: AgentAutonomyMode) -> AgentAutonomyMode:
         return AgentAutonomyMode(raw_value)
     except ValueError as exc:
         choices = ", ".join(item.value for item in AgentAutonomyMode)
+        raise ConfigurationError(f"{name} must be one of: {choices}.") from exc
+
+
+def _policy_mode(
+    name: str,
+    default: PolicyModeT,
+    mode_type: type[PolicyModeT],
+) -> PolicyModeT:
+    raw_value = os.getenv(name, default.value).strip().lower()
+    try:
+        return mode_type(raw_value)
+    except ValueError as exc:
+        choices = ", ".join(item.value for item in mode_type)
         raise ConfigurationError(f"{name} must be one of: {choices}.") from exc
 
 
@@ -686,6 +716,11 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         read_aloud_chunk_characters=_positive_int(
             "READ_ALOUD_CHUNK_CHARACTERS", 400, maximum=2_000
         ),
+        read_aloud_audience_mode=_policy_mode(
+            "READ_ALOUD_AUDIENCE_MODE",
+            ReadAloudAudienceMode.ENFORCE,
+            ReadAloudAudienceMode,
+        ),
         max_pending_speech=_positive_int("MAX_PENDING_SPEECH", 20, maximum=100),
         max_pending_music=_positive_int("MAX_PENDING_MUSIC", 100, maximum=500),
         max_pending_music_per_user=_positive_int(
@@ -806,6 +841,27 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_isolated_shell_access=agent_isolated_shell_access,
         agent_connector_access=agent_connector_access,
         agent_file_sandbox_enabled=agent_file_sandbox_enabled,
+        agent_file_workspace_mode=_policy_mode(
+            "AGENT_FILE_WORKSPACE_MODE",
+            AgentFileWorkspaceMode.ACTOR_TASK,
+            AgentFileWorkspaceMode,
+        ),
+        agent_information_flow_mode=_policy_mode(
+            "AGENT_INFORMATION_FLOW_MODE",
+            AgentInformationFlowMode.ENFORCE,
+            AgentInformationFlowMode,
+        ),
+        agent_high_risk_authorization_mode=_policy_mode(
+            "AGENT_HIGH_RISK_AUTHORIZATION_MODE",
+            AgentHighRiskAuthorizationMode.BOUND_ONCE,
+            AgentHighRiskAuthorizationMode,
+        ),
+        agent_high_risk_confirmation_timeout_seconds=_bounded_int(
+            "AGENT_HIGH_RISK_CONFIRMATION_TIMEOUT_SECONDS",
+            120,
+            minimum=30,
+            maximum=600,
+        ),
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
         agent_model=_text("AGENT_MODEL", "gpt-5.6-luna"),
@@ -883,14 +939,19 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         agent_conversation_compatibility_epoch=_positive_int(
             "AGENT_CONVERSATION_COMPATIBILITY_EPOCH",
-            5,
+            6,
             maximum=10_000,
         ),
         agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", False),
         agent_autonomy_guild_ids=agent_autonomy_guild_ids,
         agent_autonomy_mode=_autonomy_mode(
             "AGENT_AUTONOMY_MODE",
-            AgentAutonomyMode.ACT,
+            AgentAutonomyMode.OBSERVE,
+        ),
+        agent_autonomy_policy_mode=_policy_mode(
+            "AGENT_AUTONOMY_POLICY_MODE",
+            AgentAutonomyPolicyMode.STRICT,
+            AgentAutonomyPolicyMode,
         ),
         agent_autonomy_batch_seconds=_bounded_int(
             "AGENT_AUTONOMY_BATCH_SECONDS",
@@ -900,7 +961,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         agent_autonomy_max_runs=_bounded_int(
             "AGENT_AUTONOMY_MAX_RUNS",
-            0,
+            10,
             minimum=0,
             maximum=1_000,
         ),

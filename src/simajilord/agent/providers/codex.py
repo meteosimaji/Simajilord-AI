@@ -16,9 +16,10 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
+from typing import Literal, cast
 
 from simajilord.capabilities.isolated_shell import discord_workspace_for_context
-from simajilord.core import InvocationContext
+from simajilord.core import DisclosureObservation, InvocationContext
 from simajilord.core.errors import (
     MediaError,
     ModerationError,
@@ -54,9 +55,11 @@ from simajilord.providers.image.codex import (
 
 from ..contracts import (
     AGENT_FINAL_DELIVERED_CONTENT,
+    AGENT_HIGH_RISK_CAPABILITIES,
     AGENT_MESSAGE_BREAK,
     AGENT_NO_ACTION_CONTENT,
     AGENT_WEB_GRANT,
+    AgentHighRiskConfirmation,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentTaskRouteDecision,
@@ -72,6 +75,7 @@ from ..errors import (
 )
 from ..tools import AgentToolCatalog
 from .base import (
+    AgentHighRiskConfirmationCallback,
     AgentProgressCallback,
     AgentProviderThreadBindingSink,
     AgentToolTraceSink,
@@ -235,6 +239,7 @@ class _ToolTurnBudget:
     output_characters_remaining: int | None
     on_progress: AgentProgressCallback | None
     required_message_id: str | None
+    on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None
     evidence_anchor_message_id: str | None = None
     authorization_contexts: dict[str, InvocationContext] = field(default_factory=dict)
     authorization_message_ids: dict[str, str | None] = field(default_factory=dict)
@@ -255,7 +260,13 @@ class _ToolTurnBudget:
     write_attempts: set[str] = field(default_factory=set)
     final_delivery_successes: set[str] = field(default_factory=set)
     last_write_authorization_event_id: str | None = None
-    discord_disclosure_observations: list[tuple[str, str, str]] = field(default_factory=list)
+    bound_high_risk_actions: dict[str, str] = field(default_factory=dict)
+    used_high_risk_authorizations: set[str] = field(default_factory=set)
+    confirmed_high_risk_actions: set[str] = field(default_factory=set)
+    denied_high_risk_actions: set[str] = field(default_factory=set)
+    discord_disclosure_observations: list[DisclosureObservation] = field(
+        default_factory=list
+    )
     evidence_plan_recorded: bool = False
     conversation_context_required: bool = False
     conversation_context_satisfied: bool = False
@@ -312,6 +323,25 @@ class _ThreadLockState:
     users: int = 0
 
 
+def _context_authority_profile(context: InvocationContext) -> tuple[object, ...]:
+    """Fingerprint every host-enforced authority dimension for thread reuse."""
+
+    return (
+        context.grants,
+        context.approvals,
+        context.principal_kind,
+        context.read_scope_mode,
+        context.information_flow_mode,
+        context.file_workspace_mode,
+        context.high_risk_authorization_mode,
+        context.executor_principal_id,
+        context.delegator_principal_id,
+        context.requester_principal_id,
+        context.policy_id,
+        context.allowed_capabilities,
+    )
+
+
 def _configured_capacity(
     configured_limit: int | None,
     *,
@@ -350,6 +380,9 @@ def _continuation_tool_budget(
         calls_remaining=calls_remaining,
         output_characters_remaining=output_characters_remaining,
         on_progress=(source.on_progress if source is not None else fallback_progress),
+        on_high_risk_confirmation=(
+            source.on_high_risk_confirmation if source is not None else None
+        ),
         required_message_id=None,
         evidence_anchor_message_id=(
             source.evidence_anchor_message_id if source is not None else None
@@ -388,6 +421,18 @@ def _continuation_tool_budget(
         ),
         last_write_authorization_event_id=(
             source.last_write_authorization_event_id if source is not None else None
+        ),
+        bound_high_risk_actions=(
+            dict(source.bound_high_risk_actions) if source is not None else {}
+        ),
+        used_high_risk_authorizations=(
+            set(source.used_high_risk_authorizations) if source is not None else set()
+        ),
+        confirmed_high_risk_actions=(
+            set(source.confirmed_high_risk_actions) if source is not None else set()
+        ),
+        denied_high_risk_actions=(
+            set(source.denied_high_risk_actions) if source is not None else set()
         ),
         discord_disclosure_observations=(
             list(source.discord_disclosure_observations) if source is not None else []
@@ -557,7 +602,7 @@ class CodexAppServerProvider:
         self._active_threads: set[str] = set()
         self._active_thread_permissions: dict[
             str,
-            tuple[frozenset[str], frozenset[str]],
+            tuple[object, ...],
         ] = {}
         self._active_thread_workspaces: dict[str, Path] = {}
         self._active_tool_budgets: dict[str, _ToolTurnBudget] = {}
@@ -799,6 +844,7 @@ class CodexAppServerProvider:
         event_prompt: str,
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
+        on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
     ) -> ProviderTurnResult:
         first_attempt = _TurnAttemptState()
         try:
@@ -807,6 +853,7 @@ class CodexAppServerProvider:
                 event_prompt=event_prompt,
                 context=context,
                 on_progress=on_progress,
+                on_high_risk_confirmation=on_high_risk_confirmation,
                 attempt_state=first_attempt,
             )
         except (TimeoutError, _AppServerTransportError) as first_failure:
@@ -843,6 +890,7 @@ class CodexAppServerProvider:
                         event_prompt=event_prompt,
                         context=context,
                         on_progress=on_progress,
+                        on_high_risk_confirmation=on_high_risk_confirmation,
                         attempt_state=retry_attempt,
                     )
                 except (TimeoutError, _AppServerTransportError) as retry_failure:
@@ -907,6 +955,7 @@ class CodexAppServerProvider:
         event_prompt: str,
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
+        on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
         attempt_state: _TurnAttemptState | None = None,
     ) -> ProviderTurnResult:
         lock_key = provider_thread_id or f"request:{context.request_id}"
@@ -936,6 +985,7 @@ class CodexAppServerProvider:
                     calls_remaining=self.max_tool_calls,
                     output_characters_remaining=self.max_tool_output_characters,
                     on_progress=on_progress,
+                    on_high_risk_confirmation=on_high_risk_confirmation,
                     required_message_id=required_message_id,
                     evidence_anchor_message_id=(required_message_id if not autonomous else None),
                     last_progress=(
@@ -1406,6 +1456,21 @@ class CodexAppServerProvider:
                             ",".join(sorted(final_budget.final_delivery_successes)),
                         )
                         content = AGENT_FINAL_DELIVERED_CONTENT
+                    if (
+                        final_budget is not None
+                        and _information_flow_blocks_origin(final_budget)
+                    ):
+                        log.warning(
+                            "Agent final response withheld by information-flow policy "
+                            "request=%s observations=%d",
+                            context.request_id,
+                            len(final_budget.discord_disclosure_observations),
+                        )
+                        content = (
+                            "参照した情報の公開範囲をこの送信先以下だと確認できなかったため、"
+                            "内容を転記せず停止しました。元のチャンネル内で依頼するか、"
+                            "共有してよい範囲を明示してください。"
+                        )
                     return ProviderTurnResult(
                         thread_id=thread_id,
                         model=result_model,
@@ -1571,6 +1636,8 @@ class CodexAppServerProvider:
                 budget.authorization_message_ids.pop(event_id, None)
                 budget.authorization_contexts.pop(event_id, None)
                 budget.read_authorization_event_ids.discard(event_id)
+                budget.bound_high_risk_actions.pop(event_id, None)
+                budget.used_high_risk_authorizations.discard(event_id)
         loop = asyncio.get_running_loop()
         decision_future: asyncio.Future[AgentTaskRouteDecision] = loop.create_future()
         confirmation_future: asyncio.Future[bool] = loop.create_future()
@@ -1957,7 +2024,7 @@ class CodexAppServerProvider:
         }
         if provider_thread_id is not None:
             if provider_thread_id in self._active_threads:
-                permissions = (context.grants, context.approvals)
+                permissions = _context_authority_profile(context)
                 if self._active_thread_permissions.get(provider_thread_id) != permissions:
                     raise AgentThreadError(
                         "The active agent thread has a different capability profile."
@@ -1979,9 +2046,8 @@ class CodexAppServerProvider:
             thread_id = _text(thread.get("id"), "thread id")
             self._active_threads.add(thread_id)
             self._active_thread_workspaces[thread_id] = thread_workspace
-            self._active_thread_permissions[thread_id] = (
-                context.grants,
-                context.approvals,
+            self._active_thread_permissions[thread_id] = _context_authority_profile(
+                context
             )
             return thread_id
 
@@ -1999,10 +2065,7 @@ class CodexAppServerProvider:
         thread_id = _text(thread.get("id"), "thread id")
         self._active_threads.add(thread_id)
         self._active_thread_workspaces[thread_id] = thread_workspace
-        self._active_thread_permissions[thread_id] = (
-            context.grants,
-            context.approvals,
-        )
+        self._active_thread_permissions[thread_id] = _context_authority_profile(context)
         return thread_id
 
     def _workspace_for_context(self, context: InvocationContext) -> Path:
@@ -2938,6 +3001,7 @@ class CodexAppServerProvider:
             capability_arguments,
         )
         tool_context = budget.context
+        authorization_event_id: str | None = None
         if capability_name == "turn.evidence_plan":
             plan_readiness_reason = _evidence_plan_readiness_reason(budget)
             if plan_readiness_reason is not None:
@@ -3066,6 +3130,83 @@ class CodexAppServerProvider:
                 error_code=code,
             )
             return
+        information_flow_failure = (
+            _information_flow_write_failure(write_capability, budget)
+            if write_capability is not None
+            else None
+        )
+        if information_flow_failure is not None:
+            code, reason = information_flow_failure
+            if blocking_write_capability is not None:
+                budget.write_failures.append((blocking_write_capability, code))
+            await self._traced_tool_response(
+                request_id,
+                trace,
+                success=False,
+                text=_tool_error_json(
+                    code=code,
+                    reason=reason,
+                    retryable=False,
+                ),
+                outcome="rejected",
+                error_code=code,
+            )
+            return
+        high_risk_failure = (
+            _bind_high_risk_authorization(
+                budget,
+                authorization_event_id=authorization_event_id,
+                capability_name=write_capability,
+                arguments=capability_arguments,
+                context=tool_context,
+            )
+            if write_capability is not None
+            else None
+        )
+        if high_risk_failure is not None:
+            code, reason = high_risk_failure
+            if blocking_write_capability is not None:
+                budget.write_failures.append((blocking_write_capability, code))
+            await self._traced_tool_response(
+                request_id,
+                trace,
+                success=False,
+                text=_tool_error_json(
+                    code=code,
+                    reason=reason,
+                    retryable=False,
+                ),
+                outcome="rejected",
+                error_code=code,
+            )
+            return
+        high_risk_confirmation_failure = (
+            await _confirm_high_risk_action(
+                budget,
+                capability_name=write_capability,
+                arguments=capability_arguments,
+                context=tool_context,
+            )
+            if write_capability is not None
+            else None
+        )
+        if high_risk_confirmation_failure is not None:
+            code, reason = high_risk_confirmation_failure
+            if blocking_write_capability is not None:
+                budget.write_failures.append((blocking_write_capability, code))
+            await self._traced_tool_response(
+                request_id,
+                trace,
+                success=False,
+                text=_tool_error_json(
+                    code=code,
+                    reason=reason,
+                    retryable=False,
+                ),
+                outcome="rejected",
+                error_code=code,
+            )
+            return
 
         def consume_validated_call() -> None:
             """Charge only a call whose complete request will reach its handler."""
@@ -3082,6 +3223,14 @@ class CodexAppServerProvider:
                 )
             if write_capability is not None:
                 budget.write_attempts.add(write_capability)
+                if (
+                    write_capability in AGENT_HIGH_RISK_CAPABILITIES
+                    and budget.context.high_risk_authorization_mode == "bound_once"
+                    and authorization_event_id is not None
+                ):
+                    budget.used_high_risk_authorizations.add(
+                        authorization_event_id
+                    )
 
         watchdog: _TurnWatchdog | None = None
         activity_task: asyncio.Task[None] | None = None
@@ -3107,6 +3256,9 @@ class CodexAppServerProvider:
                 provider_thread_id=trace.provider_thread_id,
                 provider_turn_id=trace.provider_turn_id,
                 tool_call_id=trace.call_id,
+                disclosure_observations=tuple(
+                    budget.discord_disclosure_observations
+                ),
             )
             output = await self.tools.invoke(
                 namespace=namespace if isinstance(namespace, str) else None,
@@ -3120,6 +3272,12 @@ class CodexAppServerProvider:
                 budget,
                 capability_name=capability_name,
                 output=output.text,
+                arguments=capability_arguments,
+                discord_read=(
+                    write_capability is None
+                    and isinstance(capability_name, str)
+                    and capability_name.startswith("discord.")
+                ),
             )
             _record_exact_message_reads(
                 tool_name=canonical_tool_name,
@@ -4116,6 +4274,239 @@ def _write_readiness_failure(
     return _evidence_plan_gap(budget)
 
 
+def _information_flow_write_failure(
+    capability_name: str,
+    budget: _ToolTurnBudget,
+) -> tuple[str, str] | None:
+    """Block audience expansion and unknown external sinks in enforce mode."""
+
+    if budget.context.information_flow_mode != "enforce":
+        return None
+    observations = budget.discord_disclosure_observations
+    if not observations:
+        return None
+    if any(
+        observation.relation_to_origin != "same_or_narrower"
+        for observation in observations
+    ):
+        return (
+            "agent.information_flow_forbidden",
+            (
+                "A source read in this turn has a broader or uncertain relationship "
+                "to the active destination. The host will not perform a write from "
+                "that mixed-audience turn."
+            ),
+        )
+    unknown_sink_capabilities = {
+        "connector.write",
+        "connector.destructive",
+        "feedback.create",
+        "image.generate",
+        "discord.send_direct_message",
+    }
+    if any(
+        observation.visibility != "guild_public"
+        for observation in observations
+    ) and capability_name in unknown_sink_capabilities:
+        return (
+            "agent.information_flow_forbidden",
+            (
+                "Restricted or uncertain Discord data cannot be copied to an "
+                "external or locally published sink without declassification."
+            ),
+        )
+    return None
+
+
+def _information_flow_blocks_origin(budget: _ToolTurnBudget) -> bool:
+    return budget.context.information_flow_mode == "enforce" and any(
+        observation.relation_to_origin != "same_or_narrower"
+        for observation in budget.discord_disclosure_observations
+    )
+
+
+def _bind_high_risk_authorization(
+    budget: _ToolTurnBudget,
+    *,
+    authorization_event_id: str | None,
+    capability_name: str,
+    arguments: object,
+    context: InvocationContext,
+) -> tuple[str, str] | None:
+    """Bind one exact event revision to one high-risk argument set and one use."""
+
+    if (
+        budget.context.high_risk_authorization_mode != "bound_once"
+        or capability_name not in AGENT_HIGH_RISK_CAPABILITIES
+    ):
+        return None
+    if authorization_event_id is None:
+        return (
+            "agent.high_risk_authorization_required",
+            "A high-risk action requires an exact active authorization event.",
+        )
+    fingerprint = _high_risk_action_fingerprint(
+        capability_name,
+        arguments,
+        context,
+    )
+    existing = budget.bound_high_risk_actions.get(authorization_event_id)
+    if existing is None:
+        budget.bound_high_risk_actions[authorization_event_id] = fingerprint
+    elif not secrets.compare_digest(existing, fingerprint):
+        return (
+            "agent.high_risk_authorization_changed",
+            (
+                "The capability, target, or arguments changed after this exact event "
+                "was bound. Ask for a new active authorization event."
+            ),
+        )
+    if authorization_event_id in budget.used_high_risk_authorizations:
+        return (
+            "agent.high_risk_authorization_used",
+            (
+                "This exact event already authorized one high-risk dispatch. A new "
+                "active authorization event is required for another attempt."
+            ),
+        )
+    return None
+
+
+def _high_risk_action_fingerprint(
+    capability_name: str,
+    arguments: object,
+    context: InvocationContext,
+) -> str:
+    sanitized_arguments = (
+        {
+            key: value
+            for key, value in arguments.items()
+            if key != "authorization_event_id"
+        }
+        if isinstance(arguments, dict)
+        else arguments
+    )
+    try:
+        encoded_arguments = json.dumps(
+            sanitized_arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentToolError("High-risk capability arguments must be JSON values.") from exc
+    identity = "\0".join(
+        (
+            "simajilord-high-risk-v1",
+            capability_name,
+            context.actor_id,
+            context.workspace_id or "",
+            context.origin_resource_id or "",
+            context.active_message_id or "",
+            context.active_message_edited_at or "",
+            encoded_arguments,
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+async def _confirm_high_risk_action(
+    budget: _ToolTurnBudget,
+    *,
+    capability_name: str,
+    arguments: object,
+    context: InvocationContext,
+) -> tuple[str, str] | None:
+    """Require a requester-only host confirmation before the external dispatch."""
+
+    if (
+        budget.context.high_risk_authorization_mode != "bound_once"
+        or capability_name not in AGENT_HIGH_RISK_CAPABILITIES
+    ):
+        return None
+    fingerprint = _high_risk_action_fingerprint(
+        capability_name,
+        arguments,
+        context,
+    )
+    if fingerprint in budget.confirmed_high_risk_actions:
+        return None
+    if fingerprint in budget.denied_high_risk_actions:
+        return (
+            "agent.high_risk_confirmation_denied",
+            "The requester rejected or did not confirm this exact high-risk action.",
+        )
+    callback = budget.on_high_risk_confirmation
+    if callback is None:
+        return (
+            "agent.high_risk_confirmation_unavailable",
+            (
+                "This transport cannot obtain a host-verifiable confirmation for "
+                "the exact high-risk action."
+            ),
+        )
+    requester_principal_id = context.requester_principal_id or context.actor_id
+    authorization_message_id = context.active_message_id
+    if authorization_message_id is None:
+        return (
+            "agent.high_risk_confirmation_unavailable",
+            "A concrete Discord message revision is required for confirmation.",
+        )
+    try:
+        arguments_json = _high_risk_arguments_json(arguments)
+        confirmed = await callback(
+            AgentHighRiskConfirmation(
+                capability=capability_name,
+                arguments_json=arguments_json,
+                binding_sha256=fingerprint,
+                requester_principal_id=requester_principal_id,
+                authorization_message_id=authorization_message_id,
+                authorization_message_edited_at=context.active_message_edited_at,
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "High-risk confirmation callback failed capability=%s request=%s",
+            capability_name,
+            context.request_id,
+        )
+        confirmed = False
+    if not confirmed:
+        budget.denied_high_risk_actions.add(fingerprint)
+        return (
+            "agent.high_risk_confirmation_denied",
+            "The requester rejected or did not confirm this exact high-risk action.",
+        )
+    budget.confirmed_high_risk_actions.add(fingerprint)
+    return None
+
+
+def _high_risk_arguments_json(arguments: object) -> str:
+    sanitized = (
+        {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"authorization_event_id", "contract_id"}
+        }
+        if isinstance(arguments, dict)
+        else arguments
+    )
+    try:
+        encoded = json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentToolError("High-risk capability arguments must be JSON values.") from exc
+    if len(encoded) <= 1_500:
+        return encoded
+    return f"{encoded[:1_450]}\n… [truncated; verify SHA-256]"
+
+
 def _evidence_plan_readiness_reason(
     budget: _ToolTurnBudget,
 ) -> str | None:
@@ -4727,36 +5118,210 @@ def _record_discord_disclosure_observations(
     *,
     capability_name: str | None,
     output: str,
+    arguments: object | None = None,
+    discord_read: bool | None = None,
 ) -> None:
-    """Keep advisory source visibility in the active turn, never as authority."""
+    """Carry source audience metadata into later host-enforced decisions."""
 
-    if capability_name not in {
-        "discord.get_message",
-        "discord.read_messages",
-        "discord.search_messages",
+    tracked_discord_read = (
+        isinstance(capability_name, str) and capability_name.startswith("discord.")
+        if discord_read is None
+        else discord_read
+    )
+    if not tracked_discord_read and capability_name not in {
+        "files.list",
+        "files.read",
+        "compute.run",
     }:
+        return
+    if not isinstance(capability_name, str):
         return
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
+        assert isinstance(capability_name, str)
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
         return
-    if not isinstance(payload, dict) or payload.get("truncated") is True:
+    if not isinstance(payload, dict):
+        assert isinstance(capability_name, str)
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
         return
+    observation_count = len(budget.discord_disclosure_observations)
+    output_truncated = payload.get("truncated") is True
     candidates: list[dict[str, object]] = [payload]
     messages = payload.get("messages")
     if isinstance(messages, list):
         candidates.extend(item for item in messages if isinstance(item, dict))
+    file_records = payload.get("files")
+    if isinstance(file_records, list):
+        candidates.extend(item for item in file_records if isinstance(item, dict))
+    provenance_candidates = [
+        item.get("provenance")
+        for item in candidates
+        if isinstance(item.get("provenance"), dict)
+    ]
+    for provenance in provenance_candidates:
+        assert isinstance(provenance, dict)
+        if provenance.get("declassified_at") is not None:
+            continue
+        resources = provenance.get("source_resources")
+        if not isinstance(resources, list):
+            resources = []
+        if not resources:
+            origin_guild_id = provenance.get("origin_guild_id")
+            origin_channel_id = provenance.get("origin_channel_id")
+            origin_visibility = provenance.get("origin_visibility")
+            if origin_visibility == "actor_private":
+                if provenance.get("owner_actor_id") != budget.context.actor_id:
+                    resources = []
+                else:
+                    origin_visibility = "restricted"
+                    resources = [
+                        [origin_guild_id, origin_channel_id, origin_visibility]
+                    ]
+            else:
+                resources = [
+                    [origin_guild_id, origin_channel_id, origin_visibility]
+                ]
+        for resource in resources:
+            if not isinstance(resource, list) or len(resource) != 3:
+                continue
+            guild_id, channel_id, visibility = resource
+            if not (
+                isinstance(guild_id, str)
+                and isinstance(channel_id, str)
+                and visibility in {"guild_public", "restricted", "uncertain"}
+            ):
+                continue
+            same_origin = (
+                guild_id == budget.context.workspace_id
+                and channel_id == budget.context.origin_resource_id
+            )
+            same_guild_public = (
+                guild_id == budget.context.workspace_id
+                and visibility == "guild_public"
+            )
+            observation = DisclosureObservation(
+                source_workspace_id=guild_id,
+                source_resource_id=channel_id,
+                visibility=cast(
+                    Literal["guild_public", "restricted", "uncertain"],
+                    visibility,
+                ),
+                relation_to_origin=(
+                    "same_or_narrower"
+                    if same_origin or same_guild_public
+                    else "uncertain"
+                ),
+            )
+            if observation not in budget.discord_disclosure_observations:
+                budget.discord_disclosure_observations.append(observation)
     for item in candidates:
         guild_id = item.get("guild_id") or item.get("source_guild_id")
         channel_id = item.get("channel_id") or item.get("source_channel_id")
+        visibility = item.get("visibility", "uncertain")
         relation = item.get("disclosure_to_origin")
         if not (
             isinstance(guild_id, str)
             and isinstance(channel_id, str)
+            and visibility in {"guild_public", "restricted", "uncertain"}
             and relation in {"same_or_narrower", "broader", "uncertain"}
         ):
             continue
-        observation = (guild_id, channel_id, relation)
+        observation = DisclosureObservation(
+            source_workspace_id=guild_id,
+            source_resource_id=channel_id,
+            visibility=cast(
+                Literal["guild_public", "restricted", "uncertain"],
+                visibility,
+            ),
+            relation_to_origin=cast(
+                Literal["same_or_narrower", "broader", "uncertain"],
+                relation,
+            ),
+        )
+        if observation not in budget.discord_disclosure_observations:
+            budget.discord_disclosure_observations.append(observation)
+    missing_required_label = (
+        len(budget.discord_disclosure_observations) == observation_count
+        and (
+            (tracked_discord_read and capability_name not in {
+                "discord.read_messages",
+                "discord.search_messages",
+            })
+            or (
+                tracked_discord_read
+                and capability_name
+                in {"discord.read_messages", "discord.search_messages"}
+                and (not isinstance(messages, list) or bool(messages))
+            )
+            or capability_name in {"files.read", "compute.run"}
+            or (
+                capability_name == "files.list"
+                and isinstance(file_records, list)
+                and bool(file_records)
+            )
+        )
+    )
+    if output_truncated or missing_required_label:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+
+
+def _record_truncated_disclosure_observation(
+    budget: _ToolTurnBudget,
+    *,
+    capability_name: str,
+    arguments: object | None,
+) -> None:
+    """Fail closed when output bounding may have omitted a source label."""
+
+    resource_ids: list[str] = []
+    if isinstance(arguments, dict):
+        for key in ("channel_id", "source_channel_id", "thread_id"):
+            value = arguments.get(key)
+            if isinstance(value, str) and value:
+                resource_ids.append(value)
+        channel_ids = arguments.get("channel_ids")
+        if isinstance(channel_ids, list):
+            resource_ids.extend(
+                value for value in channel_ids if isinstance(value, str) and value
+            )
+    if not resource_ids:
+        resource_ids.append(
+            (
+                budget.context.origin_resource_id
+                if capability_name in {"files.list", "files.read", "compute.run"}
+                else None
+            )
+            or f"{capability_name}:unscoped"
+        )
+    workspace_id = budget.context.workspace_id or "unknown"
+    for resource_id in dict.fromkeys(resource_ids):
+        relation: Literal["same_or_narrower", "uncertain"] = (
+            "same_or_narrower"
+            if capability_name.startswith("discord.")
+            and workspace_id == budget.context.workspace_id
+            and resource_id == budget.context.origin_resource_id
+            else "uncertain"
+        )
+        observation = DisclosureObservation(
+            source_workspace_id=workspace_id,
+            source_resource_id=resource_id,
+            visibility="uncertain",
+            relation_to_origin=relation,
+        )
         if observation not in budget.discord_disclosure_observations:
             budget.discord_disclosure_observations.append(observation)
 

@@ -56,9 +56,10 @@ def _tool(
     *,
     connector_id: str = _FIGMA_ID,
     read_only: bool | None = True,
+    destructive: bool = False,
     schema: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
-    annotations: dict[str, object] = {"destructiveHint": read_only is False}
+    annotations: dict[str, object] = {"destructiveHint": destructive}
     if read_only is not None:
         annotations["readOnlyHint"] = read_only
     return {
@@ -226,6 +227,37 @@ async def test_connector_read_write_actions_cannot_cross_endpoints() -> None:
     with pytest.raises(UserError) as reclassified:
         await registry.invoke("connector.write", request, context)
     assert reclassified.value.code == "connector.action_class_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_destructive_connector_requires_the_dedicated_endpoint() -> None:
+    server = _AppServer(
+        (_tool("figma_delete", read_only=False, destructive=True),)
+    )
+    registry = _registry(server)
+    context = _context()
+    described = await registry.invoke(
+        "connector.describe",
+        ConnectorDescribeRequest(_FIGMA_ID, "figma_delete"),
+        context,
+    )
+    assert isinstance(described, ConnectorDescribeResponse)
+    request = ConnectorInvokeRequest(
+        connector_id=_FIGMA_ID,
+        tool="figma_delete",
+        contract_id=described.contract_id,
+        arguments={"query": "obsolete frame"},
+    )
+
+    with pytest.raises(UserError) as denied:
+        await registry.invoke("connector.write", request, context)
+    assert denied.value.code == "connector.destructive_class_mismatch"
+
+    endpoint = registry.endpoint("connector.destructive")
+    assert endpoint.descriptor.approval is ApprovalMode.WHEN_REQUESTED
+    response = await registry.invoke("connector.destructive", request, context)
+    assert isinstance(response, ConnectorInvokeResponse)
+    assert response.action_class == "write"
 
 
 @pytest.mark.asyncio

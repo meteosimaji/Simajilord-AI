@@ -29,6 +29,8 @@ from simajilord.domain.image import (
 from simajilord.services.files import AgentFileSandbox
 from simajilord.services.image import ImageGenerationService
 
+from .file_scope import file_provenance, file_workspace_id
+
 _MAX_MODEL_IMAGE_PREVIEW_BYTES = 512_000
 _MODEL_IMAGE_PREVIEW_DIMENSIONS = (1_024, 896, 768, 640, 512, 384)
 _MODEL_IMAGE_PREVIEW_QUALITIES = (86, 78, 70, 62, 54, 46)
@@ -188,7 +190,12 @@ def build_image_endpoints(
                 job_id=terminal.job_id,
                 error_code=terminal.error_code,
             )
-        return await _agent_image_result(terminal, files=files, service=service)
+        return await _agent_image_result(
+            terminal,
+            files=files,
+            service=service,
+            context=context,
+        )
 
     async def status(
         request: ImageStatusRequest,
@@ -211,9 +218,10 @@ def build_image_endpoints(
             content = await asyncio.to_thread(job.output_path.read_bytes)
             record = await asyncio.to_thread(
                 files.import_bytes,
-                job.workspace_id,
+                file_workspace_id(context),
                 _agent_image_path(job.job_id),
                 content,
+                provenance=file_provenance(context),
             )
             workspace_path = record.path
             await service.mark_handed_off(job.job_id)
@@ -312,15 +320,17 @@ async def _agent_image_result(
     *,
     files: AgentFileSandbox,
     service: ImageGenerationService,
+    context: InvocationContext,
 ) -> ImageGenerateResponse:
     if job.output_path is None or not job.output_path.is_file():
         raise UserError("image.output_unavailable", job_id=job.job_id)
     content = await asyncio.to_thread(job.output_path.read_bytes)
     record = await asyncio.to_thread(
         files.import_bytes,
-        job.workspace_id,
+        file_workspace_id(context),
         _agent_image_path(job.job_id),
         content,
+        provenance=file_provenance(context),
     )
     await service.mark_handed_off(job.job_id)
     preview, preview_media_type, preview_width, preview_height = await asyncio.to_thread(

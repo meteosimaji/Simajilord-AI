@@ -15,6 +15,7 @@ import discord
 import pytest
 from PIL import Image
 
+from simajilord.capabilities.file_scope import file_workspace_id
 from simajilord.capabilities.image import (
     _MAX_MODEL_IMAGE_PREVIEW_BYTES,
     ImageGenerateRequest,
@@ -785,7 +786,7 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
     assert response.image_data_url.startswith("data:image/")
     assert response.preview_size_bytes <= response.size_bytes
     assert (response.preview_width, response.preview_height) == (512, 512)
-    assert files.path_for_delivery("guild", response.path).is_file()
+    assert files.path_for_delivery(file_workspace_id(context), response.path).is_file()
     assert job.auto_deliver is False
     assert job.delivery_message_id is None
     assert job.delivered is False

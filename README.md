@@ -85,7 +85,9 @@ with Discord's generic “interaction failed” banner.
 - Speech-over-music sidechain ducking in the active Discord player, without restarting
   the music stream; standalone speech is used only as an overlay-failure fallback
 - Opt-in VC-member-only read aloud, short-burst merging and spam suppression, plus durable
-  server and user voice presets
+  server and user voice presets. Before each queued or delivered utterance, the default
+  `enforce` policy verifies that every current listener can read the source; incomplete member
+  state fails closed. `audit` and `disabled` remain explicit compatibility modes
 - Restart-safe Focus Timers with retryable text delivery, optional VC-aware speech, and
   temporary read-aloud focus mode
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors
@@ -112,10 +114,12 @@ with Discord's generic “interaction failed” banner.
   must actually be read before a host reply or write can be finalized
 - Read-only Discord research may cross to another shared server when both the active requester
   and BOT still have View Channel and Read Message History access (and private-thread membership
-  where applicable). Each result includes a time-local source-visibility/disclosure advisory.
-  `broader` flags a currently known audience expansion and `uncertain` means the member cache
-  cannot prove the complete audience; neither is a mechanical disclosure block or a source of
-  write authority. A write to any explicitly selected shared server still requires fresh
+  where applicable). Each result includes a time-local source-visibility label and disclosure
+  relation. `broader` flags a known audience expansion and `uncertain` means the member cache
+  cannot prove the complete audience. The default `enforce` policy blocks a write from either
+  kind of mixed-audience turn and rechecks composite source-to-target writes in the Discord
+  adapter; `audit` records without blocking and `disabled` restores the legacy advisory-only
+  behavior. A write to any explicitly selected shared server still requires fresh
   requester and BOT permissions there; historical reads never grant write authority. When an
   agent supplies a globally unique cached channel ID but omits its server ID, the write resolver
   may infer that shared server and then repeats the same live membership and permission checks;
@@ -149,13 +153,18 @@ with Discord's generic “interaction failed” banner.
   `Generate` and `Cancel` on the main screen
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
-- A quota-bound file workspace per Discord server: the agent can import Discord attachments,
+- A quota-bound file workspace isolated by Discord server, actor, and durable task by default:
+  the agent can import Discord attachments,
   download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text
-  content in chunks, edit text, and send a selected result back to Discord. PDF reads select
+  content in chunks, edit text, and send a selected result back to Discord. Durable provenance
+  records owner, origin server/channel/message, source visibility, creating task, sensitivity,
+  and any explicit declassification fields before restricted bytes become visible. `actor` and
+  the former `guild_shared` scope are reversible operator modes; provenance still prevents a
+  restricted result from being sent to a broader or unverified audience. PDF reads select
   1–20 pages at a time and return `total_pages` plus `next_page`; character-level `next_offset`
   continues within the selected page range, so documents longer than 20 pages remain readable
 - Optional `AGENT_SAFE_COMPUTE_ACCESS` runs only an argv-based Python script that the agent first
-  stores in that server workspace. On macOS, Seatbelt blocks network access, child processes,
+  stores in its selected private workspace. On macOS, Seatbelt blocks network access, child processes,
   personal/project host files, and writes outside a temporary staged workspace; wall time, CPU,
   resident memory, output, open-file, per-file, file-count, and workspace-byte limits are
   host-enforced.
@@ -169,8 +178,10 @@ with Discord's generic “interaction failed” banner.
   through Simajilord's existing capability, authorization, effect-ledger, and audit boundary.
   Native model-facing Codex Apps and plugin MCP servers remain disabled. The broker reads the live
   tool inventory for every operation, omits unknown/unclassified tools, separates read and write
-  endpoints, and requires a current actor/request/thread/schema-bound contract; connector writes
-  are approved and receipted as non-idempotent external effects
+  endpoints, and requires a current actor/request/thread/schema-bound contract. Tools carrying a
+  destructive hint are excluded from `connector.write` and require the distinct
+  `connector.destructive` capability; both writes are receipted as non-idempotent external
+  effects, while destructive calls also use the high-risk confirmation boundary
 - Optional `AGENT_CURATED_SKILLS_ENABLED` adds a small package-owned `workflow.search`
   catalog for community research, long web/PDF reading, file plus safe-compute transforms,
   generic media saving, selective memory, and Action Receipt/Undo flows. These are typed
@@ -213,12 +224,17 @@ with Discord's generic “interaction failed” banner.
 - Permission-guarded agent audio playback/control, VOICEVOX speech, and read-aloud routing;
   third parties outside the active VC cannot control playback. Capability scope and
   per-turn write approval are separate, and the exact triggering message must be read before
-  any approved write
+  any approved write. Requester and BOT service principals are distinct types; a failed member
+  lookup cannot silently become BOT authority
 - Agent actions include intentional reactions, own-message reply/edit/delete, pinning, polls,
   threads and forum posts, roles, channel settings/creation, audio and read-aloud controls, and
   permission-checked moderation. Destructive actions require the explicit capability policy,
   the active contributor's permissions, a reason/evidence where applicable, and a journaled
-  result; retrieving an old administrator message can never authorize a new action
+  result; retrieving an old administrator message can never authorize a new action. By default,
+  moderation, destructive operations, role/channel/policy mutation, persistent read-aloud,
+  direct messages, destructive connectors, and shell execution require a requester-only Discord
+  confirmation bound to the exact capability, canonical arguments, target context, active
+  message revision, short expiry, and one use. `legacy_event` is an explicit rollback mode
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
   context compaction, exact-message verification, progressive status updates, and corrective
   retries after failed writes. Native `contextCompaction` lifecycle events renew the inactivity
@@ -283,9 +299,9 @@ with Discord's generic “interaction failed” banner.
   retried; the Discord message is not posted again. Recovery uses a known message ID directly;
   only a crash before that ID is saved falls back to nonce reconciliation, and one recovery pass
   shares that bounded history read across pending deliveries in the same channel. A
-  single-source autonomous reply is attributed to that source actor for natural same-actor
-  Undo; a mixed-source batch remains BOT-owned instead of arbitrarily granting one member
-  control over the post. If a final confirmation follows a substantive write in the same turn,
+  autonomous reply records the BOT as executor and records source humans separately as trigger
+  actors; producing an event no longer attributes service-principal execution to that person.
+  If a final confirmation follows a substantive write in the same turn,
   ID-less Undo prefers that write; a reply-only turn instead removes its latest host post.
   The bounded `.data/agent_actions.sqlite3` ledger retains at most 2,000 records, at most 100 per
   actor, for seven days. It stores IDs and a small scalar inverse (maximum 4 KiB), never a file
@@ -315,10 +331,15 @@ with Discord's generic “interaction failed” banner.
   pointers in `.data/agent_autonomy.sqlite3`. The first event opens one fixed 5–15 second
   same-channel batch window
   and each turn receives the oldest candidates up to `AGENT_AUTONOMY_CANDIDATE_LIMIT`; excess
-  events stay queued for a later turn instead of being skipped. `AGENT_AUTONOMY_MAX_RUNS=0`
-  means no artificial run-count cutoff. `observe` suppresses spontaneous turns, `assist` can
-  answer, react, and manage timers, and `act` can use all otherwise granted write capabilities
-  subject to live Discord permissions and the same admission/rate limits. The autonomous
+  events stay queued for a later turn instead of being skipped. The safe defaults are
+  `observe`, `AGENT_AUTONOMY_MAX_RUNS=10`, and `AGENT_AUTONOMY_POLICY_MODE=strict`.
+  `observe` suppresses spontaneous turns, while `assist` and `act` receive only an
+  event-specific catalog. Ordinary channel events can read the exact event channel and perform
+  only same-channel BOT message/reaction work; they cannot create timers, polls, threads, pins,
+  or administrative changes, and cannot
+  search BOT-visible staff channels; voice events do not borrow the BOT's VC authority; and
+  `act` no longer converts every `WHEN_REQUESTED` capability into ambient approval. The
+  `legacy` policy mode restores the former broad catalog explicitly. The autonomous
   principal is the BOT itself, never the user who produced an event; source actors in the batch
   provide context but not borrowed authority.
   Global, per-channel, and per-human-source queue caps, per-server autonomous turn budgets,
@@ -329,7 +350,7 @@ with Discord's generic “interaction failed” banner.
   `AutonomyEventQueue` without adding a second scheduler
 - Restart-safe image generation through the saved Codex login, with atomic user/server/pending
   admission. Agent requests wait in the same turn and receive a bounded model-visible preview
-  plus the full server-scoped workspace file. Generation and publication stay independent: the
+  plus the full actor/task-scoped workspace file. Generation and publication stay independent: the
   model may inspect, compare, describe, or iterate privately, and uses `discord.send_file` only
   when the user asks to publish. Legacy automatic-delivery jobs reuse one durable Discord
   message and a hidden deterministic nonce for crash-safe reconciliation
@@ -344,8 +365,9 @@ connections.
 
 The optional agent and event autonomy are both default-off. Event autonomy is inert until the agent
 is enabled, `AGENT_AUTONOMY_ENABLED=true`, and
-`AGENT_AUTONOMY_GUILD_IDS` contains an allowed server, even though its mode defaults to `act`
-and `AGENT_AUTONOMY_MAX_RUNS=0` has no artificial run-count cutoff. Its native Codex runtime has
+`AGENT_AUTONOMY_GUILD_IDS` contains an allowed server. Its mode defaults to `observe`, its strict
+authority profile is event-specific, and its default run-count cutoff is 10; an operator may
+explicitly select `legacy` or zero runs to restore earlier behavior. Its native Codex runtime has
 browser control, model-facing Apps, plugin MCP servers, internal shell execution, personal-file
 access, remote plugin installation, sub-agents, and automatic browser-cookie extraction disabled.
 Optional host-brokered shell and design connector grants are independent of those native paths and
@@ -356,7 +378,8 @@ host automatically resets it only when the saved thread is genuinely unavailable
 `AGENT_CONVERSATION_COMPATIBILITY_EPOCH` is persisted with the local store; operators bump it
 only for an intentionally incompatible prompt/tool/permission protocol, which clears only saved
 provider continuity while preserving tasks, deliveries, receipts, memory, and audit evidence.
-The current single-broker authority and actor/task workspace protocol uses epoch `5`.
+The current typed-principal, information-flow, high-risk-confirmation, and actor/task workspace
+protocol uses epoch `6`.
 Model or capability-list changes do not silently fingerprint-reset every conversation. Existing
 conversations are never proactively rotated at a fixed host threshold. Agent turns have no wall-clock
 deadline. A turn is stopped only after its configured inactivity window, while a running

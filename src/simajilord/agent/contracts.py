@@ -6,6 +6,7 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 AGENT_NO_ACTION_CONTENT = "<simajilord:no-action>"
 AGENT_FINAL_DELIVERED_CONTENT = "<simajilord:final-delivered>"
@@ -121,7 +122,45 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     *AGENT_MEMORY_WRITE_CAPABILITIES,
     "feedback.create",
     "connector.write",
+    "connector.destructive",
     "system.shell",
+)
+AGENT_HIGH_RISK_CAPABILITIES = frozenset(
+    {
+        *AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+        "discord.set_timeout",
+        "discord.unban_member",
+        "discord.create_role",
+        "discord.assign_role",
+        "discord.remove_role",
+        "discord.update_channel_settings",
+        "discord.create_channel",
+        "discord.update_thread",
+        "discord.add_thread_member",
+        "discord.remove_thread_member",
+        "discord.create_guild_resource",
+        "discord.update_guild_resource",
+        "discord.set_channel_overwrite",
+        "discord.create_platform_asset",
+        "discord.update_platform_asset",
+        "discord.create_automod_rule",
+        "discord.update_automod_rule",
+        "discord.channel_operation",
+        "discord.message_action",
+        "discord.send_direct_message",
+        "discord.set_bot_presence",
+        "discord.read_aloud_add_sources",
+        "discord.read_aloud_remove_source",
+        "discord.read_aloud_disable",
+        "discord.read_aloud_dictionary_set",
+        "discord.read_aloud_dictionary_remove",
+        "discord.read_aloud_exclusion_set",
+        "discord.read_aloud_announcements_set",
+        "discord.read_aloud_semantics_set",
+        "discord.read_aloud_content_mode_set",
+        "connector.destructive",
+        "system.shell",
+    }
 )
 _AGENT_PUBLIC_REFERENCE_HEX_CHARACTERS = 20
 _AGENT_TASK_ID_HEX_CHARACTERS = 20
@@ -238,6 +277,44 @@ class AgentAutonomyMode(StrEnum):
     ACT = "act"
 
 
+class AgentAutonomyPolicyMode(StrEnum):
+    """Host authority profile for autonomous turns."""
+
+    STRICT = "strict"
+    LEGACY = "legacy"
+
+
+class AgentInformationFlowMode(StrEnum):
+    """How source-to-target audience uncertainty is enforced."""
+
+    ENFORCE = "enforce"
+    AUDIT = "audit"
+    DISABLED = "disabled"
+
+
+class AgentFileWorkspaceMode(StrEnum):
+    """Isolation boundary for model-visible files."""
+
+    ACTOR_TASK = "actor_task"
+    ACTOR = "actor"
+    GUILD_SHARED = "guild_shared"
+
+
+class ReadAloudAudienceMode(StrEnum):
+    """How voice listeners are checked against source readers."""
+
+    ENFORCE = "enforce"
+    AUDIT = "audit"
+    DISABLED = "disabled"
+
+
+class AgentHighRiskAuthorizationMode(StrEnum):
+    """Host binding applied to high-risk capability requests."""
+
+    BOUND_ONCE = "bound_once"
+    LEGACY_EVENT = "legacy_event"
+
+
 class AgentResponseStatus(StrEnum):
     """Stable outcome exposed to transport adapters."""
 
@@ -291,6 +368,18 @@ class AgentProgressUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentHighRiskConfirmation:
+    """Concrete host-rendered action proposal bound to one exact argument hash."""
+
+    capability: str
+    arguments_json: str
+    binding_sha256: str
+    requester_principal_id: str
+    authorization_message_id: str
+    authorization_message_edited_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class AgentRequest:
     """A compact event pointer.
 
@@ -310,6 +399,21 @@ class AgentRequest:
     resource_ids: tuple[str, ...]
     public_reference_id: str
     task_id: str = field(default_factory=new_agent_task_id)
+    principal_kind: Literal["requester", "service", "system"] = "requester"
+    read_scope_mode: Literal[
+        "resource_ids", "requester_live", "service_live"
+    ] = "resource_ids"
+    information_flow_mode: AgentInformationFlowMode = AgentInformationFlowMode.ENFORCE
+    file_workspace_mode: AgentFileWorkspaceMode = AgentFileWorkspaceMode.ACTOR_TASK
+    high_risk_authorization_mode: AgentHighRiskAuthorizationMode = (
+        AgentHighRiskAuthorizationMode.BOUND_ONCE
+    )
+    executor_principal_id: str | None = None
+    delegator_principal_id: str | None = None
+    trigger_actor_ids: tuple[str, ...] = ()
+    requester_principal_id: str | None = None
+    policy_id: str | None = None
+    allowed_capabilities: frozenset[str] | None = None
     message_edited_at: datetime | None = None
     grants: frozenset[str] = frozenset()
     approvals: frozenset[str] = frozenset()

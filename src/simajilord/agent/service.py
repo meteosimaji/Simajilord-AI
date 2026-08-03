@@ -36,8 +36,10 @@ from .errors import (
     AgentTimeoutError,
 )
 from .providers import (
+    AgentHighRiskConfirmationCallback,
     AgentProgressCallback,
     AgentProvider,
+    ProviderTurnResult,
     SemanticRoutingAgentProvider,
 )
 from .store import AgentConversationStore, AgentTaskRouteUnavailableError
@@ -126,6 +128,32 @@ class AgentService:
     @property
     def model(self) -> str:
         return self.provider.model
+
+    async def _provider_turn(
+        self,
+        *,
+        provider_thread_id: str | None,
+        event_prompt: str,
+        context: InvocationContext,
+        on_progress: AgentProgressCallback | None,
+        on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None,
+    ) -> ProviderTurnResult:
+        """Keep read-only provider implementations source-compatible."""
+
+        if on_high_risk_confirmation is None:
+            return await self.provider.respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+            )
+        return await self.provider.respond(
+            provider_thread_id=provider_thread_id,
+            event_prompt=event_prompt,
+            context=context,
+            on_progress=on_progress,
+            on_high_risk_confirmation=on_high_risk_confirmation,
+        )
 
     def runtime_metrics(self) -> dict[str, int]:
         """Return low-cardinality queue and keyed-registry diagnostics."""
@@ -233,6 +261,7 @@ class AgentService:
         request: AgentRequest,
         *,
         on_progress: AgentProgressCallback | None = None,
+        on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
     ) -> AgentResponse:
         cached = await self.store.completed_response(request.event_id)
         if cached is not None:
@@ -282,6 +311,19 @@ class AgentService:
                         ),
                         batched_message_ids=_request_batched_message_ids(request),
                         agent_trigger=request.trigger.value,
+                        principal_kind=request.principal_kind,
+                        read_scope_mode=request.read_scope_mode,
+                        information_flow_mode=request.information_flow_mode.value,
+                        file_workspace_mode=request.file_workspace_mode.value,
+                        high_risk_authorization_mode=(
+                            request.high_risk_authorization_mode.value
+                        ),
+                        executor_principal_id=request.executor_principal_id,
+                        delegator_principal_id=request.delegator_principal_id,
+                        trigger_actor_ids=request.trigger_actor_ids,
+                        requester_principal_id=request.requester_principal_id,
+                        policy_id=request.policy_id,
+                        allowed_capabilities=request.allowed_capabilities,
                     )
                     if on_progress is not None:
                         await on_progress(
@@ -291,7 +333,7 @@ class AgentService:
                     async with self._admission_lock:
                         self._active_origins[origin_key] = (request, 0)
                     try:
-                        result = await self.provider.respond(
+                        result = await self._provider_turn(
                             provider_thread_id=provider_thread_id,
                             event_prompt=_event_prompt(
                                 request,
@@ -302,13 +344,14 @@ class AgentService:
                             ),
                             context=context,
                             on_progress=on_progress,
+                            on_high_risk_confirmation=on_high_risk_confirmation,
                         )
                     except AgentThreadError:
                         await self.store.rotate(
                             request.conversation_id,
                             model=self.model,
                         )
-                        result = await self.provider.respond(
+                        result = await self._provider_turn(
                             provider_thread_id=None,
                             event_prompt=_event_prompt(
                                 request,
@@ -320,6 +363,7 @@ class AgentService:
                             ),
                             context=context,
                             on_progress=on_progress,
+                            on_high_risk_confirmation=on_high_risk_confirmation,
                         )
                     finally:
                         async with self._admission_lock:
@@ -579,7 +623,7 @@ class AgentService:
             persisted_route = await self.store.route_for_event(request.event_id)
             if persisted_route is not None:
                 return persisted_route
-            if request.grants != original.grants or request.approvals != original.approvals:
+            if _request_authority_profile(request) != _request_authority_profile(original):
                 route_reason = "authorization_profile_mismatch"
             else:
                 route_context = InvocationContext(
@@ -601,6 +645,19 @@ class AgentService:
                         else None
                     ),
                     agent_trigger=request.trigger.value,
+                    principal_kind=request.principal_kind,
+                    read_scope_mode=request.read_scope_mode,
+                    information_flow_mode=request.information_flow_mode.value,
+                    file_workspace_mode=request.file_workspace_mode.value,
+                    high_risk_authorization_mode=(
+                        request.high_risk_authorization_mode.value
+                    ),
+                    executor_principal_id=request.executor_principal_id,
+                    delegator_principal_id=request.delegator_principal_id,
+                    trigger_actor_ids=request.trigger_actor_ids,
+                    requester_principal_id=request.requester_principal_id,
+                    policy_id=request.policy_id,
+                    allowed_capabilities=request.allowed_capabilities,
                 )
                 try:
                     selected = await routing_provider.route_candidate(
@@ -1271,6 +1328,25 @@ def _request_batched_message_ids(request: AgentRequest) -> tuple[str, ...]:
         seen.add(message_id)
         message_ids.append(message_id)
     return tuple(message_ids)
+
+
+def _request_authority_profile(request: AgentRequest) -> tuple[object, ...]:
+    """Keep a routed follow-up from changing the active task's host authority."""
+
+    return (
+        request.grants,
+        request.approvals,
+        request.principal_kind,
+        request.read_scope_mode,
+        request.information_flow_mode,
+        request.file_workspace_mode,
+        request.high_risk_authorization_mode,
+        request.executor_principal_id,
+        request.delegator_principal_id,
+        request.requester_principal_id,
+        request.policy_id,
+        request.allowed_capabilities,
+    )
 
 
 def _task_candidate_prompt(

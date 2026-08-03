@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -275,6 +275,11 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
         "tracked": True,
         "undo_available": True,
         "undo_capability": "discord.remove_own_reaction",
+        "executor_principal_id": None,
+        "delegator_principal_id": None,
+        "trigger_actor_ids": [],
+        "requester_principal_id": None,
+        "policy_id": None,
     }
     assert calls == [
         (
@@ -298,6 +303,122 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
     assert effect.status is ExternalEffectStatus.CONFIRMED
     assert effect.action_id == payload["action_receipt"]["action_id"]
     assert await service.request_has_replay_barrier(context.request_id)
+
+
+async def test_action_receipt_persists_distinct_audit_principals(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ReactionRequest]] = []
+    registry = _reaction_registry(calls)
+    path = tmp_path / "actions.sqlite3"
+    service = ActionReceiptService(
+        store=ActionReceiptStore(path),
+        registry=registry,
+    )
+    context = replace(
+        _context("bot"),
+        principal_kind="service",
+        executor_principal_id="bot",
+        delegator_principal_id=None,
+        trigger_actor_ids=("human-a", "human-b"),
+        requester_principal_id=None,
+        policy_id="discord-autonomy-strict-v1",
+    )
+    request = ReactionRequest("channel", "message", "✅")
+    response = await registry.invoke("discord.add_reaction", request, context)
+
+    receipt = await service.record(
+        capability="discord.add_reaction",
+        request=request,
+        response=response,
+        context=context,
+    )
+
+    assert receipt is not None
+    assert receipt.executor_principal_id == "bot"
+    assert receipt.delegator_principal_id is None
+    assert receipt.trigger_actor_ids == ("human-a", "human-b")
+    assert receipt.requester_principal_id is None
+    assert receipt.policy_id == "discord-autonomy-strict-v1"
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            """
+            SELECT actor_id, executor_principal_id, delegator_principal_id,
+                   trigger_actor_ids_json, requester_principal_id, policy_id
+            FROM agent_actions WHERE action_id = ?
+            """,
+            (receipt.action_id,),
+        ).fetchone()
+    assert row == (
+        "bot",
+        "bot",
+        None,
+        '["human-a","human-b"]',
+        None,
+        "discord-autonomy-strict-v1",
+    )
+
+
+def test_action_receipt_store_migrates_legacy_audit_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "actions.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE agent_actions (
+                action_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                workspace_id TEXT,
+                transport TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                target_ids_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                classification TEXT NOT NULL,
+                undo_capability TEXT,
+                undo_arguments_json TEXT,
+                host_delivery INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                undone_at TEXT,
+                undo_action_id TEXT
+            );
+            INSERT INTO agent_actions (
+                action_id, capability, actor_id, workspace_id, transport,
+                request_id, target_ids_json, status, classification,
+                host_delivery, created_at, expires_at
+            ) VALUES (
+                'legacy-action', 'discord.add_reaction', 'legacy-actor',
+                'legacy-guild', 'agent', 'legacy-request', '[]', 'succeeded',
+                'fully_reversible', 0, '2026-08-03T00:00:00+00:00',
+                '2099-08-03T00:00:00+00:00'
+            );
+            """
+        )
+
+    ActionReceiptStore(path)
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(agent_actions)")
+        }
+        row = connection.execute(
+            """
+            SELECT actor_id, executor_principal_id, delegator_principal_id,
+                   trigger_actor_ids_json, requester_principal_id, policy_id
+            FROM agent_actions WHERE action_id = 'legacy-action'
+            """
+        ).fetchone()
+    assert {
+        "executor_principal_id",
+        "delegator_principal_id",
+        "trigger_actor_ids_json",
+        "requester_principal_id",
+        "policy_id",
+    }.issubset(columns)
+    assert row == ("legacy-actor", None, None, "[]", None, None)
 
 
 async def test_dispatched_external_effect_becomes_unknown_after_restart(
@@ -442,6 +563,12 @@ async def test_receipt_persistence_failure_returns_untracked_without_fake_id(
                 "evidence_event_ids": ["event"],
                 "tracked": False,
                 "host_delivery": False,
+                "executor_principal_id": None,
+                "delegator_principal_id": None,
+                "trigger_actor_ids": [],
+                "requester_principal_id": None,
+                "principal_kind": "requester",
+                "policy_id": None,
             },
         )
     ]

@@ -13,12 +13,13 @@ from simajilord.core import (
     RiskLevel,
     endpoint,
 )
-from simajilord.core.errors import UserError
 from simajilord.services.files import (
     AgentFileSandbox,
     WorkspaceFileRecord,
     WorkspaceReadResult,
 )
+
+from .file_scope import file_provenance, file_workspace_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,9 +60,7 @@ def build_file_endpoints(
     service: AgentFileSandbox,
 ) -> tuple[CapabilityEndpoint, ...]:
     def workspace(context: InvocationContext) -> str:
-        if context.workspace_id is None:
-            raise UserError("files.workspace_required")
-        return context.workspace_id
+        return file_workspace_id(context)
 
     async def list_files(
         _: FileListRequest,
@@ -95,6 +94,7 @@ def build_file_endpoints(
             request.path,
             request.content,
             expected_sha256=request.expected_sha256,
+            provenance=file_provenance(context),
         )
 
     async def replace_text(
@@ -108,13 +108,14 @@ def build_file_endpoints(
             request.old,
             request.new,
             expected_sha256=request.expected_sha256,
+            provenance=file_provenance(context),
         )
 
     return (
         endpoint(
             CapabilityDescriptor(
                 name="files.list",
-                summary="List files in this Discord server's isolated workspace.",
+                summary="List files in this actor/task's isolated workspace.",
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=(
@@ -139,7 +140,7 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.read",
                 summary=(
-                    "Read text or inspect PDF and ZIP files in the isolated workspace. "
+                    "Read text or inspect PDF and ZIP files in the actor/task workspace. "
                     "Use offset/next_offset within one chunk. For PDF files, use "
                     "page_start/page_count and continue from next_page until complete."
                 ),
@@ -176,7 +177,7 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.write_text",
                 summary=(
-                    "Create or update a UTF-8 text file in the isolated workspace, "
+                    "Create or update a UTF-8 text file in the actor/task workspace, "
                     "optionally checking the previous SHA-256."
                 ),
                 risk=RiskLevel.WRITE,

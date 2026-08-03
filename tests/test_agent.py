@@ -19,6 +19,7 @@ from simajilord.agent import (
     AGENT_WEB_GRANT,
     AgentBusyError,
     AgentEvent,
+    AgentHighRiskConfirmation,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentProviderError,
@@ -44,9 +45,11 @@ from simajilord.agent.providers.codex import (
     CodexAppServerProvider,
     _AppServerTransportError,
     _base_instructions,
+    _bind_high_risk_authorization,
     _blocking_write_capability,
     _capability_discovery_gap,
     _capability_discovery_tool_failure,
+    _confirm_high_risk_action,
     _continuation_tool_budget,
     _encode_app_server_message,
     _ExactMessageReadState,
@@ -76,6 +79,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityRegistry,
+    DisclosureObservation,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -6748,7 +6752,7 @@ async def test_retrieved_past_message_cannot_become_write_authority(
     assert "not part of this active turn" in payload["error"]["reason"]
 
 
-def test_discord_visibility_observation_is_advisory_not_authority() -> None:
+def test_discord_visibility_observation_records_taint_without_granting_authority() -> None:
     context = InvocationContext(
         "ordinary-user",
         "workspace",
@@ -6779,9 +6783,363 @@ def test_discord_visibility_observation_is_advisory_not_authority() -> None:
         ),
     )
 
-    assert budget.discord_disclosure_observations == [("other-guild", "private-channel", "broader")]
+    assert [
+        (
+            item.source_workspace_id,
+            item.source_resource_id,
+            item.visibility,
+            item.relation_to_origin,
+        )
+        for item in budget.discord_disclosure_observations
+    ] == [("other-guild", "private-channel", "uncertain", "broader")]
     assert set(budget.authorization_contexts) == {"auth_trigger"}
     assert budget.read_authorization_event_ids == {"auth_trigger"}
+
+
+def test_compute_output_restores_every_workspace_source_label() -> None:
+    context = InvocationContext(
+        actor_id="ordinary-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:trigger",
+        origin_resource_id="public",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="trigger",
+        authorization_contexts={"auth_trigger": context},
+        authorization_message_ids={"auth_trigger": "trigger"},
+        read_authorization_event_ids={"auth_trigger"},
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="compute.run",
+        output=json.dumps(
+            {
+                "stdout": "transformed",
+                "provenance": {
+                    "source_resources": [["guild", "staff", "restricted"]],
+                },
+            }
+        ),
+    )
+
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="staff",
+            visibility="restricted",
+            relation_to_origin="uncertain",
+        )
+    ]
+
+
+def test_truncated_read_output_fails_closed_without_source_metadata() -> None:
+    context = InvocationContext(
+        actor_id="ordinary-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:trigger",
+        origin_resource_id="public",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="trigger",
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="discord.search_messages",
+        output='{"truncated":true,"reason":"agent_tool_output_budget"}',
+        arguments={"channel_ids": ["staff", "private-thread"]},
+    )
+
+    assert {
+        (item.source_resource_id, item.visibility, item.relation_to_origin)
+        for item in budget.discord_disclosure_observations
+    } == {
+        ("staff", "uncertain", "uncertain"),
+        ("private-thread", "uncertain", "uncertain"),
+    }
+
+
+def test_unlabelled_workspace_read_fails_closed() -> None:
+    context = InvocationContext(
+        actor_id="ordinary-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:trigger",
+        origin_resource_id="public",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="trigger",
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="files.read",
+        output='{"path":"legacy.txt","content":"old shared data","provenance":null}',
+    )
+
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="public",
+            visibility="uncertain",
+            relation_to_origin="uncertain",
+        )
+    ]
+
+
+def test_discord_read_without_embedded_label_uses_exact_channel_scope() -> None:
+    context = InvocationContext(
+        actor_id="ordinary-user",
+        workspace_id="guild",
+        transport="agent",
+        request_id="discord:message:trigger",
+        origin_resource_id="origin",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="trigger",
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="discord.inspect_channel",
+        output='{"channel_id":"origin","name":"general"}',
+        arguments={"channel_id": "origin"},
+    )
+
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="origin",
+            visibility="uncertain",
+            relation_to_origin="same_or_narrower",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_high_risk_confirmation_binds_exact_revision_and_arguments() -> None:
+    proposals: list[AgentHighRiskConfirmation] = []
+
+    async def confirm(proposal: AgentHighRiskConfirmation) -> bool:
+        proposals.append(proposal)
+        return True
+
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="channel",
+        active_message_id="message",
+        active_message_edited_at="2026-08-03T00:00:00+00:00",
+        requester_principal_id="requester",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="message",
+        on_high_risk_confirmation=confirm,
+    )
+    arguments = {
+        "user_id": "target",
+        "reason": "confirmed moderation action",
+        "authorization_event_id": "auth",
+    }
+
+    assert (
+        _bind_high_risk_authorization(
+            budget,
+            authorization_event_id="auth",
+            capability_name="discord.ban_member",
+            arguments=arguments,
+            context=context,
+        )
+        is None
+    )
+    assert (
+        await _confirm_high_risk_action(
+            budget,
+            capability_name="discord.ban_member",
+            arguments=arguments,
+            context=context,
+        )
+        is None
+    )
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.capability == "discord.ban_member"
+    assert proposal.authorization_message_id == "message"
+    assert proposal.authorization_message_edited_at == (
+        "2026-08-03T00:00:00+00:00"
+    )
+    assert "authorization_event_id" not in proposal.arguments_json
+    assert len(proposal.binding_sha256) == 64
+
+    changed = _bind_high_risk_authorization(
+        budget,
+        authorization_event_id="auth",
+        capability_name="discord.ban_member",
+        arguments={**arguments, "user_id": "different-target"},
+        context=context,
+    )
+    assert changed is not None
+    assert changed[0] == "agent.high_risk_authorization_changed"
+
+    budget.used_high_risk_authorizations.add("auth")
+    reused = _bind_high_risk_authorization(
+        budget,
+        authorization_event_id="auth",
+        capability_name="discord.ban_member",
+        arguments=arguments,
+        context=context,
+    )
+    assert reused is not None
+    assert reused[0] == "agent.high_risk_authorization_used"
+
+
+@pytest.mark.asyncio
+async def test_high_risk_confirmation_fails_closed_without_host_callback() -> None:
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        active_message_id="message",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=1,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id="message",
+    )
+
+    failure = await _confirm_high_risk_action(
+        budget,
+        capability_name="discord.ban_member",
+        arguments={"user_id": "target", "authorization_event_id": "auth"},
+        context=context,
+    )
+
+    assert failure is not None
+    assert failure[0] == "agent.high_risk_confirmation_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_high_risk_tool_dispatches_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    proposals: list[AgentHighRiskConfirmation] = []
+    registry = CapabilityRegistry()
+
+    async def ban(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.subject)
+        return WriteResponse(job_id="done")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.ban_member",
+                "Ban one member.",
+                RiskLevel.DESTRUCTIVE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+            ),
+            WriteRequest,
+            WriteResponse,
+            ban,
+        )
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.ban_member",),
+        required_grants={"discord.ban_member": "moderation"},
+        write_capabilities=("discord.ban_member",),
+        destructive_capabilities=("discord.ban_member",),
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-high-risk",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=catalog,
+    )
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="10",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({"moderation"}),
+        approvals=frozenset({"discord.ban_member"}),
+        origin_resource_id="20",
+        active_message_id="30",
+        requester_principal_id="7",
+    )
+
+    async def confirm(proposal: AgentHighRiskConfirmation) -> bool:
+        proposals.append(proposal)
+        return True
+
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="30",
+        on_high_risk_confirmation=confirm,
+        authorization_contexts={"auth": context},
+        authorization_message_ids={"auth": "30"},
+        read_authorization_event_ids={"auth"},
+        event_message_read=True,
+    )
+    provider._active_tool_budgets["thread"] = budget
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+    call = {
+        "namespace": "simajilord",
+        "tool": "discord_ban_member",
+        "arguments": {
+            "subject": "target",
+            "authorization_event_id": "auth",
+        },
+        "threadId": "thread",
+    }
+
+    await provider._handle_dynamic_tool(1, call)
+    await provider._handle_dynamic_tool(2, call)
+
+    assert invoked == ["target"]
+    assert len(proposals) == 1
+    assert response.await_args_list[0].kwargs["success"] is True
+    assert response.await_args_list[1].kwargs["success"] is False
+    second = json.loads(response.await_args_list[1].kwargs["text"])
+    assert second["error"]["code"] == "agent.high_risk_authorization_used"
 
 
 def test_app_server_jsonl_encoder_rejects_an_unbounded_tool_result() -> None:

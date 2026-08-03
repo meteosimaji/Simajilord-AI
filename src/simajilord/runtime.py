@@ -601,6 +601,7 @@ class SimajilordRuntime:
                     "connector.describe",
                     "connector.read",
                     "connector.write",
+                    "connector.destructive",
                 )
                 agent_capabilities.extend(connector_capabilities)
                 required_grants.update(
@@ -693,7 +694,7 @@ class SimajilordRuntime:
                         else ()
                     )
                     + (
-                        ("connector.write",)
+                        ("connector.write", "connector.destructive")
                         if "connector.write" in agent_capabilities
                         else ()
                     )
@@ -725,7 +726,14 @@ class SimajilordRuntime:
                         else ()
                     )
                 ),
-                destructive_capabilities=AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+                destructive_capabilities=(
+                    *AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+                    *(
+                        ("connector.destructive",)
+                        if "connector.destructive" in agent_capabilities
+                        else ()
+                    ),
+                ),
                 image_output_capabilities=(
                     "discord.view_custom_emoji",
                     "discord.view_image_attachment",

@@ -11,7 +11,12 @@ import discord
 import pytest
 
 from simajilord.agent.tools import AgentToolCatalog
-from simajilord.core import CapabilityRegistry, InvocationContext
+from simajilord.capabilities.speech import SpeechSpeakRequest
+from simajilord.core import (
+    CapabilityRegistry,
+    DisclosureObservation,
+    InvocationContext,
+)
 from simajilord.core.errors import UserError
 from simajilord.integrations.discord.capabilities import (
     DiscordConnectVoiceRequest,
@@ -402,6 +407,7 @@ def _agent_context(*, resource_ids: tuple[str, ...] = ("20", "21")) -> Invocatio
         request_id="discord:message:30",
         origin_resource_id="20",
         resource_ids=resource_ids,
+        read_scope_mode="requester_live",
     )
 
 
@@ -1004,7 +1010,7 @@ async def test_discord_search_messages_rejects_channel_outside_actor_scope() -> 
                 content="private phrase",
                 channel_ids=("99",),
             ),
-            _agent_context(),
+            replace(_agent_context(), read_scope_mode="resource_ids"),
         )
 
     client.http.request.assert_not_awaited()
@@ -1233,6 +1239,106 @@ async def test_private_source_to_broader_destination_returns_advisory_warning() 
 
 
 @pytest.mark.asyncio
+async def test_restricted_source_cannot_flow_to_broader_destination() -> None:
+    client = Mock(spec=discord.Client)
+    guild, destination, actor, bot = _visibility_guild(10, 20)
+    other = next(member for member in guild.members if member.id == 8)
+    destination.permissions_for.side_effect = lambda member: SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    destination.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    source = Mock(spec=discord.TextChannel)
+    source.id = 21
+    source.permissions_for.side_effect = lambda member: _permission(
+        readable=member.id in {actor.id, bot.id}
+    )
+    guild.members = [actor, bot, other]
+    guild.text_channels = [destination, source]
+    guild.get_channel_or_thread.side_effect = lambda channel_id: {
+        20: destination,
+        21: source,
+    }.get(channel_id)
+    client.get_guild.return_value = guild
+    context = replace(
+        _agent_context(),
+        disclosure_observations=(
+            DisclosureObservation(
+                source_workspace_id="10",
+                source_resource_id="21",
+                visibility="restricted",
+                relation_to_origin="broader",
+            ),
+        ),
+    )
+
+    with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
+        await _endpoint_map(cast(discord.Client, client))[
+            "discord.send_message"
+        ].invoke(
+            DiscordSendMessageRequest(channel_id="20", content="restricted"),
+            context,
+        )
+    destination.send.assert_not_awaited()
+
+    response = await _endpoint_map(cast(discord.Client, client))[
+        "discord.send_message"
+    ].invoke(
+        DiscordSendMessageRequest(channel_id="20", content="audited"),
+        replace(context, information_flow_mode="audit"),
+    )
+    assert response.message_id == "31"
+
+
+@pytest.mark.asyncio
+async def test_uncertain_source_audience_fails_closed_before_send() -> None:
+    client = Mock(spec=discord.Client)
+    guild, destination, _, _ = _visibility_guild(10, 20, other_id=None)
+    destination.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    destination.send = AsyncMock()
+    source = Mock(spec=discord.TextChannel)
+    source.id = 21
+    source.permissions_for.return_value = _permission(readable=True)
+    guild.chunked = False
+    guild.member_count = 100
+    guild.text_channels = [destination, source]
+    guild.get_channel_or_thread.side_effect = lambda channel_id: {
+        20: destination,
+        21: source,
+    }.get(channel_id)
+    client.get_guild.return_value = guild
+    context = replace(
+        _agent_context(),
+        disclosure_observations=(
+            DisclosureObservation(
+                source_workspace_id="10",
+                source_resource_id="21",
+                visibility="uncertain",
+                relation_to_origin="uncertain",
+            ),
+        ),
+    )
+
+    with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
+        await _endpoint_map(cast(discord.Client, client))[
+            "discord.send_message"
+        ].invoke(
+            DiscordSendMessageRequest(channel_id="20", content="uncertain"),
+            context,
+        )
+    destination.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_public_source_to_narrower_destination_has_no_warning() -> None:
     client = Mock(spec=discord.Client)
     guild, source, _, _ = _visibility_guild(10, 21)
@@ -1294,7 +1400,7 @@ async def test_role_gated_source_with_all_effective_members_has_no_false_warning
 
 
 @pytest.mark.asyncio
-async def test_incomplete_member_cache_reports_uncertain_without_false_warning() -> None:
+async def test_incomplete_member_cache_reports_uncertain_and_warns_fail_closed() -> None:
     client = Mock(spec=discord.Client)
     guild, source, _, _ = _visibility_guild(10, 21, other_id=None)
     destination = Mock(spec=discord.TextChannel)
@@ -1322,7 +1428,8 @@ async def test_incomplete_member_cache_reports_uncertain_without_false_warning()
 
     assert response.visibility == "uncertain"
     assert response.disclosure_to_origin == "uncertain"
-    assert response.disclosure_warning is None
+    assert response.disclosure_warning is not None
+    assert "fails closed" in response.disclosure_warning
 
 
 @pytest.mark.asyncio
@@ -1452,7 +1559,7 @@ async def test_agent_poll_is_limited_to_active_channel_and_effective_permissions
                 question="Outside scope?",
                 options=("A", "B"),
             ),
-            _agent_context(),
+            replace(_agent_context(), read_scope_mode="resource_ids"),
         )
 
 
@@ -1474,6 +1581,53 @@ async def test_agent_voice_connect_requires_requester_in_selected_channel() -> N
             DiscordConnectVoiceRequest(channel_id="40"),
             _agent_context(),
         )
+
+
+@pytest.mark.asyncio
+async def test_agent_speech_rejects_listener_who_cannot_read_origin() -> None:
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    source = Mock(spec=discord.TextChannel)
+    source.id = 20
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 40
+    actor = SimpleNamespace(
+        id=7,
+        bot=False,
+        display_name="Requester",
+        voice=SimpleNamespace(channel=destination),
+    )
+    listener = SimpleNamespace(id=8, bot=False)
+    destination.members = [actor, listener]
+    source.permissions_for.side_effect = lambda member: SimpleNamespace(
+        administrator=False,
+        view_channel=member.id == actor.id,
+        read_message_history=member.id == actor.id,
+    )
+    guild.get_member.return_value = actor
+    guild.get_channel_or_thread.return_value = source
+    guild.members = [actor, listener]
+    guild.member_count = 2
+    guild.chunked = True
+    client.get_guild.return_value = guild
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(
+            cast(discord.Client, client),
+            cast(SimajilordRuntime, runtime),
+        )
+    }
+
+    with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
+        await endpoints["discord.speak"].invoke(
+            SpeechSpeakRequest(text="restricted update"),
+            _agent_context(),
+        )
+
+    assert runtime.registry.invoke.called is False
 
 
 @pytest.mark.asyncio

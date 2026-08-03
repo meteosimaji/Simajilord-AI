@@ -26,6 +26,11 @@ CapabilityIdempotency = Literal[
     "non_idempotent_write",
 ]
 CapabilityAuditPayload = Literal["full", "metadata"]
+AgentPrincipalKind = Literal["requester", "service", "system"]
+AgentReadScopeMode = Literal["resource_ids", "requester_live", "service_live"]
+InformationFlowMode = Literal["enforce", "audit", "disabled"]
+FileWorkspaceMode = Literal["actor_task", "actor", "guild_shared"]
+HighRiskAuthorizationMode = Literal["bound_once", "legacy_event"]
 log = logging.getLogger(__name__)
 
 
@@ -44,6 +49,16 @@ class ApprovalMode(StrEnum):
     NEVER = "never"
     WHEN_REQUESTED = "when_requested"
     ALWAYS = "always"
+
+
+@dataclass(frozen=True, slots=True)
+class DisclosureObservation:
+    """One source audience observed by an active model turn."""
+
+    source_workspace_id: str
+    source_resource_id: str
+    visibility: Literal["guild_public", "restricted", "uncertain"]
+    relation_to_origin: Literal["same_or_narrower", "broader", "uncertain"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +83,18 @@ class InvocationContext:
     active_message_edited_at: str | None = None
     batched_message_ids: tuple[str, ...] = ()
     agent_trigger: Literal["mention", "autonomous"] | None = None
+    principal_kind: AgentPrincipalKind = "requester"
+    read_scope_mode: AgentReadScopeMode = "resource_ids"
+    information_flow_mode: InformationFlowMode = "enforce"
+    file_workspace_mode: FileWorkspaceMode = "actor_task"
+    high_risk_authorization_mode: HighRiskAuthorizationMode = "bound_once"
+    disclosure_observations: tuple[DisclosureObservation, ...] = ()
+    executor_principal_id: str | None = None
+    delegator_principal_id: str | None = None
+    trigger_actor_ids: tuple[str, ...] = ()
+    requester_principal_id: str | None = None
+    policy_id: str | None = None
+    allowed_capabilities: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)

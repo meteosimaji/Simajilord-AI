@@ -27,7 +27,9 @@ from simajilord.providers.web.base import PublicWebFetcher
 
 from .files import (
     AgentFileSandbox,
+    WorkspaceFileProvenance,
     WorkspaceFileRecord,
+    merge_file_provenances,
     workspace_file_kind,
 )
 
@@ -116,6 +118,7 @@ class ComputeRunResult:
     changed_files: tuple[WorkspaceFileRecord, ...]
     stdout: str
     stderr: str
+    provenance: WorkspaceFileProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -562,6 +565,7 @@ class WorkspaceComputeService:
         *,
         runtime: str,
         argv: tuple[str, ...],
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> ComputeRunResult:
         if runtime != "python":
             raise UserError("compute.runtime_unsupported")
@@ -583,6 +587,12 @@ class WorkspaceComputeService:
                     self._stage_workspace,
                     workspace_id,
                     workspace,
+                )
+                effective_provenance = merge_file_provenances(
+                    (
+                        provenance,
+                        *(record.provenance for record in before.values()),
+                    )
                 )
                 script = workspace.joinpath(*PurePosixPath(normalized_argv[0]).parts)
                 if script.is_symlink() or not script.is_file():
@@ -606,6 +616,7 @@ class WorkspaceComputeService:
                         workspace_id,
                         workspace,
                         before,
+                        effective_provenance,
                     )
                 return ComputeRunResult(
                     runtime=runtime,
@@ -615,6 +626,7 @@ class WorkspaceComputeService:
                     changed_files=changed_files,
                     stdout=process_result.stdout,
                     stderr=process_result.stderr,
+                    provenance=effective_provenance,
                 )
             finally:
                 await asyncio.to_thread(
@@ -628,6 +640,7 @@ class WorkspaceComputeService:
         *,
         url: str,
         path: str,
+        provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceDownloadResult:
         resource_result = await self.web_fetcher.fetch(
             url,
@@ -644,6 +657,7 @@ class WorkspaceComputeService:
             workspace_id,
             path,
             resource_result.body,
+            provenance=provenance,
         )
         return WorkspaceDownloadResult(
             file=record,
@@ -680,6 +694,7 @@ class WorkspaceComputeService:
         workspace_id: str,
         workspace: Path,
         before: dict[str, WorkspaceFileRecord],
+        provenance: WorkspaceFileProvenance | None,
     ) -> tuple[WorkspaceFileRecord, ...]:
         after = self._scan_staged_workspace(workspace_id, workspace)
         with self.files.locked_workspace(workspace_id):
@@ -721,6 +736,7 @@ class WorkspaceComputeService:
                     )
                     for relative_path in changed_paths
                 ),
+                provenance=provenance,
             )
 
     def _scan_staged_workspace(

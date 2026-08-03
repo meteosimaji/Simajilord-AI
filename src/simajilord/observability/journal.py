@@ -133,6 +133,12 @@ class EventJournal:
             "provider_thread_id": context.provider_thread_id,
             "provider_turn_id": context.provider_turn_id,
             "tool_call_id": context.tool_call_id,
+            "executor_principal_id": context.executor_principal_id,
+            "delegator_principal_id": context.delegator_principal_id,
+            "trigger_actor_ids": list(context.trigger_actor_ids),
+            "requester_principal_id": context.requester_principal_id,
+            "principal_kind": context.principal_kind,
+            "policy_id": context.policy_id,
         }
         if audit_payload == "full":
             payload["request"] = _safe_value(request)

@@ -13,9 +13,15 @@ import discord
 import pytest
 
 from simajilord.agent import (
+    AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_NO_ACTION_CONTENT,
     AGENT_REQUESTED_WRITE_CAPABILITIES,
     AgentAutonomyMode,
+    AgentAutonomyPolicyMode,
+    AgentFileWorkspaceMode,
+    AgentHighRiskAuthorizationMode,
+    AgentHighRiskConfirmation,
+    AgentInformationFlowMode,
     AutonomyEnqueueResult,
     AutonomyEventBatch,
     AutonomyEventKind,
@@ -43,6 +49,7 @@ from simajilord.integrations.discord.cogs import (
     ObservationCog,
     _agent_delivery_nonce,
     _agent_request_replay_barrier_reason,
+    _autonomy_event_write_capabilities,
 )
 
 
@@ -78,6 +85,15 @@ async def _message_history(
         yield message
 
 
+def test_strict_autonomy_never_borrows_service_voice_authority() -> None:
+    for event_kind in AutonomyEventKind:
+        allowed = _autonomy_event_write_capabilities(
+            AgentAutonomyMode.ACT,
+            frozenset({event_kind}),
+        )
+        assert allowed.isdisjoint(AGENT_AUDIO_WRITE_CAPABILITIES)
+
+
 async def _enqueue_messages(
     queue: AutonomyEventQueue,
     *,
@@ -98,6 +114,107 @@ async def _enqueue_messages(
             payload={"content_length": index + 1},
         )
         assert result is AutonomyEnqueueResult.INSERTED
+
+
+@pytest.mark.asyncio
+async def test_high_risk_host_confirmation_rechecks_message_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = Mock(spec=discord.TextChannel)
+    confirmation_message = Mock(spec=discord.Message)
+    confirmation_message.edit = AsyncMock()
+    channel.send = AsyncMock(return_value=confirmation_message)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(
+            author=SimpleNamespace(id=7),
+            edited_at=datetime(2026, 8, 3, 0, 1, tzinfo=UTC),
+        )
+    )
+    guild = SimpleNamespace(id=10)
+    source = Mock(spec=discord.Message)
+    source.channel = channel
+    source.guild = guild
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            agent_high_risk_confirmation_timeout_seconds=120,
+        ),
+        journal=SimpleNamespace(append=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs."
+        "AgentHighRiskConfirmationView.wait_for_decision",
+        AsyncMock(return_value=True),
+    )
+    proposal = AgentHighRiskConfirmation(
+        capability="discord.ban_member",
+        arguments_json='{"user_id":"9"}',
+        binding_sha256="a" * 64,
+        requester_principal_id="7",
+        authorization_message_id="20",
+        authorization_message_edited_at="2026-08-03T00:00:00+00:00",
+    )
+
+    accepted = await AgentCog(SimpleNamespace(), runtime)._confirm_high_risk_action(
+        source,
+        proposal,
+    )
+
+    assert accepted is False
+    assert runtime.journal.append.await_args.kwargs["kind"] == (
+        "agent.high_risk.rejected"
+    )
+    assert runtime.journal.append.await_args.kwargs["payload"][
+        "revision_valid"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_high_risk_host_confirmation_fails_closed_when_journal_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = Mock(spec=discord.TextChannel)
+    confirmation_message = Mock(spec=discord.Message)
+    confirmation_message.edit = AsyncMock()
+    channel.send = AsyncMock(return_value=confirmation_message)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(
+            author=SimpleNamespace(id=7),
+            edited_at=None,
+        )
+    )
+    source = Mock(spec=discord.Message)
+    source.channel = channel
+    source.guild = SimpleNamespace(id=10)
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            agent_high_risk_confirmation_timeout_seconds=120,
+        ),
+        journal=SimpleNamespace(
+            append=AsyncMock(side_effect=RuntimeError("journal unavailable"))
+        ),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs."
+        "AgentHighRiskConfirmationView.wait_for_decision",
+        AsyncMock(return_value=True),
+    )
+    proposal = AgentHighRiskConfirmation(
+        capability="discord.ban_member",
+        arguments_json='{"user_id":"9"}',
+        binding_sha256="a" * 64,
+        requester_principal_id="7",
+        authorization_message_id="20",
+        authorization_message_edited_at=None,
+    )
+
+    accepted = await AgentCog(SimpleNamespace(), runtime)._confirm_high_risk_action(
+        source,
+        proposal,
+    )
+
+    assert accepted is False
+    final_embed = confirmation_message.edit.await_args.kwargs["embed"]
+    assert final_embed.title == "High-risk action stopped"
 
 
 @pytest.mark.asyncio
@@ -1248,7 +1365,13 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
         ),
         settings=SimpleNamespace(
             agent_autonomy_mode=AgentAutonomyMode.ACT,
+            agent_autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
             agent_autonomy_guild_ids=frozenset({"10"}),
+            agent_information_flow_mode=AgentInformationFlowMode.ENFORCE,
+            agent_file_workspace_mode=AgentFileWorkspaceMode.ACTOR_TASK,
+            agent_high_risk_authorization_mode=(
+                AgentHighRiskAuthorizationMode.BOUND_ONCE
+            ),
             agent_file_sandbox_enabled=False,
             agent_web_search_access=AgentFeatureAccess.DISABLED,
             agent_safe_compute_access=AgentFeatureAccess.DISABLED,
@@ -1265,14 +1388,21 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
                 SimpleNamespace(
                     descriptor=SimpleNamespace(
                         name=name,
-                        approval=ApprovalMode.WHEN_REQUESTED,
+                        approval=(
+                            ApprovalMode.NEVER
+                            if name == "discord.send_message"
+                            else ApprovalMode.WHEN_REQUESTED
+                        ),
                     )
                 )
-                for name in AGENT_REQUESTED_WRITE_CAPABILITIES
+                for name in (
+                    *AGENT_REQUESTED_WRITE_CAPABILITIES,
+                    "discord.send_message",
+                )
             )
         ),
     )
-    bot_member = SimpleNamespace(id=999)
+    bot_member = SimpleNamespace(id=999, bot=True)
     guild = SimpleNamespace(id=10, me=bot_member)
     channel = Mock(spec=discord.TextChannel)
     channel.permissions_for = Mock(return_value=_post_permissions())
@@ -1282,7 +1412,7 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
         get_channel=lambda channel_id: channel if channel_id == 20 else None,
     )
     monkeypatch.setattr(
-        "simajilord.integrations.discord.cogs.agent_readable_channel_ids",
+        "simajilord.integrations.discord.cogs.readable_for_service",
         lambda *args, **kwargs: ("20",),
     )
     cog = AgentAutonomyCog(bot, runtime)
@@ -1303,7 +1433,13 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
         "103",
         "104",
     }
-    assert set(AGENT_REQUESTED_WRITE_CAPABILITIES) <= request.approvals
+    assert request.principal_kind == "service"
+    assert request.resource_ids == ("20",)
+    assert "discord.send_message" in request.allowed_capabilities
+    assert "discord.create_poll" not in request.approvals
+    assert "timer.create" not in request.approvals
+    assert "discord.set_timeout" not in request.approvals
+    assert "discord.list_members" not in request.allowed_capabilities
 
 
 @pytest.mark.asyncio
@@ -1425,7 +1561,13 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
         autonomy_events=autonomy_events,
         settings=SimpleNamespace(
             agent_autonomy_mode=AgentAutonomyMode.ACT,
+            agent_autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
             agent_autonomy_guild_ids=frozenset({"10"}),
+            agent_information_flow_mode=AgentInformationFlowMode.ENFORCE,
+            agent_file_workspace_mode=AgentFileWorkspaceMode.ACTOR_TASK,
+            agent_high_risk_authorization_mode=(
+                AgentHighRiskAuthorizationMode.BOUND_ONCE
+            ),
             agent_file_sandbox_enabled=False,
             agent_web_search_access=AgentFeatureAccess.DISABLED,
             agent_safe_compute_access=AgentFeatureAccess.DISABLED,
@@ -1459,7 +1601,7 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
     channel.fetch_message = AsyncMock(return_value=target)
     channel.send = AsyncMock()
     channel.history = Mock(return_value=_message_history(()))
-    bot_member = SimpleNamespace(id=999)
+    bot_member = SimpleNamespace(id=999, bot=True)
     channel.permissions_for = Mock(return_value=_post_permissions())
     guild = SimpleNamespace(id=10, me=bot_member)
     bot = SimpleNamespace(
@@ -1468,7 +1610,7 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
         get_channel=lambda channel_id: channel if channel_id == 20 else None,
     )
     monkeypatch.setattr(
-        "simajilord.integrations.discord.cogs.agent_readable_channel_ids",
+        "simajilord.integrations.discord.cogs.readable_for_service",
         lambda *args, **kwargs: ("20",),
     )
 
@@ -1486,7 +1628,9 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
     assert receipt_call.kwargs["channel_id"] == "20"
     assert receipt_call.kwargs["message_ids"] == ("301",)
     context = receipt_call.kwargs["context"]
-    assert context.actor_id == "101"
+    assert context.actor_id == "999"
+    assert context.executor_principal_id == "999"
+    assert context.trigger_actor_ids == ("101",)
     assert context.workspace_id == "10"
     assert context.origin_resource_id == "20"
 
@@ -1851,9 +1995,12 @@ async def test_missing_post_permission_is_terminal_before_model_turn(
     agent = SimpleNamespace(respond=AsyncMock())
     runtime = SimpleNamespace(
         agent=agent,
-        settings=SimpleNamespace(agent_autonomy_guild_ids=frozenset({"10"})),
+        settings=SimpleNamespace(
+            agent_autonomy_guild_ids=frozenset({"10"}),
+            agent_autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
+        ),
     )
-    bot_member = SimpleNamespace(id=999)
+    bot_member = SimpleNamespace(id=999, bot=True)
     guild = SimpleNamespace(id=10, me=bot_member)
     channel = Mock(spec=discord.TextChannel)
     channel.permissions_for = Mock(
@@ -1865,7 +2012,7 @@ async def test_missing_post_permission_is_terminal_before_model_turn(
         get_channel=lambda _: channel,
     )
     monkeypatch.setattr(
-        "simajilord.integrations.discord.cogs.agent_readable_channel_ids",
+        "simajilord.integrations.discord.cogs.readable_for_service",
         lambda *args, **kwargs: ("20",),
     )
 

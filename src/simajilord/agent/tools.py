@@ -1028,6 +1028,13 @@ class AgentToolCatalog:
     ) -> str | None:
         """Return a coarse availability bucket without exposing endpoint metadata."""
 
+        if (
+            context is not None
+            and context.allowed_capabilities is not None
+            and capability_name not in context.allowed_capabilities
+        ):
+            return "policy_denied"
+
         required_grant = self._required_grants.get(capability_name)
         has_grant = required_grant is None or (
             context is not None and required_grant in context.grants
@@ -1060,6 +1067,14 @@ class AgentToolCatalog:
     ) -> Any:
         endpoint = self._registry.endpoint(capability_name)
         descriptor = endpoint.descriptor
+        if (
+            context is not None
+            and context.allowed_capabilities is not None
+            and capability_name not in context.allowed_capabilities
+        ):
+            raise AgentToolError(
+                f"Agent policy does not allow {capability_name} in this turn."
+            )
         required_grant = self._required_grants.get(capability_name)
         if descriptor.approval is ApprovalMode.ALWAYS:
             raise AgentToolError(

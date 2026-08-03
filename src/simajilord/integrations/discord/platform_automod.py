@@ -21,6 +21,7 @@ from simajilord.core.errors import UserError
 from .capabilities import (
     _audit_reason,
     _bounded_name,
+    _enforce_information_flow_to_guild,
     _requested_guild,
     _require_channel_permissions,
     _require_guild_permission,
@@ -129,6 +130,7 @@ def build_discord_automod_endpoints(
         context: InvocationContext,
     ) -> DiscordAutoModRuleMutationResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _automod_members(guild, context)
         trigger, actions, roles, channels = _rule_parts(
             guild, actor, bot, request.rule
@@ -150,6 +152,7 @@ def build_discord_automod_endpoints(
         context: InvocationContext,
     ) -> DiscordAutoModRuleMutationResponse:
         guild = _requested_guild(client, context, request.guild_id)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _automod_members(guild, context)
         existing = await _fetch_rule(guild, request.rule_id)
         trigger, actions, roles, channels = _rule_parts(

@@ -227,6 +227,7 @@ class ConnectorBroker:
                 request,
                 context,
                 expected_class=ConnectorActionClass.READ,
+                expected_destructive=False,
             )
 
         async def invoke_write(
@@ -237,6 +238,18 @@ class ConnectorBroker:
                 request,
                 context,
                 expected_class=ConnectorActionClass.WRITE,
+                expected_destructive=False,
+            )
+
+        async def invoke_destructive(
+            request: ConnectorInvokeRequest,
+            context: InvocationContext,
+        ) -> ConnectorInvokeResponse:
+            return await self._invoke(
+                request,
+                context,
+                expected_class=ConnectorActionClass.WRITE,
+                expected_destructive=True,
             )
 
         common_errors = (
@@ -247,6 +260,7 @@ class ConnectorBroker:
             "connector.tool_unclassified",
             "connector.inventory_collision",
             "connector.action_class_mismatch",
+            "connector.destructive_class_mismatch",
             "connector.contract_invalid",
             "connector.arguments_invalid",
             "connector.tool_failed",
@@ -358,6 +372,36 @@ class ConnectorBroker:
                 ConnectorInvokeResponse,
                 invoke_write,
             ),
+            endpoint(
+                CapabilityDescriptor(
+                    name="connector.destructive",
+                    summary=(
+                        "Invoke one live connector mutation explicitly marked destructive "
+                        "through a separately classified, one-use authorization path."
+                    ),
+                    risk=RiskLevel.DESTRUCTIVE,
+                    approval=ApprovalMode.WHEN_REQUESTED,
+                    keywords=(
+                        "delete external design",
+                        "destructive connector action",
+                        "remove Canva resource",
+                    ),
+                    side_effects=(
+                        "May irreversibly delete or replace an external resource.",
+                    ),
+                    requires_workspace=True,
+                    idempotency="non_idempotent_write",
+                    expected_errors=common_errors,
+                    timeout_seconds=180,
+                    user_visible_effect=(
+                        "Performs a connector operation marked destructive by the live tool."
+                    ),
+                    audit_payload="metadata",
+                ),
+                ConnectorInvokeRequest,
+                ConnectorInvokeResponse,
+                invoke_destructive,
+            ),
         )
 
     async def _invoke(
@@ -366,6 +410,7 @@ class ConnectorBroker:
         context: InvocationContext,
         *,
         expected_class: ConnectorActionClass,
+        expected_destructive: bool,
     ) -> ConnectorInvokeResponse:
         selected = await self._selected_tool(
             context,
@@ -374,6 +419,8 @@ class ConnectorBroker:
         )
         if selected.action_class is not expected_class:
             raise UserError("connector.action_class_mismatch")
+        if selected.destructive_hint is not expected_destructive:
+            raise UserError("connector.destructive_class_mismatch")
         expected_contract = self._contract_id(selected, context)
         if not secrets.compare_digest(request.contract_id, expected_contract):
             raise UserError("connector.contract_invalid")

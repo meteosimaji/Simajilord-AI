@@ -47,8 +47,10 @@ from simajilord.agent import (
     AGENT_TIMER_WRITE_CAPABILITIES,
     AGENT_WEB_GRANT,
     AgentAutonomyMode,
+    AgentAutonomyPolicyMode,
     AgentBusyError,
     AgentEvent,
+    AgentHighRiskConfirmation,
     AgentRateLimitError,
     AgentRequest,
     AgentTaskRouteDecision,
@@ -213,7 +215,14 @@ from .help_catalog import (
     PublicCommandSpec,
 )
 from .local_media import attachment_can_play, import_discord_attachment
-from .permissions import agent_readable_channel_ids, permission_enabled
+from .permissions import (
+    RequesterPrincipal,
+    ServicePrincipal,
+    permission_enabled,
+    read_aloud_audience_relation,
+    readable_for_requester,
+    readable_for_service,
+)
 from .presenter import (
     EmbedField,
     EmbedTone,
@@ -250,6 +259,85 @@ class SafeView(discord.ui.View):
     ) -> None:
         del item
         await handle_interaction_error(interaction, error)
+
+
+class AgentHighRiskConfirmationView(SafeView):
+    """One requester-only, expiring confirmation for an exact action binding."""
+
+    def __init__(
+        self,
+        *,
+        requester_id: int,
+        binding_sha256: str,
+        timeout: float,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.requester_id = requester_id
+        self.binding_sha256 = binding_sha256
+        self.message: discord.Message | None = None
+        self._decision: asyncio.Future[bool] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the requester can confirm this action.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        await self._finish(False, interaction=None)
+
+    async def wait_for_decision(self) -> bool:
+        return await self._decision
+
+    async def _finish(
+        self,
+        decision: bool,
+        *,
+        interaction: discord.Interaction | None,
+    ) -> None:
+        if self._decision.done():
+            if interaction is not None and not interaction.response.is_done():
+                await interaction.response.defer()
+            return
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if interaction is not None and not interaction.response.is_done():
+            await interaction.response.defer()
+        self._decision.set_result(decision)
+        self.stop()
+        if self.message is not None:
+            with suppress(discord.DiscordException):
+                await self.message.edit(view=self)
+
+    @discord.ui.button(
+        label="Confirm exact action",
+        style=discord.ButtonStyle.danger,
+        custom_id="simajilord:agent:confirm-high-risk",
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[AgentHighRiskConfirmationView],
+    ) -> None:
+        await self._finish(True, interaction=interaction)
+
+    @discord.ui.button(
+        label="Do not run",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:agent:reject-high-risk",
+    )
+    async def reject_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[AgentHighRiskConfirmationView],
+    ) -> None:
+        await self._finish(False, interaction=interaction)
 
 
 class SafeModal(discord.ui.Modal):
@@ -374,6 +462,15 @@ _ERROR_MESSAGES = {
     "discord.agent_read_channel_forbidden": (
         "The AI does not have permission to view this Discord channel."
     ),
+    "discord.agent_principal_invalid": (
+        "Could not safely resolve who is requesting this Discord action. Try again shortly."
+    ),
+    "discord.information_flow_forbidden": (
+        "This action could reveal information to a wider or unverified audience."
+    ),
+    "discord.bulk_delete_message_too_old": (
+        "Bulk delete cannot include messages that are 14 days old or older."
+    ),
     "discord.custom_emoji_decode_failed": "Could not decode that custom emoji.",
     "discord.poll_question_invalid": "Poll questions must contain 1-300 characters.",
     "discord.poll_option_count_invalid": "Polls must contain 2-10 choices.",
@@ -441,6 +538,7 @@ _ERROR_MESSAGES = {
     "web.time_range_invalid": "Time range must be day, month, or year.",
     "media.download_cooldown": "Wait 30 seconds before starting another download.",
     "workspace.required": "Run this command inside a Discord server.",
+    "files.workspace_mode_invalid": "The configured AI file-workspace policy is invalid.",
 }
 
 _MEDIA_ERROR_MESSAGES = {
@@ -662,6 +760,48 @@ def _active_read_aloud_route(
 ) -> ReadAloudRoute | None:
     route = runtime.read_aloud.get(workspace_id)
     return route if isinstance(route, ReadAloudRoute) else None
+
+
+def _read_aloud_audience_allowed(
+    runtime: SimajilordRuntime,
+    message: discord.Message,
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> bool:
+    """Apply the reversible listener-audience policy before speech is queued."""
+
+    raw_mode = getattr(runtime.settings, "read_aloud_audience_mode", "enforce")
+    mode = getattr(raw_mode, "value", raw_mode)
+    if mode not in {"enforce", "audit", "disabled"}:
+        mode = "enforce"
+    if mode == "disabled":
+        return True
+    guild = message.guild
+    source = message.channel
+    if guild is None or not isinstance(
+        source,
+        (
+            discord.TextChannel,
+            discord.Thread,
+            discord.ForumChannel,
+            discord.VoiceChannel,
+            discord.StageChannel,
+        ),
+    ):
+        relation = "uncertain"
+    else:
+        relation = read_aloud_audience_relation(guild, source, destination)
+    if relation == "same_or_narrower":
+        return True
+    log.warning(
+        "Read-aloud audience check failed mode=%s guild=%s source=%s "
+        "destination=%s relation=%s",
+        mode,
+        getattr(guild, "id", None),
+        getattr(source, "id", None),
+        destination.id,
+        relation,
+    )
+    return mode == "audit"
 
 
 def _risk_label(risk: str) -> str:
@@ -5171,6 +5311,8 @@ class ReadAloudCog(commands.Cog):
             (discord.VoiceChannel, discord.StageChannel),
         ) or not any(not listener.bot for listener in destination.members):
             return
+        if not _read_aloud_audience_allowed(self.runtime, message, destination):
+            return
         policy = self.runtime.read_aloud.policy(workspace_id)
         if policy.vc_members_only and (
             not isinstance(message.author, discord.Member)
@@ -5227,6 +5369,18 @@ class ReadAloudCog(commands.Cog):
         workspace_id = str(message.guild.id)
         route = self.runtime.read_aloud.get(workspace_id)
         if route is None or str(message.channel.id) not in route.text_channel_ids:
+            return
+        destination = message.guild.get_channel(int(route.audio_destination_id))
+        if not isinstance(
+            destination,
+            (discord.VoiceChannel, discord.StageChannel),
+        ) or not any(
+            not listener.bot for listener in destination.members
+        ) or not _read_aloud_audience_allowed(
+            self.runtime,
+            message,
+            destination,
+        ):
             return
         guild_id = message.guild.id
         session = self.runtime.audio.get_or_create(
@@ -8245,10 +8399,20 @@ def _agent_grants(
 ) -> frozenset[str]:
     settings = runtime.settings
     autonomy_mode = settings.agent_autonomy_mode if autonomous else None
+    autonomy_policy_mode = getattr(
+        settings,
+        "agent_autonomy_policy_mode",
+        AgentAutonomyPolicyMode.STRICT,
+    )
+    legacy_autonomy_act = (
+        autonomous
+        and autonomy_mode is AgentAutonomyMode.ACT
+        and autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
+    )
     grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
     if not autonomous:
         grants.add(AGENT_FEEDBACK_GRANT)
-    if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
+    if not autonomous or legacy_autonomy_act:
         grants.update((AGENT_QUOTE_GRANT, AGENT_REPOST_GRANT))
     if not autonomous or autonomy_mode in {
         AgentAutonomyMode.ASSIST,
@@ -8256,7 +8420,7 @@ def _agent_grants(
     }:
         grants.update((AGENT_MESSAGE_GRANT, AGENT_REACTION_GRANT))
     if (
-        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
+        (not autonomous or legacy_autonomy_act)
         and settings.agent_file_sandbox_enabled
         and runtime.files is not None
     ):
@@ -8270,7 +8434,7 @@ def _agent_grants(
         grants.add(AGENT_MEDIA_GRANT)
     compute_access = settings.agent_safe_compute_access
     if (
-        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
+        (not autonomous or legacy_autonomy_act)
         and runtime.compute is not None
         and (
             compute_access is AgentFeatureAccess.EVERYONE
@@ -8299,13 +8463,13 @@ def _agent_grants(
             )
         ):
             grants.add(AGENT_CONNECTOR_GRANT)
-    if not autonomous or autonomy_mode is AgentAutonomyMode.ACT:
+    if not autonomous or legacy_autonomy_act:
         grants.add(AGENT_MODERATION_GRANT)
     if runtime.moderation.provider is not None:
         grants.add(AGENT_HIVE_GRANT)
     image_access = settings.image_generation_access
     if (
-        (not autonomous or autonomy_mode is AgentAutonomyMode.ACT)
+        (not autonomous or legacy_autonomy_act)
         and runtime.image.provider is not None
         and (
             image_access is AgentFeatureAccess.EVERYONE
@@ -8316,23 +8480,204 @@ def _agent_grants(
         )
     ):
         grants.add(AGENT_IMAGE_GRANT)
-    if actor_id in settings.agent_admin_user_ids:
+    if not autonomous and actor_id in settings.agent_admin_user_ids:
         grants.add(ACTION_UNDO_ANY_GRANT)
     return frozenset(grants)
+
+
+async def _resolve_requester_principal(
+    guild: discord.Guild,
+    author: discord.User | discord.Member,
+) -> RequesterPrincipal | None:
+    """Resolve a human requester with one bounded REST fallback, or fail closed."""
+
+    member = author if isinstance(author, discord.Member) else guild.get_member(author.id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(author.id)
+        except (discord.NotFound, discord.Forbidden):
+            return None
+        except discord.DiscordException:
+            log.warning(
+                "Discord requester lookup failed guild=%s actor=%s",
+                guild.id,
+                author.id,
+                exc_info=True,
+            )
+            return None
+    try:
+        return RequesterPrincipal(member)
+    except ValueError:
+        return None
+
+
+_AUTONOMY_ASSIST_WRITES_BY_EVENT: dict[AutonomyEventKind, frozenset[str]] = {
+    AutonomyEventKind.MESSAGE_CREATE: frozenset(
+        {
+            "discord.add_reaction",
+            "discord.remove_own_reaction",
+        }
+    ),
+    AutonomyEventKind.MESSAGE_EDIT: frozenset(
+        {
+            "discord.add_reaction",
+            "discord.remove_own_reaction",
+        }
+    ),
+    AutonomyEventKind.REACTION_ADD: frozenset(
+        {"discord.add_reaction", "discord.remove_own_reaction"}
+    ),
+}
+_AUTONOMY_ACT_WRITES_BY_EVENT: dict[AutonomyEventKind, frozenset[str]] = {
+    AutonomyEventKind.MESSAGE_CREATE: frozenset(
+        {
+            "discord.send_message",
+            "discord.send_embed",
+            "discord.reply_message",
+            "discord.edit_own_message",
+            "discord.delete_own_message",
+            *_AUTONOMY_ASSIST_WRITES_BY_EVENT[AutonomyEventKind.MESSAGE_CREATE],
+        }
+    ),
+    AutonomyEventKind.MESSAGE_EDIT: frozenset(
+        {
+            "discord.send_message",
+            "discord.send_embed",
+            "discord.reply_message",
+            "discord.edit_own_message",
+            "discord.delete_own_message",
+            *_AUTONOMY_ASSIST_WRITES_BY_EVENT[AutonomyEventKind.MESSAGE_EDIT],
+        }
+    ),
+    AutonomyEventKind.REACTION_ADD: frozenset(
+        {
+            "discord.send_message",
+            "discord.send_embed",
+            *_AUTONOMY_ASSIST_WRITES_BY_EVENT[AutonomyEventKind.REACTION_ADD],
+        }
+    ),
+    AutonomyEventKind.THREAD_CREATE: frozenset(
+        {"discord.send_message", "discord.send_embed", "discord.reply_message"}
+    ),
+    # Service-principal voice events may report status, but they must not borrow
+    # the bot's current voice membership to perform user-scoped audio writes.
+    AutonomyEventKind.VOICE_STATE_UPDATE: frozenset(),
+    AutonomyEventKind.AUDIO_ERROR: frozenset(),
+}
+
+_AUTONOMY_STRICT_BASE_READ_CAPABILITIES = frozenset(
+    {
+        "turn.evidence_plan",
+        "moderation.status",
+        "translation.detect",
+        "translation.languages",
+        "translation.translate",
+        "translation.translate_batch",
+        "utility.choose",
+        "utility.roll",
+        "web.search",
+        "web.fetch",
+        "web.find",
+        "web.status",
+    }
+)
+_AUTONOMY_EVENT_CHANNEL_READ_CAPABILITIES = frozenset(
+    {
+        "discord.get_message",
+        "discord.read_messages",
+        "discord.search_messages",
+        "discord.expand_message",
+        "discord.translate_message",
+        "discord.inspect_channel",
+        "discord.list_pins",
+        "discord.list_reaction_users",
+        "discord.list_poll_voters",
+        "discord.list_thread_members",
+        "discord.view_custom_emoji",
+        "discord.view_image_attachment",
+        "discord.view_sticker",
+        "discord.analyze_attachment",
+    }
+)
+_AUTONOMY_CHANNEL_EVENT_KINDS = frozenset(
+    {
+        AutonomyEventKind.MESSAGE_CREATE,
+        AutonomyEventKind.MESSAGE_EDIT,
+        AutonomyEventKind.REACTION_ADD,
+        AutonomyEventKind.THREAD_CREATE,
+    }
+)
+
+
+def _autonomy_event_write_capabilities(
+    mode: AgentAutonomyMode,
+    event_kinds: frozenset[AutonomyEventKind],
+) -> frozenset[str]:
+    if mode is AgentAutonomyMode.OBSERVE:
+        return frozenset()
+    policy = (
+        _AUTONOMY_ASSIST_WRITES_BY_EVENT
+        if mode is AgentAutonomyMode.ASSIST
+        else _AUTONOMY_ACT_WRITES_BY_EVENT
+    )
+    return frozenset(
+        capability
+        for event_kind in event_kinds
+        for capability in policy.get(event_kind, frozenset())
+    )
 
 
 def _autonomy_approvals(
     runtime: SimajilordRuntime,
     mode: AgentAutonomyMode,
+    event_kinds: frozenset[AutonomyEventKind] | None = None,
+    *,
+    policy_mode: AgentAutonomyPolicyMode | None = None,
 ) -> frozenset[str]:
-    if mode is AgentAutonomyMode.ASSIST:
-        return frozenset(AGENT_TIMER_WRITE_CAPABILITIES)
-    if mode is not AgentAutonomyMode.ACT:
-        return frozenset()
+    selected_policy = policy_mode or getattr(
+        runtime.settings,
+        "agent_autonomy_policy_mode",
+        AgentAutonomyPolicyMode.STRICT,
+    )
+    if selected_policy is AgentAutonomyPolicyMode.LEGACY:
+        if mode is AgentAutonomyMode.ASSIST:
+            return frozenset(AGENT_TIMER_WRITE_CAPABILITIES)
+        if mode is not AgentAutonomyMode.ACT:
+            return frozenset()
+        return frozenset(
+            item.descriptor.name
+            for item in runtime.registry.all()
+            if item.descriptor.approval is ApprovalMode.WHEN_REQUESTED
+        )
+    kinds = event_kinds or frozenset(AutonomyEventKind)
+    allowed = _autonomy_event_write_capabilities(mode, kinds)
     return frozenset(
         item.descriptor.name
         for item in runtime.registry.all()
-        if item.descriptor.approval is ApprovalMode.WHEN_REQUESTED
+        if item.descriptor.name in allowed
+        and item.descriptor.approval is ApprovalMode.WHEN_REQUESTED
+    )
+
+
+def _autonomy_allowed_capabilities(
+    runtime: SimajilordRuntime,
+    mode: AgentAutonomyMode,
+    event_kinds: frozenset[AutonomyEventKind],
+    *,
+    policy_mode: AgentAutonomyPolicyMode,
+) -> frozenset[str] | None:
+    """Return an event-specific catalog ceiling; legacy keeps the old catalog."""
+
+    if policy_mode is AgentAutonomyPolicyMode.LEGACY:
+        return None
+    writes = _autonomy_event_write_capabilities(mode, event_kinds)
+    reads = set(_AUTONOMY_STRICT_BASE_READ_CAPABILITIES)
+    if event_kinds.intersection(_AUTONOMY_CHANNEL_EVENT_KINDS):
+        reads.update(_AUTONOMY_EVENT_CHANNEL_READ_CAPABILITIES)
+    return frozenset(
+        endpoint.descriptor.name
+        for endpoint in runtime.registry.all()
+        if endpoint.descriptor.name in reads or endpoint.descriptor.name in writes
     )
 
 
@@ -8359,6 +8704,17 @@ def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
         origin_resource_id=request.channel_id,
         approvals=request.approvals,
         public_reference_id=request.public_reference_id,
+        principal_kind=request.principal_kind,
+        read_scope_mode=request.read_scope_mode,
+        information_flow_mode=request.information_flow_mode.value,
+        file_workspace_mode=request.file_workspace_mode.value,
+        high_risk_authorization_mode=request.high_risk_authorization_mode.value,
+        executor_principal_id=request.executor_principal_id,
+        delegator_principal_id=request.delegator_principal_id,
+        trigger_actor_ids=request.trigger_actor_ids,
+        requester_principal_id=request.requester_principal_id,
+        policy_id=request.policy_id,
+        allowed_capabilities=request.allowed_capabilities,
     )
 
 
@@ -8474,6 +8830,134 @@ class AgentCog(commands.Cog):
             message_edited_at=edited_at,
         )
 
+    async def _confirm_high_risk_action(
+        self,
+        source: discord.Message,
+        proposal: AgentHighRiskConfirmation,
+    ) -> bool:
+        """Render and verify one concrete requester-only Discord confirmation."""
+
+        try:
+            requester_id = int(proposal.requester_principal_id)
+            authorization_message_id = int(proposal.authorization_message_id)
+        except ValueError:
+            return False
+        channel = source.channel
+        if not isinstance(
+            channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            return False
+        arguments = proposal.arguments_json.replace("```", "`​``")
+        description = (
+            "A high-risk capability is ready to run. Confirm only if this exact "
+            "target and change match your intent.\n\n"
+            f"Capability: `{proposal.capability}`\n"
+            f"Binding: `{proposal.binding_sha256[:16]}`\n"
+            f"```json\n{arguments}\n```"
+        )
+        timeout = float(
+            self.runtime.settings.agent_high_risk_confirmation_timeout_seconds
+        )
+        view = AgentHighRiskConfirmationView(
+            requester_id=requester_id,
+            binding_sha256=proposal.binding_sha256,
+            timeout=timeout,
+        )
+        try:
+            confirmation_message = await channel.send(
+                embed=command_embed(
+                    "Confirm high-risk action",
+                    description=description,
+                    tone=EmbedTone.WARNING,
+                ),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.DiscordException:
+            log.exception(
+                "Could not publish high-risk confirmation request=%s capability=%s",
+                proposal.authorization_message_id,
+                proposal.capability,
+            )
+            return False
+        view.message = confirmation_message
+        confirmed = await view.wait_for_decision()
+        revision_valid = False
+        if confirmed:
+            try:
+                authorization_message = await channel.fetch_message(
+                    authorization_message_id
+                )
+            except discord.DiscordException:
+                authorization_message = None
+            if authorization_message is not None:
+                actual_revision = (
+                    authorization_message.edited_at.isoformat()
+                    if authorization_message.edited_at is not None
+                    else None
+                )
+                revision_valid = (
+                    authorization_message.author.id == requester_id
+                    and actual_revision
+                    == proposal.authorization_message_edited_at
+                )
+        accepted = confirmed and revision_valid
+        try:
+            await self.runtime.journal.append(
+                kind=(
+                    "agent.high_risk.confirmed"
+                    if accepted
+                    else "agent.high_risk.rejected"
+                ),
+                actor_id=proposal.requester_principal_id,
+                workspace_id=(
+                    str(source.guild.id) if source.guild is not None else None
+                ),
+                transport="agent",
+                request_id=proposal.authorization_message_id,
+                payload={
+                    "capability": proposal.capability,
+                    "binding_sha256": proposal.binding_sha256,
+                    "authorization_message_id": proposal.authorization_message_id,
+                    "authorization_message_edited_at": (
+                        proposal.authorization_message_edited_at
+                    ),
+                    "confirmed": accepted,
+                    "revision_valid": revision_valid,
+                },
+            )
+        except Exception:
+            log.exception(
+                "Could not persist high-risk confirmation request=%s capability=%s",
+                proposal.authorization_message_id,
+                proposal.capability,
+            )
+            accepted = False
+        with suppress(discord.DiscordException):
+            await confirmation_message.edit(
+                embed=command_embed(
+                    "High-risk action confirmed" if accepted else "High-risk action stopped",
+                    description=(
+                        "The exact binding was confirmed and will now be rechecked "
+                        "against live permissions."
+                        if accepted
+                        else (
+                            "No external action was dispatched. The authorization "
+                            "message may have changed, expired, or been rejected."
+                        )
+                    ),
+                    tone=EmbedTone.SUCCESS if accepted else EmbedTone.WARNING,
+                ),
+                view=view,
+            )
+        return accepted
+
     async def _handle_mention(
         self,
         message: discord.Message,
@@ -8499,17 +8983,20 @@ class AgentCog(commands.Cog):
             or str(message.guild.id) not in self.runtime.settings.agent_allowed_guild_ids
         ):
             return
-        member = (
-            message.author
-            if isinstance(message.author, discord.Member)
-            else message.guild.get_member(message.author.id)
-        )
-        resource_ids = agent_readable_channel_ids(
+        requester_principal = await _resolve_requester_principal(
             message.guild,
-            member,
-            trusted_guild=(str(message.guild.id) in self.runtime.settings.agent_trusted_guild_ids),
-            trigger_channel_id=message.channel.id,
+            message.author,
         )
+        if requester_principal is None:
+            log.info(
+                "Mention agent turn rejected because requester could not be resolved "
+                "guild=%s channel=%s actor=%s",
+                message.guild.id,
+                message.channel.id,
+                message.author.id,
+            )
+            return
+        resource_ids = readable_for_requester(message.guild, requester_principal)
         if str(message.channel.id) not in resource_ids:
             log.info(
                 "Mention agent turn rejected by channel scope guild=%s channel=%s "
@@ -8567,6 +9054,20 @@ class AgentCog(commands.Cog):
             resource_ids=resource_ids,
             public_reference_id=public_reference_id,
             task_id=task_id,
+            principal_kind="requester",
+            read_scope_mode="requester_live",
+            information_flow_mode=(
+                self.runtime.settings.agent_information_flow_mode
+            ),
+            file_workspace_mode=self.runtime.settings.agent_file_workspace_mode,
+            high_risk_authorization_mode=(
+                self.runtime.settings.agent_high_risk_authorization_mode
+            ),
+            executor_principal_id=str(bot_user.id),
+            delegator_principal_id=actor_id,
+            trigger_actor_ids=(actor_id,),
+            requester_principal_id=actor_id,
+            policy_id="discord-mention-v2",
             message_edited_at=message_edited_at,
             grants=grants,
             approvals=approvals,
@@ -8604,6 +9105,9 @@ class AgentCog(commands.Cog):
             response = await agent.respond(
                 request,
                 on_progress=progress.update,
+                on_high_risk_confirmation=lambda proposal: (
+                    self._confirm_high_risk_action(message, proposal)
+                ),
             )
         except asyncio.CancelledError:
             snapshot = (
@@ -10127,11 +10631,22 @@ class AgentAutonomyCog(commands.Cog):
         guild = self.bot.get_guild(int(workspace_id))
         if guild is None:
             raise _AutonomyTerminalDrop("guild_unavailable")
-        resource_ids = agent_readable_channel_ids(
-            guild,
-            None,
-            trusted_guild=True,
-            trigger_channel_id=int(channel_id),
+        bot_member = guild.me
+        if bot_member is None:
+            raise RuntimeError("Discord bot member is temporarily unavailable")
+        try:
+            service_principal = ServicePrincipal(bot_member)
+        except ValueError as exc:
+            raise _AutonomyTerminalDrop("service_principal_invalid") from exc
+        service_resource_ids = readable_for_service(guild, service_principal)
+        autonomy_policy_mode = self.runtime.settings.agent_autonomy_policy_mode
+        resource_ids = (
+            (channel_id,)
+            if (
+                autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
+                and channel_id in service_resource_ids
+            )
+            else service_resource_ids
         )
         if channel_id not in resource_ids:
             raise _AutonomyTerminalDrop("channel_not_readable")
@@ -10155,9 +10670,6 @@ class AgentAutonomyCog(commands.Cog):
             ),
         ):
             raise _AutonomyTerminalDrop("channel_not_messageable")
-        bot_member = guild.me
-        if bot_member is None:
-            raise RuntimeError("Discord bot member is temporarily unavailable")
         permissions = channel.permissions_for(bot_member)
         can_send = (
             permission_enabled(permissions, "send_messages_in_threads")
@@ -10190,7 +10702,19 @@ class AgentAutonomyCog(commands.Cog):
             autonomous=True,
         )
         mode = self.runtime.settings.agent_autonomy_mode
-        approvals = _autonomy_approvals(self.runtime, mode)
+        event_kinds = frozenset(event.kind for event in batch.events)
+        approvals = _autonomy_approvals(
+            self.runtime,
+            mode,
+            event_kinds,
+            policy_mode=autonomy_policy_mode,
+        )
+        allowed_capabilities = _autonomy_allowed_capabilities(
+            self.runtime,
+            mode,
+            event_kinds,
+            policy_mode=autonomy_policy_mode,
+        )
         event_pointers = tuple(
             AgentEvent(
                 event_id=f"autonomy:queue:{event.sequence}",
@@ -10239,6 +10763,31 @@ class AgentAutonomyCog(commands.Cog):
             resource_ids=resource_ids,
             public_reference_id=public_reference_id,
             task_id=task_id,
+            principal_kind="service",
+            read_scope_mode=(
+                "resource_ids"
+                if autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
+                else "service_live"
+            ),
+            information_flow_mode=(
+                self.runtime.settings.agent_information_flow_mode
+            ),
+            file_workspace_mode=self.runtime.settings.agent_file_workspace_mode,
+            high_risk_authorization_mode=(
+                self.runtime.settings.agent_high_risk_authorization_mode
+            ),
+            executor_principal_id=autonomy_actor_id,
+            trigger_actor_ids=tuple(
+                sorted(
+                    {
+                        event.actor_id
+                        for event in batch.events
+                        if event.actor_id is not None
+                    }
+                )
+            ),
+            policy_id=f"discord-autonomy-{autonomy_policy_mode.value}-v1",
+            allowed_capabilities=allowed_capabilities,
             grants=grants,
             approvals=approvals,
             events=event_pointers,
@@ -10264,23 +10813,23 @@ class AgentAutonomyCog(commands.Cog):
                 raise RuntimeError(
                     "Autonomy reply target is temporarily unavailable"
                 ) from exc
-        source_actor_ids = {
-            event.actor_id
-            for event in batch.events
-            if event.actor_id is not None
-        }
-        if len(source_actor_ids) == 1:
-            host_post_actor_id = next(iter(source_actor_ids))
-        else:
-            host_post_actor_id = autonomy_actor_id
         host_post_context = InvocationContext(
-            actor_id=host_post_actor_id,
+            actor_id=autonomy_actor_id,
             workspace_id=workspace_id,
             transport="agent",
             request_id=batch.batch_id,
             resource_ids=resource_ids,
             origin_resource_id=channel_id,
             public_reference_id=request.public_reference_id,
+            principal_kind="service",
+            read_scope_mode=request.read_scope_mode,
+            information_flow_mode=request.information_flow_mode.value,
+            file_workspace_mode=request.file_workspace_mode.value,
+            high_risk_authorization_mode=request.high_risk_authorization_mode.value,
+            executor_principal_id=autonomy_actor_id,
+            trigger_actor_ids=request.trigger_actor_ids,
+            policy_id=request.policy_id,
+            allowed_capabilities=request.allowed_capabilities,
         )
         try:
             await self._deliver_response(

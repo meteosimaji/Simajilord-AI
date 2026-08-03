@@ -37,6 +37,11 @@ from simajilord.capabilities.audio import (
     AudioTuneRequest,
     AudioVolumeRequest,
 )
+from simajilord.capabilities.file_scope import (
+    file_provenance,
+    file_workspace_id,
+    provenance_observations,
+)
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
     SyntheticMediaAnalyzeResponse,
@@ -72,13 +77,17 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureObservation,
     InvocationContext,
     RiskLevel,
     endpoint,
 )
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
-from simajilord.services.files import WorkspaceFileRecord
+from simajilord.services.files import (
+    WorkspaceFileProvenance,
+    WorkspaceFileRecord,
+)
 from simajilord.services.quote import (
     QuoteCustomEmojiAsset,
     QuoteRenderRequest,
@@ -89,13 +98,14 @@ from .attachment_io import read_attachment_bytes
 from .audio import DiscordAudioOutput
 from .local_media import attachment_can_play, import_discord_attachment
 from .permissions import (
-    agent_readable_channel_ids as agent_readable_channel_ids,
+    RequesterPrincipal,
+    ServicePrincipal,
+    read_aloud_audience_relation,
+    readable_for_requester,
+    readable_for_service,
 )
 from .permissions import (
-    can_post_expanded_message as _can_post_expanded_message,
-)
-from .permissions import (
-    can_post_quote_image as _can_post_quote_image,
+    can_post_expanded_message as _can_post_expanded_message,  # noqa: F401
 )
 from .permissions import (
     can_read_messages as _can_read_messages,
@@ -1548,12 +1558,7 @@ def build_discord_endpoints(
             if guild.me is None:
                 uncertain_membership_count += 1
                 continue
-            readable = agent_readable_channel_ids(
-                guild,
-                actor,
-                trusted_guild=False,
-                trigger_channel_id=None,
-            )
+            readable = _agent_readable_channel_ids(guild, actor, context)
             records.append(
                 DiscordServerRecord(
                     server_id=str(guild.id),
@@ -1870,14 +1875,7 @@ def build_discord_endpoints(
         allowed_ids: set[str] | None = None
         if context.transport == "agent":
             actor = await _require_common_guild(guild, context)
-            allowed_ids = set(
-                agent_readable_channel_ids(
-                    guild,
-                    actor,
-                    trusted_guild=False,
-                    trigger_channel_id=None,
-                )
-            )
+            allowed_ids = set(_agent_readable_channel_ids(guild, actor, context))
         records = [
             DiscordChannelRecord(
                 channel_id=str(channel.id),
@@ -1922,6 +1920,7 @@ def build_discord_endpoints(
         if bot is None:
             raise UserError("discord.guild_unavailable")
         parent_id = _snowflake(request.parent_channel_id, "channel")
+        _assert_agent_channel_scope(context, request.parent_channel_id)
         parent = guild.get_channel(parent_id)
         if not isinstance(parent, (discord.TextChannel, discord.ForumChannel)):
             raise UserError("discord.archived_thread_parent_invalid")
@@ -1935,6 +1934,9 @@ def build_discord_endpoints(
             before=before,
         ):
             if (
+                context.read_scope_mode == "resource_ids"
+                and str(thread.id) not in context.resource_ids
+            ) or (
                 not _can_read_messages(thread, actor)
                 or not _can_read_private_thread(thread, actor)
                 or not _can_read_messages(thread, bot)
@@ -2090,14 +2092,7 @@ def build_discord_endpoints(
         readable_ids: set[str] | None = None
         if context.transport == "agent":
             actor = await _actor_member(guild, context)
-            readable_ids = set(
-                agent_readable_channel_ids(
-                    guild,
-                    actor,
-                    trusted_guild=False,
-                    trigger_channel_id=None,
-                )
-            )
+            readable_ids = set(_agent_readable_channel_ids(guild, actor, context))
             if any(channel_id not in readable_ids for channel_id in requested_ids):
                 raise UserError("discord.agent_read_channel_forbidden")
             scoped_ids = (
@@ -2597,19 +2592,21 @@ def build_discord_endpoints(
             ),
             context,
         )
-        guild = _guild(client, context)
-        destination = _message_channel(guild, request.destination_channel_id)
-        if context.transport == "agent":
-            _assert_agent_channel_scope(context, request.destination_channel_id)
-        else:
-            actor = await _actor_member(guild, context)
-            if not _can_read_messages(destination, actor) or not _can_read_private_thread(
-                destination, actor
-            ):
-                raise UserError("discord.expand_destination_unavailable")
-        bot_member = guild.me
-        if bot_member is None or not _can_post_expanded_message(destination, bot_member):
-            raise UserError("discord.expand_destination_unavailable")
+        _guild_value, destination, _actor, _bot = await _write_message_channel(
+            client,
+            context,
+            request.destination_channel_id,
+            required_permissions=("send_messages", "embed_links"),
+        )
+        source_guild = _requested_guild(client, context, response.guild_id)
+        source_channel = _message_channel(source_guild, response.channel_id)
+        _enforce_source_to_destination(
+            context,
+            source_guild,
+            source_channel,
+            _guild_value,
+            destination,
+        )
         try:
             posted = await destination.send(
                 embeds=expanded_message_embeds(response),
@@ -2632,24 +2629,25 @@ def build_discord_endpoints(
         context: InvocationContext,
     ) -> DiscordCreateQuoteImageResponse:
         guild = _guild(client, context)
-        _, message = await _fetch_readable_message(
+        source_channel, message = await _fetch_readable_message(
             guild,
             channel_id=request.source_channel_id,
             message_id=request.source_message_id,
             context=context,
         )
-        destination = _message_channel(guild, request.destination_channel_id)
-        if context.transport == "agent":
-            _assert_agent_channel_scope(context, request.destination_channel_id)
-        else:
-            actor = await _actor_member(guild, context)
-            if not _can_read_messages(destination, actor) or not _can_read_private_thread(
-                destination, actor
-            ):
-                raise UserError("discord.quote_destination_unavailable")
-        bot_member = guild.me
-        if bot_member is None or not _can_post_quote_image(destination, bot_member):
-            raise UserError("discord.quote_destination_unavailable")
+        _destination_guild, destination, _actor, _bot = await _write_message_channel(
+            client,
+            context,
+            request.destination_channel_id,
+            required_permissions=("send_messages", "attach_files"),
+        )
+        _enforce_source_to_destination(
+            context,
+            guild,
+            source_channel,
+            _destination_guild,
+            destination,
+        )
         avatar, custom_emojis, stickers = await asyncio.gather(
             _quote_avatar(client, message),
             _quote_custom_emojis(client, message.content),
@@ -2885,7 +2883,6 @@ def build_discord_endpoints(
             request.message_id,
             request.attachment_index,
         )
-        del message
         if attachment.size > runtime.files.max_file_bytes:
             raise UserError("files.file_too_large")
         try:
@@ -2898,11 +2895,34 @@ def build_discord_endpoints(
             f"attachments/{request.message_id}/"
             f"{_workspace_attachment_name(attachment)}"
         )
+        source_guild = message.guild
+        source_channel = message.channel
+        if source_guild is None or not isinstance(
+            source_channel,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.ForumChannel,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            raise UserError("discord.attachment_unavailable")
         return await asyncio.to_thread(
             runtime.files.import_bytes,
-            context.workspace_id,
+            file_workspace_id(context),
             destination,
             content,
+            provenance=file_provenance(
+                context,
+                origin_guild_id=str(source_guild.id),
+                origin_channel_id=str(source_channel.id),
+                origin_message_id=str(message.id),
+                origin_visibility=_channel_visibility(
+                    source_guild,
+                    source_channel,
+                ),
+            ),
         )
 
     async def view_image_attachment(
@@ -3086,8 +3106,8 @@ def build_discord_endpoints(
         _guild_value, channel, actor, bot = await _write_message_channel(
             client, context, request.channel_id
         )
-        _require_channel_permissions(channel, actor, "manage_messages")
-        _require_channel_permissions(channel, bot, "manage_messages")
+        _require_channel_permissions(channel, actor, "pin_messages")
+        _require_channel_permissions(channel, bot, "pin_messages")
         message = await _fetch_message_for_write(channel, request.message_id)
         if bool(message.pinned) == pinned:
             return DiscordMessageWriteResponse(
@@ -3153,6 +3173,7 @@ def build_discord_endpoints(
         thread = guild.get_thread(_snowflake(request.thread_id, "channel"))
         if thread is None:
             raise UserError("discord.thread_not_found")
+        _enforce_information_flow_to_destination(client, context, guild, thread)
         actor, bot = await _write_members(guild, context)
         for member in (actor, bot):
             _require_channel_permissions(thread, member, "manage_threads")
@@ -3213,6 +3234,7 @@ def build_discord_endpoints(
         thread = guild.get_thread(_snowflake(request.thread_id, "channel"))
         if thread is None:
             raise UserError("discord.thread_not_found")
+        _enforce_information_flow_to_destination(client, context, guild, thread)
         actor, bot = await _write_members(guild, context)
         for member in (actor, bot):
             _require_channel_permissions(thread, member, "manage_threads")
@@ -3221,6 +3243,18 @@ def build_discord_endpoints(
         if existing == present:
             return DiscordThreadMemberResponse(
                 request.thread_id, request.user_id, present, changed=False
+            )
+        if (
+            present
+            and isinstance(thread, discord.Thread)
+            and thread.type is discord.ChannelType.private_thread
+            and context.information_flow_mode != "disabled"
+        ):
+            _handle_information_flow_violations(
+                context,
+                guild,
+                thread,
+                [(str(guild.id), str(thread.id), "broader")],
             )
         if (
             request.expected_present is not None
@@ -3254,6 +3288,7 @@ def build_discord_endpoints(
         forum = guild.get_channel(_snowflake(request.forum_id, "channel"))
         if not isinstance(forum, discord.ForumChannel):
             raise UserError("discord.forum_channel_required")
+        _enforce_information_flow_to_destination(client, context, guild, forum)
         actor, bot = await _write_members(guild, context)
         for member in (actor, bot):
             _require_channel_permissions(forum, member, "send_messages")
@@ -3279,6 +3314,7 @@ def build_discord_endpoints(
     ) -> DiscordRoleResponse:
         guild = _guild(client, context)
         _assert_origin_guild(context, guild)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         _require_guild_permission(actor, "manage_roles")
         _require_guild_permission(bot, "manage_roles")
@@ -3335,6 +3371,7 @@ def build_discord_endpoints(
     ) -> DiscordRoleMemberResponse:
         guild = _guild(client, context)
         _assert_origin_guild(context, guild)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         target = await _guild_member(guild, request.user_id)
         role = guild.get_role(_snowflake(request.role_id, "role"))
@@ -3381,6 +3418,7 @@ def build_discord_endpoints(
         channel = guild.get_channel(_snowflake(request.channel_id, "channel"))
         if not isinstance(channel, discord.TextChannel):
             raise UserError("discord.text_destination_invalid")
+        _enforce_information_flow_to_destination(client, context, guild, channel)
         actor, bot = await _write_members(guild, context)
         _require_channel_permissions(channel, actor, "manage_channels")
         _require_channel_permissions(channel, bot, "manage_channels")
@@ -3437,6 +3475,7 @@ def build_discord_endpoints(
     ) -> DiscordChannelCreateResponse:
         guild = _guild(client, context)
         _assert_origin_guild(context, guild)
+        _enforce_information_flow_to_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         _require_guild_permission(actor, "manage_channels")
         _require_guild_permission(bot, "manage_channels")
@@ -3551,6 +3590,9 @@ def build_discord_endpoints(
             await _fetch_message_for_write(channel, message_id)
             for message_id in ids
         ]
+        oldest_bulk_delete_time = datetime.now(UTC) - timedelta(days=14)
+        if any(message.created_at <= oldest_bulk_delete_time for message in messages):
+            raise UserError("discord.bulk_delete_message_too_old")
         await channel.delete_messages(
             messages,
             reason=_audit_reason(request.reason, context),
@@ -3818,14 +3860,21 @@ def build_discord_endpoints(
         snapshots = await asyncio.gather(
             *(
                 asyncio.to_thread(
-                    runtime.files.snapshot_for_delivery,
-                    context.workspace_id,
+                    runtime.files.snapshot_for_delivery_with_provenance,
+                    file_workspace_id(context),
                     item.path,
                 )
                 for item in request.attachments
             )
         )
-        sizes = tuple(len(content) for _filename, content in snapshots)
+        _enforce_file_provenance_to_destination(
+            client,
+            context,
+            guild,
+            channel,
+            tuple(provenance for _filename, _content, provenance in snapshots),
+        )
+        sizes = tuple(len(content) for _filename, content, _provenance in snapshots)
         if any(size > guild.filesize_limit for size in sizes):
             raise UserError("discord.file_too_large")
         files = [
@@ -3835,7 +3884,7 @@ def build_discord_endpoints(
                 spoiler=item.spoiler,
                 description=item.description or None,
             )
-            for item, (filename, content) in zip(
+            for item, (filename, content, _provenance) in zip(
                 request.attachments,
                 snapshots,
                 strict=True,
@@ -3920,6 +3969,7 @@ def build_discord_endpoints(
         guild = _guild(client, context)
         _assert_agent_update_scope(context, request.channel_id)
         channel = _text_channel(guild, request.channel_id)
+        _enforce_information_flow_to_destination(client, context, guild, channel)
         actor = await _actor_member(guild, context)
         bot_member = guild.me
         actor_permissions = channel.permissions_for(actor)
@@ -4206,6 +4256,16 @@ def build_discord_endpoints(
 
         guild = _guild(client, context)
         member = await _actor_member(guild, context)
+        destination = _member_voice_channel(member)
+        if destination is None:
+            raise UserError("discord.voice_join_required")
+        _enforce_information_flow_to_destination(
+            client,
+            context,
+            guild,
+            destination,
+        )
+        _enforce_voice_listener_audience(runtime, context, guild, destination)
         await _prepare_actor_audio(client, runtime, guild, member)
         response = await runtime.registry.invoke(
             "speech.speak",
@@ -5693,6 +5753,10 @@ def build_discord_endpoints(
                     "メッセージ",
                 ),
                 requires_workspace=True,
+                expected_errors=(
+                    "discord.bulk_delete_limit_invalid",
+                    "discord.bulk_delete_message_too_old",
+                ),
             ),
             DiscordBulkDeleteRequest,
             DiscordBulkDeleteResponse,
@@ -6663,6 +6727,7 @@ async def _readable_message_channel(
     """Enforce effective requester and bot permissions at retrieval time."""
 
     guild = _requested_guild(client, context, guild_id)
+    _assert_agent_channel_scope(context, channel_id)
     resolved_channel_id = _snowflake(channel_id, "channel")
     cached = guild.get_channel_or_thread(resolved_channel_id)
     if isinstance(
@@ -6763,13 +6828,367 @@ def _disclosure_to_origin(
 def _disclosure_warning(
     relation: Literal["same_or_narrower", "broader", "uncertain"],
 ) -> str | None:
-    if relation != "broader":
+    if relation == "same_or_narrower":
         return None
+    if relation == "broader":
+        return (
+            "The destination has at least one known reader who cannot read the source. "
+            "The enforce policy blocks disclosure unless it is explicitly declassified."
+        )
     return (
-        "The destination has at least one known reader who cannot read the source. "
-        "Before replying, decide whether disclosure is necessary and minimize or omit "
-        "quotes, summaries, identifiers, and sensitive details."
+        "The complete source and destination audiences could not be proven. "
+        "The enforce policy fails closed."
     )
+
+
+def _enforce_information_flow_to_destination(
+    client: discord.Client,
+    context: InvocationContext,
+    destination_guild: discord.Guild,
+    destination: DiscordReadableChannel,
+) -> None:
+    """Apply every observed source label to the actual write destination."""
+
+    mode = context.information_flow_mode
+    if mode == "disabled" or not context.disclosure_observations:
+        return
+    violations = _information_flow_violations(
+        client,
+        context.disclosure_observations,
+        destination_guild,
+        destination,
+    )
+    _handle_information_flow_violations(
+        context,
+        destination_guild,
+        destination,
+        violations,
+    )
+
+
+def _enforce_source_to_destination(
+    context: InvocationContext,
+    source_guild: discord.Guild,
+    source: DiscordReadableChannel,
+    destination_guild: discord.Guild,
+    destination: DiscordReadableChannel,
+) -> None:
+    """Check a source consumed and published inside one composite capability."""
+
+    if context.information_flow_mode == "disabled":
+        return
+    relation = _disclosure_audience_relation(
+        source_guild,
+        source,
+        destination_guild,
+        destination,
+    )
+    violations: list[tuple[str, str, str]] = (
+        []
+        if relation == "same_or_narrower"
+        else [(str(source_guild.id), str(source.id), relation)]
+    )
+    _handle_information_flow_violations(
+        context,
+        destination_guild,
+        destination,
+        violations,
+    )
+
+
+def _enforce_voice_listener_audience(
+    runtime: SimajilordRuntime,
+    context: InvocationContext,
+    guild: discord.Guild,
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> None:
+    """Apply the reversible read-aloud policy to one-off synthesized speech."""
+
+    raw_mode = getattr(runtime.settings, "read_aloud_audience_mode", "enforce")
+    mode = getattr(raw_mode, "value", raw_mode)
+    if mode not in {"enforce", "audit", "disabled"}:
+        mode = "enforce"
+    if mode == "disabled":
+        return
+    relation: str = "uncertain"
+    if context.workspace_id == str(guild.id) and context.origin_resource_id is not None:
+        try:
+            source_id = int(context.origin_resource_id)
+        except ValueError:
+            source_id = 0
+        source = guild.get_channel_or_thread(source_id)
+        if isinstance(
+            source,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            relation = read_aloud_audience_relation(guild, source, destination)
+    if relation == "same_or_narrower":
+        return
+    log.warning(
+        "One-off speech audience check failed mode=%s request=%s "
+        "guild=%s source=%s destination=%s relation=%s",
+        mode,
+        context.request_id,
+        guild.id,
+        context.origin_resource_id,
+        destination.id,
+        relation,
+    )
+    if mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_information_flow_to_guild(
+    context: InvocationContext,
+    destination_guild: discord.Guild,
+) -> None:
+    """Treat guild-wide resources as visible to the guild's broad audience."""
+
+    if context.information_flow_mode == "disabled":
+        return
+    violations = [
+        (
+            observation.source_workspace_id,
+            observation.source_resource_id,
+            "broader" if observation.visibility == "restricted" else "uncertain",
+        )
+        for observation in context.disclosure_observations
+        if observation.source_workspace_id != str(destination_guild.id)
+        or observation.visibility != "guild_public"
+    ]
+    if not violations:
+        return
+    log.warning(
+        "Discord guild-wide information-flow check failed mode=%s request=%s "
+        "destination_guild=%s sources=%s",
+        context.information_flow_mode,
+        context.request_id,
+        destination_guild.id,
+        violations,
+    )
+    if context.information_flow_mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_unknown_audience(
+    context: InvocationContext,
+    *,
+    sink: str,
+) -> None:
+    """Block publication to a global or otherwise unbounded audience."""
+
+    if context.information_flow_mode == "disabled" or not context.disclosure_observations:
+        return
+    log.warning(
+        "Discord unknown-audience information-flow check failed mode=%s "
+        "request=%s sink=%s sources=%s",
+        context.information_flow_mode,
+        context.request_id,
+        sink,
+        [
+            (item.source_workspace_id, item.source_resource_id, item.visibility)
+            for item in context.disclosure_observations
+        ],
+    )
+    if context.information_flow_mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_file_provenance_to_guild(
+    context: InvocationContext,
+    destination_guild: discord.Guild,
+    provenance: WorkspaceFileProvenance | None,
+) -> None:
+    """Require a public same-guild source label before guild-wide file publication."""
+
+    if context.information_flow_mode == "disabled":
+        return
+    allowed = (
+        provenance is not None
+        and provenance.declassified_at is not None
+    ) or (
+        provenance is not None
+        and provenance.sensitivity == "guild_public"
+        and all(
+            workspace_id == str(destination_guild.id)
+            and visibility == "guild_public"
+            for workspace_id, _resource_id, visibility in provenance.source_resources
+        )
+        and bool(provenance.source_resources)
+    )
+    if allowed:
+        return
+    log.warning(
+        "Discord guild-wide file provenance check failed mode=%s request=%s "
+        "destination_guild=%s labelled=%s",
+        context.information_flow_mode,
+        context.request_id,
+        destination_guild.id,
+        provenance is not None,
+    )
+    if context.information_flow_mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_file_provenance_to_unknown_audience(
+    context: InvocationContext,
+    provenance: WorkspaceFileProvenance | None,
+    *,
+    sink: str,
+) -> None:
+    """Treat a durable file as restricted until explicitly declassified."""
+
+    if context.information_flow_mode == "disabled" or (
+        provenance is not None and provenance.declassified_at is not None
+    ):
+        return
+    log.warning(
+        "Discord unknown-audience file provenance check failed mode=%s "
+        "request=%s sink=%s labelled=%s",
+        context.information_flow_mode,
+        context.request_id,
+        sink,
+        provenance is not None,
+    )
+    if context.information_flow_mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_file_provenance_to_destination(
+    client: discord.Client,
+    context: InvocationContext,
+    destination_guild: discord.Guild,
+    destination: DiscordReadableChannel,
+    provenances: tuple[WorkspaceFileProvenance | None, ...],
+) -> None:
+    """Fail closed when durable file sources cannot flow to the actual target."""
+
+    if context.information_flow_mode == "disabled":
+        return
+    violations: list[tuple[str, str, str]] = []
+    observations: list[DisclosureObservation] = []
+    for provenance in provenances:
+        if provenance is None:
+            violations.append(("file", "unlabelled", "uncertain"))
+            continue
+        if provenance.declassified_at is not None:
+            continue
+        if provenance.sensitivity == "actor_private":
+            same_origin = (
+                provenance.owner_actor_id == context.actor_id
+                and provenance.origin_guild_id == str(destination_guild.id)
+                and provenance.origin_channel_id == str(destination.id)
+            )
+            if not same_origin:
+                violations.append(
+                    (
+                        provenance.origin_guild_id or "file",
+                        provenance.origin_channel_id or "actor_private",
+                        "broader",
+                    )
+                )
+            if not provenance.source_resources:
+                continue
+        file_observations = provenance_observations(provenance)
+        if not file_observations:
+            violations.append(
+                (
+                    provenance.origin_guild_id or "file",
+                    provenance.origin_channel_id or "unknown",
+                    "uncertain",
+                )
+            )
+        observations.extend(file_observations)
+    violations.extend(
+        _information_flow_violations(
+            client,
+            tuple(dict.fromkeys(observations)),
+            destination_guild,
+            destination,
+        )
+    )
+    _handle_information_flow_violations(
+        context,
+        destination_guild,
+        destination,
+        violations,
+    )
+
+
+def _information_flow_violations(
+    client: discord.Client,
+    observations: tuple[DisclosureObservation, ...],
+    destination_guild: discord.Guild,
+    destination: DiscordReadableChannel,
+) -> list[tuple[str, str, str]]:
+    violations: list[tuple[str, str, str]] = []
+    for observation in observations:
+        try:
+            source_guild_id = int(observation.source_workspace_id)
+            source_channel_id = int(observation.source_resource_id)
+        except ValueError:
+            relation = "uncertain"
+        else:
+            source_guild = client.get_guild(source_guild_id)
+            source = (
+                source_guild.get_channel_or_thread(source_channel_id)
+                if source_guild is not None
+                else None
+            )
+            if source_guild is None or not isinstance(
+                source,
+                (
+                    discord.TextChannel,
+                    discord.Thread,
+                    discord.ForumChannel,
+                    discord.VoiceChannel,
+                    discord.StageChannel,
+                ),
+            ):
+                relation = "uncertain"
+            else:
+                relation = _disclosure_audience_relation(
+                    source_guild,
+                    source,
+                    destination_guild,
+                    destination,
+                )
+        if relation != "same_or_narrower":
+            violations.append(
+                (
+                    observation.source_workspace_id,
+                    observation.source_resource_id,
+                    relation,
+                )
+            )
+    return violations
+
+
+def _handle_information_flow_violations(
+    context: InvocationContext,
+    destination_guild: discord.Guild,
+    destination: DiscordReadableChannel,
+    violations: list[tuple[str, str, str]],
+) -> None:
+    if not violations:
+        return
+    mode = context.information_flow_mode
+    log.warning(
+        "Discord information-flow destination check failed mode=%s request=%s "
+        "destination=%s/%s sources=%s",
+        mode,
+        context.request_id,
+        destination_guild.id,
+        destination.id,
+        violations,
+    )
+    if mode == "enforce":
+        raise UserError("discord.information_flow_forbidden")
 
 
 async def _actor_member(
@@ -7187,9 +7606,9 @@ async def _write_message_channel(
         channel_id=channel_id,
         requested_guild_id=guild_id,
     )
-    if str(guild.id) == context.workspace_id:
-        _assert_agent_update_scope(context, channel_id)
+    _assert_agent_update_scope(context, channel_id)
     channel = _message_channel(guild, channel_id)
+    _enforce_information_flow_to_destination(client, context, guild, channel)
     actor, bot = await _write_members(guild, context)
     for member in (actor, bot):
         if not _can_read_messages(channel, member) or not _can_read_private_thread(
@@ -8122,8 +8541,34 @@ def _assert_agent_channel_scope(
     context: InvocationContext,
     channel_id: str,
 ) -> None:
-    if context.transport == "agent" and channel_id not in context.resource_ids:
+    if (
+        context.transport == "agent"
+        and context.read_scope_mode == "resource_ids"
+        and channel_id not in context.resource_ids
+    ):
         raise UserError("discord.agent_read_channel_forbidden")
+
+
+def _agent_readable_channel_ids(
+    guild: discord.Guild,
+    actor: discord.Member,
+    context: InvocationContext,
+) -> tuple[str, ...]:
+    """Resolve a typed principal, then apply any event-bounded read scope."""
+
+    try:
+        if context.principal_kind == "service":
+            readable = readable_for_service(guild, ServicePrincipal(actor))
+        elif context.principal_kind == "requester":
+            readable = readable_for_requester(guild, RequesterPrincipal(actor))
+        else:
+            raise UserError("discord.agent_principal_invalid")
+    except ValueError as exc:
+        raise UserError("discord.agent_principal_invalid") from exc
+    if context.read_scope_mode != "resource_ids":
+        return readable
+    bounded = set(context.resource_ids)
+    return tuple(channel_id for channel_id in readable if channel_id in bounded)
 
 
 async def _fetch_readable_message(
