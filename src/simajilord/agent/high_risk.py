@@ -273,7 +273,7 @@ _SPECS: dict[str, _PresentationSpec] = {
     "files.publish_copy": _PresentationSpec(
         "Publish a target-bound file copy",
         "One exact Discord channel audience",
-        target_keys=("source_path", "channel_id", "guild_id"),
+        target_keys=("source_path", "source_file_ref", "channel_id", "guild_id"),
         payload_keys=("expires_at_iso",),
         audience=(
             "The host-calculated expected fields show the target name, exact reader "
@@ -282,6 +282,17 @@ _SPECS: dict[str, _PresentationSpec] = {
         external_transfer=(
             "This action creates a local revocable copy; Discord receives the bytes only "
             "if discord.send_published_file is later called for the same target."
+        ),
+    ),
+    "files.delete": _PresentationSpec(
+        "Permanently delete a private file",
+        "The requester's configured file workspace",
+        target_keys=("file_ref",),
+        payload_keys=("expected_sha256",),
+        audience="No Discord audience receives the file or its contents.",
+        external_transfer=(
+            "The selected private file is permanently removed locally; its body is not "
+            "retained for Undo."
         ),
     ),
     "system.shell": _PresentationSpec(

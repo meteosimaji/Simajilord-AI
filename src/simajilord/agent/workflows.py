@@ -337,7 +337,7 @@ _WORKFLOWS = (
                 _step(
                     1,
                     "discord.import_attachment",
-                    "Import the exact requested attachment into the isolated workspace.",
+                    "Import the exact requested attachment into the configured workspace.",
                 ),
                 _step(
                     2,
@@ -398,7 +398,7 @@ _WORKFLOWS = (
             workflow_id="media.save_and_deliver",
             summary=(
                 "Resolve a user-supplied public media URL generically, save it into "
-                "the isolated workspace, and deliver the resulting file."
+                "the configured workspace, and deliver the resulting file."
             ),
             required_grants=("files", "media_download"),
             steps=(

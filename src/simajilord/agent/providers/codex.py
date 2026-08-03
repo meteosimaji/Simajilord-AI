@@ -132,6 +132,7 @@ _FINAL_DELIVERY_CAPABILITIES = frozenset(
         "discord.send_embed",
         "discord.send_file",
         "discord.send_files",
+        "discord.send_managed_file",
         "discord.send_published_file",
         "discord.send_message",
         "discord.speak",
@@ -4249,6 +4250,7 @@ def _blocking_write_capability(
             "discord.send_embed",
             "discord.send_file",
             "discord.send_files",
+            "discord.send_managed_file",
             "discord.send_published_file",
             "discord.send_message",
         }

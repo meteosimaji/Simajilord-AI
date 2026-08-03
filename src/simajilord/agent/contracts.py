@@ -128,6 +128,7 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     "system.shell",
     "files.publish_copy",
     "files.revoke_publication",
+    "files.delete",
 )
 AGENT_HIGH_RISK_CAPABILITIES = frozenset(
     {
@@ -164,6 +165,7 @@ AGENT_HIGH_RISK_CAPABILITIES = frozenset(
         "discord.read_aloud_content_mode_set",
         "connector.destructive",
         "files.publish_copy",
+        "files.delete",
         "system.shell",
     }
 )

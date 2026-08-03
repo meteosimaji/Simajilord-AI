@@ -231,6 +231,14 @@ DISCOVERY_CASES: dict[str, tuple[str, str]] = {
         "対象限定コピーをDiscordへ配信して",
         "send the confirmed published copy to its bound Discord channel",
     ),
+    "discord.send_managed_file": (
+        "選択した管理ファイルをここへ送って",
+        "send this selected managed file by opaque reference",
+    ),
+    "discord.open_file_manager": (
+        "My Task Sharedのファイル管理を開いて",
+        "open my private file manager",
+    ),
     "discord.create_poll": (
         "この質問で投票アンケートを作って",
         "create a native poll for this question",
@@ -505,10 +513,10 @@ def _contains_japanese(value: str) -> bool:
     )
 
 
-def test_all_111_discord_transport_capabilities_have_discovery_classification() -> None:
+def test_all_113_discord_transport_capabilities_have_discovery_classification() -> None:
     registry, names = _discord_registry()
 
-    assert len(names) == 111
+    assert len(names) == 113
     assert len(names) == len(set(names))
     assert set(names) == set(DISCOVERY_CASES) | INTERNAL_DISCORD_CAPABILITIES
     assert not set(DISCOVERY_CASES) & INTERNAL_DISCORD_CAPABILITIES
@@ -526,7 +534,7 @@ def test_all_111_discord_transport_capabilities_have_discovery_classification() 
 
 
 @pytest.mark.asyncio
-async def test_runtime_exposes_exactly_the_105_model_facing_transport_capabilities(
+async def test_runtime_exposes_exactly_the_107_model_facing_transport_capabilities(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:

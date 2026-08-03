@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -22,6 +23,8 @@ from typing import Literal, TypeAlias, cast
 from pypdf import PdfReader
 
 from simajilord.core.errors import UserError
+
+log = logging.getLogger(__name__)
 
 _SAFE_COMPONENT = re.compile(r"^[^/\x00]{1,180}$")
 _TEXT_SUFFIXES = {
@@ -66,6 +69,22 @@ WorkspaceSourceVisibility: TypeAlias = Literal[
     "uncertain",
 ]
 WorkspacePublicationTargetKind: TypeAlias = Literal["discord_channel"]
+WorkspaceManagedFileSection: TypeAlias = Literal["my", "task", "shared"]
+WorkspaceManagedFileShareState: TypeAlias = Literal[
+    "private",
+    "shared_active",
+    "shared_inactive",
+    "active",
+    "expired",
+    "revoked",
+]
+WorkspaceFileActionKind: TypeAlias = Literal[
+    "copied_to_task",
+    "published",
+    "sent",
+    "deleted",
+    "revoked",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +257,60 @@ class WorkspaceFileRecord:
     sha256: str
     kind: str
     provenance: WorkspaceFileProvenance | None = None
+    file_ref: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceManagedFile:
+    """User-safe metadata selected by an opaque reference, never a raw path."""
+
+    file_ref: str
+    section: WorkspaceManagedFileSection
+    filename: str
+    kind: str
+    size_bytes: int
+    sha256: str
+    owner: str
+    origin: str
+    sensitivity: WorkspaceVisibility
+    created_task: str
+    share_state: WorkspaceManagedFileShareState
+    target_display_name: str | None
+    revision: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceManagedFileCatalog:
+    """Requester-private My, Task, and explicitly published file metadata."""
+
+    files: tuple[WorkspaceManagedFile, ...]
+    my_count: int
+    task_count: int
+    shared_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceFileAction:
+    """Body-free user-visible history for one opaque managed file reference."""
+
+    action_id: str
+    file_ref: str
+    action: WorkspaceFileActionKind
+    summary: str
+    occurred_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceManagedFileLocation:
+    """Host-only resolution result; never return this from a capability."""
+
+    workspace_id: str
+    relative_path: str
+    record: WorkspaceFileRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +371,537 @@ class AgentFileSandbox:
                 for record in self._list_unlocked(workspace_id)
                 if file_provenance_is_owned_by(record.provenance, actor_id)
             )
+
+    def managed_catalog_for_actor(
+        self,
+        guild_id: str,
+        actor_id: str,
+        *,
+        current_task_id: str | None,
+    ) -> WorkspaceManagedFileCatalog:
+        """Build user-safe sections without exposing paths or other actors."""
+
+        _validate_managed_identity(guild_id, actor_id)
+        private_rows: list[tuple[object, ...]]
+        publication_rows: list[sqlite3.Row]
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            private_rows = connection.execute(
+                """
+                SELECT workspace_id, relative_path
+                FROM file_provenance
+                WHERE owner_actor_id = ?
+                  AND origin_guild_id = ?
+                  AND publication_id IS NULL
+                ORDER BY updated_at DESC
+                """,
+                (actor_id, guild_id),
+            ).fetchall()
+            connection.row_factory = sqlite3.Row
+            publication_rows = connection.execute(
+                """
+                SELECT *
+                FROM file_publications
+                WHERE published_by_actor_id = ? AND target_workspace_id = ?
+                ORDER BY published_at DESC
+                """,
+                (actor_id, guild_id),
+            ).fetchall()
+
+        managed: list[WorkspaceManagedFile] = []
+        for raw_workspace_id, raw_relative_path in private_rows:
+            workspace_id = str(raw_workspace_id)
+            relative_path = str(raw_relative_path)
+            with self.locked_workspace(workspace_id):
+                provenance = self._load_provenance(workspace_id, relative_path)
+                if (
+                    not file_provenance_is_owned_by(provenance, actor_id)
+                    or provenance is None
+                    or provenance.origin_guild_id != guild_id
+                    or provenance.publication_id is not None
+                ):
+                    continue
+                scope = self._scope_path(workspace_id)
+                path = self._path(scope, relative_path)
+                if not path.is_file() or path.is_symlink():
+                    continue
+                record = self._record(workspace_id, scope, path)
+            if (
+                record.file_ref is None
+                or record.created_at is None
+                or record.updated_at is None
+            ):
+                continue
+            section: WorkspaceManagedFileSection = (
+                "task"
+                if current_task_id is not None
+                and provenance.created_task_id == current_task_id
+                else "my"
+            )
+            managed.append(
+                WorkspaceManagedFile(
+                    file_ref=record.file_ref,
+                    section=section,
+                    filename=path.name,
+                    kind=record.kind,
+                    size_bytes=record.size_bytes,
+                    sha256=record.sha256,
+                    owner="You",
+                    origin=_managed_origin(provenance),
+                    sensitivity=provenance.sensitivity,
+                    created_task=_managed_task_label(
+                        provenance.created_task_id,
+                        current_task_id,
+                    ),
+                    share_state=self._private_share_state(
+                        workspace_id,
+                        relative_path,
+                        actor_id,
+                    ),
+                    target_display_name=None,
+                    revision=1,
+                    created_at=record.created_at,
+                    updated_at=record.updated_at,
+                )
+            )
+
+        for row in publication_rows:
+            try:
+                publication = _publication_from_row(row)
+                with self.locked_workspace(publication.copy_workspace_id):
+                    scope = self._scope_path(publication.copy_workspace_id)
+                    path = self._path(scope, publication.copy_path)
+                    if not path.is_file() or path.is_symlink():
+                        continue
+                    record = self._record(
+                        publication.copy_workspace_id,
+                        scope,
+                        path,
+                    )
+            except (TypeError, ValueError, UserError):
+                continue
+            provenance = record.provenance
+            if (
+                provenance is None
+                or provenance.publication_id != publication.publication_id
+                or publication.published_by_actor_id != actor_id
+                or publication.target_workspace_id != guild_id
+            ):
+                continue
+            managed.append(
+                WorkspaceManagedFile(
+                    file_ref=publication.publication_id,
+                    section="shared",
+                    filename=path.name,
+                    kind=record.kind,
+                    size_bytes=record.size_bytes,
+                    sha256=record.sha256,
+                    owner="You",
+                    origin="Published copy",
+                    sensitivity=provenance.sensitivity,
+                    created_task=_managed_task_label(
+                        provenance.created_task_id,
+                        current_task_id,
+                    ),
+                    share_state=_publication_share_state(publication),
+                    target_display_name=publication.target_display_name,
+                    revision=publication.revision,
+                    created_at=publication.published_at,
+                    updated_at=publication.revoked_at or publication.published_at,
+                )
+            )
+
+        section_order = {"task": 0, "my": 1, "shared": 2}
+        files = tuple(
+            sorted(
+                managed,
+                key=lambda item: (
+                    section_order[item.section],
+                    item.filename.casefold(),
+                    item.file_ref,
+                ),
+            )
+        )
+        return WorkspaceManagedFileCatalog(
+            files=files,
+            my_count=sum(item.section == "my" for item in files),
+            task_count=sum(item.section == "task" for item in files),
+            shared_count=sum(item.section == "shared" for item in files),
+        )
+
+    def resolve_managed_file_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+    ) -> WorkspaceManagedFileLocation:
+        """Resolve one private opaque ref, failing closed on ownership or guild."""
+
+        _validate_private_file_ref(file_ref)
+        _validate_managed_identity(guild_id, actor_id)
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT workspace_id, relative_path
+                FROM file_provenance
+                WHERE file_ref = ? AND owner_actor_id = ?
+                  AND origin_guild_id = ? AND publication_id IS NULL
+                """,
+                (file_ref, actor_id, guild_id),
+            ).fetchone()
+        if row is None:
+            raise UserError("files.file_ref_not_found")
+        workspace_id, relative_path = str(row[0]), str(row[1])
+        with self.locked_workspace(workspace_id):
+            provenance = self._load_provenance(workspace_id, relative_path)
+            if (
+                not file_provenance_is_owned_by(provenance, actor_id)
+                or provenance is None
+                or provenance.origin_guild_id != guild_id
+                or provenance.publication_id is not None
+            ):
+                raise UserError("files.file_ref_not_found")
+            scope = self._scope_path(workspace_id)
+            path = self._path(scope, relative_path)
+            self._assert_regular_file(path)
+            record = self._record(workspace_id, scope, path)
+            if record.file_ref != file_ref:
+                raise UserError("files.file_ref_not_found")
+        return WorkspaceManagedFileLocation(
+            workspace_id=workspace_id,
+            relative_path=relative_path,
+            record=record,
+        )
+
+    def managed_file_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        current_task_id: str | None,
+    ) -> WorkspaceManagedFile:
+        """Return one user-safe catalog entry by opaque reference."""
+
+        catalog = self.managed_catalog_for_actor(
+            guild_id,
+            actor_id,
+            current_task_id=current_task_id,
+        )
+        item = next(
+            (candidate for candidate in catalog.files if candidate.file_ref == file_ref),
+            None,
+        )
+        if item is None:
+            raise UserError("files.file_ref_not_found")
+        return item
+
+    def snapshot_managed_file_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+    ) -> tuple[str, bytes, WorkspaceFileProvenance, WorkspaceFileRecord]:
+        """Read immutable bytes through an opaque private reference."""
+
+        location = self.resolve_managed_file_for_actor(
+            file_ref,
+            actor_id,
+            guild_id,
+        )
+        with self.locked_workspace(location.workspace_id):
+            path = self.path_for_delivery(
+                location.workspace_id,
+                location.relative_path,
+            )
+            record = self._record(
+                location.workspace_id,
+                self._scope_path(location.workspace_id),
+                path,
+            )
+            provenance = record.provenance
+            if (
+                record.file_ref != file_ref
+                or not file_provenance_is_owned_by(provenance, actor_id)
+            ):
+                raise UserError("files.file_ref_not_found")
+            assert provenance is not None
+            return path.name, path.read_bytes(), provenance, record
+
+    def copy_managed_file_to_task_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        expected_sha256: str,
+        current_task_id: str,
+        target_workspace_id: str,
+    ) -> WorkspaceFileRecord:
+        """Copy one actor-owned file into the current configured task workspace."""
+
+        if not current_task_id or len(current_task_id) > 200:
+            raise UserError("files.task_required")
+        filename, content, provenance, record = self.snapshot_managed_file_for_actor(
+            file_ref,
+            actor_id,
+            guild_id,
+        )
+        if record.sha256 != expected_sha256:
+            raise UserError("files.hash_conflict")
+        copy_path = f"task-copies/{uuid.uuid4().hex}/{filename}"
+        copied = self.import_bytes(
+            target_workspace_id,
+            copy_path,
+            content,
+            provenance=replace(
+                provenance,
+                created_task_id=current_task_id,
+                publication_id=None,
+                declassified_at=None,
+                declassified_by=None,
+            ),
+        )
+        self.record_managed_action(
+            file_ref,
+            actor_id,
+            guild_id,
+            action="copied_to_task",
+            summary="Copied to the current task.",
+        )
+        if copied.file_ref is not None:
+            self.record_managed_action(
+                copied.file_ref,
+                actor_id,
+                guild_id,
+                action="copied_to_task",
+                summary="Created as a task copy.",
+            )
+        return copied
+
+    def delete_managed_file_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        expected_sha256: str,
+    ) -> str:
+        """Delete one exact private file with ownership and revision checks."""
+
+        location = self.resolve_managed_file_for_actor(
+            file_ref,
+            actor_id,
+            guild_id,
+        )
+        if location.record.sha256 != expected_sha256:
+            raise UserError("files.hash_conflict")
+        with self.locked_workspace(location.workspace_id):
+            path = self.path_for_delivery(
+                location.workspace_id,
+                location.relative_path,
+            )
+            content = path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != expected_sha256:
+                raise UserError("files.hash_conflict")
+            provenance = self._load_provenance(
+                location.workspace_id,
+                location.relative_path,
+            )
+            if not file_provenance_is_owned_by(provenance, actor_id):
+                raise UserError("files.file_ref_not_found")
+            path.unlink()
+            try:
+                with self._provenance_lock, sqlite3.connect(
+                    self._provenance_path,
+                    timeout=5.0,
+                ) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    cursor = connection.execute(
+                        """
+                        DELETE FROM file_provenance
+                        WHERE file_ref = ? AND workspace_id = ? AND relative_path = ?
+                        """,
+                        (file_ref, location.workspace_id, location.relative_path),
+                    )
+                    if cursor.rowcount != 1:
+                        raise UserError("files.file_ref_not_found")
+                    self._insert_file_action(
+                        connection,
+                        file_ref,
+                        actor_id,
+                        guild_id,
+                        action="deleted",
+                        summary="Deleted the private file.",
+                    )
+            except Exception:
+                self._replace_bytes_unlocked(
+                    self._scope(location.workspace_id),
+                    location.workspace_id,
+                    location.relative_path,
+                    content,
+                    provenance=provenance,
+                    replace_provenance=True,
+                )
+                raise
+        return path.name
+
+    def managed_history_for_actor(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        limit: int = 20,
+    ) -> tuple[WorkspaceFileAction, ...]:
+        """Return only this actor's body-free history for an accessible ref."""
+
+        if not 1 <= limit <= 50:
+            raise UserError("files.history_limit_invalid")
+        if file_ref.startswith("fil_"):
+            self.resolve_managed_file_for_actor(file_ref, actor_id, guild_id)
+        elif file_ref.startswith("pub_"):
+            publication = self.get_publication_for_actor(file_ref, actor_id)
+            if publication.target_workspace_id != guild_id:
+                raise UserError("files.publication_not_found")
+        else:
+            raise UserError("files.file_ref_not_found")
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT action_id, file_ref, action, summary, occurred_at
+                FROM file_actions
+                WHERE actor_id = ? AND guild_id = ? AND file_ref = ?
+                ORDER BY occurred_at DESC, action_id DESC
+                LIMIT ?
+                """,
+                (actor_id, guild_id, file_ref, limit),
+            ).fetchall()
+        try:
+            return tuple(
+                WorkspaceFileAction(
+                    action_id=str(row[0]),
+                    file_ref=str(row[1]),
+                    action=_file_action_kind(str(row[2])),
+                    summary=str(row[3]),
+                    occurred_at=str(row[4]),
+                )
+                for row in rows
+            )
+        except (TypeError, ValueError) as exc:
+            raise UserError("files.history_invalid") from exc
+
+    def record_managed_action(
+        self,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        action: WorkspaceFileActionKind,
+        summary: str,
+    ) -> WorkspaceFileAction:
+        """Record one bounded user-visible action without file content or IDs."""
+
+        _validate_managed_ref(file_ref)
+        _validate_managed_identity(guild_id, actor_id)
+        if file_ref.startswith("fil_"):
+            self.resolve_managed_file_for_actor(file_ref, actor_id, guild_id)
+        else:
+            publication = self.get_publication_for_actor(file_ref, actor_id)
+            if publication.target_workspace_id != guild_id:
+                raise UserError("files.publication_not_found")
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            return self._insert_file_action(
+                connection,
+                file_ref,
+                actor_id,
+                guild_id,
+                action=action,
+                summary=summary,
+            )
+
+    @staticmethod
+    def _insert_file_action(
+        connection: sqlite3.Connection,
+        file_ref: str,
+        actor_id: str,
+        guild_id: str,
+        *,
+        action: WorkspaceFileActionKind,
+        summary: str,
+    ) -> WorkspaceFileAction:
+        if action not in {
+            "copied_to_task",
+            "published",
+            "sent",
+            "deleted",
+            "revoked",
+        }:
+            raise UserError("files.history_action_invalid")
+        clean_summary = summary.strip()
+        if not clean_summary or len(clean_summary) > 200:
+            raise UserError("files.history_summary_invalid")
+        action_id = f"fact_{uuid.uuid4().hex}"
+        occurred_at = datetime.now(UTC).isoformat()
+        connection.execute(
+            """
+            INSERT INTO file_actions (
+                action_id, file_ref, actor_id, guild_id,
+                action, summary, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                action_id,
+                file_ref,
+                actor_id,
+                guild_id,
+                action,
+                clean_summary,
+                occurred_at,
+            ),
+        )
+        return WorkspaceFileAction(
+            action_id=action_id,
+            file_ref=file_ref,
+            action=action,
+            summary=clean_summary,
+            occurred_at=occurred_at,
+        )
+
+    def _private_share_state(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        actor_id: str,
+    ) -> WorkspaceManagedFileShareState:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT * FROM file_publications
+                WHERE source_workspace_id = ? AND source_path = ?
+                  AND published_by_actor_id = ?
+                """,
+                (workspace_id, relative_path, actor_id),
+            ).fetchall()
+        if not rows:
+            return "private"
+        publications = tuple(_publication_from_row(row) for row in rows)
+        return "shared_active" if any(item.active for item in publications) else "shared_inactive"
 
     def _list_unlocked(
         self,
@@ -978,6 +1582,12 @@ class AgentFileSandbox:
                 source_path,
             )
         )
+        source_file_ref, _created_at, _updated_at = self._load_file_identity(
+            source_workspace_id,
+            source_path,
+        )
+        if source_file_ref is None:
+            raise UserError("files.file_ref_not_found")
         actual_sha256 = hashlib.sha256(content).hexdigest()
         if actual_sha256 != expected_sha256:
             raise UserError("files.hash_conflict")
@@ -1022,7 +1632,10 @@ class AgentFileSandbox:
                 provenance=copy_provenance,
             )
             try:
-                self._store_publication(publication)
+                self._store_publication(
+                    publication,
+                    source_file_ref=source_file_ref,
+                )
             except Exception:
                 copy_scope = self._scope_path(copy_workspace_id)
                 self._path(copy_scope, copy_path).unlink(missing_ok=True)
@@ -1136,6 +1749,38 @@ class AgentFileSandbox:
                     expected_revision,
                 ),
             )
+            source_row = connection.execute(
+                """
+                SELECT file_ref, origin_guild_id FROM file_provenance
+                WHERE workspace_id = ? AND relative_path = ?
+                """,
+                (publication.source_workspace_id, publication.source_path),
+            ).fetchone()
+            summary = f"Revoked sharing to {publication.target_display_name}."
+            self._insert_file_action(
+                connection,
+                publication.publication_id,
+                actor_id,
+                publication.target_workspace_id,
+                action="revoked",
+                summary=summary,
+            )
+            if source_row is not None:
+                source_file_ref = str(source_row[0])
+                if re.fullmatch(r"fil_[0-9a-f]{32}", source_file_ref):
+                    source_guild_id = (
+                        str(source_row[1])
+                        if source_row[1] is not None
+                        else publication.target_workspace_id
+                    )
+                    self._insert_file_action(
+                        connection,
+                        source_file_ref,
+                        actor_id,
+                        source_guild_id,
+                        action="revoked",
+                        summary=summary,
+                    )
             updated = replace(
                 publication,
                 revision=next_revision,
@@ -1232,6 +1877,10 @@ class AgentFileSandbox:
     ) -> WorkspaceFileRecord:
         data = path.read_bytes()
         relative_path = path.relative_to(scope).as_posix()
+        file_ref, created_at, updated_at = self._load_file_identity(
+            workspace_id,
+            relative_path,
+        )
         return WorkspaceFileRecord(
             path=relative_path,
             size_bytes=len(data),
@@ -1241,6 +1890,9 @@ class AgentFileSandbox:
                 self._load_provenance(workspace_id, relative_path)
                 or unlabelled_file_provenance()
             ),
+            file_ref=file_ref,
+            created_at=created_at,
+            updated_at=updated_at,
         )
 
     def _initialize_provenance(self) -> None:
@@ -1254,6 +1906,7 @@ class AgentFileSandbox:
                 CREATE TABLE IF NOT EXISTS file_provenance (
                     workspace_id TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
+                    file_ref TEXT,
                     owner_actor_id TEXT NOT NULL,
                     owner_actor_ids_json TEXT NOT NULL DEFAULT '[]',
                     origin_guild_id TEXT,
@@ -1268,6 +1921,7 @@ class AgentFileSandbox:
                     declassified_at TEXT,
                     declassified_by TEXT,
                     publication_id TEXT,
+                    created_at TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (workspace_id, relative_path)
                 )
@@ -1280,10 +1934,12 @@ class AgentFileSandbox:
                 ).fetchall()
             }
             additions = {
+                "file_ref": "TEXT",
                 "owner_actor_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "unlabelled_input": "INTEGER NOT NULL DEFAULT 0",
                 "sources_truncated": "INTEGER NOT NULL DEFAULT 0",
                 "publication_id": "TEXT",
+                "created_at": "TEXT",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -1332,6 +1988,41 @@ class AgentFileSandbox:
                         str(relative_path),
                     ),
                 )
+            identity_rows = connection.execute(
+                """
+                SELECT rowid, file_ref, created_at, updated_at
+                FROM file_provenance
+                ORDER BY rowid
+                """
+            ).fetchall()
+            seen_file_refs: set[str] = set()
+            for rowid, raw_file_ref, raw_created_at, raw_updated_at in identity_rows:
+                file_ref = str(raw_file_ref) if raw_file_ref is not None else ""
+                if (
+                    not re.fullmatch(r"fil_[0-9a-f]{32}", file_ref)
+                    or file_ref in seen_file_refs
+                ):
+                    file_ref = f"fil_{uuid.uuid4().hex}"
+                seen_file_refs.add(file_ref)
+                created_at = (
+                    str(raw_created_at)
+                    if raw_created_at is not None and str(raw_created_at).strip()
+                    else str(raw_updated_at)
+                )
+                connection.execute(
+                    """
+                    UPDATE file_provenance
+                    SET file_ref = ?, created_at = ?
+                    WHERE rowid = ?
+                    """,
+                    (file_ref, created_at, int(rowid)),
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS file_provenance_file_ref
+                ON file_provenance (file_ref)
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS file_publications (
@@ -1367,7 +2058,50 @@ class AgentFileSandbox:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_actions (
+                    action_id TEXT PRIMARY KEY,
+                    file_ref TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    guild_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS file_actions_actor_file
+                ON file_actions (actor_id, guild_id, file_ref, occurred_at)
+                """
+            )
         self._provenance_path.chmod(0o600)
+
+    def _load_file_identity(
+        self,
+        workspace_id: str,
+        relative_path: str,
+    ) -> tuple[str | None, str | None, str | None]:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT file_ref, created_at, updated_at
+                FROM file_provenance
+                WHERE workspace_id = ? AND relative_path = ?
+                """,
+                (workspace_id, relative_path),
+            ).fetchone()
+        if row is None:
+            return None, None, None
+        file_ref = str(row[0])
+        if not re.fullmatch(r"fil_[0-9a-f]{32}", file_ref):
+            raise UserError("files.provenance_invalid")
+        return file_ref, str(row[1]), str(row[2])
 
     def _load_provenance(
         self,
@@ -1442,6 +2176,8 @@ class AgentFileSandbox:
             self._delete_provenance(workspace_id, relative_path)
             return
         payload = asdict(provenance)
+        now = datetime.now(UTC).isoformat()
+        file_ref = f"fil_{uuid.uuid4().hex}"
         with self._provenance_lock, sqlite3.connect(
             self._provenance_path,
             timeout=5.0,
@@ -1449,15 +2185,15 @@ class AgentFileSandbox:
             connection.execute(
                 """
                 INSERT INTO file_provenance (
-                    workspace_id, relative_path, owner_actor_id,
+                    workspace_id, relative_path, file_ref, owner_actor_id,
                     owner_actor_ids_json,
                     origin_guild_id, origin_channel_id, origin_message_id,
                     origin_visibility, created_task_id, sensitivity,
                     source_resources_json, unlabelled_input,
                     sources_truncated, declassified_at, declassified_by,
                     publication_id,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workspace_id, relative_path) DO UPDATE SET
                     owner_actor_id = excluded.owner_actor_id,
                     owner_actor_ids_json = excluded.owner_actor_ids_json,
@@ -1478,6 +2214,7 @@ class AgentFileSandbox:
                 (
                     workspace_id,
                     relative_path,
+                    file_ref,
                     (
                         payload["owner_actor_ids"][0]
                         if payload["owner_actor_ids"]
@@ -1504,11 +2241,18 @@ class AgentFileSandbox:
                     payload["declassified_at"],
                     payload["declassified_by"],
                     payload["publication_id"],
-                    datetime.now(UTC).isoformat(),
+                    now,
+                    now,
                 ),
             )
 
-    def _store_publication(self, publication: WorkspaceFilePublication) -> None:
+    def _store_publication(
+        self,
+        publication: WorkspaceFilePublication,
+        *,
+        source_file_ref: str,
+    ) -> None:
+        _validate_private_file_ref(source_file_ref)
         with self._provenance_lock, sqlite3.connect(
             self._provenance_path,
             timeout=5.0,
@@ -1543,6 +2287,35 @@ class AgentFileSandbox:
                     publication.revoked_at,
                     publication.revoked_by,
                 ),
+            )
+            source_row = connection.execute(
+                """
+                SELECT origin_guild_id FROM file_provenance
+                WHERE file_ref = ?
+                """,
+                (source_file_ref,),
+            ).fetchone()
+            source_guild_id = (
+                str(source_row[0])
+                if source_row is not None and source_row[0] is not None
+                else publication.target_workspace_id
+            )
+            summary = f"Published a copy to {publication.target_display_name}."
+            self._insert_file_action(
+                connection,
+                source_file_ref,
+                publication.published_by_actor_id,
+                source_guild_id,
+                action="published",
+                summary=summary,
+            )
+            self._insert_file_action(
+                connection,
+                publication.publication_id,
+                publication.published_by_actor_id,
+                publication.target_workspace_id,
+                action="published",
+                summary=summary,
             )
 
     def _load_publication(
@@ -1580,6 +2353,69 @@ class AgentFileSandbox:
                 "DELETE FROM file_provenance WHERE workspace_id = ? AND relative_path = ?",
                 (workspace_id, relative_path),
             )
+
+
+def _validate_managed_identity(guild_id: str, actor_id: str) -> None:
+    if (
+        not guild_id
+        or len(guild_id) > 200
+        or not actor_id
+        or len(actor_id) > 200
+    ):
+        raise UserError("files.file_ref_not_found")
+
+
+def _validate_private_file_ref(file_ref: str) -> None:
+    if not re.fullmatch(r"fil_[0-9a-f]{32}", file_ref):
+        raise UserError("files.file_ref_not_found")
+
+
+def _validate_managed_ref(file_ref: str) -> None:
+    if not re.fullmatch(r"(?:fil|pub)_[0-9a-f]{32}", file_ref):
+        raise UserError("files.file_ref_not_found")
+
+
+def _managed_origin(provenance: WorkspaceFileProvenance) -> str:
+    if provenance.origin_message_id is not None:
+        return "Discord message"
+    if provenance.origin_channel_id is not None:
+        return "Discord channel"
+    if provenance.created_task_id is not None:
+        return "Agent task"
+    return "Configured workspace"
+
+
+def _managed_task_label(
+    created_task_id: str | None,
+    current_task_id: str | None,
+) -> str:
+    if created_task_id is None:
+        return "No task"
+    if current_task_id is not None and created_task_id == current_task_id:
+        return "Current task"
+    return "Another task"
+
+
+def _publication_share_state(
+    publication: WorkspaceFilePublication,
+) -> WorkspaceManagedFileShareState:
+    if publication.revoked_at is not None:
+        return "revoked"
+    if datetime.now(UTC) >= _publication_datetime(publication.expires_at):
+        return "expired"
+    return "active"
+
+
+def _file_action_kind(value: str) -> WorkspaceFileActionKind:
+    if value not in {
+        "copied_to_task",
+        "published",
+        "sent",
+        "deleted",
+        "revoked",
+    }:
+        raise ValueError("invalid managed file action")
+    return cast(WorkspaceFileActionKind, value)
 
 
 def _publication_datetime(value: str) -> datetime:

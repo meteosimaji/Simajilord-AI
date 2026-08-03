@@ -110,7 +110,7 @@ def build_media_save_endpoint(
     media: MediaService,
     files: AgentFileSandbox,
 ) -> CapabilityEndpoint:
-    """Save public media into the caller's isolated file workspace."""
+    """Save public media into the caller's configured file workspace."""
 
     async def save(
         request: MediaSaveRequest,
@@ -160,8 +160,8 @@ def build_media_save_endpoint(
         CapabilityDescriptor(
             name="media.save",
             summary=(
-                "Save video or audio from a supported public URL into the isolated "
-                "actor/task workspace for later file use or Discord delivery."
+                "Save video or audio from a supported public URL into the configured "
+                "workspace for later file use or Discord delivery."
             ),
             risk=RiskLevel.WRITE,
             disclosure_class=DisclosureClass.ACTOR_PRIVATE,
@@ -185,7 +185,7 @@ def build_media_save_endpoint(
             ),
             side_effects=(
                 "Connects to the public media URL.",
-                "Creates up to four bounded files in the isolated workspace.",
+                "Creates up to four bounded files in the configured workspace.",
             ),
             audit_payload="metadata",
             egress=EgressDescriptor(
@@ -209,7 +209,7 @@ def build_media_save_endpoint(
             ),
             timeout_seconds=180,
             user_visible_effect=(
-                "Saves reusable media files in this server's isolated workspace."
+                "Saves reusable media files in the configured workspace."
             ),
         ),
         MediaSaveRequest,

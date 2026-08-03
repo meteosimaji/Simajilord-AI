@@ -28,12 +28,14 @@ from simajilord.integrations.discord.capabilities import (
     DiscordListRolesRequest,
     DiscordListServersRequest,
     DiscordMemberModerationRequest,
+    DiscordOpenFileManagerRequest,
     DiscordPollRequest,
     DiscordReactionRequest,
     DiscordReadMessagesRequest,
     DiscordReplyMessageRequest,
     DiscordSearchMessagesRequest,
     DiscordSendEmbedRequest,
+    DiscordSendManagedFileRequest,
     DiscordSendMessageRequest,
     DiscordSendPublishedFileRequest,
     DiscordThreadAudienceInspectRequest,
@@ -43,6 +45,7 @@ from simajilord.integrations.discord.capabilities import (
     FilePublishTargetInspectRequest,
     build_discord_endpoints,
 )
+from simajilord.integrations.discord.file_manager import FileManagerLauncherView
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
 
@@ -417,6 +420,70 @@ def _agent_context(*, resource_ids: tuple[str, ...] = ("20", "21")) -> Invocatio
         resource_ids=resource_ids,
         read_scope_mode="requester_live",
     )
+
+
+@pytest.mark.asyncio
+async def test_open_file_manager_posts_only_metadata_free_launcher(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = replace(
+        _agent_context(resource_ids=("20",)),
+        agent_task_id="task-a",
+        file_workspace_mode="guild_shared",
+    )
+    sandbox.import_bytes(
+        "10",
+        "private-secret.txt",
+        b"secret",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("7",),
+            origin_guild_id="10",
+            created_task_id="task-a",
+        ),
+    )
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = sandbox
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    guild.get_member.return_value = actor
+    guild.me = bot
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(
+            cast(discord.Client, client),
+            runtime,
+        )
+    }
+
+    response = await endpoints["discord.open_file_manager"].invoke(
+        DiscordOpenFileManagerRequest(channel_id="20"),
+        context,
+    )
+
+    assert response.message_id == "31"
+    sent_embed = channel.send.await_args.kwargs["embed"]
+    sent_view = channel.send.await_args.kwargs["view"]
+    rendered = str(sent_embed.to_dict())
+    assert "private-secret" not in rendered
+    assert "fil_" not in rendered
+    assert isinstance(sent_view, FileManagerLauncherView)
+    assert sent_view.requester_id == 7
 
 
 def _readable_guild(
@@ -1395,6 +1462,7 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         b"private bytes",
         provenance=WorkspaceFileProvenance(
             owner_actor_ids=("7",),
+            origin_guild_id="10",
             sensitivity="actor_private",
         ),
     )
@@ -1443,10 +1511,12 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         )
     }
     publication_expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    assert source.file_ref is not None
 
     inspection = await endpoints["files.inspect_publish_target"].invoke(
         FilePublishTargetInspectRequest(
-            source_path="private.txt",
+            source_path="",
+            source_file_ref=source.file_ref,
             channel_id="20",
             expires_at_iso=publication_expiry,
             reason="Share for review",
@@ -1454,12 +1524,14 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         context,
     )
     assert inspection.source_sha256 == source.sha256
+    assert inspection.source_file_ref == source.file_ref
     assert inspection.target_reader_count == 2
     assert inspection.new_reader_count == 1
 
     publication = await endpoints["files.publish_copy"].invoke(
         FilePublishCopyRequest(
-            source_path="private.txt",
+            source_path="",
+            source_file_ref=source.file_ref,
             channel_id="20",
             expires_at_iso=publication_expiry,
             reason="Share for review",
@@ -1496,16 +1568,21 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         )
     other.send.assert_not_awaited()
 
-    sent = await endpoints["discord.send_published_file"].invoke(
-        DiscordSendPublishedFileRequest(
-            publication_id=publication.publication_id,
+    sent = await endpoints["discord.send_managed_file"].invoke(
+        DiscordSendManagedFileRequest(
+            file_ref=publication.publication_id,
             channel_id="20",
-            expected_revision=publication.revision,
         ),
         context,
     )
     assert sent.message_id == "31"
     target.send.assert_awaited_once()
+    shared_history = sandbox.managed_history_for_actor(
+        publication.publication_id,
+        "7",
+        "10",
+    )
+    assert [item.action for item in shared_history[:2]] == ["sent", "published"]
 
     revoked = await endpoints["files.revoke_publication"].invoke(
         FilePublicationRevokeRequest(
@@ -1515,6 +1592,12 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         context,
     )
     assert revoked.active is False
+    revoked_history = sandbox.managed_history_for_actor(
+        publication.publication_id,
+        "7",
+        "10",
+    )
+    assert revoked_history[0].action == "revoked"
     with pytest.raises(UserError, match=r"files\.publication_revoked"):
         await endpoints["discord.send_published_file"].invoke(
             DiscordSendPublishedFileRequest(

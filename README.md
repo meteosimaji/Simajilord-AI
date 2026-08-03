@@ -147,7 +147,7 @@ with Discord's generic “interaction failed” banner.
   only provider, field kinds, policy decision, and an opaque policy reference. Hive attachment
   bytes are materialized by the host after consent and never enter the model tool arguments.
   Egress capabilities use metadata-only invocation audit records
-- The Discord adapter currently registers 111 typed capability endpoints covering the bot-visible
+- The Discord adapter currently registers 113 typed capability endpoints covering the bot-visible
   conversation, moderation, audio, and common server-management areas listed below. This is a
   broad capability catalog, not a one-to-one implementation of every route in Discord's official
   REST API: six endpoints are internal compatibility/Undo helpers, and file or synthetic-media
@@ -196,6 +196,13 @@ with Discord's generic “interaction failed” banner.
   reversible operator modes. Even in `guild_shared`, model-facing list/read/write/import/send and
   compute paths require the current actor's exact single-owner label; unlabelled legacy files and
   multi-owner results stay hidden and are never implicitly shared or declassified.
+  A natural-language request can open a metadata-free `discord.open_file_manager` launcher;
+  only the requester sees the ephemeral My / Task / Shared selector. It shows owner, origin,
+  sensitivity, size, task relation, and share state, while selection and typed
+  `files.copy_to_task`, `files.delete`, `files.history`, publish, revoke, and
+  `discord.send_managed_file` actions use opaque `fil_…` or `pub_…` references rather than raw
+  paths, actor IDs, or internal workspace hashes. My and Task are exact-owner views across all
+  three workspace modes; Shared is populated only from explicit target-bound publication copies.
   An explicit `files.publish_copy` flow first inspects the exact current Discord target audience,
   then creates a separate immutable copy whose ledger binds publisher, reason, target, audience
   revision, expiry, and revocation state; the original bytes and provenance remain unchanged.

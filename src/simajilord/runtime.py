@@ -608,17 +608,23 @@ class SimajilordRuntime:
                     required_grants[capability_name] = AGENT_IMAGE_GRANT
             if files is not None:
                 file_capabilities = (
+                    "files.catalog",
                     "files.list",
                     "files.read",
                     "files.write_text",
                     "files.replace_text",
+                    "files.copy_to_task",
+                    "files.delete",
+                    "files.history",
                     "files.inspect_publish_target",
                     "files.publish_copy",
                     "files.revoke_publication",
                     "discord.import_attachment",
                     "discord.send_file",
                     "discord.send_files",
+                    "discord.send_managed_file",
                     "discord.send_published_file",
+                    "discord.open_file_manager",
                 )
                 agent_capabilities.extend(file_capabilities)
                 required_grants.update({name: AGENT_FILE_GRANT for name in file_capabilities})
@@ -686,12 +692,16 @@ class SimajilordRuntime:
                         (
                             "files.write_text",
                             "files.replace_text",
+                            "files.copy_to_task",
+                            "files.delete",
                             "files.publish_copy",
                             "files.revoke_publication",
                             "discord.import_attachment",
                             "discord.send_file",
                             "discord.send_files",
+                            "discord.send_managed_file",
                             "discord.send_published_file",
+                            "discord.open_file_manager",
                             "media.save",
                         )
                         if files is not None
@@ -701,6 +711,7 @@ class SimajilordRuntime:
                 ),
                 destructive_capabilities=(
                     *AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+                    *(("files.delete",) if files is not None else ()),
                     *(
                         ("connector.destructive",)
                         if "connector.destructive" in agent_capabilities

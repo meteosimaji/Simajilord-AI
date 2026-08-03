@@ -1,4 +1,4 @@
-"""Typed capabilities for isolated workspace computation and downloads."""
+"""Typed capabilities for sandboxed computation in the configured workspace."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def build_compute_endpoints(
                 ),
                 side_effects=(
                     "Runs one resource-bounded process without network access.",
-                    "Commits validated file changes to the isolated workspace.",
+                    "Commits validated file changes to the configured workspace.",
                 ),
                 requires_workspace=True,
                 idempotency="non_idempotent_write",
@@ -120,7 +120,7 @@ def build_compute_endpoints(
                 ),
                 timeout_seconds=150,
                 user_visible_effect=(
-                    "May create or update files in the isolated workspace."
+                    "May create or update files in the configured workspace."
                 ),
             ),
             ComputeRunRequest,
@@ -132,7 +132,7 @@ def build_compute_endpoints(
                 name="files.download_url",
                 summary=(
                     "Download one bounded public HTTP(S) file into this server's "
-                    "isolated workspace with redirect and SSRF protection."
+                    "configured workspace with redirect and SSRF protection."
                 ),
                 risk=RiskLevel.WRITE,
                 disclosure_class=DisclosureClass.ACTOR_PRIVATE,
@@ -148,7 +148,7 @@ def build_compute_endpoints(
                 ),
                 side_effects=(
                     "Fetches one public HTTP or HTTPS resource.",
-                    "Creates or replaces a file in the isolated workspace.",
+                    "Creates or replaces a file in the configured workspace.",
                 ),
                 audit_payload="metadata",
                 egress=EgressDescriptor(
@@ -166,7 +166,7 @@ def build_compute_endpoints(
                 ),
                 timeout_seconds=45,
                 user_visible_effect=(
-                    "Creates or replaces a downloaded file in the isolated workspace."
+                    "Creates or replaces a downloaded file in the configured workspace."
                 ),
             ),
             FileDownloadUrlRequest,

@@ -12,7 +12,7 @@ import logging
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePath
@@ -43,6 +43,14 @@ from simajilord.capabilities.file_scope import (
     file_provenance,
     file_workspace_id,
     provenance_observations,
+)
+from simajilord.capabilities.files import (
+    FileCopyToTaskRequest,
+    FileCopyToTaskResponse,
+    FileDeleteRequest,
+    FileDeleteResponse,
+    FileHistoryRequest,
+    FileHistoryResponse,
 )
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -91,9 +99,12 @@ from simajilord.core import (
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import (
+    WorkspaceFileAction,
     WorkspaceFileProvenance,
     WorkspaceFilePublication,
     WorkspaceFileRecord,
+    WorkspaceManagedFile,
+    WorkspaceManagedFileCatalog,
 )
 from simajilord.services.quote import (
     QuoteCustomEmojiAsset,
@@ -103,6 +114,12 @@ from simajilord.services.quote import (
 
 from .attachment_io import read_attachment_bytes
 from .audio import DiscordAudioOutput
+from .file_manager import (
+    FileManagerCallbacks,
+    FileManagerLauncherView,
+    FileManagerPublishReview,
+    file_manager_launcher_embed,
+)
 from .local_media import (
     attachment_can_play,
     import_discord_attachment,
@@ -188,6 +205,22 @@ class _FilePublishAudience:
     target_reader_ids: tuple[int, ...]
     new_reader_count: int
     target_revision: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedPrivateFileSource:
+    workspace_id: str
+    relative_path: str
+    file_ref: str | None
+    filename: str
+    content: bytes
+    provenance: WorkspaceFileProvenance
+
+
+@dataclass(frozen=True, slots=True)
+class _FileManagerPublishPayload:
+    context: InvocationContext
+    request: FilePublishCopyRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -1202,7 +1235,6 @@ class DiscordSendFilesResponse:
 
 @dataclass(frozen=True, slots=True)
 class FilePublishTargetInspectRequest:
-    source_path: str
     channel_id: str
     expires_at_iso: str
     reason: str
@@ -1210,6 +1242,8 @@ class FilePublishTargetInspectRequest:
         default=None,
         metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
+    source_path: str = ""
+    source_file_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1227,11 +1261,11 @@ class FilePublishTargetInspectResponse:
     publication_expires_at: str
     audience_expansion_token: str
     audience_expansion_expires_at: str
+    source_file_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class FilePublishCopyRequest:
-    source_path: str
     channel_id: str
     expires_at_iso: str
     reason: str
@@ -1248,6 +1282,8 @@ class FilePublishCopyRequest:
         default=None,
         metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
     )
+    source_path: str = ""
+    source_file_ref: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1299,6 +1335,48 @@ class DiscordSendPublishedFileResponse:
     channel_id: str
     filename: str
     size_bytes: int
+    guild_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendManagedFileRequest:
+    file_ref: str
+    channel_id: str
+    caption: str = ""
+    description: str = ""
+    spoiler: bool = False
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+    reply_to_message_id: str | None = None
+    silent: bool = False
+    purpose: DiscordDeliveryPurpose = "requested_action"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendManagedFileResponse:
+    file_ref: str
+    message_id: str
+    channel_id: str
+    filename: str
+    size_bytes: int
+    guild_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordOpenFileManagerRequest:
+    channel_id: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordOpenFileManagerResponse:
+    message_id: str
+    channel_id: str
     guild_id: str
 
 
@@ -4235,12 +4313,67 @@ def build_discord_endpoints(
             changed=already_reacted,
         )
 
+    async def resolve_private_file_source(
+        context: InvocationContext,
+        *,
+        source_path: str,
+        source_file_ref: str,
+    ) -> _ResolvedPrivateFileSource:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if context.workspace_id is None:
+            raise UserError("files.workspace_required")
+        path_selected = bool(source_path.strip())
+        ref_selected = bool(source_file_ref.strip())
+        if path_selected == ref_selected:
+            raise UserError("files.source_selector_invalid")
+        if ref_selected:
+            location = await asyncio.to_thread(
+                runtime.files.resolve_managed_file_for_actor,
+                source_file_ref,
+                context.actor_id,
+                context.workspace_id,
+            )
+            filename, content, provenance, record = await asyncio.to_thread(
+                runtime.files.snapshot_managed_file_for_actor,
+                source_file_ref,
+                context.actor_id,
+                context.workspace_id,
+            )
+            if record.file_ref != source_file_ref:
+                raise UserError("files.file_ref_not_found")
+            return _ResolvedPrivateFileSource(
+                workspace_id=location.workspace_id,
+                relative_path=location.relative_path,
+                file_ref=source_file_ref,
+                filename=filename,
+                content=content,
+                provenance=provenance,
+            )
+        workspace_id = file_workspace_id(context)
+        filename, content, provenance = await asyncio.to_thread(
+            runtime.files.snapshot_for_actor_delivery_with_provenance,
+            workspace_id,
+            context.actor_id,
+            source_path,
+        )
+        return _ResolvedPrivateFileSource(
+            workspace_id=workspace_id,
+            relative_path=source_path,
+            file_ref=None,
+            filename=filename,
+            content=content,
+            provenance=provenance,
+        )
+
     def file_publish_payload(
         context: InvocationContext,
         guild: discord.Guild,
         channel: DiscordMessageChannel,
         *,
+        source_workspace_id: str,
         source_path: str,
+        source_file_ref: str | None,
         reason: str,
         publication_expires_at: str,
         token_expires_at: str,
@@ -4251,8 +4384,9 @@ def build_discord_endpoints(
             "kind": "file_publish_copy_v1",
             "actor_id": context.actor_id,
             "request_id": context.request_id,
-            "source_workspace_id": file_workspace_id(context),
+            "source_workspace_id": source_workspace_id,
             "source_path": source_path,
+            "source_file_ref": source_file_ref,
             "source_sha256": audience.source_sha256,
             "source_provenance_revision": _file_provenance_revision(provenance),
             "source_sensitivity": audience.source_sensitivity,
@@ -4290,19 +4424,18 @@ def build_discord_endpoints(
             required_permissions=("send_messages", "attach_files"),
             enforce_information_flow=False,
         )
-        source_filename, content, provenance = await asyncio.to_thread(
-            runtime.files.snapshot_for_actor_delivery_with_provenance,
-            file_workspace_id(context),
-            context.actor_id,
-            request.source_path,
+        source = await resolve_private_file_source(
+            context,
+            source_path=request.source_path,
+            source_file_ref=request.source_file_ref,
         )
         audience = await _file_publish_audience(
             context,
             guild,
             channel,
-            source_filename=source_filename,
-            content=content,
-            provenance=provenance,
+            source_filename=source.filename,
+            content=source.content,
+            provenance=source.provenance,
         )
         token_expires_at = (
             datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL
@@ -4311,16 +4444,18 @@ def build_discord_endpoints(
             context,
             guild,
             channel,
-            source_path=request.source_path,
+            source_workspace_id=source.workspace_id,
+            source_path=source.relative_path,
+            source_file_ref=source.file_ref,
             reason=reason,
             publication_expires_at=publication_expires_at,
             token_expires_at=token_expires_at,
             audience=audience,
-            provenance=provenance,
+            provenance=source.provenance,
         )
         return FilePublishTargetInspectResponse(
             source_path=request.source_path,
-            source_filename=source_filename,
+            source_filename=source.filename,
             source_sha256=audience.source_sha256,
             source_sensitivity=audience.source_sensitivity,
             source_reader_count=audience.source_reader_count,
@@ -4335,6 +4470,7 @@ def build_discord_endpoints(
                 payload,
             ),
             audience_expansion_expires_at=token_expires_at,
+            source_file_ref=source.file_ref,
         )
 
     async def publish_file_copy(
@@ -4364,19 +4500,18 @@ def build_discord_endpoints(
             required_permissions=("send_messages", "attach_files"),
             enforce_information_flow=False,
         )
-        source_filename, content, provenance = await asyncio.to_thread(
-            runtime.files.snapshot_for_actor_delivery_with_provenance,
-            file_workspace_id(context),
-            context.actor_id,
-            request.source_path,
+        source = await resolve_private_file_source(
+            context,
+            source_path=request.source_path,
+            source_file_ref=request.source_file_ref,
         )
         audience = await _file_publish_audience(
             context,
             guild,
             channel,
-            source_filename=source_filename,
-            content=content,
-            provenance=provenance,
+            source_filename=source.filename,
+            content=source.content,
+            provenance=source.provenance,
         )
         if (
             request.expected_source_sha256 != audience.source_sha256
@@ -4410,12 +4545,14 @@ def build_discord_endpoints(
                 context,
                 guild,
                 channel,
-                source_path=request.source_path,
+                source_workspace_id=source.workspace_id,
+                source_path=source.relative_path,
+                source_file_ref=source.file_ref,
                 reason=reason,
                 publication_expires_at=publication_expires_at,
                 token_expires_at=token_expires_at,
                 audience=audience,
-                provenance=provenance,
+                provenance=source.provenance,
             ),
             request.audience_expansion_token,
             error_code="files.publication_confirmation_required",
@@ -4425,9 +4562,9 @@ def build_discord_endpoints(
             WorkspaceFilePublication,
             await asyncio.to_thread(
                 runtime.files.publish_copy_for_actor,
-                file_workspace_id(context),
+                source.workspace_id,
                 context.actor_id,
-                request.source_path,
+                source.relative_path,
                 expected_sha256=audience.source_sha256,
                 target_workspace_id=str(guild.id),
                 target_resource_id=str(channel.id),
@@ -4439,7 +4576,7 @@ def build_discord_endpoints(
         )
         return FilePublishCopyResponse(
             publication_id=publication.publication_id,
-            source_filename=source_filename,
+            source_filename=source.filename,
             target_channel_id=publication.target_resource_id,
             target_display_name=publication.target_display_name,
             expires_at_iso=publication.expires_at,
@@ -4699,6 +4836,362 @@ def build_discord_endpoints(
             filename=response.filenames[0],
             size_bytes=response.size_bytes[0],
             guild_id=response.guild_id,
+        )
+
+    async def send_managed_file(
+        request: DiscordSendManagedFileRequest,
+        context: InvocationContext,
+    ) -> DiscordSendManagedFileResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if context.workspace_id is None:
+            raise UserError("files.workspace_required")
+        if request.file_ref.startswith("pub_"):
+            publication = await asyncio.to_thread(
+                runtime.files.get_publication_for_actor,
+                request.file_ref,
+                context.actor_id,
+            )
+            response = await send_published_file(
+                DiscordSendPublishedFileRequest(
+                    publication_id=publication.publication_id,
+                    channel_id=request.channel_id,
+                    expected_revision=publication.revision,
+                    caption=request.caption,
+                    description=request.description,
+                    spoiler=request.spoiler,
+                    guild_id=request.guild_id,
+                    reply_to_message_id=request.reply_to_message_id,
+                    silent=request.silent,
+                    purpose=request.purpose,
+                ),
+                context,
+            )
+            try:
+                await asyncio.to_thread(
+                    runtime.files.record_managed_action,
+                    request.file_ref,
+                    context.actor_id,
+                    response.guild_id,
+                    action="sent",
+                    summary="Sent the published copy to its confirmed Discord target.",
+                )
+            except Exception:
+                log.exception("Could not append published file manager history")
+            return DiscordSendManagedFileResponse(
+                file_ref=request.file_ref,
+                message_id=response.message_id,
+                channel_id=response.channel_id,
+                filename=response.filename,
+                size_bytes=response.size_bytes,
+                guild_id=response.guild_id,
+            )
+        if len(request.caption) > 2_000:
+            raise UserError("discord.file_caption_too_long")
+        if len(request.description) > 1_024:
+            raise UserError("discord.file_description_too_long")
+        guild, channel, _actor, _bot = await _write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages", "attach_files"),
+        )
+        filename, content, provenance, record = await asyncio.to_thread(
+            runtime.files.snapshot_managed_file_for_actor,
+            request.file_ref,
+            context.actor_id,
+            str(guild.id),
+        )
+        if record.file_ref != request.file_ref:
+            raise UserError("files.file_ref_not_found")
+        _enforce_file_provenance_to_destination(
+            client,
+            context,
+            guild,
+            channel,
+            (provenance,),
+        )
+        if len(content) > guild.filesize_limit:
+            raise UserError("discord.file_too_large")
+        reply = (
+            await _fetch_message_for_write(channel, request.reply_to_message_id)
+            if request.reply_to_message_id is not None
+            else None
+        )
+        file = discord.File(
+            io.BytesIO(content),
+            filename=filename,
+            spoiler=request.spoiler,
+            description=request.description or None,
+        )
+        try:
+            send_arguments: dict[str, Any] = {
+                "allowed_mentions": discord.AllowedMentions.none(),
+                "nonce": _discord_write_nonce(context, "managed-attachment"),
+                "suppress_embeds": True,
+                "file": file,
+            }
+            if reply is not None:
+                send_arguments["reference"] = reply
+                send_arguments["mention_author"] = False
+            if request.silent:
+                send_arguments["silent"] = True
+            await context.dispatch_external_effect()
+            message = await channel.send(request.caption or None, **send_arguments)
+        except discord.Forbidden as exc:
+            raise UserError("discord.file_send_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.file_send_failed") from exc
+        finally:
+            file.close()
+        try:
+            await asyncio.to_thread(
+                runtime.files.record_managed_action,
+                request.file_ref,
+                context.actor_id,
+                str(guild.id),
+                action="sent",
+                summary="Sent the private file to an authorized Discord channel.",
+            )
+        except Exception:
+            log.exception("Could not append private file manager history")
+        return DiscordSendManagedFileResponse(
+            file_ref=request.file_ref,
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            filename=filename,
+            size_bytes=len(content),
+            guild_id=str(guild.id),
+        )
+
+    def file_manager_interaction_context(
+        base: InvocationContext,
+        interaction: discord.Interaction,
+    ) -> InvocationContext:
+        if str(interaction.user.id) != base.actor_id:
+            raise UserError("discord.agent_actor_mismatch")
+        if (
+            interaction.guild_id is None
+            or base.workspace_id != str(interaction.guild_id)
+        ):
+            raise UserError("files.workspace_required")
+        return replace(
+            base,
+            transport="discord",
+            request_id=str(interaction.id),
+            origin_resource_id=(
+                str(interaction.channel_id)
+                if interaction.channel_id is not None
+                else base.origin_resource_id
+            ),
+            approvals=frozenset(),
+            external_effect_dispatch=None,
+        )
+
+    def file_manager_callbacks(
+        base_context: InvocationContext,
+        target_channel_id: str,
+    ) -> FileManagerCallbacks:
+        async def catalog(
+            interaction: discord.Interaction,
+        ) -> WorkspaceManagedFileCatalog:
+            context = file_manager_interaction_context(base_context, interaction)
+            if runtime.files is None or context.workspace_id is None:
+                raise UserError("files.workspace_required")
+            return await asyncio.to_thread(
+                runtime.files.managed_catalog_for_actor,
+                context.workspace_id,
+                context.actor_id,
+                current_task_id=context.agent_task_id,
+            )
+
+        async def copy_to_task(
+            file: WorkspaceManagedFile,
+            interaction: discord.Interaction,
+        ) -> str:
+            context = file_manager_interaction_context(base_context, interaction)
+            response = cast(
+                FileCopyToTaskResponse,
+                await runtime.registry.endpoint("files.copy_to_task").invoke(
+                    FileCopyToTaskRequest(
+                        file_ref=file.file_ref,
+                        expected_sha256=file.sha256,
+                    ),
+                    context,
+                ),
+            )
+            return f"Copied {response.file.filename} to the current task."
+
+        async def inspect_publish(
+            file: WorkspaceManagedFile,
+            interaction: discord.Interaction,
+        ) -> FileManagerPublishReview:
+            context = file_manager_interaction_context(base_context, interaction)
+            expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+            inspected = await inspect_file_publish_target(
+                FilePublishTargetInspectRequest(
+                    source_path="",
+                    source_file_ref=file.file_ref,
+                    channel_id=target_channel_id,
+                    expires_at_iso=expiry,
+                    reason="Requester confirmed a target-bound copy in the private file manager.",
+                ),
+                context,
+            )
+            publish_request = FilePublishCopyRequest(
+                source_path="",
+                source_file_ref=file.file_ref,
+                channel_id=target_channel_id,
+                expires_at_iso=inspected.publication_expires_at,
+                reason="Requester confirmed a target-bound copy in the private file manager.",
+                expected_source_sha256=inspected.source_sha256,
+                expected_source_sensitivity=inspected.source_sensitivity,
+                expected_source_reader_count=inspected.source_reader_count,
+                expected_target_display_name=inspected.target_display_name,
+                expected_target_reader_count=inspected.target_reader_count,
+                expected_new_reader_count=inspected.new_reader_count,
+                expected_target_audience_revision=inspected.target_audience_revision,
+                audience_expansion_token=inspected.audience_expansion_token,
+                audience_expansion_expires_at=inspected.audience_expansion_expires_at,
+            )
+            return FileManagerPublishReview(
+                target_display_name=inspected.target_display_name,
+                new_reader_count=inspected.new_reader_count,
+                expires_at_iso=inspected.publication_expires_at,
+                payload=_FileManagerPublishPayload(
+                    context=context,
+                    request=publish_request,
+                ),
+            )
+
+        async def publish(
+            file: WorkspaceManagedFile,
+            review: FileManagerPublishReview,
+            interaction: discord.Interaction,
+        ) -> str:
+            if str(interaction.user.id) != base_context.actor_id:
+                raise UserError("discord.agent_actor_mismatch")
+            payload = review.payload
+            if (
+                not isinstance(payload, _FileManagerPublishPayload)
+                or payload.request.source_file_ref != file.file_ref
+                or payload.request.expected_source_sha256 != file.sha256
+            ):
+                raise UserError("files.publication_confirmation_required")
+            response = await publish_file_copy(payload.request, payload.context)
+            return (
+                f"Published a revocable copy of {response.source_filename} to "
+                f"{response.target_display_name}. Use Shared to send or revoke it."
+            )
+
+        async def send(
+            file: WorkspaceManagedFile,
+            interaction: discord.Interaction,
+        ) -> str:
+            context = file_manager_interaction_context(base_context, interaction)
+            response = await send_managed_file(
+                DiscordSendManagedFileRequest(
+                    file_ref=file.file_ref,
+                    channel_id=target_channel_id,
+                ),
+                context,
+            )
+            return f"Sent {response.filename} here."
+
+        async def delete_or_revoke(
+            file: WorkspaceManagedFile,
+            interaction: discord.Interaction,
+        ) -> str:
+            context = file_manager_interaction_context(base_context, interaction)
+            if file.section == "shared":
+                revoke_response = await revoke_file_publication(
+                    FilePublicationRevokeRequest(
+                        publication_id=file.file_ref,
+                        expected_revision=file.revision,
+                    ),
+                    context,
+                )
+                return (
+                    "Revoked future sends of the publication copy."
+                    if revoke_response.changed
+                    else "The publication copy was already revoked."
+                )
+            delete_response = cast(
+                FileDeleteResponse,
+                await runtime.registry.endpoint("files.delete").invoke(
+                    FileDeleteRequest(
+                        file_ref=file.file_ref,
+                        expected_sha256=file.sha256,
+                    ),
+                    context,
+                ),
+            )
+            return f"Deleted {delete_response.filename}."
+
+        async def history(
+            file: WorkspaceManagedFile,
+            interaction: discord.Interaction,
+        ) -> tuple[WorkspaceFileAction, ...]:
+            context = file_manager_interaction_context(base_context, interaction)
+            response = cast(
+                FileHistoryResponse,
+                await runtime.registry.endpoint("files.history").invoke(
+                    FileHistoryRequest(file_ref=file.file_ref),
+                    context,
+                ),
+            )
+            return response.actions
+
+        return FileManagerCallbacks(
+            catalog=catalog,
+            copy_to_task=copy_to_task,
+            inspect_publish=inspect_publish,
+            publish=publish,
+            send=send,
+            delete_or_revoke=delete_or_revoke,
+            history=history,
+        )
+
+    async def open_file_manager(
+        request: DiscordOpenFileManagerRequest,
+        context: InvocationContext,
+    ) -> DiscordOpenFileManagerResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        guild, channel, _actor, _bot = await _authorized_write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages",),
+            enforce_information_flow=False,
+        )
+        try:
+            requester_id = int(context.actor_id)
+        except ValueError as exc:
+            raise UserError("discord.agent_principal_invalid") from exc
+        view = FileManagerLauncherView(
+            requester_id=requester_id,
+            callbacks=file_manager_callbacks(context, str(channel.id)),
+            task_available=context.agent_task_id is not None,
+        )
+        try:
+            await context.dispatch_external_effect()
+            message = await channel.send(
+                embed=file_manager_launcher_embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+                nonce=_discord_write_nonce(context, "private-file-manager"),
+            )
+        except discord.Forbidden as exc:
+            raise UserError("discord.message_send_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.message_send_failed") from exc
+        return DiscordOpenFileManagerResponse(
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            guild_id=str(guild.id),
         )
 
     async def create_poll(
@@ -5930,7 +6423,7 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.import_attachment",
                 summary=(
-                    "Import a Discord attachment into this server's isolated workspace "
+                    "Import a Discord attachment into the configured workspace "
                     "and return its SHA-256 digest."
                 ),
                 risk=RiskLevel.WRITE,
@@ -5946,7 +6439,7 @@ def build_discord_endpoints(
                     "作業領域に保存",
                     "添付を保存",
                 ),
-                side_effects=("Creates or replaces a file inside the isolated workspace.",),
+                side_effects=("Creates or replaces a file inside the configured workspace.",),
                 requires_workspace=True,
                 idempotency="idempotent_write",
                 expected_errors=(
@@ -5960,7 +6453,7 @@ def build_discord_endpoints(
                     "files.file_too_large",
                 ),
                 timeout_seconds=60,
-                user_visible_effect="Creates or replaces a file in the isolated workspace.",
+                user_visible_effect="Creates or replaces a file in the configured workspace.",
             ),
             DiscordImportAttachmentRequest,
             WorkspaceFileRecord,
@@ -6759,7 +7252,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="files.inspect_publish_target",
                 summary=(
-                    "Inspect one actor-owned file and the exact human audience of one "
+                    "Inspect one actor-owned file selected by path or opaque file_ref and "
+                    "the exact human audience of one "
                     "Discord target before creating a target-bound publication copy. "
                     "Copy all returned expected fields, token, and expiries into "
                     "files.publish_copy."
@@ -6780,6 +7274,8 @@ def build_discord_endpoints(
                 expected_errors=(
                     "files.workspace_required",
                     "files.not_found",
+                    "files.file_ref_not_found",
+                    "files.source_selector_invalid",
                     "files.publication_expiry_invalid",
                     "files.publication_reason_required",
                     "files.publication_source_uncertain",
@@ -6795,7 +7291,8 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="files.publish_copy",
                 summary=(
-                    "Create an immutable, revocable file copy bound to the exact Discord "
+                    "Create an immutable, revocable file copy selected by path or opaque "
+                    "file_ref and bound to the exact Discord "
                     "channel audience previously returned by files.inspect_publish_target. "
                     "The original file and its provenance remain unchanged."
                 ),
@@ -6820,6 +7317,8 @@ def build_discord_endpoints(
                 expected_errors=(
                     "files.workspace_required",
                     "files.not_found",
+                    "files.file_ref_not_found",
+                    "files.source_selector_invalid",
                     "files.publication_confirmation_required",
                     "files.publication_confirmation_expired",
                     "files.publication_audience_changed",
@@ -6908,6 +7407,83 @@ def build_discord_endpoints(
             DiscordSendPublishedFileRequest,
             DiscordSendPublishedFileResponse,
             send_published_file,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.send_managed_file",
+                summary=(
+                    "Send one requester-owned private or explicitly Shared file selected "
+                    "by opaque file_ref. Private files retain information-flow checks; "
+                    "Shared copies retain their exact target, revision, expiry, and "
+                    "audience checks."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "managed file",
+                    "send selected file",
+                    "opaque file reference",
+                    "選択したファイルを送る",
+                    "管理ファイル送信",
+                ),
+                side_effects=("Creates one Discord message with the selected attachment.",),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.file_ref_not_found",
+                    "files.publication_not_found",
+                    "files.publication_target_mismatch",
+                    "files.publication_revision_conflict",
+                    "files.publication_revoked",
+                    "files.publication_expired",
+                    "files.publication_audience_changed",
+                    "discord.information_flow_forbidden",
+                    "discord.file_too_large",
+                    "discord.file_send_forbidden",
+                ),
+                timeout_seconds=30,
+                user_visible_effect="Posts one selected managed file in Discord.",
+            ),
+            DiscordSendManagedFileRequest,
+            DiscordSendManagedFileResponse,
+            send_managed_file,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.open_file_manager",
+                summary=(
+                    "Post a metadata-free launcher for the requester's private My / "
+                    "Task / Shared file manager. The public channel never receives file "
+                    "names, paths, owner IDs, or workspace identifiers."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "file manager",
+                    "manage files",
+                    "my task shared files",
+                    "ファイル管理を開く",
+                    "My Task Shared",
+                ),
+                side_effects=(
+                    "Creates one neutral Discord launcher; private metadata is ephemeral.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.disabled",
+                    "files.workspace_required",
+                    "discord.message_send_forbidden",
+                ),
+                timeout_seconds=15,
+                user_visible_effect="Posts a requester-private file manager launcher.",
+            ),
+            DiscordOpenFileManagerRequest,
+            DiscordOpenFileManagerResponse,
+            open_file_manager,
         ),
         endpoint(
             CapabilityDescriptor(

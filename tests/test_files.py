@@ -16,6 +16,10 @@ from pypdf import PdfWriter
 
 from simajilord.capabilities.file_scope import file_provenance, file_workspace_id
 from simajilord.capabilities.files import (
+    FileCatalogRequest,
+    FileCopyToTaskRequest,
+    FileDeleteRequest,
+    FileHistoryRequest,
     FileReadRequest,
     FileWriteTextRequest,
     build_file_endpoints,
@@ -66,6 +70,226 @@ def test_agent_file_workspace_mode_isolates_actor_and_task() -> None:
     ) == "guild"
 
 
+@pytest.mark.parametrize("mode", ("actor_task", "actor", "guild_shared"))
+def test_managed_catalog_is_private_and_mode_neutral(
+    tmp_path: Path,
+    mode: Literal["actor_task", "actor", "guild_shared"],
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    current = _agent_file_context(mode=mode)
+    other_actor = _agent_file_context(actor_id="actor-b", mode=mode)
+    source = sandbox.import_bytes(
+        file_workspace_id(current),
+        "private/report.txt",
+        b"actor a",
+        provenance=file_provenance(current),
+    )
+    sandbox.import_bytes(
+        file_workspace_id(other_actor),
+        "private/other-secret.txt",
+        b"actor b",
+        provenance=file_provenance(other_actor),
+    )
+
+    catalog = sandbox.managed_catalog_for_actor(
+        "guild",
+        "actor-a",
+        current_task_id="task-a",
+    )
+
+    assert catalog.task_count == 1
+    assert catalog.my_count == 0
+    assert catalog.shared_count == 0
+    assert len(catalog.files) == 1
+    item = catalog.files[0]
+    assert item.section == "task"
+    assert item.filename == "report.txt"
+    assert item.file_ref == source.file_ref
+    assert item.owner == "You"
+    assert item.created_task == "Current task"
+    assert item.share_state == "private"
+    assert not hasattr(item, "path")
+    assert "actor-b" not in repr(catalog)
+    assert "other-secret" not in repr(catalog)
+
+    later_task = sandbox.managed_catalog_for_actor(
+        "guild",
+        "actor-a",
+        current_task_id="task-later",
+    )
+    assert later_task.my_count == 1
+    assert later_task.task_count == 0
+    assert later_task.files[0].created_task == "Another task"
+
+
+def test_managed_shared_section_contains_only_explicit_publication_copies(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = _agent_file_context(actor_id="7", task_id="task-a")
+    workspace_id = file_workspace_id(context)
+    source = sandbox.import_bytes(
+        workspace_id,
+        "brief.txt",
+        b"brief",
+        provenance=file_provenance(context),
+    )
+    sandbox.import_bytes(
+        workspace_id,
+        "private-only.txt",
+        b"private",
+        provenance=file_provenance(context),
+    )
+    publication = sandbox.publish_copy_for_actor(
+        workspace_id,
+        "7",
+        "brief.txt",
+        expected_sha256=source.sha256,
+        target_workspace_id="guild",
+        target_resource_id="21",
+        target_display_name="#review",
+        target_audience_revision="a" * 64,
+        reason="Explicit review copy",
+        expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    )
+
+    catalog = sandbox.managed_catalog_for_actor(
+        "guild",
+        "7",
+        current_task_id="task-a",
+    )
+    shared = tuple(item for item in catalog.files if item.section == "shared")
+
+    assert len(shared) == 1
+    assert shared[0].file_ref == publication.publication_id
+    assert shared[0].filename == "brief.txt"
+    assert shared[0].share_state == "active"
+    assert shared[0].target_display_name == "#review"
+    assert catalog.shared_count == 1
+    assert "private-only.txt" not in {item.filename for item in shared}
+    assert (
+        sandbox.managed_catalog_for_actor(
+            "guild",
+            "other-actor",
+            current_task_id="task-a",
+        ).files
+        == ()
+    )
+
+
+def test_cross_guild_publication_history_keeps_source_and_target_scopes(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    source_context = replace(
+        _agent_file_context(actor_id="7"),
+        workspace_id="source-guild",
+    )
+    workspace_id = file_workspace_id(source_context)
+    source = sandbox.import_bytes(
+        workspace_id,
+        "brief.txt",
+        b"brief",
+        provenance=file_provenance(source_context),
+    )
+    assert source.file_ref is not None
+    publication = sandbox.publish_copy_for_actor(
+        workspace_id,
+        "7",
+        "brief.txt",
+        expected_sha256=source.sha256,
+        target_workspace_id="target-guild",
+        target_resource_id="21",
+        target_display_name="#review",
+        target_audience_revision="b" * 64,
+        reason="Cross-guild review copy",
+        expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    )
+
+    source_history = sandbox.managed_history_for_actor(
+        source.file_ref,
+        "7",
+        "source-guild",
+    )
+    target_history = sandbox.managed_history_for_actor(
+        publication.publication_id,
+        "7",
+        "target-guild",
+    )
+
+    assert source_history[0].action == "published"
+    assert target_history[0].action == "published"
+    with pytest.raises(UserError, match=r"files\.publication_not_found"):
+        sandbox.managed_history_for_actor(
+            publication.publication_id,
+            "7",
+            "source-guild",
+        )
+
+
+def test_managed_copy_delete_and_history_use_opaque_refs(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    source_context = _agent_file_context(task_id="old-task")
+    current_context = _agent_file_context(task_id="current-task")
+    source = sandbox.import_bytes(
+        file_workspace_id(source_context),
+        "nested/source.txt",
+        b"copy me",
+        provenance=file_provenance(source_context),
+    )
+    assert source.file_ref is not None
+
+    copied = sandbox.copy_managed_file_to_task_for_actor(
+        source.file_ref,
+        "actor-a",
+        "guild",
+        expected_sha256=source.sha256,
+        current_task_id="current-task",
+        target_workspace_id=file_workspace_id(current_context),
+    )
+    assert copied.file_ref is not None
+    assert copied.file_ref != source.file_ref
+    managed_copy = sandbox.managed_file_for_actor(
+        copied.file_ref,
+        "actor-a",
+        "guild",
+        current_task_id="current-task",
+    )
+    assert managed_copy.section == "task"
+    assert managed_copy.filename == "source.txt"
+    assert managed_copy.created_task == "Current task"
+    assert not hasattr(managed_copy, "path")
+    source_history = sandbox.managed_history_for_actor(
+        source.file_ref,
+        "actor-a",
+        "guild",
+    )
+    assert source_history[0].action == "copied_to_task"
+
+    deleted_name = sandbox.delete_managed_file_for_actor(
+        copied.file_ref,
+        "actor-a",
+        "guild",
+        expected_sha256=copied.sha256,
+    )
+    assert deleted_name == "source.txt"
+    with pytest.raises(UserError, match=r"files\.file_ref_not_found"):
+        sandbox.resolve_managed_file_for_actor(
+            copied.file_ref,
+            "actor-a",
+            "guild",
+        )
+    with pytest.raises(UserError, match=r"files\.file_ref_not_found"):
+        sandbox.delete_managed_file_for_actor(
+            source.file_ref,
+            "actor-b",
+            "guild",
+            expected_sha256=source.sha256,
+        )
+
+
 @pytest.mark.asyncio
 async def test_actor_workspace_reuses_owned_files_across_tasks(
     tmp_path: Path,
@@ -89,6 +313,55 @@ async def test_actor_workspace_reuses_owned_files_across_tasks(
     assert result.content == "shared by actor"
     assert result.provenance is not None
     assert result.provenance.owner_actor_ids == ("actor-a",)
+
+
+@pytest.mark.asyncio
+async def test_typed_managed_file_actions_do_not_require_raw_paths(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    endpoints = {
+        item.descriptor.name: item for item in build_file_endpoints(sandbox)
+    }
+    old_task = _agent_file_context(task_id="old-task")
+    current_task = _agent_file_context(task_id="current-task")
+    written = await endpoints["files.write_text"].invoke(
+        FileWriteTextRequest(path="hidden/internal/path.txt", content="managed"),
+        old_task,
+    )
+    assert written.file_ref is not None
+
+    catalog = await endpoints["files.catalog"].invoke(
+        FileCatalogRequest(),
+        current_task,
+    )
+    item = catalog.catalog.files[0]
+    assert item.file_ref == written.file_ref
+    assert item.filename == "path.txt"
+    assert not hasattr(item, "path")
+
+    copied = await endpoints["files.copy_to_task"].invoke(
+        FileCopyToTaskRequest(
+            file_ref=item.file_ref,
+            expected_sha256=item.sha256,
+        ),
+        current_task,
+    )
+    assert copied.file.section == "task"
+    history = await endpoints["files.history"].invoke(
+        FileHistoryRequest(file_ref=item.file_ref),
+        current_task,
+    )
+    assert history.actions[0].action == "copied_to_task"
+    deleted = await endpoints["files.delete"].invoke(
+        FileDeleteRequest(
+            file_ref=copied.file.file_ref,
+            expected_sha256=copied.file.sha256,
+        ),
+        current_task,
+    )
+    assert deleted.deleted
+    assert deleted.filename == "path.txt"
 
 
 def test_guild_shared_workspace_enforces_exact_actor_file_authority(
@@ -269,6 +542,8 @@ def test_provenance_schema_migrates_legacy_single_owner_rows(
             )
         }
     assert {
+        "file_ref",
+        "created_at",
         "owner_actor_ids_json",
         "unlabelled_input",
         "sources_truncated",
