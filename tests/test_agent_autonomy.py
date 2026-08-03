@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,8 @@ from simajilord.agent import (
     AgentHighRiskAuthorizationMode,
     AgentHighRiskConfirmation,
     AgentInformationFlowMode,
+    AgentRequest,
+    AgentTrigger,
     AutonomyEnqueueResult,
     AutonomyEventBatch,
     AutonomyEventKind,
@@ -29,6 +32,7 @@ from simajilord.agent import (
     AutonomyLeaseLostError,
     AutonomyQueuedEvent,
 )
+from simajilord.agent.actions import ActionReceiptService, ActionReceiptStore
 from simajilord.agent.autonomy import (
     AutonomyDeliveryConflictError,
     AutonomyDeliveryReceiptState,
@@ -42,14 +46,16 @@ from simajilord.agent.store import (
     AgentUnroutedTaskCandidate,
 )
 from simajilord.config import AgentFeatureAccess
-from simajilord.core import ApprovalMode, InvocationContext
+from simajilord.core import ApprovalMode, CapabilityRegistry, InvocationContext
 from simajilord.integrations.discord.cogs import (
     AgentAutonomyCog,
     AgentCog,
     ObservationCog,
     _agent_delivery_nonce,
+    _agent_invocation_context,
     _agent_request_replay_barrier_reason,
     _autonomy_event_write_capabilities,
+    _pending_host_invocation_context,
 )
 
 
@@ -1629,8 +1635,11 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
     assert receipt_call.kwargs["message_ids"] == ("301",)
     context = receipt_call.kwargs["context"]
     assert context.actor_id == "999"
+    assert context.principal_kind == "service"
     assert context.executor_principal_id == "999"
     assert context.trigger_actor_ids == ("101",)
+    assert context.requester_principal_id is None
+    assert context.policy_id == "discord-autonomy-strict-v1"
     assert context.workspace_id == "10"
     assert context.origin_resource_id == "20"
 
@@ -1759,6 +1768,149 @@ async def test_autonomy_delivery_reconciles_saved_id_then_nonce_without_resend()
 
 
 @pytest.mark.asyncio
+async def test_mention_host_delivery_receipt_restores_request_principal_chain(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    request = AgentRequest(
+        conversation_id="conversation",
+        event_id="discord:message:201",
+        trigger=AgentTrigger.MENTION,
+        actor_id="101",
+        actor_name="requester",
+        workspace_id="10",
+        channel_id="20",
+        message_id="201",
+        occurred_at=now,
+        resource_ids=("20",),
+        public_reference_id="agt_0123456789abcdef0123",
+        task_id="tsk_0123456789abcdef0123",
+        principal_kind="requester",
+        executor_principal_id="999",
+        delegator_principal_id="101",
+        trigger_actor_ids=("101",),
+        requester_principal_id="101",
+        policy_id="discord-mention-v2",
+    )
+    pending = AgentPendingHostDelivery(
+        event_id=request.event_id,
+        public_reference_id=request.public_reference_id,
+        actor_id=request.actor_id,
+        workspace_id=request.workspace_id,
+        channel_id=request.channel_id,
+        source_message_id=request.message_id,
+        principal_kind=request.principal_kind,
+        executor_principal_id=request.executor_principal_id,
+        delegator_principal_id=request.delegator_principal_id,
+        trigger_actor_ids=request.trigger_actor_ids,
+        requester_principal_id=request.requester_principal_id,
+        policy_id=request.policy_id,
+        response_content="completed response",
+        occurred_at=now,
+        completed_at=now,
+    )
+    record = AgentHostDeliveryRecord(
+        event_id=pending.event_id,
+        purpose="response",
+        chunk_index=0,
+        content_sha256=hashlib.sha256(b"completed response").hexdigest(),
+        channel_id=pending.channel_id,
+        message_id="301",
+        receipted_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+    store = SimpleNamespace(
+        plan_host_delivery=AsyncMock(return_value=(record,)),
+        host_delivery_records=AsyncMock(return_value=(record,)),
+        mark_host_delivery_receipted=AsyncMock(),
+        complete_host_delivery=AsyncMock(return_value=True),
+    )
+    action_path = tmp_path / "actions.sqlite3"
+    action_journal = SimpleNamespace(append=AsyncMock())
+    receipts = ActionReceiptService(
+        store=ActionReceiptStore(action_path),
+        registry=CapabilityRegistry(),
+        journal=action_journal,
+    )
+    cog = AgentCog(
+        SimpleNamespace(user=SimpleNamespace(id=999)),
+        SimpleNamespace(agent_store=store, action_receipts=receipts),
+    )
+    cog._agent_host_channel = AsyncMock(return_value=object())  # type: ignore[method-assign]
+    cog._agent_source_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await cog._deliver_host_response(pending)
+
+    tool_context = _agent_invocation_context(request)
+    with sqlite3.connect(action_path) as connection:
+        stored_identity = connection.execute(
+            """
+            SELECT principal_kind, executor_principal_id,
+                   delegator_principal_id, trigger_actor_ids_json,
+                   requester_principal_id, policy_id, host_delivery
+            FROM agent_actions
+            """
+        ).fetchone()
+    assert stored_identity is not None
+    assert (
+        stored_identity[0],
+        stored_identity[1],
+        stored_identity[2],
+        tuple(json.loads(str(stored_identity[3]))),
+        stored_identity[4],
+        stored_identity[5],
+        stored_identity[6],
+    ) == (
+        tool_context.principal_kind,
+        tool_context.executor_principal_id,
+        tool_context.delegator_principal_id,
+        tool_context.trigger_actor_ids,
+        tool_context.requester_principal_id,
+        tool_context.policy_id,
+        1,
+    )
+    journal_payload = action_journal.append.await_args.kwargs["payload"]
+    assert journal_payload["principal_kind"] == tool_context.principal_kind
+    assert journal_payload["executor_principal_id"] == "999"
+    assert journal_payload["delegator_principal_id"] == "101"
+    assert journal_payload["trigger_actor_ids"] == ["101"]
+    assert journal_payload["requester_principal_id"] == "101"
+    assert journal_payload["policy_id"] == "discord-mention-v2"
+
+
+def test_legacy_host_delivery_never_infers_actor_as_executor() -> None:
+    now = datetime.now(UTC)
+    pending = AgentPendingHostDelivery(
+        event_id="discord:message:legacy",
+        public_reference_id="agt_1123456789abcdef0123",
+        actor_id="101",
+        workspace_id="10",
+        channel_id="20",
+        source_message_id="201",
+        principal_kind=None,
+        executor_principal_id=None,
+        delegator_principal_id=None,
+        trigger_actor_ids=(),
+        requester_principal_id=None,
+        policy_id=None,
+        response_content="legacy response",
+        occurred_at=now,
+        completed_at=now,
+    )
+
+    context = _pending_host_invocation_context(pending)
+
+    assert context.actor_id == "101"
+    assert context.principal_kind == "legacy_unknown"
+    assert context.executor_principal_id is None
+    assert context.delegator_principal_id is None
+    assert context.trigger_actor_ids == ()
+    assert context.requester_principal_id is None
+    assert context.policy_id is None
+
+
+@pytest.mark.asyncio
 async def test_mention_recovery_does_not_reuse_saved_identical_chunk() -> None:
     now = datetime.now(UTC)
     pending = AgentPendingHostDelivery(
@@ -1768,6 +1920,12 @@ async def test_mention_recovery_does_not_reuse_saved_identical_chunk() -> None:
         workspace_id="10",
         channel_id="20",
         source_message_id="201",
+        principal_kind="requester",
+        executor_principal_id="999",
+        delegator_principal_id="101",
+        trigger_actor_ids=("101",),
+        requester_principal_id="101",
+        policy_id="discord-mention-v2",
         response_content="same",
         occurred_at=now,
         completed_at=now,

@@ -15,9 +15,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from simajilord.core import (
+    AgentPrincipalKind,
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
@@ -73,6 +74,7 @@ class ActionReceipt:
     undo_available: bool
     undo_capability: str | None
     classification: ActionClassification
+    principal_kind: AgentPrincipalKind
     executor_principal_id: str | None = None
     delegator_principal_id: str | None = None
     trigger_actor_ids: tuple[str, ...] = ()
@@ -132,6 +134,7 @@ class ActionRecord:
     workspace_id: str | None
     transport: str
     request_id: str
+    principal_kind: AgentPrincipalKind | None
     executor_principal_id: str | None
     delegator_principal_id: str | None
     trigger_actor_ids: tuple[str, ...]
@@ -885,6 +888,7 @@ class ActionReceiptStore:
             workspace_id=context.workspace_id,
             transport=context.transport,
             request_id=context.request_id,
+            principal_kind=context.principal_kind,
             executor_principal_id=context.executor_principal_id,
             delegator_principal_id=context.delegator_principal_id,
             trigger_actor_ids=context.trigger_actor_ids,
@@ -1042,6 +1046,7 @@ class ActionReceiptStore:
                     workspace_id TEXT,
                     transport TEXT NOT NULL,
                     request_id TEXT NOT NULL,
+                    principal_kind TEXT,
                     executor_principal_id TEXT,
                     delegator_principal_id TEXT,
                     trigger_actor_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -1099,6 +1104,7 @@ class ActionReceiptStore:
                     """
                 )
             identity_columns = {
+                "principal_kind": "TEXT",
                 "executor_principal_id": "TEXT",
                 "delegator_principal_id": "TEXT",
                 "trigger_actor_ids_json": "TEXT NOT NULL DEFAULT '[]'",
@@ -1182,12 +1188,15 @@ class ActionReceiptStore:
                 """
                 INSERT INTO agent_actions(
                     action_id, capability, actor_id, workspace_id, transport,
-                    request_id, executor_principal_id, delegator_principal_id,
-                    trigger_actor_ids_json, requester_principal_id, policy_id,
-                    target_ids_json, status, classification,
+                    request_id, principal_kind, executor_principal_id,
+                    delegator_principal_id, trigger_actor_ids_json,
+                    requester_principal_id, policy_id, target_ids_json,
+                    status, classification,
                     undo_capability, undo_arguments_json, host_delivery,
                     created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 ON CONFLICT(action_id) DO NOTHING
                 """,
                 (
@@ -1197,6 +1206,7 @@ class ActionReceiptStore:
                     record.workspace_id,
                     record.transport,
                     record.request_id,
+                    record.principal_kind,
                     record.executor_principal_id,
                     record.delegator_principal_id,
                     trigger_actor_ids_json,
@@ -1224,6 +1234,7 @@ class ActionReceiptStore:
                 persisted.workspace_id,
                 persisted.transport,
                 persisted.request_id,
+                persisted.principal_kind,
                 persisted.executor_principal_id,
                 persisted.delegator_principal_id,
                 persisted.trigger_actor_ids,
@@ -1241,6 +1252,7 @@ class ActionReceiptStore:
                 record.workspace_id,
                 record.transport,
                 record.request_id,
+                record.principal_kind,
                 record.executor_principal_id,
                 record.delegator_principal_id,
                 record.trigger_actor_ids,
@@ -1827,6 +1839,7 @@ class ActionReceiptService:
             undo_available=tracked and undo_capability is not None,
             undo_capability=undo_capability,
             classification=policy.classification,
+            principal_kind=context.principal_kind,
             executor_principal_id=context.executor_principal_id,
             delegator_principal_id=context.delegator_principal_id,
             trigger_actor_ids=context.trigger_actor_ids,
@@ -2000,6 +2013,13 @@ def _action_identity_payload(context: InvocationContext) -> dict[str, object]:
 
 
 def _validate_action_identities(context: InvocationContext) -> None:
+    if context.principal_kind not in {
+        "requester",
+        "service",
+        "system",
+        "legacy_unknown",
+    }:
+        raise ValueError("action principal kind is invalid")
     values = (
         context.executor_principal_id,
         context.delegator_principal_id,
@@ -2213,6 +2233,20 @@ def _row_external_effect(row: sqlite3.Row) -> ExternalEffectRecord:
     )
 
 
+def _action_principal_kind(value: object) -> AgentPrincipalKind | None:
+    if value is None:
+        return None
+    normalized = str(value)
+    if normalized not in {
+        "requester",
+        "service",
+        "system",
+        "legacy_unknown",
+    }:
+        raise RuntimeError("Invalid action principal kind")
+    return cast(AgentPrincipalKind, normalized)
+
+
 def _row_record(row: sqlite3.Row) -> ActionRecord:
     target_ids_value = json.loads(str(row["target_ids_json"]))
     trigger_actor_ids_value = json.loads(str(row["trigger_actor_ids_json"]))
@@ -2241,6 +2275,7 @@ def _row_record(row: sqlite3.Row) -> ActionRecord:
         ),
         transport=str(row["transport"]),
         request_id=str(row["request_id"]),
+        principal_kind=_action_principal_kind(row["principal_kind"]),
         executor_principal_id=(
             str(row["executor_principal_id"])
             if row["executor_principal_id"] is not None

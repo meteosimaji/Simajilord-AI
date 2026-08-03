@@ -1,6 +1,7 @@
 """Platform kernel shared by every transport adapter."""
 
 from .capabilities import (
+    AgentPrincipalKind,
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
@@ -14,6 +15,7 @@ from .capabilities import (
 )
 
 __all__ = [
+    "AgentPrincipalKind",
     "ApprovalMode",
     "CapabilityDescriptor",
     "CapabilityEndpoint",

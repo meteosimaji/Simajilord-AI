@@ -1200,8 +1200,9 @@ async def test_concurrent_agent_failures_keep_public_references_isolated(
 async def test_completed_mention_host_delivery_is_restart_safe_and_body_free(
     tmp_path: Path,
 ) -> None:
+    path = tmp_path / "agent.sqlite3"
     provider = FakeProvider()
-    store = AgentConversationStore(tmp_path / "agent.sqlite3")
+    store = AgentConversationStore(path)
     service = AgentService(
         provider=provider,
         store=store,
@@ -1209,11 +1210,29 @@ async def test_completed_mention_host_delivery_is_restart_safe_and_body_free(
         limits=_limits(),
     )
 
-    await service.respond(_request("discord:message:44"))
-    pending = await store.pending_host_delivery("discord:message:44")
+    request = replace(
+        _request("discord:message:44", actor_id="101"),
+        executor_principal_id="999",
+        delegator_principal_id="101",
+        trigger_actor_ids=("101",),
+        requester_principal_id="101",
+        policy_id="discord-mention-v2",
+    )
+    await service.respond(request)
+    immediate = await store.pending_host_delivery(request.event_id)
+    pending = await AgentConversationStore(path).pending_host_delivery(
+        request.event_id
+    )
 
     assert pending is not None
+    assert pending == immediate
     assert pending.response_content == "Hello from the agent."
+    assert pending.principal_kind == "requester"
+    assert pending.executor_principal_id == "999"
+    assert pending.delegator_principal_id == "101"
+    assert pending.trigger_actor_ids == ("101",)
+    assert pending.requester_principal_id == "101"
+    assert pending.policy_id == "discord-mention-v2"
     planned = await store.plan_host_delivery(
         event_id=pending.event_id,
         purpose="response",
@@ -1239,6 +1258,34 @@ async def test_completed_mention_host_delivery_is_restart_safe_and_body_free(
     )
     assert await store.complete_host_delivery(pending.event_id)
     assert await store.pending_host_delivery(pending.event_id) is None
+
+
+@pytest.mark.asyncio
+async def test_request_principal_chain_is_immutable_for_one_event(
+    tmp_path: Path,
+) -> None:
+    store = AgentConversationStore(tmp_path / "agent.sqlite3")
+    request = replace(
+        _request("discord:message:identity", actor_id="101"),
+        executor_principal_id="999",
+        delegator_principal_id="101",
+        trigger_actor_ids=("101",),
+        requester_principal_id="101",
+        policy_id="discord-mention-v2",
+    )
+    await store.begin(request, model="test-model")
+
+    with pytest.raises(ValueError, match="principal chain"):
+        await store.begin(
+            replace(request, executor_principal_id="attacker"),
+            model="test-model",
+        )
+
+    stored = await store.request_by_public_reference_id(
+        request.public_reference_id
+    )
+    assert stored is not None
+    assert stored.executor_principal_id == "999"
 
 
 @pytest.mark.asyncio
@@ -1291,12 +1338,24 @@ async def test_autonomous_turn_is_not_claimed_by_mention_host_outbox(
     request = replace(
         _request("autonomy:batch:1"),
         trigger=AgentTrigger.AUTONOMOUS,
+        principal_kind="service",
+        executor_principal_id="999",
+        trigger_actor_ids=("101", "102"),
+        policy_id="discord-autonomy-strict-v1",
     )
 
     await service.respond(request)
 
     assert await store.pending_host_delivery(request.event_id) is None
     assert await store.pending_host_deliveries() == ()
+    stored = await store.request_by_public_reference_id(request.public_reference_id)
+    assert stored is not None
+    assert stored.principal_kind == "service"
+    assert stored.executor_principal_id == "999"
+    assert stored.delegator_principal_id is None
+    assert stored.trigger_actor_ids == ("101", "102")
+    assert stored.requester_principal_id is None
+    assert stored.policy_id == "discord-autonomy-strict-v1"
 
 
 def test_host_outbox_migration_never_reposts_legacy_completed_turns(
@@ -1377,13 +1436,16 @@ def test_host_outbox_migration_never_reposts_legacy_completed_turns(
     with sqlite3.connect(path) as connection:
         reference_row = connection.execute(
             """
-            SELECT public_reference_id
+            SELECT public_reference_id, principal_kind,
+                   executor_principal_id, delegator_principal_id,
+                   trigger_actor_ids_json, requester_principal_id, policy_id
             FROM agent_requests
             WHERE event_id = 'legacy'
             """
         ).fetchone()
     assert reference_row is not None
     assert is_agent_public_reference_id(str(reference_row[0]))
+    assert reference_row[1:] == (None, None, None, None, None, None)
 
 
 @pytest.mark.asyncio

@@ -159,7 +159,7 @@ from simajilord.capabilities.web import (
     WebSearchResponse,
 )
 from simajilord.config import AgentFeatureAccess
-from simajilord.core import ApprovalMode, InvocationContext
+from simajilord.core import AgentPrincipalKind, ApprovalMode, InvocationContext
 from simajilord.core.errors import MediaError, ModerationError, UserError, WebError
 from simajilord.domain.audio import AudioKind, LoopMode
 from simajilord.domain.media import DownloadFormat
@@ -8718,6 +8718,34 @@ def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
     )
 
 
+def _pending_host_invocation_context(
+    pending: AgentPendingHostDelivery,
+) -> InvocationContext:
+    """Restore only persisted host-delivery authority after any restart."""
+
+    principal_kind: AgentPrincipalKind = (
+        pending.principal_kind
+        if pending.principal_kind is not None
+        else "legacy_unknown"
+    )
+    return InvocationContext(
+        actor_id=pending.actor_id,
+        workspace_id=pending.workspace_id,
+        transport="agent",
+        request_id=pending.event_id,
+        resource_ids=(pending.channel_id,),
+        origin_resource_id=pending.channel_id,
+        public_reference_id=pending.public_reference_id,
+        agent_trigger="mention",
+        principal_kind=principal_kind,
+        executor_principal_id=pending.executor_principal_id,
+        delegator_principal_id=pending.delegator_principal_id,
+        trigger_actor_ids=pending.trigger_actor_ids,
+        requester_principal_id=pending.requester_principal_id,
+        policy_id=pending.policy_id,
+    )
+
+
 async def _record_agent_host_posts(
     runtime: SimajilordRuntime,
     *,
@@ -9438,15 +9466,7 @@ class AgentCog(commands.Cog):
                 records,
                 recovery_candidates=recovery_candidates,
             )
-            context = InvocationContext(
-                actor_id=pending.actor_id,
-                workspace_id=pending.workspace_id,
-                transport="agent",
-                request_id=pending.event_id,
-                resource_ids=(pending.channel_id,),
-                origin_resource_id=pending.channel_id,
-                public_reference_id=pending.public_reference_id,
-            )
+            context = _pending_host_invocation_context(pending)
             for record, content in zip(records, chunks, strict=True):
                 message_id = record.message_id
                 if message_id is None:
@@ -10813,24 +10833,7 @@ class AgentAutonomyCog(commands.Cog):
                 raise RuntimeError(
                     "Autonomy reply target is temporarily unavailable"
                 ) from exc
-        host_post_context = InvocationContext(
-            actor_id=autonomy_actor_id,
-            workspace_id=workspace_id,
-            transport="agent",
-            request_id=batch.batch_id,
-            resource_ids=resource_ids,
-            origin_resource_id=channel_id,
-            public_reference_id=request.public_reference_id,
-            principal_kind="service",
-            read_scope_mode=request.read_scope_mode,
-            information_flow_mode=request.information_flow_mode.value,
-            file_workspace_mode=request.file_workspace_mode.value,
-            high_risk_authorization_mode=request.high_risk_authorization_mode.value,
-            executor_principal_id=autonomy_actor_id,
-            trigger_actor_ids=request.trigger_actor_ids,
-            policy_id=request.policy_id,
-            allowed_capabilities=request.allowed_capabilities,
-        )
+        host_post_context = _agent_invocation_context(request)
         try:
             await self._deliver_response(
                 batch,

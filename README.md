@@ -310,7 +310,11 @@ with Discord's generic “interaction failed” banner.
   retried; the Discord message is not posted again. Recovery uses a known message ID directly;
   only a crash before that ID is saved falls back to nonce reconciliation, and one recovery pass
   shares that bounded history read across pending deliveries in the same channel. A
-  autonomous reply records the BOT as executor and records source humans separately as trigger
+  mention request persists principal kind, executor, delegator, trigger actors, requester, and
+  policy before execution; immediate host delivery and restart recovery both rebuild their
+  Action Receipt from that saved chain. Rows created before this schema remain explicitly
+  `legacy_unknown` and never infer the historical actor as executor. An autonomous reply records
+  the BOT as executor and records source humans separately as trigger
   actors; producing an event no longer attributes service-principal execution to that person.
   If a final confirmation follows a substantive write in the same turn,
   ID-less Undo prefers that write; a reply-only turn instead removes its latest host post.

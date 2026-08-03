@@ -275,6 +275,7 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
         "tracked": True,
         "undo_available": True,
         "undo_capability": "discord.remove_own_reaction",
+        "principal_kind": "requester",
         "executor_principal_id": None,
         "delegator_principal_id": None,
         "trigger_actor_ids": [],
@@ -335,6 +336,7 @@ async def test_action_receipt_persists_distinct_audit_principals(
     )
 
     assert receipt is not None
+    assert receipt.principal_kind == "service"
     assert receipt.executor_principal_id == "bot"
     assert receipt.delegator_principal_id is None
     assert receipt.trigger_actor_ids == ("human-a", "human-b")
@@ -343,14 +345,16 @@ async def test_action_receipt_persists_distinct_audit_principals(
     with sqlite3.connect(path) as connection:
         row = connection.execute(
             """
-            SELECT actor_id, executor_principal_id, delegator_principal_id,
-                   trigger_actor_ids_json, requester_principal_id, policy_id
+            SELECT actor_id, principal_kind, executor_principal_id,
+                   delegator_principal_id, trigger_actor_ids_json,
+                   requester_principal_id, policy_id
             FROM agent_actions WHERE action_id = ?
             """,
             (receipt.action_id,),
         ).fetchone()
     assert row == (
         "bot",
+        "service",
         "bot",
         None,
         '["human-a","human-b"]',
@@ -406,19 +410,21 @@ def test_action_receipt_store_migrates_legacy_audit_schema(
         }
         row = connection.execute(
             """
-            SELECT actor_id, executor_principal_id, delegator_principal_id,
-                   trigger_actor_ids_json, requester_principal_id, policy_id
+            SELECT actor_id, principal_kind, executor_principal_id,
+                   delegator_principal_id, trigger_actor_ids_json,
+                   requester_principal_id, policy_id
             FROM agent_actions WHERE action_id = 'legacy-action'
             """
         ).fetchone()
     assert {
+        "principal_kind",
         "executor_principal_id",
         "delegator_principal_id",
         "trigger_actor_ids_json",
         "requester_principal_id",
         "policy_id",
     }.issubset(columns)
-    assert row == ("legacy-actor", None, None, "[]", None, None)
+    assert row == ("legacy-actor", None, None, None, "[]", None, None)
 
 
 async def test_dispatched_external_effect_becomes_unknown_after_restart(

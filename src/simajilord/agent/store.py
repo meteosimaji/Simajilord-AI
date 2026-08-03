@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
+
+from simajilord.core import AgentPrincipalKind
 
 from .contracts import (
     AGENT_NO_ACTION_CONTENT,
@@ -59,6 +63,12 @@ class AgentPendingHostDelivery:
     workspace_id: str | None
     channel_id: str
     source_message_id: str | None
+    principal_kind: AgentPrincipalKind | None
+    executor_principal_id: str | None
+    delegator_principal_id: str | None
+    trigger_actor_ids: tuple[str, ...]
+    requester_principal_id: str | None
+    policy_id: str | None
     response_content: str
     occurred_at: datetime
     completed_at: datetime
@@ -105,6 +115,12 @@ class AgentRequestRecord:
     workspace_id: str | None
     channel_id: str
     source_message_id: str | None
+    principal_kind: AgentPrincipalKind | None
+    executor_principal_id: str | None
+    delegator_principal_id: str | None
+    trigger_actor_ids: tuple[str, ...]
+    requester_principal_id: str | None
+    policy_id: str | None
     model: str
     status: str
     provider_thread_id: str | None
@@ -665,6 +681,12 @@ class AgentConversationStore:
                     workspace_id TEXT,
                     channel_id TEXT NOT NULL,
                     message_id TEXT,
+                    principal_kind TEXT,
+                    executor_principal_id TEXT,
+                    delegator_principal_id TEXT,
+                    trigger_actor_ids_json TEXT,
+                    requester_principal_id TEXT,
+                    policy_id TEXT,
                     model TEXT NOT NULL,
                     status TEXT NOT NULL,
                     provider_thread_id TEXT,
@@ -780,6 +802,19 @@ class AgentConversationStore:
                 connection.execute(
                     "ALTER TABLE agent_requests ADD COLUMN task_id TEXT"
                 )
+            identity_columns = {
+                "principal_kind": "TEXT",
+                "executor_principal_id": "TEXT",
+                "delegator_principal_id": "TEXT",
+                "trigger_actor_ids_json": "TEXT",
+                "requester_principal_id": "TEXT",
+                "policy_id": "TEXT",
+            }
+            for name, definition in identity_columns.items():
+                if name not in request_columns:
+                    connection.execute(
+                        f"ALTER TABLE agent_requests ADD COLUMN {name} {definition}"
+                    )
             task_event_columns = {
                 str(row[1])
                 for row in connection.execute("PRAGMA table_info(agent_task_events)")
@@ -1206,8 +1241,11 @@ class AgentConversationStore:
                 """
                 SELECT event_id, public_reference_id, conversation_id, trigger,
                        task_id, actor_id, workspace_id, channel_id, message_id, model,
-                       status, provider_thread_id, error_type, occurred_at,
-                       started_at, completed_at, host_delivered_at
+                       principal_kind, executor_principal_id,
+                       delegator_principal_id, trigger_actor_ids_json,
+                       requester_principal_id, policy_id, status,
+                       provider_thread_id, error_type, occurred_at, started_at,
+                       completed_at, host_delivered_at
                 FROM agent_requests
                 WHERE public_reference_id = ?
                 """,
@@ -1303,8 +1341,10 @@ class AgentConversationStore:
             rows = connection.execute(
                 """
                 SELECT event_id, public_reference_id, actor_id, workspace_id,
-                       channel_id, message_id, response_content, occurred_at,
-                       completed_at
+                       channel_id, message_id, principal_kind,
+                       executor_principal_id, delegator_principal_id,
+                       trigger_actor_ids_json, requester_principal_id, policy_id,
+                       response_content, occurred_at, completed_at
                 FROM agent_requests
                 WHERE status = ?
                   AND trigger = ?
@@ -1332,8 +1372,10 @@ class AgentConversationStore:
             row = connection.execute(
                 """
                 SELECT event_id, public_reference_id, actor_id, workspace_id,
-                       channel_id, message_id, response_content, occurred_at,
-                       completed_at
+                       channel_id, message_id, principal_kind,
+                       executor_principal_id, delegator_principal_id,
+                       trigger_actor_ids_json, requester_principal_id, policy_id,
+                       response_content, occurred_at, completed_at
                 FROM agent_requests
                 WHERE event_id = ?
                   AND status = ?
@@ -2241,6 +2283,7 @@ class AgentConversationStore:
             raise ValueError("invalid agent public reference ID")
         if not is_agent_task_id(request.task_id):
             raise ValueError("invalid agent task ID")
+        identity_values = _request_identity_values(request)
         now = datetime.now(UTC).isoformat()
         connection = sqlite3.connect(self.path)
         try:
@@ -2327,9 +2370,14 @@ class AgentConversationStore:
                 """
                 INSERT INTO agent_requests(
                     event_id, public_reference_id, task_id, conversation_id, trigger,
-                    actor_id, workspace_id, channel_id, message_id, model,
-                    status, occurred_at, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                    actor_id, workspace_id, channel_id, message_id, principal_kind,
+                    executor_principal_id, delegator_principal_id,
+                    trigger_actor_ids_json, requester_principal_id, policy_id,
+                    model, status, occurred_at, started_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'in_progress', ?, ?
+                )
                 ON CONFLICT(event_id) DO UPDATE SET
                     status = CASE
                         WHEN agent_requests.status IN ('completed', 'cancelled')
@@ -2345,6 +2393,48 @@ class AgentConversationStore:
                         WHEN agent_requests.status IN ('completed', 'cancelled')
                             THEN agent_requests.error_type
                         ELSE NULL
+                    END,
+                    principal_kind = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.principal_kind
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.principal_kind
+                        ELSE agent_requests.principal_kind
+                    END,
+                    executor_principal_id = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.executor_principal_id
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.executor_principal_id
+                        ELSE agent_requests.executor_principal_id
+                    END,
+                    delegator_principal_id = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.delegator_principal_id
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.delegator_principal_id
+                        ELSE agent_requests.delegator_principal_id
+                    END,
+                    trigger_actor_ids_json = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.trigger_actor_ids_json
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.trigger_actor_ids_json
+                        ELSE agent_requests.trigger_actor_ids_json
+                    END,
+                    requester_principal_id = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.requester_principal_id
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.requester_principal_id
+                        ELSE agent_requests.requester_principal_id
+                    END,
+                    policy_id = CASE
+                        WHEN agent_requests.status IN ('completed', 'cancelled')
+                            THEN agent_requests.policy_id
+                        WHEN agent_requests.principal_kind IS NULL
+                            THEN excluded.policy_id
+                        ELSE agent_requests.policy_id
                     END
                 """,
                 (
@@ -2357,6 +2447,7 @@ class AgentConversationStore:
                     request.workspace_id,
                     request.channel_id,
                     request.message_id,
+                    *identity_values,
                     model,
                     request.occurred_at.isoformat(),
                     now,
@@ -2364,7 +2455,10 @@ class AgentConversationStore:
             )
             stored_reference = connection.execute(
                 """
-                SELECT public_reference_id, task_id, conversation_id
+                SELECT public_reference_id, task_id, conversation_id,
+                       principal_kind, executor_principal_id,
+                       delegator_principal_id, trigger_actor_ids_json,
+                       requester_principal_id, policy_id
                 FROM agent_requests
                 WHERE event_id = ?
                 """,
@@ -2372,12 +2466,17 @@ class AgentConversationStore:
             ).fetchone()
             if (
                 stored_reference is None
-                or str(stored_reference[0]) != request.public_reference_id
-                or str(stored_reference[1]) != request.task_id
-                or str(stored_reference[2]) != request.conversation_id
+                or tuple(stored_reference)
+                != (
+                    request.public_reference_id,
+                    request.task_id,
+                    request.conversation_id,
+                    *identity_values,
+                )
             ):
                 raise ValueError(
-                    "agent event ID is bound to a different reference, task, or conversation"
+                    "agent event ID is bound to a different reference, task, or "
+                    "conversation, or principal chain"
                 )
             stored_task = connection.execute(
                 """
@@ -2757,6 +2856,12 @@ def _pending_host_delivery_from_row(
         workspace_id=_optional_text(row["workspace_id"]),
         channel_id=str(row["channel_id"]),
         source_message_id=_optional_text(row["message_id"]),
+        principal_kind=_principal_kind_from_row(row),
+        executor_principal_id=_optional_text(row["executor_principal_id"]),
+        delegator_principal_id=_optional_text(row["delegator_principal_id"]),
+        trigger_actor_ids=_trigger_actor_ids_from_row(row),
+        requester_principal_id=_optional_text(row["requester_principal_id"]),
+        policy_id=_optional_text(row["policy_id"]),
         response_content=str(row["response_content"] or ""),
         occurred_at=datetime.fromisoformat(str(row["occurred_at"])),
         completed_at=datetime.fromisoformat(str(completed_at)),
@@ -2811,6 +2916,12 @@ def _request_record_from_row(row: sqlite3.Row) -> AgentRequestRecord:
         workspace_id=_optional_text(row["workspace_id"]),
         channel_id=str(row["channel_id"]),
         source_message_id=_optional_text(row["message_id"]),
+        principal_kind=_principal_kind_from_row(row),
+        executor_principal_id=_optional_text(row["executor_principal_id"]),
+        delegator_principal_id=_optional_text(row["delegator_principal_id"]),
+        trigger_actor_ids=_trigger_actor_ids_from_row(row),
+        requester_principal_id=_optional_text(row["requester_principal_id"]),
+        policy_id=_optional_text(row["policy_id"]),
         model=str(row["model"]),
         status=str(row["status"]),
         provider_thread_id=_optional_text(row["provider_thread_id"]),
@@ -2897,6 +3008,73 @@ def _usage_from_row(row: sqlite3.Row) -> AgentTokenUsage:
         total_tokens=int(row["total_tokens"]),
         model_context_window=int(context_window) if context_window is not None else None,
     )
+
+
+_PERSISTED_PRINCIPAL_KINDS = frozenset({"requester", "service", "system"})
+
+
+def _request_identity_values(
+    request: AgentRequest,
+) -> tuple[str, str | None, str | None, str, str | None, str | None]:
+    if request.principal_kind not in _PERSISTED_PRINCIPAL_KINDS:
+        raise ValueError("agent request principal kind is invalid")
+    optional_values = (
+        request.executor_principal_id,
+        request.delegator_principal_id,
+        request.requester_principal_id,
+        request.policy_id,
+    )
+    if any(
+        value is not None and (not value or len(value) > 200)
+        for value in optional_values
+    ):
+        raise ValueError("agent request principal identities must be bounded")
+    if len(request.trigger_actor_ids) > 32 or any(
+        not value or len(value) > 200 for value in request.trigger_actor_ids
+    ):
+        raise ValueError("agent request trigger actor identities must be bounded")
+    trigger_actor_ids_json = json.dumps(
+        request.trigger_actor_ids,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return (
+        request.principal_kind,
+        request.executor_principal_id,
+        request.delegator_principal_id,
+        trigger_actor_ids_json,
+        request.requester_principal_id,
+        request.policy_id,
+    )
+
+
+def _principal_kind_from_row(row: sqlite3.Row) -> AgentPrincipalKind | None:
+    raw_value = _optional_text(row["principal_kind"])
+    if raw_value is None:
+        return None
+    if raw_value not in _PERSISTED_PRINCIPAL_KINDS:
+        raise ValueError("persisted agent principal kind is invalid")
+    return cast(AgentPrincipalKind, raw_value)
+
+
+def _trigger_actor_ids_from_row(row: sqlite3.Row) -> tuple[str, ...]:
+    raw_value = row["trigger_actor_ids_json"]
+    if raw_value is None:
+        return ()
+    try:
+        decoded = json.loads(str(raw_value))
+    except json.JSONDecodeError as exc:
+        raise ValueError("persisted trigger actor identities are invalid") from exc
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) > 32
+        or any(
+            not isinstance(value, str) or not value or len(value) > 200
+            for value in decoded
+        )
+    ):
+        raise ValueError("persisted trigger actor identities are invalid")
+    return tuple(decoded)
 
 
 def _optional_text(value: object) -> str | None:

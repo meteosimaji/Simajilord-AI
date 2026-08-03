@@ -26,7 +26,12 @@ CapabilityIdempotency = Literal[
     "non_idempotent_write",
 ]
 CapabilityAuditPayload = Literal["full", "metadata"]
-AgentPrincipalKind = Literal["requester", "service", "system"]
+AgentPrincipalKind = Literal[
+    "requester",
+    "service",
+    "system",
+    "legacy_unknown",
+]
 AgentReadScopeMode = Literal["resource_ids", "requester_live", "service_live"]
 InformationFlowMode = Literal["enforce", "audit", "disabled"]
 FileWorkspaceMode = Literal["actor_task", "actor", "guild_shared"]
