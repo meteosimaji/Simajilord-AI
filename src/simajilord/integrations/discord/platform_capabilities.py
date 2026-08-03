@@ -17,6 +17,7 @@ from discord.http import Route
 from simajilord.core import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -853,6 +854,7 @@ def build_discord_platform_endpoints(
                     "permissions, cached presence/activity, and voice participation."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "members",
@@ -890,6 +892,7 @@ def build_discord_platform_endpoints(
                     "requester and bot permissions."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "channel",
@@ -915,6 +918,7 @@ def build_discord_platform_endpoints(
                 name="discord.list_pins",
                 summary="Page through pinned messages in a mutually visible channel.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "pins",
@@ -937,6 +941,7 @@ def build_discord_platform_endpoints(
                     "Page through users represented by one reaction on a readable message."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "reaction",
@@ -959,6 +964,7 @@ def build_discord_platform_endpoints(
                 name="discord.list_thread_members",
                 summary="Page through the current member list of a mutually visible thread.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "thread",
@@ -982,6 +988,7 @@ def build_discord_platform_endpoints(
                     "Page through users who selected one answer on a readable Discord poll."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "poll",
@@ -1021,6 +1028,7 @@ def build_discord_platform_endpoints(
                     "Permission-sensitive families require both requester and bot access."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
                 keywords=(
                     "discord",
                     "platform resources",
@@ -1098,6 +1106,7 @@ def build_discord_platform_endpoints(
                     "latency, shards, and cached reach without exposing credentials."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=(
                     "discord",
                     "bot",

@@ -9,6 +9,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -82,6 +83,7 @@ def build_compute_endpoints(
                     "staged. Shell commands are not accepted."
                 ),
                 risk=RiskLevel.WRITE,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "compute",
@@ -128,6 +130,7 @@ def build_compute_endpoints(
                     "isolated workspace with redirect and SSRF protection."
                 ),
                 risk=RiskLevel.WRITE,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "file",

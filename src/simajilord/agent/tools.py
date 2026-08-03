@@ -23,6 +23,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityRegistry,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
 )
@@ -367,6 +368,22 @@ class AgentToolCatalog:
         if capability_name is None:
             return None
         return self._registry.endpoint(capability_name).descriptor.timeout_seconds
+
+    def disclosure_class_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> DisclosureClass | None:
+        """Return the host-declared information class for one concrete call."""
+
+        capability_name = self.capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        if capability_name is None:
+            return None
+        return self._registry.endpoint(capability_name).descriptor.disclosure_class
 
     def canonical_tool_name_for_call(
         self,
@@ -1128,6 +1145,11 @@ def _descriptor_metadata(descriptor: CapabilityDescriptor) -> Mapping[str, objec
         "expected_errors": descriptor.expected_errors,
         "timeout_seconds": descriptor.timeout_seconds,
         "user_visible_effect": descriptor.user_visible_effect,
+        "disclosure_class": (
+            descriptor.disclosure_class.value
+            if descriptor.disclosure_class is not None
+            else None
+        ),
     }
 
 

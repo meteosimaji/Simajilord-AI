@@ -8,6 +8,7 @@ from typing import Literal
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -175,6 +176,7 @@ def build_source_inspection_endpoints(
                     "executing one. The AI decides from meaning, never from a host keyword list."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=(
                     "evidence plan",
                     "source decision",
@@ -200,6 +202,7 @@ def build_source_inspection_endpoints(
                     "without exposing runtime data, secrets, or the full repository."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=(
                     "source",
                     "repository",
@@ -230,6 +233,7 @@ def build_source_inspection_endpoints(
                     "test, or documentation file returned by source.search."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=(
                     "source",
                     "repository",

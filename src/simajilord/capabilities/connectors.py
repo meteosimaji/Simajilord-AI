@@ -15,6 +15,7 @@ from simajilord.core.capabilities import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -274,6 +275,7 @@ class ConnectorBroker:
                         "Unknown or unclassified tools are omitted instead of treated as reads."
                     ),
                     risk=RiskLevel.EXTERNAL,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
                     keywords=(
                         "Figma",
                         "Canva",
@@ -305,6 +307,7 @@ class ConnectorBroker:
                         "for one reviewed design connector tool."
                     ),
                     risk=RiskLevel.EXTERNAL,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
                     keywords=("connector schema", "app tool contract", "design tool details"),
                     requires_workspace=True,
                     idempotency="read",
@@ -332,6 +335,7 @@ class ConnectorBroker:
                         "classifies it as read-only."
                     ),
                     risk=RiskLevel.EXTERNAL,
+                    disclosure_class=DisclosureClass.EXTERNAL_PRIVATE,
                     keywords=("read Figma", "inspect Canva", "search Adobe", "connector read"),
                     requires_workspace=True,
                     idempotency="read",

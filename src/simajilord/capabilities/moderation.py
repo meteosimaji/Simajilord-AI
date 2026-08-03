@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -142,6 +143,7 @@ def build_moderation_endpoints(
                 name="moderation.status",
                 summary="Check synthetic-media analysis provider readiness.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=("moderation", "status", "quota", "hive"),
             ),
             ModerationStatusRequest,

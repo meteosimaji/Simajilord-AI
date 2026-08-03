@@ -8,6 +8,7 @@ from simajilord.core.capabilities import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -261,6 +262,7 @@ def build_focus_timer_endpoints(
                 name="timer.list",
                 summary="List active Focus Timers.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "timer",
                     "focus",

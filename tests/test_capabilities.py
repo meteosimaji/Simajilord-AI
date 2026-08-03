@@ -8,6 +8,7 @@ import pytest
 from simajilord.core import (
     CapabilityDescriptor,
     CapabilityRegistry,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -50,7 +51,12 @@ def build_endpoint():
         return Response(request.value * 2)
 
     return endpoint(
-        CapabilityDescriptor("test.double", "Double an integer.", RiskLevel.READ),
+        CapabilityDescriptor(
+            "test.double",
+            "Double an integer.",
+            RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
+        ),
         Request,
         Response,
         handler,
@@ -68,6 +74,23 @@ async def test_registry_invokes_typed_endpoint() -> None:
     )
     assert result == Response(8)
     assert registry.manifest()[0]["request_fields"] == ("value",)
+    assert registry.manifest()[0]["disclosure_class"] == "no_user_content"
+
+
+def test_read_descriptor_requires_explicit_disclosure_class() -> None:
+    with pytest.raises(
+        ValueError,
+        match="read capabilities require an explicit disclosure_class",
+    ):
+        CapabilityDescriptor("test.unclassified", "Unsafe read.", RiskLevel.READ)
+
+    with pytest.raises(ValueError, match="must be a DisclosureClass"):
+        CapabilityDescriptor(
+            "test.invalid_class",
+            "Invalid class.",
+            RiskLevel.READ,
+            disclosure_class="channel_scoped_content",  # type: ignore[arg-type]
+        )
 
 
 def test_registry_rejects_duplicate_names() -> None:
@@ -156,6 +179,7 @@ async def test_registry_enforces_descriptor_timeout_and_records_stable_error() -
                 "test.timeout",
                 "Wait beyond the declared deadline.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 timeout_seconds=0.01,
             ),
             Request,
@@ -201,7 +225,12 @@ async def test_journal_failure_does_not_replace_capability_outcome(
     failed = CapabilityRegistry(journal=FailingJournal())
     failed.register(
         endpoint(
-            CapabilityDescriptor("test.fail", "Fail predictably.", RiskLevel.READ),
+            CapabilityDescriptor(
+                "test.fail",
+                "Fail predictably.",
+                RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
+            ),
             Request,
             Response,
             fail,

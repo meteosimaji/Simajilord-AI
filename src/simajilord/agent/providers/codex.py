@@ -19,7 +19,7 @@ from time import monotonic
 from typing import Literal, cast
 
 from simajilord.capabilities.isolated_shell import discord_workspace_for_context
-from simajilord.core import DisclosureObservation, InvocationContext
+from simajilord.core import DisclosureClass, DisclosureObservation, InvocationContext
 from simajilord.core.errors import (
     MediaError,
     ModerationError,
@@ -3273,6 +3273,10 @@ class CodexAppServerProvider:
                 capability_name=capability_name,
                 output=output.text,
                 arguments=capability_arguments,
+                disclosure_class=self.tools.disclosure_class_for_call(
+                    tool_name=tool_name,
+                    arguments=raw_params.get("arguments"),
+                ),
                 discord_read=(
                     write_capability is None
                     and isinstance(capability_name, str)
@@ -5119,23 +5123,56 @@ def _record_discord_disclosure_observations(
     capability_name: str | None,
     output: str,
     arguments: object | None = None,
+    disclosure_class: DisclosureClass | None = None,
     discord_read: bool | None = None,
 ) -> None:
     """Carry source audience metadata into later host-enforced decisions."""
 
-    tracked_discord_read = (
-        isinstance(capability_name, str) and capability_name.startswith("discord.")
-        if discord_read is None
-        else discord_read
-    )
-    if not tracked_discord_read and capability_name not in {
-        "files.list",
-        "files.read",
-        "compute.run",
-    }:
-        return
     if not isinstance(capability_name, str):
         return
+    if disclosure_class is None and discord_read is False:
+        return
+    effective_class = disclosure_class or (
+        DisclosureClass.ACTOR_PRIVATE
+        if capability_name in {"files.list", "files.read", "compute.run"}
+        else DisclosureClass.CHANNEL_SCOPED_CONTENT
+        if capability_name.startswith("discord.")
+        else None
+    )
+    if effective_class is None or effective_class is DisclosureClass.NO_USER_CONTENT:
+        return
+    if effective_class in {
+        DisclosureClass.GUILD_MEMBER_METADATA,
+        DisclosureClass.GUILD_PUBLIC_METADATA,
+    }:
+        _record_guild_metadata_disclosure_observations(
+            budget,
+            capability_name=capability_name,
+            output=output,
+            arguments=arguments,
+            disclosure_class=effective_class,
+        )
+        return
+    if effective_class is DisclosureClass.EXTERNAL_PUBLIC:
+        _record_external_public_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            output=output,
+            arguments=arguments,
+        )
+        return
+    if effective_class in {
+        DisclosureClass.EXTERNAL_PRIVATE,
+        DisclosureClass.UNKNOWN,
+    }:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+        return
+    tracked_discord_read = effective_class is DisclosureClass.CHANNEL_SCOPED_CONTENT
+    tracked_actor_private = effective_class is DisclosureClass.ACTOR_PRIVATE
     try:
         payload = json.loads(output)
     except json.JSONDecodeError:
@@ -5163,6 +5200,9 @@ def _record_discord_disclosure_observations(
     file_records = payload.get("files")
     if isinstance(file_records, list):
         candidates.extend(item for item in file_records if isinstance(item, dict))
+    file_record = payload.get("file")
+    if isinstance(file_record, dict):
+        candidates.append(file_record)
     provenance_candidates = [
         item.get("provenance")
         for item in candidates
@@ -5273,9 +5313,10 @@ def _record_discord_disclosure_observations(
                 in {"discord.read_messages", "discord.search_messages"}
                 and (not isinstance(messages, list) or bool(messages))
             )
-            or capability_name in {"files.read", "compute.run"}
+            or (tracked_actor_private and capability_name != "files.list")
             or (
-                capability_name == "files.list"
+                tracked_actor_private
+                and capability_name == "files.list"
                 and isinstance(file_records, list)
                 and bool(file_records)
             )
@@ -5287,6 +5328,110 @@ def _record_discord_disclosure_observations(
             capability_name=capability_name,
             arguments=arguments,
         )
+
+
+def _record_guild_metadata_disclosure_observations(
+    budget: _ToolTurnBudget,
+    *,
+    capability_name: str,
+    output: str,
+    arguments: object | None,
+    disclosure_class: DisclosureClass,
+) -> None:
+    """Label metadata by guild without pretending it contains channel messages."""
+
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+        return
+    if not isinstance(payload, dict) or payload.get("truncated") is True:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+        return
+    guild_ids: list[str] = []
+    for key in ("guild_id", "source_guild_id", "server_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            guild_ids.append(value)
+    servers = payload.get("servers")
+    if isinstance(servers, list):
+        guild_ids.extend(
+            server_id
+            for item in servers
+            if isinstance(item, dict)
+            and isinstance((server_id := item.get("server_id")), str)
+            and server_id
+        )
+    if isinstance(arguments, dict):
+        requested_guild_id = arguments.get("guild_id")
+        if isinstance(requested_guild_id, str) and requested_guild_id:
+            guild_ids.append(requested_guild_id)
+    if not guild_ids and budget.context.workspace_id is not None:
+        guild_ids.append(budget.context.workspace_id)
+    if not guild_ids:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+        return
+    visibility: Literal["guild_public", "restricted"] = (
+        "guild_public"
+        if disclosure_class is DisclosureClass.GUILD_PUBLIC_METADATA
+        else "restricted"
+    )
+    metadata_kind = disclosure_class.value
+    for guild_id in dict.fromkeys(guild_ids):
+        observation = DisclosureObservation(
+            source_workspace_id=guild_id,
+            source_resource_id=f"guild:{guild_id}:{metadata_kind}",
+            visibility=visibility,
+            relation_to_origin=(
+                "same_or_narrower"
+                if guild_id == budget.context.workspace_id
+                else "uncertain"
+            ),
+        )
+        if observation not in budget.discord_disclosure_observations:
+            budget.discord_disclosure_observations.append(observation)
+
+
+def _record_external_public_disclosure_observation(
+    budget: _ToolTurnBudget,
+    *,
+    capability_name: str,
+    output: str,
+    arguments: object | None,
+) -> None:
+    """Mark successfully decoded public external data as freely redisclosable."""
+
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict) or payload.get("truncated") is True:
+        _record_truncated_disclosure_observation(
+            budget,
+            capability_name=capability_name,
+            arguments=arguments,
+        )
+        return
+    observation = DisclosureObservation(
+        source_workspace_id="external:public",
+        source_resource_id=capability_name,
+        visibility="guild_public",
+        relation_to_origin="same_or_narrower",
+    )
+    if observation not in budget.discord_disclosure_observations:
+        budget.discord_disclosure_observations.append(observation)
 
 
 def _record_truncated_disclosure_observation(

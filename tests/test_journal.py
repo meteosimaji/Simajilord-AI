@@ -13,6 +13,7 @@ import pytest
 from simajilord.core import (
     CapabilityDescriptor,
     CapabilityRegistry,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -151,6 +152,7 @@ async def test_capability_results_do_not_wait_for_slow_audit_commit(
                 "test.audit_independent",
                 "Return before the audit disk commit.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
             ),
             SecretRequest,
             AuditResponse,

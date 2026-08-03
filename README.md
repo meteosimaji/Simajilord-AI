@@ -124,6 +124,12 @@ with Discord's generic “interaction failed” banner.
   agent supplies a globally unique cached channel ID but omits its server ID, the write resolver
   may infer that shared server and then repeats the same live membership and permission checks;
   an explicit mismatched server ID is never silently corrected
+- Capability contracts classify returned information independently from operational read/write
+  risk: no-user-content, guild metadata, channel-scoped content, actor-private data, public or
+  private external data, and unknown. Every read endpoint must declare a class. Metadata-only
+  reads create a guild-scoped observation instead of pretending message labels are missing;
+  channel/file/memory/compute content still requires audience or provenance metadata, while an
+  absent, invalid, or truncated label remains fail-closed as `uncertain`
 - The Discord adapter currently registers 106 typed capability endpoints covering the bot-visible
   conversation, moderation, audio, and common server-management areas listed below. This is a
   broad capability catalog, not a one-to-one implementation of every route in Discord's official

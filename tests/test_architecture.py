@@ -76,3 +76,46 @@ def test_user_errors_use_stable_machine_codes() -> None:
             if code_pattern.fullmatch(node.args[0].value) is None:
                 unstable.append(f"{path}:{node.lineno}:{node.args[0].value}")
     assert unstable == []
+
+
+def test_read_capabilities_declare_disclosure_classes() -> None:
+    missing: list[str] = []
+    declared: dict[str, str] = {}
+    for path in Path("src/simajilord").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Name)
+                or node.func.id != "CapabilityDescriptor"
+            ):
+                continue
+            keywords = {item.arg: item.value for item in node.keywords if item.arg}
+            name_node = keywords.get("name") or (node.args[0] if node.args else None)
+            risk_node = keywords.get("risk") or (
+                node.args[2] if len(node.args) > 2 else None
+            )
+            class_node = keywords.get("disclosure_class")
+            name = (
+                name_node.value
+                if isinstance(name_node, ast.Constant)
+                and isinstance(name_node.value, str)
+                else f"{path}:{node.lineno}"
+            )
+            if isinstance(class_node, ast.Attribute):
+                declared[name] = class_node.attr
+            if (
+                isinstance(risk_node, ast.Attribute)
+                and risk_node.attr == "READ"
+                and class_node is None
+            ):
+                missing.append(f"{path}:{node.lineno}:{name}")
+
+    assert missing == []
+    assert {
+        "memory.search": "ACTOR_PRIVATE",
+        "connector.read": "EXTERNAL_PRIVATE",
+        "files.list": "ACTOR_PRIVATE",
+        "files.read": "ACTOR_PRIVATE",
+        "compute.run": "ACTOR_PRIVATE",
+    }.items() <= declared.items()

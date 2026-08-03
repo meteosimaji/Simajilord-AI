@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from simajilord.core import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -145,6 +146,7 @@ def build_curated_workflow_endpoint(
                 "semantically, then query the exact workflow_id when needed."
             ),
             risk=RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             keywords=(
                 "workflow",
                 "multi-step task",

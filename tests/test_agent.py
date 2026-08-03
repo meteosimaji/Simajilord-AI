@@ -53,6 +53,7 @@ from simajilord.agent.providers.codex import (
     _continuation_tool_budget,
     _encode_app_server_message,
     _ExactMessageReadState,
+    _information_flow_write_failure,
     _is_final_delivery,
     _last_write_failure,
     _mark_authorization_message_read,
@@ -79,6 +80,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityRegistry,
+    DisclosureClass,
     DisclosureObservation,
     InvocationContext,
     RiskLevel,
@@ -3559,6 +3561,7 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
                 "test.read",
                 "Read a bounded test chunk.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
             ),
             ReadRequest,
             ReadResponse,
@@ -3583,6 +3586,13 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
         max_output_characters=1_000,
     )
     assert '"content":"bc"' in output
+    assert (
+        catalog.disclosure_class_for_call(
+            tool_name="test_read",
+            arguments={"offset": 1},
+        )
+        is DisclosureClass.NO_USER_CONTENT
+    )
     discovery = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_search",
@@ -3598,7 +3608,16 @@ async def test_dynamic_tool_catalog_builds_typed_schema_and_invokes(tmp_path) ->
         context=context,
         max_output_characters=1_000,
     )
-    contract_id = json.loads(contract.text)["contract_id"]
+    contract_payload = json.loads(contract.text)
+    contract_id = contract_payload["contract_id"]
+    assert contract_payload["metadata"]["disclosure_class"] == "no_user_content"
+    assert (
+        catalog.disclosure_class_for_call(
+            tool_name="capability_invoke",
+            arguments={"name": "test.read"},
+        )
+        is DisclosureClass.NO_USER_CONTENT
+    )
     brokered_output = await catalog.invoke(
         namespace="simajilord",
         tool_name="capability_invoke",
@@ -3692,6 +3711,7 @@ def test_workspace_capability_is_hidden_without_workspace_context() -> None:
                 "discord.read",
                 "Read one server value.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 requires_workspace=True,
             ),
             ReadRequest,
@@ -3721,6 +3741,7 @@ async def test_dynamic_tool_catalog_validates_literal_choices() -> None:
                 "test.select",
                 "Select one test mode.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
             ),
             LiteralRequest,
             LiteralResponse,
@@ -3828,7 +3849,12 @@ async def test_progressive_catalog_hides_schema_until_search_and_granted_invoke(
 
     registry.register(
         endpoint(
-            CapabilityDescriptor("test.read", "Read a message.", RiskLevel.READ),
+            CapabilityDescriptor(
+                "test.read",
+                "Read a message.",
+                RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
+            ),
             ReadRequest,
             ReadResponse,
             read,
@@ -4172,6 +4198,7 @@ async def test_capability_search_never_leaks_missing_grant_or_approval() -> None
                 "test.public",
                 "Read a public test value.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("public",),
             ),
             ReadRequest,
@@ -4254,7 +4281,12 @@ async def test_capability_search_always_returns_the_same_complete_semantic_index
     for name in ("test.alpha", "test.beta", "test.gamma"):
         registry.register(
             endpoint(
-                CapabilityDescriptor(name, f"Read {name}.", RiskLevel.READ),
+                CapabilityDescriptor(
+                    name,
+                    f"Read {name}.",
+                    RiskLevel.READ,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
+                ),
                 ReadRequest,
                 ReadResponse,
                 read,
@@ -4321,7 +4353,12 @@ async def test_capability_list_uses_compact_opaque_cursor_pages() -> None:
     for name in ("test.alpha", "test.beta", "test.gamma"):
         registry.register(
             endpoint(
-                CapabilityDescriptor(name, f"Read {name}.", RiskLevel.READ),
+                CapabilityDescriptor(
+                    name,
+                    f"Read {name}.",
+                    RiskLevel.READ,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
+                ),
                 ReadRequest,
                 ReadResponse,
                 read,
@@ -4398,7 +4435,12 @@ async def test_concrete_search_never_pages_or_omits_the_complete_large_index() -
     for name in names:
         registry.register(
             endpoint(
-                CapabilityDescriptor(name, f"Read {name}.", RiskLevel.READ),
+                CapabilityDescriptor(
+                    name,
+                    f"Read {name}.",
+                    RiskLevel.READ,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
+                ),
                 ReadRequest,
                 ReadResponse,
                 read,
@@ -4434,22 +4476,30 @@ async def test_capability_browse_reports_only_coarse_unavailable_counts() -> Non
         return ReadResponse(str(request.offset), None)
 
     descriptors = (
-        CapabilityDescriptor("test.open", "Visible public summary.", RiskLevel.READ),
+        CapabilityDescriptor(
+            "test.open",
+            "Visible public summary.",
+            RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
+        ),
         CapabilityDescriptor(
             "test.grant_secret",
             "Hidden grant summary.",
             RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
         ),
         CapabilityDescriptor(
             "test.workspace_secret",
             "Hidden workspace summary.",
             RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             requires_workspace=True,
         ),
         CapabilityDescriptor(
             "test.approval_secret",
             "Hidden approval summary.",
             RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             approval=ApprovalMode.WHEN_REQUESTED,
         ),
     )
@@ -4767,7 +4817,12 @@ async def test_primary_model_can_collect_evidence_before_semantic_handoff(
 
     registry.register(
         endpoint(
-            CapabilityDescriptor("test.read", "Read a value.", RiskLevel.READ),
+            CapabilityDescriptor(
+                "test.read",
+                "Read a value.",
+                RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
+            ),
             ReadRequest,
             ReadResponse,
             read,
@@ -4917,7 +4972,12 @@ async def test_provider_persists_body_free_trace_for_every_broker_route(
     for name in ("test.eager", "test.hidden"):
         registry.register(
             endpoint(
-                CapabilityDescriptor(name, f"Read through {name}.", RiskLevel.READ),
+                CapabilityDescriptor(
+                    name,
+                    f"Read through {name}.",
+                    RiskLevel.READ,
+                    disclosure_class=DisclosureClass.NO_USER_CONTENT,
+                ),
                 ReadRequest,
                 ReadResponse,
                 read,
@@ -5128,7 +5188,12 @@ async def test_concurrent_provider_tool_traces_do_not_cross_turns(
 
     registry.register(
         endpoint(
-            CapabilityDescriptor("test.read", "Read a value.", RiskLevel.READ),
+            CapabilityDescriptor(
+                "test.read",
+                "Read a value.",
+                RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
+            ),
             ReadRequest,
             ReadResponse,
             read,
@@ -5434,6 +5499,7 @@ async def test_provider_returns_structured_expected_error_without_ending_turn(
                 "test.media",
                 "Test a provider error.",
                 RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
             ),
             ReadRequest,
             ReadResponse,
@@ -6617,7 +6683,12 @@ async def test_provider_default_turn_has_no_aggregate_tool_budget(
 
     registry.register(
         endpoint(
-            CapabilityDescriptor("test.read", "Read one value.", RiskLevel.READ),
+            CapabilityDescriptor(
+                "test.read",
+                "Read one value.",
+                RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
+            ),
             ReadRequest,
             ReadResponse,
             read,
@@ -6773,6 +6844,7 @@ def test_discord_visibility_observation_records_taint_without_granting_authority
     _record_discord_disclosure_observations(
         budget,
         capability_name="discord.get_message",
+        disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
         output=json.dumps(
             {
                 "guild_id": "other-guild",
@@ -6794,6 +6866,86 @@ def test_discord_visibility_observation_records_taint_without_granting_authority
     ] == [("other-guild", "private-channel", "uncertain", "broader")]
     assert set(budget.authorization_contexts) == {"auth_trigger"}
     assert budget.read_authorization_event_ids == {"auth_trigger"}
+
+
+def test_same_guild_metadata_class_allows_role_workflow_without_content_taint() -> None:
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="general",
+        information_flow_mode="enforce",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="event",
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="discord.list_roles",
+        disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
+        output=json.dumps(
+            {
+                "source_guild_id": "guild",
+                "roles": [{"role_id": "role", "name": "Member"}],
+            }
+        ),
+    )
+
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="guild:guild:guild_public_metadata",
+            visibility="guild_public",
+            relation_to_origin="same_or_narrower",
+        )
+    ]
+    assert _information_flow_write_failure("discord.assign_role", budget) is None
+
+
+def test_no_content_and_unknown_disclosure_classes_are_distinct() -> None:
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="general",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="event",
+    )
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="system.status",
+        disclosure_class=DisclosureClass.NO_USER_CONTENT,
+        output="not relevant to disclosure",
+    )
+    assert budget.discord_disclosure_observations == []
+
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="future.unclassified_read",
+        disclosure_class=DisclosureClass.UNKNOWN,
+        output='{"value":"opaque"}',
+    )
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="future.unclassified_read:unscoped",
+            visibility="uncertain",
+            relation_to_origin="uncertain",
+        )
+    ]
 
 
 def test_compute_output_restores_every_workspace_source_label() -> None:
@@ -7494,6 +7646,7 @@ async def test_provider_routes_candidate_only_after_exact_read(
                 name="discord.get_message",
                 summary="Read one exact Discord message.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
             ),
             FollowUpMessageRequest,
             FollowUpMessageResponse,
@@ -7776,6 +7929,7 @@ async def test_provider_reserves_exact_read_budget_for_late_follow_up(
                 name="discord.get_message",
                 summary="Read one exact Discord message.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
             ),
             FollowUpMessageRequest,
             FollowUpMessageResponse,
@@ -7788,6 +7942,7 @@ async def test_provider_reserves_exact_read_budget_for_late_follow_up(
                 name="turn.evidence_plan",
                 summary="Record a semantic evidence plan.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
             ),
             FollowUpEvidencePlanRequest,
             FollowUpEvidencePlanResponse,

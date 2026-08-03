@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from simajilord.core import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -191,6 +192,7 @@ def build_translation_endpoints(
                 name="translation.detect",
                 summary="Detect the dominant BCP-47 language of supplied text locally.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("language", "detect", "identify", "translation"),
                 expected_errors=(
                     "translation.text_required",
@@ -209,6 +211,7 @@ def build_translation_endpoints(
                     "List locally supported translation targets and installation status."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("language", "supported", "targets", "translation"),
                 expected_errors=("translation.unavailable",),
                 timeout_seconds=30,
@@ -222,6 +225,7 @@ def build_translation_endpoints(
                 name="translation.translate",
                 summary="Translate supplied text into the requested language.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("translate", "translation", "language", "local"),
                 expected_errors=(
                     "translation.text_required",
@@ -243,6 +247,7 @@ def build_translation_endpoints(
                     "Translate identified document segments in one structured batch."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=(
                     "translate",
                     "translation",

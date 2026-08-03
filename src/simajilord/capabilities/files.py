@@ -9,6 +9,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -127,6 +128,7 @@ def build_file_endpoints(
                     "workspace. Other actors and unlabelled legacy files are hidden."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "files",
@@ -156,6 +158,7 @@ def build_file_endpoints(
                     "page_start/page_count and continue from next_page until complete."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "file",

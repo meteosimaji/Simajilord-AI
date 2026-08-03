@@ -77,6 +77,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     DisclosureObservation,
     InvocationContext,
     RiskLevel,
@@ -4547,6 +4548,7 @@ def build_discord_endpoints(
                     "incomplete discovery."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "servers",
@@ -4575,6 +4577,7 @@ def build_discord_endpoints(
                 name="discord.inspect_server",
                 summary="Inspect an accessible Discord server's structure and identifiers.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "server",
                     "guild",
@@ -4597,6 +4600,7 @@ def build_discord_endpoints(
                 name="discord.inspect_user",
                 summary="Inspect a Discord user's public account and server membership details.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "user",
                     "member",
@@ -4625,6 +4629,7 @@ def build_discord_endpoints(
                     "video, and speaker state."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "voice",
@@ -4659,6 +4664,7 @@ def build_discord_endpoints(
                     "requester/bot assignability signals."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
                 keywords=(
                     "discord",
                     "roles",
@@ -4691,6 +4697,7 @@ def build_discord_endpoints(
                     "currently readable by both requester and bot in a shared server."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "channels",
@@ -4721,6 +4728,7 @@ def build_discord_endpoints(
                     "readable text/forum parent, returning IDs usable for retrieval."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "archived",
@@ -4757,6 +4765,7 @@ def build_discord_endpoints(
                     "identifies the active anchor and its immediate Discord predecessor."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "messages",
@@ -4800,6 +4809,7 @@ def build_discord_endpoints(
                     "proof that every historical message was indexed."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "messages",
@@ -4846,6 +4856,7 @@ def build_discord_endpoints(
                     "discord.list_poll_voters can be called without guessing."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "message",
@@ -4881,6 +4892,7 @@ def build_discord_endpoints(
                     "Resolve a Discord message link for display after enforcing view permissions."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "message link",
@@ -4909,6 +4921,7 @@ def build_discord_endpoints(
                     "to a requested BCP-47 language."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "message",
@@ -5008,6 +5021,7 @@ def build_discord_endpoints(
                     "including its full animation or a requested frame when available."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
                 keywords=(
                     "discord",
                     "custom emoji",
@@ -5039,6 +5053,7 @@ def build_discord_endpoints(
                     "its full animation or a requested frame when the format supports it."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
                 keywords=(
                     "discord",
                     "sticker",
@@ -5070,6 +5085,7 @@ def build_discord_endpoints(
                     "signals without exposing its bytes or signed URL to the model."
                 ),
                 risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 keywords=(
                     "discord",
                     "attachment",
@@ -5114,6 +5130,7 @@ def build_discord_endpoints(
                     "and return its SHA-256 digest."
                 ),
                 risk=RiskLevel.WRITE,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "discord",
@@ -5153,6 +5170,7 @@ def build_discord_endpoints(
                     "revealing the signed Discord URL."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.CHANNEL_SCOPED_CONTENT,
                 approval=ApprovalMode.NEVER,
                 keywords=(
                     "discord",
@@ -6354,6 +6372,7 @@ def build_discord_endpoints(
                 name="discord.read_aloud_status",
                 summary="Inspect the current Discord read-aloud routes without changing them.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "read aloud status",
@@ -6454,6 +6473,7 @@ def build_discord_endpoints(
                     "Inspect current read-aloud dictionary, exclusion, and voice-event settings."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "read aloud policy",
@@ -6472,6 +6492,7 @@ def build_discord_endpoints(
                 name="discord.read_aloud_dictionary_list",
                 summary="List this Discord server's read-aloud dictionary.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
                 keywords=(
                     "discord",
                     "list pronunciation dictionary",

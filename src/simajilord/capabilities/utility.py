@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -64,6 +65,7 @@ def build_utility_endpoints() -> tuple[CapabilityEndpoint, CapabilityEndpoint]:
                 name="utility.roll",
                 summary="Roll virtual dice with the host's secure random source.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("dice", "random", "roll", "game"),
             ),
             RollRequest,
@@ -75,6 +77,7 @@ def build_utility_endpoints() -> tuple[CapabilityEndpoint, CapabilityEndpoint]:
                 name="utility.choose",
                 summary="Choose one item from the supplied options.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("choose", "pick", "random", "decision"),
             ),
             ChooseRequest,

@@ -8,6 +8,7 @@ from typing import Literal
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -72,6 +73,7 @@ def build_task_route_endpoint() -> CapabilityEndpoint:
                 "semantic model judgment; the host does not classify message text."
             ),
             risk=RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             keywords=(
                 "task routing",
                 "follow-up decision",

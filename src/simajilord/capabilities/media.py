@@ -12,6 +12,7 @@ from pathlib import Path
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -81,6 +82,7 @@ def build_download_endpoint(media: MediaService) -> CapabilityEndpoint:
             name="media.download",
             summary="Download a supported public media URL to a bounded destination.",
             risk=RiskLevel.EXTERNAL,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             keywords=("media", "download", "video", "audio", "save", "attachment"),
             side_effects=(
                 "Connects to a public media service.",
@@ -150,6 +152,7 @@ def build_media_save_endpoint(
                 "actor/task workspace for later file use or Discord delivery."
             ),
             risk=RiskLevel.WRITE,
+            disclosure_class=DisclosureClass.ACTOR_PRIVATE,
             keywords=(
                 "media",
                 "download",

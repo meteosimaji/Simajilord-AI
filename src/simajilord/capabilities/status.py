@@ -9,6 +9,7 @@ from simajilord.core import (
     CapabilityDescriptor,
     CapabilityEndpoint,
     CapabilityRegistry,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -137,6 +138,7 @@ def build_status_endpoint(
             name="system.status",
             summary="Summarise platform, event journal, audio, and AI readiness.",
             risk=RiskLevel.READ,
+            disclosure_class=DisclosureClass.NO_USER_CONTENT,
             keywords=(
                 "status",
                 "health",

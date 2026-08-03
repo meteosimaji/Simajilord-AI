@@ -19,6 +19,7 @@ from simajilord.core import (
     ApprovalMode,
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -1404,6 +1405,7 @@ def build_memory_endpoints(
                     "next_offset for later source retrieval, update, or explicit forget."
                 ),
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
                 keywords=(
                     "memory",
                     "preference",

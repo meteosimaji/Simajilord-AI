@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
+    DisclosureClass,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -183,6 +184,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                     "bounded sources, domains, and time ranges."
                 ),
                 risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
                 keywords=(
                     "web",
                     "search",
@@ -206,6 +208,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                     "the URL with files.download_url and use paginated files.read."
                 ),
                 risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
                 keywords=("web", "fetch", "open", "read", "page", "pdf", "url"),
                 side_effects=("Fetches one public HTTP or HTTPS resource.",),
             ),
@@ -221,6 +224,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                     "bounded context. source_truncated reports an incomplete source."
                 ),
                 risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
                 keywords=("web", "find", "page", "phrase", "match", "context"),
                 side_effects=(
                     "Fetches one public HTTP or HTTPS resource when not cached.",
@@ -235,6 +239,7 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
                 name="web.status",
                 summary="Check readiness of the local metasearch service.",
                 risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.NO_USER_CONTENT,
                 keywords=("web", "search", "status", "health", "provider"),
             ),
             WebStatusRequest,

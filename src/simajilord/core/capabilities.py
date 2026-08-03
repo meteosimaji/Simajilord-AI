@@ -51,6 +51,19 @@ class ApprovalMode(StrEnum):
     ALWAYS = "always"
 
 
+class DisclosureClass(StrEnum):
+    """Kind of information a capability can add to the active model turn."""
+
+    NO_USER_CONTENT = "no_user_content"
+    GUILD_MEMBER_METADATA = "guild_member_metadata"
+    GUILD_PUBLIC_METADATA = "guild_public_metadata"
+    CHANNEL_SCOPED_CONTENT = "channel_scoped_content"
+    ACTOR_PRIVATE = "actor_private"
+    EXTERNAL_PUBLIC = "external_public"
+    EXTERNAL_PRIVATE = "external_private"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class DisclosureObservation:
     """One source audience observed by an active model turn."""
@@ -115,6 +128,7 @@ class CapabilityDescriptor:
     timeout_seconds: float | None = None
     user_visible_effect: str | None = None
     audit_payload: CapabilityAuditPayload = "full"
+    disclosure_class: DisclosureClass | None = None
 
     def __post_init__(self) -> None:
         """Reject metadata that would teach an agent contradictory behavior."""
@@ -131,6 +145,13 @@ class CapabilityDescriptor:
             raise ValueError("expected_errors must not contain empty values")
         if self.risk is RiskLevel.READ and self.idempotency != "read":
             raise ValueError("read capabilities must use read idempotency")
+        if self.risk is RiskLevel.READ and self.disclosure_class is None:
+            raise ValueError("read capabilities require an explicit disclosure_class")
+        if self.disclosure_class is not None and not isinstance(
+            self.disclosure_class,
+            DisclosureClass,
+        ):
+            raise ValueError("disclosure_class must be a DisclosureClass")
         if (
             self.risk in {RiskLevel.WRITE, RiskLevel.DESTRUCTIVE}
             and self.idempotency == "read"
@@ -354,6 +375,11 @@ class CapabilityRegistry:
                 "request_fields": item.schema.request_fields,
                 "response_fields": item.schema.response_fields,
                 "side_effects": item.descriptor.side_effects,
+                "disclosure_class": (
+                    item.descriptor.disclosure_class.value
+                    if item.descriptor.disclosure_class is not None
+                    else None
+                ),
             }
             for item in self.all()
         )
