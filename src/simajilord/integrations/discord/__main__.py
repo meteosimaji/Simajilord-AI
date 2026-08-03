@@ -18,7 +18,7 @@ def main() -> None:
     settings = load_settings()
     _configure_logging(settings)
     for warning in security_policy_warnings(settings):
-        log.critical("SECURITY COMPATIBILITY MODE: %s", warning)
+        log.critical("SECURITY WARNING: %s", warning)
     bot = SimajilordDiscordBot(SimajilordRuntime.build(settings))
     bot.run(settings.token, log_handler=None)
 
@@ -29,9 +29,7 @@ def _configure_logging(settings: Settings) -> None:
     log_dir = settings.data_dir / "logs"
     log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     log_path = log_dir / "simajilord.log"
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     local_file = RotatingFileHandler(

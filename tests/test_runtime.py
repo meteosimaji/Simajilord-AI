@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +29,7 @@ from simajilord.agent import (
     action_policy,
 )
 from simajilord.agent.providers import CodexAppServerProvider
+from simajilord.capabilities.status import StatusRequest, StatusResponse
 from simajilord.config import load_settings
 from simajilord.core import InvocationContext, RiskLevel
 from simajilord.integrations.discord.capabilities import build_discord_endpoints
@@ -73,9 +75,7 @@ def test_runtime_composes_before_discord_starts_the_event_loop(
     settings = load_settings(dotenv_path=tmp_path / "missing.env")
     runtime = SimajilordRuntime.build(settings)
 
-    capability_names = tuple(
-        endpoint.descriptor.name for endpoint in runtime.registry.all()
-    )
+    capability_names = tuple(endpoint.descriptor.name for endpoint in runtime.registry.all())
     assert len(capability_names) == len(set(capability_names))
     assert {
         "web.search",
@@ -116,9 +116,7 @@ def test_agent_and_image_queue_share_the_primary_codex_provider(
         assert runtime.agent.provider.allow_image_generation is True
         assert runtime.agent.provider.max_tool_calls is None
         assert runtime.agent.provider.max_tool_output_characters is None
-        assert runtime.agent.provider.image_timeout_seconds == (
-            settings.image_timeout_seconds
-        )
+        assert runtime.agent.provider.image_timeout_seconds == (settings.image_timeout_seconds)
     finally:
         asyncio.run(runtime.close())
 
@@ -142,6 +140,68 @@ def test_host_shell_and_connectors_are_disabled_by_default(
         assert not {name for name in names if name.startswith("connector.")}
     finally:
         asyncio.run(runtime.close())
+
+
+def test_system_status_reports_effective_security_without_secrets_or_private_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    private_token = "status-private-token"
+    private_admin_id = "987654321012345678"
+    for name in (
+        "AGENT_WEB_SEARCH_ACCESS",
+        "AGENT_SAFE_COMPUTE_ACCESS",
+        "IMAGE_GENERATION_ACCESS",
+        "AGENT_ISOLATED_SHELL_ACCESS",
+        "AGENT_CONNECTOR_ACCESS",
+        "AGENT_FILE_SANDBOX_ENABLED",
+        "AGENT_FILE_WORKSPACE_MODE",
+        "AGENT_INFORMATION_FLOW_MODE",
+        "READ_ALOUD_AUDIENCE_MODE",
+        "AGENT_HIGH_RISK_AUTHORIZATION_MODE",
+        "AGENT_AUTONOMY_ENABLED",
+        "AGENT_AUTONOMY_MODE",
+        "AGENT_AUTONOMY_POLICY_MODE",
+        "AGENT_AUTONOMY_MAX_RUNS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DISCORD_TOKEN", private_token)
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_SECURITY_PRESET", "trusted_admin")
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", private_admin_id)
+    monkeypatch.setenv("AGENT_INFORMATION_FLOW_MODE", "audit")
+
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+
+    async def run() -> StatusResponse:
+        try:
+            return cast(
+                StatusResponse,
+                await runtime.registry.invoke(
+                    "system.status",
+                    StatusRequest(),
+                    InvocationContext("7", "1", "status", "request"),
+                ),
+            )
+        finally:
+            await runtime.close()
+
+    response = asyncio.run(run())
+
+    assert response.security_configured_preset == "trusted_admin"
+    assert response.security_effective_preset == "trusted_admin"
+    assert response.security_file_workspace_mode == "actor"
+    assert response.security_information_flow_mode == "audit"
+    assert response.security_shell_access == "admins"
+    assert response.security_connector_access == "admins"
+    assert response.security_autonomy_enabled is False
+    assert any("Information-flow" in item for item in response.security_warnings)
+    rendered = json.dumps(asdict(response), sort_keys=True)
+    assert private_token not in rendered
+    assert private_admin_id not in rendered
 
 
 def test_admin_host_shell_and_design_connectors_use_agent_capability_policy(
@@ -300,15 +360,13 @@ def test_every_current_mutation_has_an_explicit_undo_classification(
     mutations = {
         item.descriptor.name
         for item in endpoints
-        if item.descriptor.risk is RiskLevel.WRITE
-        or item.descriptor.idempotency != "read"
+        if item.descriptor.risk is RiskLevel.WRITE or item.descriptor.idempotency != "read"
     }
 
     for capability in mutations:
         policy = action_policy(capability)
         assert (
-            capability in NON_UNDOABLE_ACTION_CAPABILITIES
-            or policy.undo_capability is not None
+            capability in NON_UNDOABLE_ACTION_CAPABILITIES or policy.undo_capability is not None
         ), capability
     asyncio.run(runtime.close())
 
@@ -370,14 +428,8 @@ def test_agent_discovers_only_permission_guarded_audio_writes(
         current_track_catalog = json.loads(current_track.text)
         assert current_track_catalog["catalog_complete"] is True
         assert "audio.queue" in current_track_catalog["catalog_index"]["audio"]
-        assert (
-            "discord.inspect_application"
-            in current_track_catalog["catalog_index"]["discord"]
-        )
-        assert (
-            "discord.list_voice_states"
-            in current_track_catalog["catalog_index"]["discord"]
-        )
+        assert "discord.inspect_application" in current_track_catalog["catalog_index"]["discord"]
+        assert "discord.list_voice_states" in current_track_catalog["catalog_index"]["discord"]
         assert "system.status" in current_track_catalog["catalog_index"]["system"]
         queue_contract = await provider.tools.invoke(
             namespace="simajilord",
@@ -509,13 +561,12 @@ def test_agent_web_grant_exposes_local_search_fetch_and_find(
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    denied_names, granted_names = asyncio.run(
-        _listed_capability_names(provider, denied)
-    ), asyncio.run(_listed_capability_names(provider, granted))
-
-    assert {"web_search", "web_fetch", "web_find"}.isdisjoint(
-        denied_eager_names
+    denied_names, granted_names = (
+        asyncio.run(_listed_capability_names(provider, denied)),
+        asyncio.run(_listed_capability_names(provider, granted)),
     )
+
+    assert {"web_search", "web_fetch", "web_find"}.isdisjoint(denied_eager_names)
     assert "web_search" in granted_eager_names
     assert {"web_fetch", "web_find"}.isdisjoint(granted_eager_names)
     assert {"web.search", "web.fetch", "web.find"}.isdisjoint(denied_names)
@@ -562,9 +613,10 @@ def test_agent_file_grant_exposes_complete_attachment_read_and_delivery_path(
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    denied_names, granted_names = asyncio.run(
-        _listed_capability_names(provider, denied)
-    ), asyncio.run(_listed_capability_names(provider, granted))
+    denied_names, granted_names = (
+        asyncio.run(_listed_capability_names(provider, denied)),
+        asyncio.run(_listed_capability_names(provider, granted)),
+    )
 
     assert {
         "files.list",
@@ -634,9 +686,10 @@ def test_agent_safe_compute_access_exposes_only_isolated_workspace_tools(
         for namespace in provider.tools.dynamic_specs(granted)
         for tool in cast(list[dict[str, object]], namespace["tools"])
     }
-    denied_names, granted_names = asyncio.run(
-        _listed_capability_names(provider, denied)
-    ), asyncio.run(_listed_capability_names(provider, granted))
+    denied_names, granted_names = (
+        asyncio.run(_listed_capability_names(provider, denied)),
+        asyncio.run(_listed_capability_names(provider, granted)),
+    )
 
     assert {"compute.run", "files.download_url"}.isdisjoint(denied_names)
     assert {"compute.run", "files.download_url"} <= granted_names
@@ -906,13 +959,16 @@ def test_agent_hive_attachment_analysis_requires_per_message_write_authority(
     assert runtime.agent is not None
     provider = cast(CodexAppServerProvider, runtime.agent.provider)
 
-    assert provider.tools.write_capability_for_call(
-        tool_name="capability_invoke",
-        arguments={
-            "name": "discord.analyze_attachment",
-            "arguments": {},
-        },
-    ) == "discord.analyze_attachment"
+    assert (
+        provider.tools.write_capability_for_call(
+            tool_name="capability_invoke",
+            arguments={
+                "name": "discord.analyze_attachment",
+                "arguments": {},
+            },
+        )
+        == "discord.analyze_attachment"
+    )
     egress = provider.tools.egress_descriptor_for_call(
         tool_name="capability_invoke",
         arguments={
@@ -925,9 +981,7 @@ def test_agent_hive_attachment_analysis_requires_per_message_write_authority(
     assert tuple(item.value for item in egress.field_kinds) == ("media",)
     assert egress.request_fields == ()
     assert egress.source_resource_fields == ("channel_id",)
-    assert runtime.registry.endpoint(
-        "discord.analyze_attachment"
-    ).schema.request_fields == (
+    assert runtime.registry.endpoint("discord.analyze_attachment").schema.request_fields == (
         "channel_id",
         "message_id",
         "attachment_index",
@@ -960,7 +1014,5 @@ def test_agent_hive_attachment_analysis_requires_per_message_write_authority(
         return output.text
 
     assert "discord.analyze_attachment" in asyncio.run(search(hive_context))
-    assert "discord.analyze_attachment" not in asyncio.run(
-        search(moderation_context)
-    )
+    assert "discord.analyze_attachment" not in asyncio.run(search(moderation_context))
     asyncio.run(runtime.close())

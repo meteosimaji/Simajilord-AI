@@ -176,6 +176,15 @@ with Discord's generic “interaction failed” banner.
   `Generate` and `Cancel` on the main screen
 - Local-first web Search / Fetch / Find with source diversity, readable HTML/PDF extraction,
   one-click chunk continuation, short-lived caching, and private-network/redirect blocking
+- `AGENT_SECURITY_PRESET` provides reviewed `personal_lab`, `trusted_admin`,
+  `guild_assistant`, and `legacy_compatibility` starting points. Individual security environment
+  variables remain explicit overrides; the existing `/status` UI and `system.status` return their
+  secret-free effective result, including file workspace, information-flow, read-aloud,
+  high-risk authorization, autonomy, and web/compute/image/shell/connector access. Unsafe
+  combinations are emitted as critical startup warnings and warning-tone status fields.
+  `legacy_compatibility` requires `AGENT_SECURITY_PRESET_EXPIRES_AT`; after that RFC 3339 instant
+  its preset defaults revert to `guild_assistant` while separately configured overrides remain
+  visible for review
 - A quota-bound file workspace isolated by Discord server, actor, and durable task by default:
   the agent can import Discord attachments,
   download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text

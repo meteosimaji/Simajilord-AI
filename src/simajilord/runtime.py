@@ -74,7 +74,7 @@ from simajilord.capabilities import (
     build_web_endpoints,
 )
 from simajilord.capabilities.status import build_status_endpoint
-from simajilord.config import AgentFeatureAccess, Settings
+from simajilord.config import AgentFeatureAccess, Settings, effective_security_policy
 from simajilord.core.capabilities import CapabilityRegistry
 from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
@@ -844,6 +844,7 @@ class SimajilordRuntime:
                 web,
                 maintenance,
                 agent_enabled=settings.agent_enabled,
+                security_policy=effective_security_policy(settings),
                 agent_metrics=agent.runtime_metrics if agent is not None else None,
                 speech_provider=settings.tts_provider,
                 speech_voice=(

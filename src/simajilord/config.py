@@ -6,6 +6,7 @@ import os
 import stat
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TypeVar
@@ -37,6 +38,145 @@ class AgentFeatureAccess(StrEnum):
     DISABLED = "disabled"
     ADMINS = "admins"
     EVERYONE = "everyone"
+
+
+class AgentSecurityPreset(StrEnum):
+    """Reviewed starting points for the agent's effective security boundary."""
+
+    PERSONAL_LAB = "personal_lab"
+    TRUSTED_ADMIN = "trusted_admin"
+    GUILD_ASSISTANT = "guild_assistant"
+    LEGACY_COMPATIBILITY = "legacy_compatibility"
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveSecurityPolicy:
+    """Secret-free effective policy suitable for logs and status presenters."""
+
+    configured_preset: str
+    effective_preset: str
+    preset_expires_at_epoch: int | None
+    preset_expired: bool
+    override_names: tuple[str, ...]
+    agent_enabled: bool
+    file_sandbox_enabled: bool
+    file_workspace_mode: str
+    information_flow_mode: str
+    read_aloud_audience_mode: str
+    high_risk_authorization_mode: str
+    autonomy_enabled: bool
+    autonomy_mode: str
+    autonomy_policy_mode: str
+    autonomy_max_runs: int
+    web_access: str
+    compute_access: str
+    image_access: str
+    shell_access: str
+    connector_access: str
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SecurityPresetDefaults:
+    file_sandbox_enabled: bool
+    file_workspace_mode: AgentFileWorkspaceMode
+    information_flow_mode: AgentInformationFlowMode
+    read_aloud_audience_mode: ReadAloudAudienceMode
+    high_risk_authorization_mode: AgentHighRiskAuthorizationMode
+    autonomy_enabled: bool
+    autonomy_mode: AgentAutonomyMode
+    autonomy_policy_mode: AgentAutonomyPolicyMode
+    autonomy_max_runs: int
+    web_access: AgentFeatureAccess
+    compute_access: AgentFeatureAccess
+    image_access: AgentFeatureAccess
+    shell_access: AgentFeatureAccess
+    connector_access: AgentFeatureAccess
+
+
+_SECURITY_PRESETS: dict[AgentSecurityPreset, _SecurityPresetDefaults] = {
+    AgentSecurityPreset.GUILD_ASSISTANT: _SecurityPresetDefaults(
+        file_sandbox_enabled=False,
+        file_workspace_mode=AgentFileWorkspaceMode.ACTOR_TASK,
+        information_flow_mode=AgentInformationFlowMode.ENFORCE,
+        read_aloud_audience_mode=ReadAloudAudienceMode.ENFORCE,
+        high_risk_authorization_mode=AgentHighRiskAuthorizationMode.BOUND_ONCE,
+        autonomy_enabled=False,
+        autonomy_mode=AgentAutonomyMode.OBSERVE,
+        autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
+        autonomy_max_runs=10,
+        web_access=AgentFeatureAccess.DISABLED,
+        compute_access=AgentFeatureAccess.DISABLED,
+        image_access=AgentFeatureAccess.DISABLED,
+        shell_access=AgentFeatureAccess.DISABLED,
+        connector_access=AgentFeatureAccess.DISABLED,
+    ),
+    AgentSecurityPreset.TRUSTED_ADMIN: _SecurityPresetDefaults(
+        file_sandbox_enabled=True,
+        file_workspace_mode=AgentFileWorkspaceMode.ACTOR,
+        information_flow_mode=AgentInformationFlowMode.ENFORCE,
+        read_aloud_audience_mode=ReadAloudAudienceMode.ENFORCE,
+        high_risk_authorization_mode=AgentHighRiskAuthorizationMode.BOUND_ONCE,
+        autonomy_enabled=False,
+        autonomy_mode=AgentAutonomyMode.OBSERVE,
+        autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
+        autonomy_max_runs=10,
+        web_access=AgentFeatureAccess.ADMINS,
+        compute_access=AgentFeatureAccess.ADMINS,
+        image_access=AgentFeatureAccess.ADMINS,
+        shell_access=AgentFeatureAccess.ADMINS,
+        connector_access=AgentFeatureAccess.ADMINS,
+    ),
+    AgentSecurityPreset.PERSONAL_LAB: _SecurityPresetDefaults(
+        file_sandbox_enabled=True,
+        file_workspace_mode=AgentFileWorkspaceMode.ACTOR,
+        information_flow_mode=AgentInformationFlowMode.ENFORCE,
+        read_aloud_audience_mode=ReadAloudAudienceMode.ENFORCE,
+        high_risk_authorization_mode=AgentHighRiskAuthorizationMode.BOUND_ONCE,
+        autonomy_enabled=False,
+        autonomy_mode=AgentAutonomyMode.OBSERVE,
+        autonomy_policy_mode=AgentAutonomyPolicyMode.STRICT,
+        autonomy_max_runs=10,
+        web_access=AgentFeatureAccess.EVERYONE,
+        compute_access=AgentFeatureAccess.EVERYONE,
+        image_access=AgentFeatureAccess.EVERYONE,
+        shell_access=AgentFeatureAccess.EVERYONE,
+        connector_access=AgentFeatureAccess.EVERYONE,
+    ),
+    AgentSecurityPreset.LEGACY_COMPATIBILITY: _SecurityPresetDefaults(
+        file_sandbox_enabled=True,
+        file_workspace_mode=AgentFileWorkspaceMode.GUILD_SHARED,
+        information_flow_mode=AgentInformationFlowMode.DISABLED,
+        read_aloud_audience_mode=ReadAloudAudienceMode.DISABLED,
+        high_risk_authorization_mode=AgentHighRiskAuthorizationMode.LEGACY_EVENT,
+        autonomy_enabled=False,
+        autonomy_mode=AgentAutonomyMode.OBSERVE,
+        autonomy_policy_mode=AgentAutonomyPolicyMode.LEGACY,
+        autonomy_max_runs=0,
+        web_access=AgentFeatureAccess.EVERYONE,
+        compute_access=AgentFeatureAccess.EVERYONE,
+        image_access=AgentFeatureAccess.EVERYONE,
+        shell_access=AgentFeatureAccess.EVERYONE,
+        connector_access=AgentFeatureAccess.EVERYONE,
+    ),
+}
+
+_SECURITY_OVERRIDE_NAMES = (
+    "AGENT_WEB_SEARCH_ACCESS",
+    "AGENT_SAFE_COMPUTE_ACCESS",
+    "IMAGE_GENERATION_ACCESS",
+    "AGENT_ISOLATED_SHELL_ACCESS",
+    "AGENT_CONNECTOR_ACCESS",
+    "AGENT_FILE_SANDBOX_ENABLED",
+    "AGENT_FILE_WORKSPACE_MODE",
+    "AGENT_INFORMATION_FLOW_MODE",
+    "READ_ALOUD_AUDIENCE_MODE",
+    "AGENT_HIGH_RISK_AUTHORIZATION_MODE",
+    "AGENT_AUTONOMY_ENABLED",
+    "AGENT_AUTONOMY_MODE",
+    "AGENT_AUTONOMY_POLICY_MODE",
+    "AGENT_AUTONOMY_MAX_RUNS",
+)
 
 
 PolicyModeT = TypeVar("PolicyModeT", bound=StrEnum)
@@ -114,6 +254,11 @@ class Settings:
     image_per_workspace_requests: int
     image_per_workspace_window_seconds: int
     image_max_pending_jobs: int
+    agent_security_preset: AgentSecurityPreset
+    agent_effective_security_preset: AgentSecurityPreset
+    agent_security_preset_expires_at: datetime | None
+    agent_security_preset_expired: bool
+    agent_security_override_names: tuple[str, ...]
     agent_enabled: bool
     agent_allowed_guild_ids: frozenset[str]
     agent_trusted_guild_ids: frozenset[str]
@@ -160,9 +305,22 @@ class Settings:
 
 
 def security_policy_warnings(settings: Settings) -> tuple[str, ...]:
-    """Describe reversible compatibility modes that need operator attention."""
+    """Describe effective combinations that need immediate operator attention."""
 
     warnings: list[str] = []
+    if settings.agent_security_preset_expired:
+        warnings.append(
+            "The configured security preset expired and its preset defaults were "
+            "replaced by guild_assistant. Review any individual environment overrides."
+        )
+    elif settings.agent_security_preset is AgentSecurityPreset.LEGACY_COMPATIBILITY:
+        expires_at = settings.agent_security_preset_expires_at
+        assert expires_at is not None
+        warnings.append(
+            "legacy_compatibility is active only until "
+            f"{expires_at.isoformat().replace('+00:00', 'Z')}; it restores wider "
+            "ambient authority and must remain temporary."
+        )
     if settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED:
         warnings.append(
             "AGENT_FILE_WORKSPACE_MODE=guild_shared uses one physical guild file "
@@ -170,7 +328,111 @@ def security_policy_warnings(settings: Settings) -> tuple[str, ...]:
             "collisions and trusted-internal maintenance paths have a wider blast "
             "radius; prefer actor or actor_task when compatibility is unnecessary."
         )
+    if settings.agent_information_flow_mode is not AgentInformationFlowMode.ENFORCE:
+        warnings.append(
+            "Information-flow enforcement is "
+            f"{settings.agent_information_flow_mode.value}; broader or uncertain "
+            "source-to-target disclosures are not blocked by the strict policy kernel."
+        )
+    if settings.read_aloud_audience_mode is not ReadAloudAudienceMode.ENFORCE:
+        warnings.append(
+            "Read-aloud audience enforcement is "
+            f"{settings.read_aloud_audience_mode.value}; voice listeners may receive "
+            "content they cannot read in its source channel."
+        )
+    if settings.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.LEGACY_EVENT:
+        warnings.append(
+            "High-risk authorization uses legacy_event instead of a one-use binding "
+            "to the exact capability, arguments, target, and message revision."
+        )
+    if settings.agent_isolated_shell_access is AgentFeatureAccess.EVERYONE:
+        warnings.append(
+            "The isolated host shell is granted to everyone; Seatbelt limits impact "
+            "but does not make arbitrary process execution a low-risk capability."
+        )
+    if settings.agent_connector_access is AgentFeatureAccess.EVERYONE:
+        warnings.append(
+            "External connector writes are granted to everyone; connector contracts "
+            "and receipts do not replace a narrow requester policy."
+        )
+    if (
+        settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED
+        and settings.agent_information_flow_mode
+        is not AgentInformationFlowMode.ENFORCE
+    ):
+        warnings.append(
+            "Unsafe combination: guild_shared files and non-enforcing information "
+            "flow widen both the data namespace and its possible disclosure path."
+        )
+    if (
+        settings.agent_high_risk_authorization_mode
+        is AgentHighRiskAuthorizationMode.LEGACY_EVENT
+        and (
+            settings.agent_isolated_shell_access is not AgentFeatureAccess.DISABLED
+            or settings.agent_connector_access is not AgentFeatureAccess.DISABLED
+        )
+    ):
+        warnings.append(
+            "Unsafe combination: legacy_event authorization is active while shell or "
+            "connector effects are enabled; exact arguments and targets are not bound once."
+        )
+    if settings.agent_autonomy_enabled:
+        if settings.agent_autonomy_mode is AgentAutonomyMode.ACT:
+            warnings.append(
+                "Autonomy act mode is enabled; spontaneous events may produce external "
+                "effects within the effective autonomy policy and finite budgets."
+            )
+        if settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY:
+            warnings.append(
+                "Autonomy uses the legacy BOT-principal authority profile instead of "
+                "event-scoped strict authority."
+            )
+        if settings.agent_autonomy_max_runs == 0:
+            warnings.append(
+                "Autonomy has no run-count ceiling; configure a finite "
+                "AGENT_AUTONOMY_MAX_RUNS before unattended operation."
+            )
+        if (
+            settings.agent_autonomy_mode is AgentAutonomyMode.ACT
+            and settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
+        ):
+            warnings.append(
+                "Unsafe combination: autonomy act and the legacy BOT-principal policy "
+                "compose spontaneous effects with ambient service authority."
+            )
     return tuple(warnings)
+
+
+def effective_security_policy(settings: Settings) -> EffectiveSecurityPolicy:
+    """Return the exact effective boundary without secrets or Discord identifiers."""
+
+    return EffectiveSecurityPolicy(
+        configured_preset=settings.agent_security_preset.value,
+        effective_preset=settings.agent_effective_security_preset.value,
+        preset_expires_at_epoch=(
+            int(settings.agent_security_preset_expires_at.timestamp())
+            if settings.agent_security_preset_expires_at is not None
+            else None
+        ),
+        preset_expired=settings.agent_security_preset_expired,
+        override_names=settings.agent_security_override_names,
+        agent_enabled=settings.agent_enabled,
+        file_sandbox_enabled=settings.agent_file_sandbox_enabled,
+        file_workspace_mode=settings.agent_file_workspace_mode.value,
+        information_flow_mode=settings.agent_information_flow_mode.value,
+        read_aloud_audience_mode=settings.read_aloud_audience_mode.value,
+        high_risk_authorization_mode=(settings.agent_high_risk_authorization_mode.value),
+        autonomy_enabled=settings.agent_autonomy_enabled,
+        autonomy_mode=settings.agent_autonomy_mode.value,
+        autonomy_policy_mode=settings.agent_autonomy_policy_mode.value,
+        autonomy_max_runs=settings.agent_autonomy_max_runs,
+        web_access=settings.agent_web_search_access.value,
+        compute_access=settings.agent_safe_compute_access.value,
+        image_access=settings.image_generation_access.value,
+        shell_access=settings.agent_isolated_shell_access.value,
+        connector_access=settings.agent_connector_access.value,
+        warnings=security_policy_warnings(settings),
+    )
 
 
 def _required(name: str) -> str:
@@ -334,15 +596,11 @@ def _voicevox_base_url() -> str:
 def _optional_voicevox_engine_path() -> Path | None:
     raw_path = os.getenv("VOICEVOX_ENGINE_PATH", "").strip()
     if not raw_path:
-        default_path = (
-            Path.home() / "Applications" / "voicevox-engine" / "macos-arm64" / "run"
-        )
+        default_path = Path.home() / "Applications" / "voicevox-engine" / "macos-arm64" / "run"
         return default_path.resolve() if default_path.is_file() else None
     path = Path(raw_path).expanduser().resolve()
     if not path.is_file():
-        raise ConfigurationError(
-            "VOICEVOX_ENGINE_PATH does not point to an existing executable."
-        )
+        raise ConfigurationError("VOICEVOX_ENGINE_PATH does not point to an existing executable.")
     if not os.access(path, os.X_OK):
         raise ConfigurationError("VOICEVOX_ENGINE_PATH is not executable.")
     return path
@@ -377,6 +635,48 @@ def _policy_mode(
     except ValueError as exc:
         choices = ", ".join(item.value for item in mode_type)
         raise ConfigurationError(f"{name} must be one of: {choices}.") from exc
+
+
+def _security_preset(
+    *,
+    now: datetime,
+) -> tuple[AgentSecurityPreset, AgentSecurityPreset, datetime | None, bool]:
+    raw_value = (
+        os.getenv(
+            "AGENT_SECURITY_PRESET",
+            AgentSecurityPreset.GUILD_ASSISTANT.value,
+        )
+        .strip()
+        .lower()
+    )
+    try:
+        configured = AgentSecurityPreset(raw_value)
+    except ValueError as exc:
+        choices = ", ".join(item.value for item in AgentSecurityPreset)
+        raise ConfigurationError(f"AGENT_SECURITY_PRESET must be one of: {choices}.") from exc
+
+    raw_expiry = os.getenv("AGENT_SECURITY_PRESET_EXPIRES_AT", "").strip()
+    expires_at: datetime | None = None
+    if raw_expiry:
+        try:
+            expires_at = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ConfigurationError(
+                "AGENT_SECURITY_PRESET_EXPIRES_AT must be an RFC 3339 timestamp."
+            ) from exc
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ConfigurationError("AGENT_SECURITY_PRESET_EXPIRES_AT must include a UTC offset.")
+        expires_at = expires_at.astimezone(UTC)
+    if configured is AgentSecurityPreset.LEGACY_COMPATIBILITY and expires_at is None:
+        raise ConfigurationError(
+            "AGENT_SECURITY_PRESET_EXPIRES_AT is required when "
+            "AGENT_SECURITY_PRESET=legacy_compatibility."
+        )
+
+    normalized_now = now.astimezone(UTC)
+    expired = expires_at is not None and expires_at <= normalized_now
+    effective = AgentSecurityPreset.GUILD_ASSISTANT if expired else configured
+    return configured, effective, expires_at, expired
 
 
 def _snowflake_set(name: str) -> frozenset[str]:
@@ -432,10 +732,28 @@ def _optional_private_executable(name: str) -> Path | None:
     return path
 
 
-def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
+def load_settings(
+    *,
+    dotenv_path: str | Path = ".env",
+    now: datetime | None = None,
+) -> Settings:
     """Load settings without overriding variables already set by the process."""
 
     load_dotenv(dotenv_path=dotenv_path, override=False)
+
+    security_now = now or datetime.now(UTC)
+    if security_now.tzinfo is None or security_now.utcoffset() is None:
+        raise ConfigurationError("load_settings now must include a UTC offset.")
+    (
+        agent_security_preset,
+        agent_effective_security_preset,
+        agent_security_preset_expires_at,
+        agent_security_preset_expired,
+    ) = _security_preset(now=security_now)
+    security_defaults = _SECURITY_PRESETS[agent_effective_security_preset]
+    agent_security_override_names = tuple(
+        name for name in _SECURITY_OVERRIDE_NAMES if name in os.environ
+    )
 
     raw_application_id = _required("DISCORD_APPLICATION_ID")
     try:
@@ -492,11 +810,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     voicevox_base_url = _voicevox_base_url()
     voicevox_engine_path = _optional_voicevox_engine_path()
     voicevox_auto_start = _boolean("VOICEVOX_AUTO_START", True)
-    if (
-        tts_provider == "voicevox"
-        and voicevox_auto_start
-        and voicevox_engine_path is None
-    ):
+    if tts_provider == "voicevox" and voicevox_auto_start and voicevox_engine_path is None:
         raise ConfigurationError(
             "VOICEVOX_ENGINE_PATH is required when VOICEVOX_AUTO_START is enabled."
         )
@@ -507,9 +821,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     agent_allowed_guild_ids = _snowflake_set("AGENT_ALLOWED_GUILD_IDS")
     agent_trusted_guild_ids = _snowflake_set("AGENT_TRUSTED_GUILD_IDS")
     agent_admin_user_ids = _snowflake_set("AGENT_ADMIN_USER_IDS")
-    agent_rate_limit_exempt_user_ids = _snowflake_set(
-        "AGENT_RATE_LIMIT_EXEMPT_USER_IDS"
-    )
+    agent_rate_limit_exempt_user_ids = _snowflake_set("AGENT_RATE_LIMIT_EXEMPT_USER_IDS")
     agent_autonomy_guild_ids = _snowflake_set("AGENT_AUTONOMY_GUILD_IDS")
     if not agent_trusted_guild_ids <= agent_allowed_guild_ids:
         raise ConfigurationError(
@@ -534,53 +846,46 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         50,
         maximum=10_000,
     )
-    if (
-        agent_autonomy_max_pending_events_per_channel
-        > agent_autonomy_max_pending_events
-    ):
+    if agent_autonomy_max_pending_events_per_channel > agent_autonomy_max_pending_events:
         raise ConfigurationError(
             "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_CHANNEL must not exceed "
             "AGENT_AUTONOMY_MAX_PENDING_EVENTS."
         )
-    if (
-        agent_autonomy_max_pending_events_per_actor
-        > agent_autonomy_max_pending_events
-    ):
+    if agent_autonomy_max_pending_events_per_actor > agent_autonomy_max_pending_events:
         raise ConfigurationError(
             "AGENT_AUTONOMY_MAX_PENDING_EVENTS_PER_ACTOR must not exceed "
             "AGENT_AUTONOMY_MAX_PENDING_EVENTS."
         )
     agent_web_search_access = _feature_access(
         "AGENT_WEB_SEARCH_ACCESS",
-        AgentFeatureAccess.DISABLED,
+        security_defaults.web_access,
     )
     agent_safe_compute_access = _feature_access(
         "AGENT_SAFE_COMPUTE_ACCESS",
-        AgentFeatureAccess.DISABLED,
+        security_defaults.compute_access,
     )
     agent_isolated_shell_access = _feature_access(
         "AGENT_ISOLATED_SHELL_ACCESS",
-        AgentFeatureAccess.DISABLED,
+        security_defaults.shell_access,
     )
     agent_connector_access = _feature_access(
         "AGENT_CONNECTOR_ACCESS",
-        AgentFeatureAccess.DISABLED,
+        security_defaults.connector_access,
     )
     agent_file_sandbox_enabled = _boolean(
         "AGENT_FILE_SANDBOX_ENABLED",
-        False,
+        security_defaults.file_sandbox_enabled,
     )
     if (
         agent_safe_compute_access is not AgentFeatureAccess.DISABLED
         and not agent_file_sandbox_enabled
     ):
         raise ConfigurationError(
-            "AGENT_FILE_SANDBOX_ENABLED must be true when "
-            "AGENT_SAFE_COMPUTE_ACCESS is enabled."
+            "AGENT_FILE_SANDBOX_ENABLED must be true when AGENT_SAFE_COMPUTE_ACCESS is enabled."
         )
     image_generation_access = _feature_access(
         "IMAGE_GENERATION_ACCESS",
-        AgentFeatureAccess.DISABLED,
+        security_defaults.image_access,
     )
     if (
         AgentFeatureAccess.ADMINS
@@ -595,10 +900,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         raise ConfigurationError(
             "AGENT_ADMIN_USER_IDS is required when an agent feature is admin-only."
         )
-    if (
-        image_generation_access is AgentFeatureAccess.ADMINS
-        and not agent_admin_user_ids
-    ):
+    if image_generation_access is AgentFeatureAccess.ADMINS and not agent_admin_user_ids:
         raise ConfigurationError(
             "AGENT_ADMIN_USER_IDS is required when image generation is admin-only."
         )
@@ -635,8 +937,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
     )
     if local_media_cache_bytes < local_media_max_file_bytes:
         raise ConfigurationError(
-            "LOCAL_MEDIA_CACHE_BYTES cannot be smaller than "
-            "LOCAL_MEDIA_MAX_FILE_BYTES."
+            "LOCAL_MEDIA_CACHE_BYTES cannot be smaller than LOCAL_MEDIA_MAX_FILE_BYTES."
         )
 
     data_retention_days = _positive_int(
@@ -644,13 +945,10 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         30,
         maximum=3_650,
     )
-    max_data_size_bytes = (
-        _positive_int("MAX_DATA_SIZE_GB", 10, maximum=100) * 1_000_000_000
-    )
+    max_data_size_bytes = _positive_int("MAX_DATA_SIZE_GB", 10, maximum=100) * 1_000_000_000
     if local_media_cache_bytes > max_data_size_bytes:
         raise ConfigurationError(
-            "LOCAL_MEDIA_SIZE_GB/LOCAL_MEDIA_CACHE_BYTES cannot exceed "
-            "MAX_DATA_SIZE_GB."
+            "LOCAL_MEDIA_SIZE_GB/LOCAL_MEDIA_CACHE_BYTES cannot exceed MAX_DATA_SIZE_GB."
         )
 
     return Settings(
@@ -664,21 +962,11 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             "DISCORD_PRESENCE_INTENT_ENABLED",
             False,
         ),
-        discord_emoji_loading_id=_optional_snowflake(
-            "DISCORD_EMOJI_LOADING_ID"
-        ),
-        discord_emoji_success_id=_optional_snowflake(
-            "DISCORD_EMOJI_SUCCESS_ID"
-        ),
-        discord_emoji_warning_id=_optional_snowflake(
-            "DISCORD_EMOJI_WARNING_ID"
-        ),
-        discord_emoji_audio_wave_id=_optional_snowflake(
-            "DISCORD_EMOJI_AUDIO_WAVE_ID"
-        ),
-        discord_emoji_radio_id=_optional_snowflake(
-            "DISCORD_EMOJI_RADIO_ID"
-        ),
+        discord_emoji_loading_id=_optional_snowflake("DISCORD_EMOJI_LOADING_ID"),
+        discord_emoji_success_id=_optional_snowflake("DISCORD_EMOJI_SUCCESS_ID"),
+        discord_emoji_warning_id=_optional_snowflake("DISCORD_EMOJI_WARNING_ID"),
+        discord_emoji_audio_wave_id=_optional_snowflake("DISCORD_EMOJI_AUDIO_WAVE_ID"),
+        discord_emoji_radio_id=_optional_snowflake("DISCORD_EMOJI_RADIO_ID"),
         activity_enabled=activity_enabled,
         activity_client_secret=activity_client_secret,
         activity_host=_text("DISCORD_ACTIVITY_HOST", "127.0.0.1"),
@@ -699,9 +987,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         tts_provider=tts_provider,
         tts_voice=tts_voice,
         voicevox_base_url=voicevox_base_url,
-        voicevox_speaker_id=_bounded_int(
-            "VOICEVOX_SPEAKER_ID", 3, minimum=0, maximum=65_535
-        ),
+        voicevox_speaker_id=_bounded_int("VOICEVOX_SPEAKER_ID", 3, minimum=0, maximum=65_535),
         voicevox_preset_clear_id=_bounded_int(
             "VOICEVOX_PRESET_CLEAR_ID", 2, minimum=0, maximum=65_535
         ),
@@ -719,9 +1005,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         voicevox_engine_path=voicevox_engine_path,
         voicevox_auto_start=voicevox_auto_start,
-        voicevox_timeout_seconds=_positive_float(
-            "VOICEVOX_TIMEOUT_SECONDS", 30.0, maximum=120.0
-        ),
+        voicevox_timeout_seconds=_positive_float("VOICEVOX_TIMEOUT_SECONDS", 30.0, maximum=120.0),
         voicevox_readiness_ttl_seconds=_positive_float(
             "VOICEVOX_READINESS_TTL_SECONDS",
             5.0,
@@ -732,7 +1016,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         read_aloud_audience_mode=_policy_mode(
             "READ_ALOUD_AUDIENCE_MODE",
-            ReadAloudAudienceMode.ENFORCE,
+            security_defaults.read_aloud_audience_mode,
             ReadAloudAudienceMode,
         ),
         max_pending_speech=_positive_int("MAX_PENDING_SPEECH", 20, maximum=100),
@@ -751,9 +1035,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         max_concurrent_media=max_concurrent_media,
         max_concurrent_media_per_guild=max_concurrent_media_per_guild,
         max_active_voice_guilds=_positive_int("MAX_ACTIVE_VOICE_GUILDS", 8, maximum=100),
-        download_timeout_seconds=_positive_float(
-            "DOWNLOAD_TIMEOUT_SECONDS", 180.0, maximum=900.0
-        ),
+        download_timeout_seconds=_positive_float("DOWNLOAD_TIMEOUT_SECONDS", 180.0, maximum=900.0),
         local_media_max_file_bytes=local_media_max_file_bytes,
         local_media_cache_bytes=local_media_cache_bytes,
         local_media_max_duration_seconds=_positive_float(
@@ -762,9 +1044,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             maximum=86_400.0,
         ),
         translation_enabled=_boolean("TRANSLATION_ENABLED", True),
-        translation_helper_path=_optional_private_executable(
-            "TRANSLATION_HELPER_PATH"
-        ),
+        translation_helper_path=_optional_private_executable("TRANSLATION_HELPER_PATH"),
         translation_timeout_seconds=_positive_float(
             "TRANSLATION_TIMEOUT_SECONDS",
             30.0,
@@ -845,6 +1125,11 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             10,
             maximum=100,
         ),
+        agent_security_preset=agent_security_preset,
+        agent_effective_security_preset=agent_effective_security_preset,
+        agent_security_preset_expires_at=agent_security_preset_expires_at,
+        agent_security_preset_expired=agent_security_preset_expired,
+        agent_security_override_names=agent_security_override_names,
         agent_enabled=_boolean("AGENT_ENABLED", False),
         agent_allowed_guild_ids=agent_allowed_guild_ids,
         agent_trusted_guild_ids=agent_trusted_guild_ids,
@@ -857,17 +1142,17 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_file_sandbox_enabled=agent_file_sandbox_enabled,
         agent_file_workspace_mode=_policy_mode(
             "AGENT_FILE_WORKSPACE_MODE",
-            AgentFileWorkspaceMode.ACTOR_TASK,
+            security_defaults.file_workspace_mode,
             AgentFileWorkspaceMode,
         ),
         agent_information_flow_mode=_policy_mode(
             "AGENT_INFORMATION_FLOW_MODE",
-            AgentInformationFlowMode.ENFORCE,
+            security_defaults.information_flow_mode,
             AgentInformationFlowMode,
         ),
         agent_high_risk_authorization_mode=_policy_mode(
             "AGENT_HIGH_RISK_AUTHORIZATION_MODE",
-            AgentHighRiskAuthorizationMode.BOUND_ONCE,
+            security_defaults.high_risk_authorization_mode,
             AgentHighRiskAuthorizationMode,
         ),
         agent_high_risk_confirmation_timeout_seconds=_bounded_int(
@@ -956,15 +1241,18 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
             6,
             maximum=10_000,
         ),
-        agent_autonomy_enabled=_boolean("AGENT_AUTONOMY_ENABLED", False),
+        agent_autonomy_enabled=_boolean(
+            "AGENT_AUTONOMY_ENABLED",
+            security_defaults.autonomy_enabled,
+        ),
         agent_autonomy_guild_ids=agent_autonomy_guild_ids,
         agent_autonomy_mode=_autonomy_mode(
             "AGENT_AUTONOMY_MODE",
-            AgentAutonomyMode.OBSERVE,
+            security_defaults.autonomy_mode,
         ),
         agent_autonomy_policy_mode=_policy_mode(
             "AGENT_AUTONOMY_POLICY_MODE",
-            AgentAutonomyPolicyMode.STRICT,
+            security_defaults.autonomy_policy_mode,
             AgentAutonomyPolicyMode,
         ),
         agent_autonomy_batch_seconds=_bounded_int(
@@ -975,7 +1263,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         ),
         agent_autonomy_max_runs=_bounded_int(
             "AGENT_AUTONOMY_MAX_RUNS",
-            10,
+            security_defaults.autonomy_max_runs,
             minimum=0,
             maximum=1_000,
         ),
@@ -989,9 +1277,7 @@ def load_settings(*, dotenv_path: str | Path = ".env") -> Settings:
         agent_autonomy_max_pending_events_per_channel=(
             agent_autonomy_max_pending_events_per_channel
         ),
-        agent_autonomy_max_pending_events_per_actor=(
-            agent_autonomy_max_pending_events_per_actor
-        ),
+        agent_autonomy_max_pending_events_per_actor=(agent_autonomy_max_pending_events_per_actor),
     )
 
 

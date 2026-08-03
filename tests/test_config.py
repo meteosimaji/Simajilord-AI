@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ from simajilord.agent import (
 )
 from simajilord.config import (
     AgentFeatureAccess,
+    AgentSecurityPreset,
+    effective_security_policy,
     load_settings,
     security_policy_warnings,
 )
@@ -22,6 +25,8 @@ from simajilord.core.errors import ConfigurationError
 from simajilord.integrations.discord.bot import _gateway_intents
 
 _AGENT_ENVIRONMENT_NAMES = (
+    "AGENT_SECURITY_PRESET",
+    "AGENT_SECURITY_PRESET_EXPIRES_AT",
     "AGENT_ENABLED",
     "AGENT_ALLOWED_GUILD_IDS",
     "AGENT_TRUSTED_GUILD_IDS",
@@ -31,6 +36,7 @@ _AGENT_ENVIRONMENT_NAMES = (
     "AGENT_SAFE_COMPUTE_ACCESS",
     "AGENT_ISOLATED_SHELL_ACCESS",
     "AGENT_CONNECTOR_ACCESS",
+    "IMAGE_GENERATION_ACCESS",
     "AGENT_FILE_SANDBOX_ENABLED",
     "AGENT_FILE_WORKSPACE_MODE",
     "AGENT_INFORMATION_FLOW_MODE",
@@ -150,6 +156,10 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_autonomy_batch_seconds == 10
     assert settings.agent_autonomy_max_runs == 10
     assert settings.agent_autonomy_max_pending_events_per_actor == 50
+    assert settings.agent_security_preset is AgentSecurityPreset.GUILD_ASSISTANT
+    assert settings.agent_effective_security_preset is AgentSecurityPreset.GUILD_ASSISTANT
+    assert settings.agent_security_preset_expires_at is None
+    assert settings.agent_security_preset_expired is False
     assert settings.agent_isolated_shell_access is AgentFeatureAccess.DISABLED
     assert settings.agent_connector_access is AgentFeatureAccess.DISABLED
     assert settings.codex_expected_version_prefix == "0.146."
@@ -223,10 +233,7 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.agent_file_sandbox_enabled is True
     assert settings.agent_file_workspace_mode is AgentFileWorkspaceMode.ACTOR_TASK
     assert settings.agent_information_flow_mode is AgentInformationFlowMode.ENFORCE
-    assert (
-        settings.agent_high_risk_authorization_mode
-        is AgentHighRiskAuthorizationMode.BOUND_ONCE
-    )
+    assert settings.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.BOUND_ONCE
     assert settings.agent_high_risk_confirmation_timeout_seconds == 120
     assert settings.agent_curated_skills_enabled is False
     assert settings.web_search_base_url == "http://127.0.0.1:8888"
@@ -252,6 +259,121 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.activity_enabled is False
     assert settings.activity_client_secret is None
     assert security_policy_warnings(settings) == ()
+
+
+@pytest.mark.parametrize(
+    ("preset", "workspace_mode", "web_access", "shell_access"),
+    (
+        (
+            AgentSecurityPreset.GUILD_ASSISTANT,
+            AgentFileWorkspaceMode.ACTOR_TASK,
+            AgentFeatureAccess.DISABLED,
+            AgentFeatureAccess.DISABLED,
+        ),
+        (
+            AgentSecurityPreset.TRUSTED_ADMIN,
+            AgentFileWorkspaceMode.ACTOR,
+            AgentFeatureAccess.ADMINS,
+            AgentFeatureAccess.ADMINS,
+        ),
+        (
+            AgentSecurityPreset.PERSONAL_LAB,
+            AgentFileWorkspaceMode.ACTOR,
+            AgentFeatureAccess.EVERYONE,
+            AgentFeatureAccess.EVERYONE,
+        ),
+    ),
+)
+def test_reviewed_security_presets_supply_typed_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    preset: AgentSecurityPreset,
+    workspace_mode: AgentFileWorkspaceMode,
+    web_access: AgentFeatureAccess,
+    shell_access: AgentFeatureAccess,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_SECURITY_PRESET", preset.value)
+    if preset is AgentSecurityPreset.TRUSTED_ADMIN:
+        monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "30")
+
+    settings = load_settings(dotenv_path=dotenv_path)
+
+    assert settings.agent_security_preset is preset
+    assert settings.agent_effective_security_preset is preset
+    assert settings.agent_file_workspace_mode is workspace_mode
+    assert settings.agent_web_search_access is web_access
+    assert settings.agent_isolated_shell_access is shell_access
+    assert settings.agent_autonomy_enabled is False
+    assert settings.agent_autonomy_mode is AgentAutonomyMode.OBSERVE
+
+
+def test_legacy_compatibility_requires_expiry_and_reverts_to_safe_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+    monkeypatch.setenv(
+        "AGENT_SECURITY_PRESET",
+        AgentSecurityPreset.LEGACY_COMPATIBILITY.value,
+    )
+
+    with pytest.raises(ConfigurationError, match="EXPIRES_AT is required"):
+        load_settings(dotenv_path=dotenv_path, now=now)
+
+    monkeypatch.setenv(
+        "AGENT_SECURITY_PRESET_EXPIRES_AT",
+        (now + timedelta(hours=2)).isoformat(),
+    )
+    active = load_settings(dotenv_path=dotenv_path, now=now)
+    assert active.agent_effective_security_preset is AgentSecurityPreset.LEGACY_COMPATIBILITY
+    assert active.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED
+    assert active.agent_information_flow_mode is AgentInformationFlowMode.DISABLED
+    assert active.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.LEGACY_EVENT
+    assert active.agent_autonomy_enabled is False
+    assert active.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
+
+    expired = load_settings(dotenv_path=dotenv_path, now=now + timedelta(hours=3))
+    assert expired.agent_security_preset is AgentSecurityPreset.LEGACY_COMPATIBILITY
+    assert expired.agent_effective_security_preset is AgentSecurityPreset.GUILD_ASSISTANT
+    assert expired.agent_security_preset_expired is True
+    assert expired.agent_file_workspace_mode is AgentFileWorkspaceMode.ACTOR_TASK
+    assert expired.agent_information_flow_mode is AgentInformationFlowMode.ENFORCE
+    assert expired.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.BOUND_ONCE
+    assert expired.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
+    assert any("expired" in item for item in security_policy_warnings(expired))
+
+
+def test_security_preset_individual_environment_overrides_are_effective(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_SECURITY_PRESET", "personal_lab")
+    monkeypatch.setenv("AGENT_ISOLATED_SHELL_ACCESS", "disabled")
+    monkeypatch.setenv("AGENT_CONNECTOR_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "30")
+    monkeypatch.setenv("AGENT_FILE_WORKSPACE_MODE", "actor_task")
+
+    settings = load_settings(dotenv_path=dotenv_path)
+    policy = effective_security_policy(settings)
+
+    assert settings.agent_isolated_shell_access is AgentFeatureAccess.DISABLED
+    assert settings.agent_connector_access is AgentFeatureAccess.ADMINS
+    assert settings.agent_file_workspace_mode is AgentFileWorkspaceMode.ACTOR_TASK
+    assert policy.effective_preset == "personal_lab"
+    assert policy.shell_access == "disabled"
+    assert policy.connector_access == "admins"
+    assert policy.file_workspace_mode == "actor_task"
+    assert policy.override_names == (
+        "AGENT_ISOLATED_SHELL_ACCESS",
+        "AGENT_CONNECTOR_ACCESS",
+        "AGENT_FILE_WORKSPACE_MODE",
+    )
+    rendered = repr(policy)
+    assert "30" not in rendered
+    assert "test-token" not in rendered
 
 
 def test_safe_compute_requires_the_isolated_file_workspace(
@@ -311,14 +433,38 @@ def test_security_policy_compatibility_modes_are_typed(
     assert settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED
     assert settings.agent_information_flow_mode is AgentInformationFlowMode.DISABLED
     assert (
-        settings.agent_high_risk_authorization_mode
-        is AgentHighRiskAuthorizationMode.LEGACY_EVENT
+        settings.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.LEGACY_EVENT
     )
     assert settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
     warnings = security_policy_warnings(settings)
-    assert len(warnings) == 1
-    assert "AGENT_FILE_WORKSPACE_MODE=guild_shared" in warnings[0]
-    assert "Per-actor ownership checks remain enforced" in warnings[0]
+    assert any(
+        "AGENT_FILE_WORKSPACE_MODE=guild_shared" in warning
+        and "Per-actor ownership checks remain enforced" in warning
+        for warning in warnings
+    )
+    assert any("Information-flow enforcement is disabled" in item for item in warnings)
+    assert any("Read-aloud audience enforcement is audit" in item for item in warnings)
+    assert any("legacy_event" in item for item in warnings)
+    assert any("Unsafe combination: guild_shared" in item for item in warnings)
+
+
+def test_unsafe_autonomy_and_effect_combinations_are_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "30")
+    monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "true")
+    monkeypatch.setenv("AGENT_ISOLATED_SHELL_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_HIGH_RISK_AUTHORIZATION_MODE", "legacy_event")
+    monkeypatch.setenv("AGENT_AUTONOMY_ENABLED", "true")
+    monkeypatch.setenv("AGENT_AUTONOMY_MODE", "act")
+    monkeypatch.setenv("AGENT_AUTONOMY_POLICY_MODE", "legacy")
+
+    warnings = security_policy_warnings(load_settings(dotenv_path=dotenv_path))
+
+    assert any("shell or connector effects" in item for item in warnings)
+    assert any("autonomy act and the legacy" in item for item in warnings)
 
 
 def test_autonomy_per_channel_queue_cannot_exceed_global_queue(

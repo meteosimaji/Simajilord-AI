@@ -776,9 +776,7 @@ _ERROR_MESSAGES = {
     "files.publication_audience_changed": (
         "The source file or sharing audience changed. Inspect the target again."
     ),
-    "files.publication_target_mismatch": (
-        "That file copy is bound to a different Discord target."
-    ),
+    "files.publication_target_mismatch": ("That file copy is bound to a different Discord target."),
     "files.publication_expired": "That file-sharing copy has expired.",
     "files.publication_revoked": "That file-sharing copy was revoked.",
     "discord.bulk_delete_message_too_old": (
@@ -994,6 +992,18 @@ def _storage_size(value: int) -> str:
             return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
         amount /= 1024.0
     raise AssertionError("unreachable")
+
+
+def _security_warning_summary(warnings: tuple[str, ...]) -> str:
+    if not warnings:
+        return "**None**"
+    lines: list[str] = []
+    for warning in warnings[:4]:
+        bounded = warning if len(warning) <= 210 else f"{warning[:207]}..."
+        lines.append(f"• {bounded}")
+    if len(warnings) > len(lines):
+        lines.append(f"• and {len(warnings) - len(lines)} more warning(s)")
+    return "\n".join(lines)
 
 
 def _read_aloud_mode_label(mode: str | None) -> str:
@@ -4069,6 +4079,68 @@ class SystemCog(commands.Cog):
                         ),
                     ),
                     EmbedField(
+                        "Effective security boundary",
+                        (
+                            f"Preset: **{response.security_effective_preset}**"
+                            + (
+                                f" (configured: {response.security_configured_preset})"
+                                if response.security_configured_preset
+                                != response.security_effective_preset
+                                else ""
+                            )
+                            + (
+                                "\nPreset expiry: "
+                                f"<t:{response.security_preset_expires_at_epoch}:F>"
+                                if response.security_preset_expires_at_epoch is not None
+                                else "\nPreset expiry: **None**"
+                            )
+                            + f"\nFile workspace: **{response.security_file_workspace_mode}**"
+                            + (
+                                " · sandbox enabled"
+                                if response.security_file_sandbox_enabled
+                                else " · sandbox disabled"
+                            )
+                            + f"\nInformation flow: **{response.security_information_flow_mode}**"
+                            + f" · Read aloud: **{response.security_read_aloud_audience_mode}**"
+                            + "\nHigh-risk authorization: "
+                            f"**{response.security_high_risk_authorization_mode}**"
+                            + f"\nIndividual overrides: **{len(response.security_override_names)}**"
+                        ),
+                        inline=False,
+                    ),
+                    EmbedField(
+                        "Effective AI access policy",
+                        (
+                            f"Web: **{response.security_web_access}**"
+                            f" · Compute: **{response.security_compute_access}**"
+                            f" · Image: **{response.security_image_access}**"
+                            f"\nShell: **{response.security_shell_access}**"
+                            f" · Connectors: **{response.security_connector_access}**"
+                        ),
+                        inline=False,
+                    ),
+                    EmbedField(
+                        "Autonomy boundary",
+                        (
+                            "Enabled: "
+                            f"**{'Yes' if response.security_autonomy_enabled else 'No'}**"
+                            f" · Mode: **{response.security_autonomy_mode}**"
+                            f" · Policy: **{response.security_autonomy_policy_mode}**"
+                            "\nRun ceiling: "
+                            + (
+                                "**Unbounded**"
+                                if response.security_autonomy_max_runs == 0
+                                else f"**{response.security_autonomy_max_runs}**"
+                            )
+                        ),
+                        inline=False,
+                    ),
+                    EmbedField(
+                        "Security warnings",
+                        _security_warning_summary(response.security_warnings),
+                        inline=False,
+                    ),
+                    EmbedField(
                         "Storage",
                         (
                             f"Used: **{_storage_size(response.storage_used_bytes)}** / "
@@ -4118,7 +4190,7 @@ class SystemCog(commands.Cog):
                         inline=False,
                     ),
                 ),
-                tone=EmbedTone.SUCCESS,
+                tone=(EmbedTone.WARNING if response.security_warnings else EmbedTone.SUCCESS),
             )
         )
 
