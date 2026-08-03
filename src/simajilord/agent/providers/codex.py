@@ -14,10 +14,16 @@ from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Literal, cast
 
+from simajilord.capabilities.high_risk_plan import (
+    MAX_HIGH_RISK_PLAN_ACTIONS,
+    HighRiskPlanRequest,
+    high_risk_plan_request_from_arguments,
+)
 from simajilord.capabilities.isolated_shell import discord_workspace_for_context
 from simajilord.core import (
     DisclosureClass,
@@ -67,6 +73,11 @@ from ..contracts import (
     AGENT_NO_ACTION_CONTENT,
     AGENT_WEB_GRANT,
     AgentHighRiskConfirmation,
+    AgentHighRiskPlanAction,
+    AgentHighRiskPlanActionOutcome,
+    AgentHighRiskPlanActionStatus,
+    AgentHighRiskPlanStatus,
+    AgentHighRiskPlanStatusUpdate,
     AgentHighRiskPresentation,
     AgentHighRiskReviewField,
     AgentProgressStage,
@@ -86,6 +97,7 @@ from ..high_risk import HighRiskPresentationError, high_risk_presentation
 from ..tools import AgentToolCatalog
 from .base import (
     AgentHighRiskConfirmationCallback,
+    AgentHighRiskPlanStatusCallback,
     AgentProgressCallback,
     AgentProviderThreadBindingSink,
     AgentToolTraceSink,
@@ -243,6 +255,38 @@ class _TaskRouteCandidateState:
 
 
 @dataclass(slots=True)
+class _BoundHighRiskPlanAction:
+    """One immutable effect identity plus its body-free execution outcome."""
+
+    position: int
+    capability: str
+    contract_id: str
+    fingerprint: str
+    argument_template: dict[str, object]
+    presentation: AgentHighRiskPresentation
+    status: AgentHighRiskPlanActionStatus = AgentHighRiskPlanActionStatus.PENDING
+    tool_call_id: str | None = None
+    action_receipt_id: str | None = None
+    external_effect_id: str | None = None
+    error_code: str | None = None
+    result_bindings: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _BoundHighRiskPlan:
+    """One confirmed ordered plan; no unreviewed action slots can be added."""
+
+    plan_id: str
+    binding_sha256: str
+    authorization_event_id: str
+    max_actions: int
+    expires_in_seconds: int
+    expires_at: datetime
+    actions: list[_BoundHighRiskPlanAction]
+    status: AgentHighRiskPlanStatus = AgentHighRiskPlanStatus.CONFIRMED
+
+
+@dataclass(slots=True)
 class _ToolTurnBudget:
     context: InvocationContext
     calls_remaining: int | None
@@ -250,6 +294,7 @@ class _ToolTurnBudget:
     on_progress: AgentProgressCallback | None
     required_message_id: str | None
     on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None
+    on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None = None
     evidence_anchor_message_id: str | None = None
     authorization_contexts: dict[str, InvocationContext] = field(default_factory=dict)
     authorization_message_ids: dict[str, str | None] = field(default_factory=dict)
@@ -260,9 +305,7 @@ class _ToolTurnBudget:
     read_follow_up_message_ids: set[str] = field(default_factory=set)
     follow_up_evidence_calls_remaining: int = 0
     follow_up_evidence_output_characters_remaining: int = 0
-    task_route_candidates: dict[str, _TaskRouteCandidateState] = field(
-        default_factory=dict
-    )
+    task_route_candidates: dict[str, _TaskRouteCandidateState] = field(default_factory=dict)
     last_progress: AgentProgressStage | None = None
     last_progress_activity_at: float = 0.0
     write_successes: set[str] = field(default_factory=set)
@@ -274,11 +317,11 @@ class _ToolTurnBudget:
     used_high_risk_authorizations: set[str] = field(default_factory=set)
     confirmed_high_risk_actions: set[str] = field(default_factory=set)
     denied_high_risk_actions: set[str] = field(default_factory=set)
+    high_risk_plans: dict[str, _BoundHighRiskPlan] = field(default_factory=dict)
+    high_risk_plan_action_calls: dict[str, tuple[str, int]] = field(default_factory=dict)
     confirmed_egress_actions: set[str] = field(default_factory=set)
     denied_egress_actions: set[str] = field(default_factory=set)
-    discord_disclosure_observations: list[DisclosureObservation] = field(
-        default_factory=list
-    )
+    discord_disclosure_observations: list[DisclosureObservation] = field(default_factory=list)
     evidence_plan_recorded: bool = False
     conversation_context_required: bool = False
     conversation_context_satisfied: bool = False
@@ -295,6 +338,7 @@ class _ToolTurnBudget:
     capability_discovery_name: str | None = None
     capability_discovery_contract_id: str | None = None
     capability_discovery_contract_used: bool = False
+    capability_discovery_contracts: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -330,6 +374,9 @@ class _ToolTraceState:
     response_characters: int = 0
     response_truncated: bool = False
     action_receipt_id: str | None = None
+    external_effect_id: str | None = None
+    high_risk_plan_id: str | None = None
+    high_risk_plan_action_position: int | None = None
     final_delivery_disposition: str | None = None
 
 
@@ -370,6 +417,33 @@ def _configured_capacity(
     return None if configured_limit is None else min(bounded_value, configured_limit)
 
 
+def _copy_high_risk_plans(
+    plans: Mapping[str, _BoundHighRiskPlan],
+) -> dict[str, _BoundHighRiskPlan]:
+    """Carry only immutable bindings and body-free outcomes into a continuation."""
+
+    return {
+        event_id: _BoundHighRiskPlan(
+            plan_id=plan.plan_id,
+            binding_sha256=plan.binding_sha256,
+            authorization_event_id=plan.authorization_event_id,
+            max_actions=plan.max_actions,
+            expires_in_seconds=plan.expires_in_seconds,
+            expires_at=plan.expires_at,
+            actions=[
+                replace(
+                    action,
+                    argument_template=dict(action.argument_template),
+                    result_bindings=dict(action.result_bindings),
+                )
+                for action in plan.actions
+            ],
+            status=plan.status,
+        )
+        for event_id, plan in plans.items()
+    }
+
+
 def _continued_capacity(
     current: int | None,
     *,
@@ -401,6 +475,7 @@ def _continuation_tool_budget(
         on_high_risk_confirmation=(
             source.on_high_risk_confirmation if source is not None else None
         ),
+        on_high_risk_plan_status=(source.on_high_risk_plan_status if source is not None else None),
         required_message_id=None,
         evidence_anchor_message_id=(
             source.evidence_anchor_message_id if source is not None else None
@@ -426,9 +501,7 @@ def _continuation_tool_budget(
         follow_up_evidence_output_characters_remaining=(
             source.follow_up_evidence_output_characters_remaining if source is not None else 0
         ),
-        task_route_candidates=(
-            dict(source.task_route_candidates) if source is not None else {}
-        ),
+        task_route_candidates=(dict(source.task_route_candidates) if source is not None else {}),
         last_progress=(source.last_progress if source is not None else None),
         last_progress_activity_at=(source.last_progress_activity_at if source is not None else 0.0),
         write_successes=(set(source.write_successes) if source is not None else set()),
@@ -452,12 +525,13 @@ def _continuation_tool_budget(
         denied_high_risk_actions=(
             set(source.denied_high_risk_actions) if source is not None else set()
         ),
+        high_risk_plans=(
+            _copy_high_risk_plans(source.high_risk_plans) if source is not None else {}
+        ),
         confirmed_egress_actions=(
             set(source.confirmed_egress_actions) if source is not None else set()
         ),
-        denied_egress_actions=(
-            set(source.denied_egress_actions) if source is not None else set()
-        ),
+        denied_egress_actions=(set(source.denied_egress_actions) if source is not None else set()),
         discord_disclosure_observations=(
             list(source.discord_disclosure_observations) if source is not None else []
         ),
@@ -502,6 +576,9 @@ def _continuation_tool_budget(
         ),
         capability_discovery_contract_used=(
             source.capability_discovery_contract_used if source is not None else False
+        ),
+        capability_discovery_contracts=(
+            dict(source.capability_discovery_contracts) if source is not None else {}
         ),
     )
 
@@ -869,6 +946,7 @@ class CodexAppServerProvider:
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
         on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
+        on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None = None,
     ) -> ProviderTurnResult:
         first_attempt = _TurnAttemptState()
         try:
@@ -878,6 +956,7 @@ class CodexAppServerProvider:
                 context=context,
                 on_progress=on_progress,
                 on_high_risk_confirmation=on_high_risk_confirmation,
+                on_high_risk_plan_status=on_high_risk_plan_status,
                 attempt_state=first_attempt,
             )
         except (TimeoutError, _AppServerTransportError) as first_failure:
@@ -915,6 +994,7 @@ class CodexAppServerProvider:
                         context=context,
                         on_progress=on_progress,
                         on_high_risk_confirmation=on_high_risk_confirmation,
+                        on_high_risk_plan_status=on_high_risk_plan_status,
                         attempt_state=retry_attempt,
                     )
                 except (TimeoutError, _AppServerTransportError) as retry_failure:
@@ -980,6 +1060,7 @@ class CodexAppServerProvider:
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
         on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
+        on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None = None,
         attempt_state: _TurnAttemptState | None = None,
     ) -> ProviderTurnResult:
         lock_key = provider_thread_id or f"request:{context.request_id}"
@@ -1010,6 +1091,7 @@ class CodexAppServerProvider:
                     output_characters_remaining=self.max_tool_output_characters,
                     on_progress=on_progress,
                     on_high_risk_confirmation=on_high_risk_confirmation,
+                    on_high_risk_plan_status=on_high_risk_plan_status,
                     required_message_id=required_message_id,
                     evidence_anchor_message_id=(required_message_id if not autonomous else None),
                     last_progress=(
@@ -1118,9 +1200,7 @@ class CodexAppServerProvider:
                             "required" if budget.source_inspection_required else "not_required"
                         )
                         capability_requirement = (
-                            "required"
-                            if budget.capability_discovery_required
-                            else "not_required"
+                            "required" if budget.capability_discovery_required else "not_required"
                         )
                         plan_reason = (
                             budget.evidence_plan_reason
@@ -1332,9 +1412,7 @@ class CodexAppServerProvider:
                         )
                         turn_id = _text(discovery_turn.get("id"), "turn id")
                         self._thread_by_turn[turn_id] = thread_id
-                        self._turn_watchdogs[turn_id] = _TurnWatchdog(
-                            self.idle_timeout_seconds
-                        )
+                        self._turn_watchdogs[turn_id] = _TurnWatchdog(self.idle_timeout_seconds)
                         self._active_routes[route_key] = (
                             thread_id,
                             turn_id,
@@ -1359,9 +1437,21 @@ class CodexAppServerProvider:
                     failed_write = _last_write_failure(budget)
                     if failed_write is not None:
                         failed_capability, failure_code = failed_write
-                        retry_allowed = self.tools.write_is_safe_to_retry(
-                            failed_capability
-                        ) and _error_may_be_retryable(failure_code)
+                        retry_allowed = (
+                            self.tools.write_is_safe_to_retry(failed_capability)
+                            and _error_may_be_retryable(failure_code)
+                            and not (
+                                budget is not None
+                                and any(
+                                    plan.status
+                                    in {
+                                        AgentHighRiskPlanStatus.STOPPED,
+                                        AgentHighRiskPlanStatus.EXPIRED,
+                                    }
+                                    for plan in budget.high_risk_plans.values()
+                                )
+                            )
+                        )
                         retry_authorization_event_id = (
                             budget.last_write_authorization_event_id if budget is not None else None
                         )
@@ -1480,10 +1570,7 @@ class CodexAppServerProvider:
                             ",".join(sorted(final_budget.final_delivery_successes)),
                         )
                         content = AGENT_FINAL_DELIVERED_CONTENT
-                    if (
-                        final_budget is not None
-                        and _information_flow_blocks_origin(final_budget)
-                    ):
+                    if final_budget is not None and _information_flow_blocks_origin(final_budget):
                         log.warning(
                             "Agent final response withheld by information-flow policy "
                             "request=%s observations=%d",
@@ -1630,10 +1717,7 @@ class CodexAppServerProvider:
             and (
                 reserve_calls <= 0
                 or reserve_output_characters < 200
-                or (
-                    budget.follow_up_evidence_calls_remaining + reserve_calls
-                    > self.max_tool_calls
-                )
+                or (budget.follow_up_evidence_calls_remaining + reserve_calls > self.max_tool_calls)
                 or (
                     budget.follow_up_evidence_output_characters_remaining
                     + reserve_output_characters
@@ -1662,6 +1746,14 @@ class CodexAppServerProvider:
                 budget.read_authorization_event_ids.discard(event_id)
                 budget.bound_high_risk_actions.pop(event_id, None)
                 budget.used_high_risk_authorizations.discard(event_id)
+                invalidated_plan = budget.high_risk_plans.get(event_id)
+                if invalidated_plan is not None:
+                    _stop_high_risk_plan(
+                        invalidated_plan,
+                        status=AgentHighRiskPlanStatus.STOPPED,
+                        error_code=("agent.high_risk_plan_authorization_revision_changed"),
+                    )
+                    await _notify_high_risk_plan_status(budget, invalidated_plan)
         loop = asyncio.get_running_loop()
         decision_future: asyncio.Future[AgentTaskRouteDecision] = loop.create_future()
         confirmation_future: asyncio.Future[bool] = loop.create_future()
@@ -1723,13 +1815,8 @@ class CodexAppServerProvider:
                     context.request_id,
                     None,
                 )
-                if (
-                    pending_candidate is not None
-                    and not pending_candidate.decision.done()
-                ):
-                    pending_candidate.decision.set_result(
-                        AgentTaskRouteDecision.SEPARATE
-                    )
+                if pending_candidate is not None and not pending_candidate.decision.done():
+                    pending_candidate.decision.set_result(AgentTaskRouteDecision.SEPARATE)
                 budget.follow_up_evidence_calls_remaining = previous_reserve_calls
                 budget.follow_up_evidence_output_characters_remaining = (
                     previous_reserve_output_characters
@@ -1745,9 +1832,7 @@ class CodexAppServerProvider:
     ) -> bool:
         """Acknowledge host durability before the model can act on a route."""
 
-        route = self._active_routes.get(
-            (context.workspace_id, context.origin_resource_id)
-        )
+        route = self._active_routes.get((context.workspace_id, context.origin_resource_id))
         if route is None:
             return False
         budget = self._active_tool_budgets.get(route[0])
@@ -2070,9 +2155,7 @@ class CodexAppServerProvider:
             thread_id = _text(thread.get("id"), "thread id")
             self._active_threads.add(thread_id)
             self._active_thread_workspaces[thread_id] = thread_workspace
-            self._active_thread_permissions[thread_id] = _context_authority_profile(
-                context
-            )
+            self._active_thread_permissions[thread_id] = _context_authority_profile(context)
             return thread_id
 
         response = await self._request(
@@ -2697,9 +2780,7 @@ class CodexAppServerProvider:
             if status == "completed":
                 budget.write_successes.add(capability)
                 budget.write_failures = [
-                    failure
-                    for failure in budget.write_failures
-                    if failure[0] != capability
+                    failure for failure in budget.write_failures if failure[0] != capability
                 ]
             else:
                 budget.write_failures.append((capability, "app.tool_failed"))
@@ -2724,12 +2805,8 @@ class CodexAppServerProvider:
                     "public_reference_id": (
                         context.public_reference_id if context is not None else None
                     ),
-                    "agent_request_id": (
-                        context.request_id if context is not None else None
-                    ),
-                    "task_id": (
-                        context.agent_task_id if context is not None else None
-                    ),
+                    "agent_request_id": (context.request_id if context is not None else None),
+                    "task_id": (context.agent_task_id if context is not None else None),
                     "provider_thread_id": self._notification_thread_id(params),
                     "provider_turn_id": _notification_turn_id(params),
                 },
@@ -2761,9 +2838,7 @@ class CodexAppServerProvider:
         app_context = app_context if isinstance(app_context, dict) else {}
         arguments = item.get("arguments")
         argument_names = (
-            sorted(str(name)[:80] for name in arguments)
-            if isinstance(arguments, dict)
-            else []
+            sorted(str(name)[:80] for name in arguments) if isinstance(arguments, dict) else []
         )
         resource_uri = app_context.get("resourceUri")
         resource_reference = (
@@ -2787,9 +2862,7 @@ class CodexAppServerProvider:
             action = raw_tool if isinstance(raw_tool, str) else None
         payload: dict[str, object] = {
             "schema_version": 1,
-            "public_reference_id": (
-                context.public_reference_id if context is not None else None
-            ),
+            "public_reference_id": (context.public_reference_id if context is not None else None),
             "agent_request_id": context.request_id if context is not None else None,
             "task_id": context.agent_task_id if context is not None else None,
             "provider_thread_id": self._notification_thread_id(params),
@@ -2913,8 +2986,7 @@ class CodexAppServerProvider:
             )
         )
         if (available_calls is not None and available_calls <= 0) or (
-            available_output_characters is not None
-            and available_output_characters < 200
+            available_output_characters is not None and available_output_characters < 200
         ):
             reason = (
                 "The per-turn capability call limit was reached."
@@ -3038,6 +3110,7 @@ class CodexAppServerProvider:
         )
         tool_context = budget.context
         authorization_event_id: str | None = None
+        registered_high_risk_plan: _BoundHighRiskPlan | None = None
         if capability_name == "turn.evidence_plan":
             plan_readiness_reason = _evidence_plan_readiness_reason(budget)
             if plan_readiness_reason is not None:
@@ -3052,6 +3125,27 @@ class CodexAppServerProvider:
                     ),
                     outcome="rejected",
                     error_code="agent.event_message_not_read",
+                )
+                return
+        if capability_name == "turn.high_risk_plan":
+            registered_high_risk_plan, plan_failure = await _confirm_high_risk_plan(
+                budget,
+                arguments=capability_arguments,
+                tools=self.tools,
+            )
+            if plan_failure is not None:
+                plan_code, plan_reason = plan_failure
+                await self._traced_tool_response(
+                    request_id,
+                    trace,
+                    success=False,
+                    text=_tool_error_json(
+                        code=plan_code,
+                        reason=plan_reason,
+                        retryable=False,
+                    ),
+                    outcome="rejected",
+                    error_code=plan_code,
                 )
                 return
         if write_capability is not None:
@@ -3226,12 +3320,20 @@ class CodexAppServerProvider:
                 capability_name=write_capability,
                 arguments=capability_arguments,
                 context=tool_context,
+                tool_call_id=trace.call_id,
             )
             if write_capability is not None
             else None
         )
         if high_risk_failure is not None:
             code, reason = high_risk_failure
+            if authorization_event_id is not None:
+                failed_plan = budget.high_risk_plans.get(authorization_event_id)
+                if failed_plan is not None and failed_plan.status in {
+                    AgentHighRiskPlanStatus.STOPPED,
+                    AgentHighRiskPlanStatus.EXPIRED,
+                }:
+                    await _notify_high_risk_plan_status(budget, failed_plan)
             if blocking_write_capability is not None:
                 budget.write_failures.append((blocking_write_capability, code))
             await self._traced_tool_response(
@@ -3247,12 +3349,20 @@ class CodexAppServerProvider:
                 error_code=code,
             )
             return
+        plan_action_reference = budget.high_risk_plan_action_calls.get(trace.call_id)
+        if plan_action_reference is not None:
+            plan_event_id, plan_action_index = plan_action_reference
+            plan = budget.high_risk_plans.get(plan_event_id)
+            if plan is not None:
+                trace.high_risk_plan_id = plan.plan_id
+                trace.high_risk_plan_action_position = plan_action_index + 1
         high_risk_confirmation_failure = (
             await _confirm_high_risk_action(
                 budget,
                 capability_name=write_capability,
                 arguments=capability_arguments,
                 context=tool_context,
+                tool_call_id=trace.call_id,
             )
             if write_capability is not None
             else None
@@ -3295,9 +3405,13 @@ class CodexAppServerProvider:
                     and budget.context.high_risk_authorization_mode == "bound_once"
                     and authorization_event_id is not None
                 ):
-                    budget.used_high_risk_authorizations.add(
-                        authorization_event_id
-                    )
+                    if trace.call_id in budget.high_risk_plan_action_calls:
+                        _dispatch_high_risk_plan_action(
+                            budget,
+                            trace.call_id,
+                        )
+                    else:
+                        budget.used_high_risk_authorizations.add(authorization_event_id)
 
         watchdog: _TurnWatchdog | None = None
         activity_task: asyncio.Task[None] | None = None
@@ -3323,9 +3437,7 @@ class CodexAppServerProvider:
                 provider_thread_id=trace.provider_thread_id,
                 provider_turn_id=trace.provider_turn_id,
                 tool_call_id=trace.call_id,
-                disclosure_observations=tuple(
-                    budget.discord_disclosure_observations
-                ),
+                disclosure_observations=tuple(budget.discord_disclosure_observations),
             )
             output = await self.tools.invoke(
                 namespace=namespace if isinstance(namespace, str) else None,
@@ -3335,6 +3447,16 @@ class CodexAppServerProvider:
                 max_output_characters=per_call_budget,
                 before_invoke=consume_validated_call,
             )
+            if registered_high_risk_plan is not None:
+                output = replace(
+                    output,
+                    text=_high_risk_plan_tool_output(registered_high_risk_plan),
+                )
+            # Preserve host-only effect identities directly. The model-facing
+            # JSON may be bounded and is therefore not a durable source for a
+            # receipt ID.
+            trace.action_receipt_id = output.action_receipt_id
+            trace.external_effect_id = output.external_effect_id
             _record_discord_disclosure_observations(
                 budget,
                 capability_name=capability_name,
@@ -3430,12 +3552,8 @@ class CodexAppServerProvider:
                         AgentTaskRouteDecision(route_decision),
                     )
                     try:
-                        async with asyncio.timeout(
-                            _TASK_ROUTE_DECISION_TIMEOUT_SECONDS
-                        ):
-                            committed = await asyncio.shield(
-                                candidate.durable_confirmation
-                            )
+                        async with asyncio.timeout(_TASK_ROUTE_DECISION_TIMEOUT_SECONDS):
+                            committed = await asyncio.shield(candidate.durable_confirmation)
                     except TimeoutError:
                         _resolve_task_route_candidate(
                             budget,
@@ -3451,9 +3569,7 @@ class CodexAppServerProvider:
                             candidate_event_id,
                             AgentTaskRouteDecision.SEPARATE,
                         )
-                        raise AgentToolError(
-                            "The host could not durably record this task route."
-                        )
+                        raise AgentToolError("The host could not durably record this task route.")
                     _apply_confirmed_task_route_decision(
                         budget,
                         candidate_event_id,
@@ -3491,6 +3607,11 @@ class CodexAppServerProvider:
                 final_delivery_disposition=("agent_tool" if final_delivery else None),
             )
         except UserError as exc:
+            if registered_high_risk_plan is not None:
+                await _discard_registered_high_risk_plan(
+                    budget,
+                    registered_high_risk_plan,
+                )
             log.info("Agent dynamic tool rejected: %s", exc.code)
             if blocking_write_capability is not None:
                 budget.write_failures.append((blocking_write_capability, exc.code))
@@ -3508,6 +3629,11 @@ class CodexAppServerProvider:
                 error_code=exc.code,
             )
         except (MediaError, WebError, ModerationError) as exc:
+            if registered_high_risk_plan is not None:
+                await _discard_registered_high_risk_plan(
+                    budget,
+                    registered_high_risk_plan,
+                )
             prefix = (
                 "media"
                 if isinstance(exc, MediaError)
@@ -3532,6 +3658,11 @@ class CodexAppServerProvider:
                 error_code=code,
             )
         except AgentToolError as exc:
+            if registered_high_risk_plan is not None:
+                await _discard_registered_high_risk_plan(
+                    budget,
+                    registered_high_risk_plan,
+                )
             log.info(
                 "Agent dynamic tool contract rejected tool=%s capability=%s reason=%s",
                 tool_name,
@@ -3558,6 +3689,11 @@ class CodexAppServerProvider:
                 error_code="agent.tool_contract_rejected",
             )
         except ProviderError:
+            if registered_high_risk_plan is not None:
+                await _discard_registered_high_risk_plan(
+                    budget,
+                    registered_high_risk_plan,
+                )
             log.exception("Agent dynamic provider failed capability=%s", capability_name)
             if blocking_write_capability is not None:
                 budget.write_failures.append((blocking_write_capability, "provider.internal_error"))
@@ -3577,6 +3713,11 @@ class CodexAppServerProvider:
                 error_code="provider.internal_error",
             )
         except Exception as exc:
+            if registered_high_risk_plan is not None:
+                await _discard_registered_high_risk_plan(
+                    budget,
+                    registered_high_risk_plan,
+                )
             log.exception(
                 "Agent dynamic tool failed capability=%s error=%s",
                 capability_name,
@@ -3670,9 +3811,7 @@ class CodexAppServerProvider:
             )
             if egress is not None:
                 egress_provider = egress.provider
-                egress_field_kinds = tuple(
-                    field_kind.value for field_kind in egress.field_kinds
-                )
+                egress_field_kinds = tuple(field_kind.value for field_kind in egress.field_kinds)
                 egress_sink_audience = egress.sink_audience.value
                 egress_consent = egress.consent.value
         context = budget.context if budget is not None else None
@@ -3694,9 +3833,7 @@ class CodexAppServerProvider:
             egress_field_kinds=egress_field_kinds,
             egress_sink_audience=egress_sink_audience,
             egress_consent=egress_consent,
-            egress_policy_decision=(
-                "not_evaluated" if egress_provider is not None else None
-            ),
+            egress_policy_decision=("not_evaluated" if egress_provider is not None else None),
             egress_policy_reference_id=None,
             calls_remaining_before=(budget.calls_remaining if budget is not None else None),
             output_characters_before=(
@@ -3727,9 +3864,18 @@ class CodexAppServerProvider:
     ) -> None:
         trace.outcome = outcome
         trace.error_code = error_code
+        if trace.action_receipt_id is None:
+            trace.action_receipt_id = _tool_output_action_receipt_id(text)
+        plan_update = await _finalize_high_risk_plan_action(
+            trace,
+            succeeded=success,
+            error_code=error_code,
+            tool_output=text if success else None,
+        )
+        if plan_update is not None:
+            text = _tool_error_with_high_risk_plan_status(text, plan_update)
         trace.response_characters = len(text)
         trace.response_truncated = _tool_output_was_truncated(text)
-        trace.action_receipt_id = _tool_output_action_receipt_id(text)
         trace.final_delivery_disposition = final_delivery_disposition
         await self._tool_response(
             request_id,
@@ -3767,9 +3913,9 @@ class CodexAppServerProvider:
             "egress_sink_audience": trace.egress_sink_audience,
             "egress_consent": trace.egress_consent,
             "egress_policy_decision": trace.egress_policy_decision,
-            "egress_policy_reference_id": (
-                trace.egress_policy_reference_id
-            ),
+            "egress_policy_reference_id": (trace.egress_policy_reference_id),
+            "high_risk_plan_id": trace.high_risk_plan_id,
+            "high_risk_plan_action_position": (trace.high_risk_plan_action_position),
             "calls_remaining_before": trace.calls_remaining_before,
             "output_characters_before": trace.output_characters_before,
             "follow_up_evidence_calls_before": (trace.follow_up_evidence_calls_before),
@@ -3804,6 +3950,7 @@ class CodexAppServerProvider:
                     "response_characters": trace.response_characters,
                     "response_truncated": trace.response_truncated,
                     "action_receipt_id": trace.action_receipt_id,
+                    "external_effect_id": trace.external_effect_id,
                     "final_delivery_disposition": (trace.final_delivery_disposition),
                 }
             )
@@ -4195,9 +4342,7 @@ def _apply_confirmed_task_route_decision(
     try:
         if decision is AgentTaskRouteDecision.ATTACH:
             budget.context = candidate.context
-            budget.authorization_contexts[candidate.authorization_event_id] = (
-                candidate.context
-            )
+            budget.authorization_contexts[candidate.authorization_event_id] = candidate.context
             budget.authorization_message_ids[candidate.authorization_event_id] = (
                 candidate.message_id
             )
@@ -4234,6 +4379,7 @@ def _reset_semantic_evidence_plan(budget: _ToolTurnBudget) -> None:
     budget.capability_discovery_name = None
     budget.capability_discovery_contract_id = None
     budget.capability_discovery_contract_used = False
+    budget.capability_discovery_contracts.clear()
     budget.execution_model = None
     budget.evidence_plan_reason = None
     budget.escalation_handoff_completed = False
@@ -4286,15 +4432,13 @@ def _is_follow_up_evidence_call(
     if (
         canonical_tool_name == "discord_get_message"
         and isinstance(capability_arguments, dict)
-        and capability_arguments.get("message_id")
-        in unread_follow_ups | candidate_message_ids
+        and capability_arguments.get("message_id") in unread_follow_ups | candidate_message_ids
     ):
         return True
     if (
         capability_name == "turn.route_task_event"
         and isinstance(capability_arguments, dict)
-        and capability_arguments.get("candidate_event_id")
-        in budget.task_route_candidates
+        and capability_arguments.get("candidate_event_id") in budget.task_route_candidates
     ):
         return True
     return (
@@ -4305,11 +4449,13 @@ def _is_follow_up_evidence_call(
 
 
 def _follow_up_evidence_is_pending(budget: _ToolTurnBudget) -> bool:
-    return bool(budget.task_route_candidates) or bool(
-        budget.follow_up_message_ids - budget.read_follow_up_message_ids
-    ) or (
-        budget.evidence_anchor_message_id in budget.follow_up_message_ids
-        and not budget.evidence_plan_recorded
+    return (
+        bool(budget.task_route_candidates)
+        or bool(budget.follow_up_message_ids - budget.read_follow_up_message_ids)
+        or (
+            budget.evidence_anchor_message_id in budget.follow_up_message_ids
+            and not budget.evidence_plan_recorded
+        )
     )
 
 
@@ -4387,10 +4533,7 @@ def _information_flow_write_failure(
     observations = budget.discord_disclosure_observations
     if not observations:
         return None
-    if any(
-        observation.relation_to_origin != "same_or_narrower"
-        for observation in observations
-    ):
+    if any(observation.relation_to_origin != "same_or_narrower" for observation in observations):
         return (
             "agent.information_flow_forbidden",
             (
@@ -4403,10 +4546,10 @@ def _information_flow_write_failure(
         "feedback.create",
         "discord.send_direct_message",
     }
-    if any(
-        observation.visibility != "guild_public"
-        for observation in observations
-    ) and capability_name in unscoped_publication_capabilities:
+    if (
+        any(observation.visibility != "guild_public" for observation in observations)
+        and capability_name in unscoped_publication_capabilities
+    ):
         return (
             "agent.information_flow_forbidden",
             (
@@ -4425,10 +4568,7 @@ def _external_egress_policy_decision(
     """Resolve one external transfer without inspecting or retaining its body."""
 
     context = budget.context
-    if (
-        context.agent_trigger == "autonomous"
-        and context.policy_id == "discord-autonomy-strict-v1"
-    ):
+    if context.agent_trigger == "autonomous" and context.policy_id == "discord-autonomy-strict-v1":
         return (
             "deny",
             "denied_strict_autonomy",
@@ -4450,18 +4590,11 @@ def _external_egress_policy_decision(
         or unlabelled_source
         or descriptor.sink_audience is EgressSinkAudience.UNKNOWN
     )
-    consent_required = (
-        descriptor.consent is EgressConsentRequirement.ALWAYS
-        or consent_boundary
-    )
+    consent_required = descriptor.consent is EgressConsentRequirement.ALWAYS or consent_boundary
     if context.information_flow_mode == "audit":
         return (
             "allow",
-            (
-                "audit_would_require_consent"
-                if consent_required
-                else "audit_allowed"
-            ),
+            ("audit_would_require_consent" if consent_required else "audit_allowed"),
             None,
         )
     if not consent_required:
@@ -4503,9 +4636,7 @@ async def _enforce_external_egress(
         context,
         budget.discord_disclosure_observations,
     )
-    trace.egress_policy_reference_id = _opaque_egress_policy_reference(
-        fingerprint
-    )
+    trace.egress_policy_reference_id = _opaque_egress_policy_reference(fingerprint)
     action, decision, reason = _external_egress_policy_decision(
         descriptor,
         budget,
@@ -4541,8 +4672,7 @@ async def _enforce_external_egress(
         )
     requester_principal_id = context.requester_principal_id or context.actor_id
     source_labels: set[str] = {
-        observation.visibility
-        for observation in budget.discord_disclosure_observations
+        observation.visibility for observation in budget.discord_disclosure_observations
     }
     if not source_labels or _egress_has_unobserved_source_resource(
         descriptor,
@@ -4627,9 +4757,7 @@ def _egress_has_unobserved_source_resource(
         return False
     if not isinstance(arguments, Mapping):
         return True
-    observed_resource_ids = {
-        observation.source_resource_id for observation in observations
-    }
+    observed_resource_ids = {observation.source_resource_id for observation in observations}
     for field_name in descriptor.source_resource_fields:
         raw_resource = arguments.get(field_name)
         if not isinstance(raw_resource, str) or raw_resource not in observed_resource_ids:
@@ -4702,8 +4830,9 @@ def _bind_high_risk_authorization(
     capability_name: str,
     arguments: object,
     context: InvocationContext,
+    tool_call_id: str | None = None,
 ) -> tuple[str, str] | None:
-    """Bind one exact event revision to one high-risk argument set and one use."""
+    """Bind one exact event to one action or the next action of one fixed plan."""
 
     if (
         budget.context.high_risk_authorization_mode != "bound_once"
@@ -4720,6 +4849,120 @@ def _bind_high_risk_authorization(
         arguments,
         context,
     )
+    plan = budget.high_risk_plans.get(authorization_event_id)
+    if plan is not None:
+        if datetime.now(UTC) >= plan.expires_at:
+            _stop_high_risk_plan(
+                plan,
+                status=AgentHighRiskPlanStatus.EXPIRED,
+                error_code="agent.high_risk_plan_expired",
+            )
+            return (
+                "agent.high_risk_plan_expired",
+                "The confirmed high-risk plan expired; request a new exact confirmation.",
+            )
+        if plan.status in {
+            AgentHighRiskPlanStatus.STOPPED,
+            AgentHighRiskPlanStatus.EXPIRED,
+        }:
+            return (
+                "agent.high_risk_plan_stopped",
+                _high_risk_plan_status_reason(plan),
+            )
+        if plan.status is AgentHighRiskPlanStatus.COMPLETED:
+            return (
+                "agent.high_risk_plan_exhausted",
+                "Every confirmed action slot has already been used; a fourth or changed "
+                "action requires a new confirmation.",
+            )
+        if any(
+            action.status is AgentHighRiskPlanActionStatus.DISPATCHED for action in plan.actions
+        ):
+            return (
+                "agent.high_risk_plan_action_in_progress",
+                "The prior plan action has not reached a terminal receipt.",
+            )
+        expected_index = next(
+            (
+                index
+                for index, action in enumerate(plan.actions)
+                if action.status is AgentHighRiskPlanActionStatus.PENDING
+            ),
+            None,
+        )
+        if expected_index is None or expected_index >= plan.max_actions:
+            return (
+                "agent.high_risk_plan_exhausted",
+                "The confirmed high-risk plan has no unused action slot.",
+            )
+        expected = plan.actions[expected_index]
+        try:
+            expected_dispatch_fingerprint = _high_risk_action_fingerprint(
+                expected.capability,
+                _resolved_plan_action_arguments(plan, expected),
+                context,
+            )
+        except AgentToolError:
+            _stop_high_risk_plan(
+                plan,
+                status=AgentHighRiskPlanStatus.STOPPED,
+                error_code="agent.high_risk_plan_result_unavailable",
+            )
+            return (
+                "agent.high_risk_plan_result_unavailable",
+                "A required earlier action result is unavailable; dependent actions were "
+                "not dispatched.",
+            )
+        if not secrets.compare_digest(expected_dispatch_fingerprint, fingerprint):
+            later_match = False
+            for action in plan.actions[expected_index + 1 :]:
+                if action.status is not AgentHighRiskPlanActionStatus.PENDING:
+                    continue
+                try:
+                    later_fingerprint = _high_risk_action_fingerprint(
+                        action.capability,
+                        _resolved_plan_action_arguments(plan, action),
+                        context,
+                    )
+                except AgentToolError:
+                    if _unresolved_plan_action_matches_dispatch(
+                        action,
+                        capability_name=capability_name,
+                        arguments=arguments,
+                    ):
+                        later_match = True
+                        break
+                    continue
+                if secrets.compare_digest(later_fingerprint, fingerprint):
+                    later_match = True
+                    break
+            return (
+                (
+                    "agent.high_risk_plan_order_changed"
+                    if later_match
+                    else "agent.high_risk_plan_action_changed"
+                ),
+                (
+                    "The action order differs from the privately confirmed plan."
+                    if later_match
+                    else (
+                        "The capability, target, or arguments are outside the privately "
+                        "confirmed plan."
+                    )
+                )
+                + " Request a new exact confirmation.",
+            )
+        if expected.capability != capability_name:
+            return (
+                "agent.high_risk_plan_action_changed",
+                "The capability differs from the privately confirmed plan.",
+            )
+        if tool_call_id is not None:
+            budget.high_risk_plan_action_calls[tool_call_id] = (
+                authorization_event_id,
+                expected_index,
+            )
+        return None
     existing = budget.bound_high_risk_actions.get(authorization_event_id)
     if existing is None:
         budget.bound_high_risk_actions[authorization_event_id] = fingerprint
@@ -4748,11 +4991,7 @@ def _high_risk_action_fingerprint(
     context: InvocationContext,
 ) -> str:
     sanitized_arguments = (
-        {
-            key: value
-            for key, value in arguments.items()
-            if key != "authorization_event_id"
-        }
+        {key: value for key, value in arguments.items() if key != "authorization_event_id"}
         if isinstance(arguments, dict)
         else arguments
     )
@@ -4780,12 +5019,747 @@ def _high_risk_action_fingerprint(
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+_PLAN_RESULT_REFERENCE_KEY = "$plan_result"
+
+
+def _plan_arguments_for_validation(
+    arguments: dict[str, object],
+    *,
+    action_position: int,
+) -> dict[str, object]:
+    """Replace earlier string-result references with bounded schema placeholders."""
+
+    converted = _convert_plan_result_references(
+        arguments,
+        action_position=action_position,
+        result_lookup=None,
+    )
+    if not isinstance(converted, dict):
+        raise AgentToolError("High-risk plan action arguments must be an object.")
+    return cast(dict[str, object], converted)
+
+
+def _convert_plan_result_references(
+    value: object,
+    *,
+    action_position: int,
+    result_lookup: Mapping[tuple[int, str], str] | None,
+) -> object:
+    if isinstance(value, dict):
+        if set(value) == {_PLAN_RESULT_REFERENCE_KEY}:
+            reference = value.get(_PLAN_RESULT_REFERENCE_KEY)
+            if not isinstance(reference, dict) or set(reference) != {
+                "action",
+                "field",
+            }:
+                raise AgentToolError("A plan result reference is malformed.")
+            source_position = reference.get("action")
+            field_name = reference.get("field")
+            if (
+                not isinstance(source_position, int)
+                or isinstance(source_position, bool)
+                or not 1 <= source_position < action_position
+                or not isinstance(field_name, str)
+                or not 1 <= len(field_name) <= 80
+                or not field_name.replace("_", "").isalnum()
+            ):
+                raise AgentToolError(
+                    "A plan result reference must name one earlier action and bounded field."
+                )
+            if result_lookup is None:
+                return f"plan-result-{source_position}-{field_name}"
+            resolved = result_lookup.get((source_position, field_name))
+            if resolved is None:
+                raise AgentToolError(
+                    "A required earlier plan result is unavailable; no dependent action "
+                    "was dispatched."
+                )
+            return resolved
+        return {
+            str(key): _convert_plan_result_references(
+                item,
+                action_position=action_position,
+                result_lookup=result_lookup,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _convert_plan_result_references(
+                item,
+                action_position=action_position,
+                result_lookup=result_lookup,
+            )
+            for item in value
+        ]
+    return value
+
+
+def _resolved_plan_action_arguments(
+    plan: _BoundHighRiskPlan,
+    action: _BoundHighRiskPlanAction,
+) -> dict[str, object]:
+    lookup = {
+        (source.position, field_name): field_value
+        for source in plan.actions
+        for field_name, field_value in source.result_bindings.items()
+    }
+    resolved = _convert_plan_result_references(
+        action.argument_template,
+        action_position=action.position,
+        result_lookup=lookup,
+    )
+    if not isinstance(resolved, dict):
+        raise AgentToolError("Resolved plan arguments are not an object.")
+    return cast(dict[str, object], resolved)
+
+
+def _unresolved_plan_action_matches_dispatch(
+    action: _BoundHighRiskPlanAction,
+    *,
+    capability_name: str,
+    arguments: object,
+) -> bool:
+    """Classify an out-of-order call without treating fixed fields as wildcards."""
+
+    if action.capability != capability_name or not isinstance(arguments, dict):
+        return False
+    sanitized_arguments = {
+        key: value for key, value in arguments.items() if key != "authorization_event_id"
+    }
+
+    def matches(template: object, actual: object) -> bool:
+        if isinstance(template, dict):
+            if set(template) == {_PLAN_RESULT_REFERENCE_KEY}:
+                # Result references are already structurally validated while the
+                # plan is registered. Before their source action succeeds only
+                # the eventual bounded string value is unknown.
+                return isinstance(actual, str) and 1 <= len(actual) <= 200
+            if not isinstance(actual, dict) or set(template) != set(actual):
+                return False
+            return all(matches(value, actual[key]) for key, value in template.items())
+        if isinstance(template, list):
+            return (
+                isinstance(actual, list)
+                and len(template) == len(actual)
+                and all(
+                    matches(template_item, actual_item)
+                    for template_item, actual_item in zip(template, actual, strict=True)
+                )
+            )
+        try:
+            return json.dumps(
+                template,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ) == json.dumps(
+                actual,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return False
+
+    return matches(action.argument_template, sanitized_arguments)
+
+
+def _plan_result_fields_used_by_later_actions(
+    plan: _BoundHighRiskPlan,
+    source_position: int,
+) -> set[str]:
+    fields: set[str] = set()
+
+    def visit(value: object, *, action_position: int) -> None:
+        if isinstance(value, dict):
+            if set(value) == {_PLAN_RESULT_REFERENCE_KEY}:
+                reference = value.get(_PLAN_RESULT_REFERENCE_KEY)
+                if isinstance(reference, dict) and (reference.get("action") == source_position):
+                    field_name = reference.get("field")
+                    if isinstance(field_name, str):
+                        fields.add(field_name)
+                return
+            for item in value.values():
+                visit(item, action_position=action_position)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, action_position=action_position)
+
+    for action in plan.actions[source_position:]:
+        visit(action.argument_template, action_position=action.position)
+    return fields
+
+
+def _capture_plan_result_bindings(
+    plan: _BoundHighRiskPlan,
+    action: _BoundHighRiskPlanAction,
+    tool_output: str | None,
+) -> bool:
+    required_fields = _plan_result_fields_used_by_later_actions(
+        plan,
+        action.position,
+    )
+    if not required_fields:
+        return True
+    if tool_output is None:
+        return False
+    try:
+        payload = json.loads(tool_output)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    bindings: dict[str, str] = {}
+    for field_name in required_fields:
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not 1 <= len(value) <= 200:
+            return False
+        bindings[field_name] = value
+    action.result_bindings = bindings
+    return True
+
+
+async def _confirm_high_risk_plan(
+    budget: _ToolTurnBudget,
+    *,
+    arguments: object,
+    tools: AgentToolCatalog,
+) -> tuple[_BoundHighRiskPlan | None, tuple[str, str] | None]:
+    """Validate and privately confirm every immutable action before any dispatch."""
+
+    if budget.context.high_risk_authorization_mode != "bound_once":
+        return None, (
+            "agent.high_risk_plan_mode_unavailable",
+            "Bounded plans require the bound_once high-risk authorization mode.",
+        )
+    try:
+        request = high_risk_plan_request_from_arguments(arguments)
+    except UserError as exc:
+        return None, (
+            exc.code,
+            "The bounded high-risk plan shape is invalid.",
+        )
+    authorization_event_id = request.authorization_event_id.strip()
+    authorized_context = budget.authorization_contexts.get(authorization_event_id)
+    if authorized_context is None:
+        return None, (
+            "agent.write_authorization_unknown",
+            "The plan authorization event is not part of this active turn.",
+        )
+    budget.last_write_authorization_event_id = authorization_event_id
+    readiness_failure = _write_readiness_failure(budget)
+    if readiness_failure is not None:
+        return None, readiness_failure
+    if (
+        authorization_event_id in budget.bound_high_risk_actions
+        or authorization_event_id in budget.used_high_risk_authorizations
+    ):
+        return None, (
+            "agent.high_risk_plan_authorization_used",
+            "This event was already bound to a direct high-risk action.",
+        )
+    callback = budget.on_high_risk_confirmation
+    if callback is None:
+        return None, (
+            "agent.high_risk_confirmation_unavailable",
+            "This transport cannot obtain a requester-private plan confirmation.",
+        )
+    authorization_message_id = authorized_context.active_message_id
+    if authorization_message_id is None:
+        return None, (
+            "agent.high_risk_confirmation_unavailable",
+            "A concrete Discord message revision is required for plan confirmation.",
+        )
+
+    planned_actions: list[_BoundHighRiskPlanAction] = []
+    seen_fingerprints: set[str] = set()
+    requested_capabilities: set[str] = set()
+    for position, requested_action in enumerate(request.actions, start=1):
+        capability = requested_action.capability.strip()
+        contract_id = requested_action.contract_id.strip()
+        if capability not in AGENT_HIGH_RISK_CAPABILITIES:
+            return None, (
+                "agent.high_risk_plan_capability_not_high_risk",
+                "Every bounded plan action must be a host-classified high-risk capability.",
+            )
+        described_contract = budget.capability_discovery_contracts.get(capability)
+        if described_contract is None or not secrets.compare_digest(
+            described_contract,
+            contract_id,
+        ):
+            return None, (
+                "agent.high_risk_plan_contract_missing",
+                "Describe every distinct plan capability from the current catalog first.",
+            )
+        try:
+            argument_template = cast(
+                dict[str, object],
+                requested_action.arguments,
+            )
+            validation_arguments = _plan_arguments_for_validation(
+                argument_template,
+                action_position=position,
+            )
+            tools.validate_planned_write(
+                capability_name=capability,
+                arguments=validation_arguments,
+                contract_id=contract_id,
+                context=authorized_context,
+            )
+            presentation = high_risk_presentation(
+                capability,
+                argument_template,
+            )
+        except (AgentToolError, HighRiskPresentationError) as exc:
+            return None, (
+                "agent.high_risk_confirmation_unreviewable",
+                str(exc),
+            )
+        fingerprint = _high_risk_action_fingerprint(
+            capability,
+            argument_template,
+            authorized_context,
+        )
+        if fingerprint in seen_fingerprints:
+            return None, (
+                "agent.high_risk_plan_duplicate_action",
+                "An exact high-risk action appears more than once in the plan.",
+            )
+        seen_fingerprints.add(fingerprint)
+        requested_capabilities.add(capability)
+        planned_actions.append(
+            _BoundHighRiskPlanAction(
+                position=position,
+                capability=capability,
+                contract_id=contract_id,
+                fingerprint=fingerprint,
+                argument_template=argument_template,
+                presentation=presentation,
+            )
+        )
+    if requested_capabilities != set(budget.capability_discovery_contracts):
+        return None, (
+            "agent.high_risk_plan_contract_set_mismatch",
+            "The plan must consume exactly the distinct capability contracts loaded for it.",
+        )
+
+    existing = budget.high_risk_plans.get(authorization_event_id)
+    if existing is not None:
+        same_plan = (
+            existing.max_actions == request.max_actions
+            and existing.expires_in_seconds == request.expires_in_seconds
+            and tuple(action.fingerprint for action in existing.actions)
+            == tuple(action.fingerprint for action in planned_actions)
+            and tuple(action.contract_id for action in existing.actions)
+            == tuple(action.contract_id for action in planned_actions)
+        )
+        if same_plan and existing.status in {
+            AgentHighRiskPlanStatus.CONFIRMED,
+            AgentHighRiskPlanStatus.RUNNING,
+        }:
+            return existing, None
+        return None, (
+            "agent.high_risk_plan_changed",
+            "This authorization event is already bound to a different or completed plan.",
+        )
+
+    expires_at = datetime.now(UTC) + timedelta(seconds=request.expires_in_seconds)
+    binding_sha256 = _high_risk_plan_fingerprint(
+        request,
+        actions=planned_actions,
+        context=authorized_context,
+        expires_at=expires_at,
+    )
+    plan = _BoundHighRiskPlan(
+        plan_id=f"hrp_{binding_sha256[:24]}",
+        binding_sha256=binding_sha256,
+        authorization_event_id=authorization_event_id,
+        max_actions=request.max_actions,
+        expires_in_seconds=request.expires_in_seconds,
+        expires_at=expires_at,
+        actions=planned_actions,
+    )
+    try:
+        confirmed = await callback(
+            AgentHighRiskConfirmation(
+                capability="turn.high_risk_plan",
+                presentation=AgentHighRiskPresentation(
+                    public_action=(f"Run {len(planned_actions)} ordered high-risk actions"),
+                    public_target=(f"{len(planned_actions)} fixed action target scopes"),
+                    review_fields=(
+                        AgentHighRiskReviewField(
+                            "Plan size",
+                            f"{len(planned_actions)} fixed actions; hard maximum "
+                            f"{request.max_actions}.",
+                        ),
+                        AgentHighRiskReviewField(
+                            "Execution order",
+                            "Actions run only in the displayed order.",
+                        ),
+                        AgentHighRiskReviewField(
+                            "Failure policy",
+                            "The first failure stops the plan. Remaining actions are not run; "
+                            "there is no automatic retry or rollback.",
+                        ),
+                    ),
+                ),
+                binding_sha256=binding_sha256,
+                requester_principal_id=(
+                    authorized_context.requester_principal_id or authorized_context.actor_id
+                ),
+                authorization_message_id=authorization_message_id,
+                authorization_message_edited_at=(authorized_context.active_message_edited_at),
+                confirmation_kind="high_risk_plan",
+                plan_id=plan.plan_id,
+                plan_actions=tuple(
+                    AgentHighRiskPlanAction(
+                        position=action.position,
+                        capability=action.capability,
+                        arguments_sha256=action.fingerprint,
+                        presentation=action.presentation,
+                    )
+                    for action in planned_actions
+                ),
+                max_actions=request.max_actions,
+                expires_at=expires_at,
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "High-risk plan confirmation callback failed request=%s",
+            budget.context.request_id,
+        )
+        confirmed = False
+    if confirmed and datetime.now(UTC) >= expires_at:
+        _stop_high_risk_plan(
+            plan,
+            status=AgentHighRiskPlanStatus.EXPIRED,
+            error_code="agent.high_risk_plan_expired",
+        )
+        await _notify_high_risk_plan_status(budget, plan)
+    if not confirmed or plan.status is AgentHighRiskPlanStatus.EXPIRED:
+        return None, (
+            "agent.high_risk_confirmation_denied",
+            "The requester rejected, did not confirm, or allowed the exact plan to expire.",
+        )
+    budget.high_risk_plans[authorization_event_id] = plan
+    budget.capability_discovery_pending = False
+    budget.capability_discovery_contract_used = True
+    await _notify_high_risk_plan_status(budget, plan)
+    return plan, None
+
+
+def _high_risk_plan_fingerprint(
+    request: HighRiskPlanRequest,
+    *,
+    actions: list[_BoundHighRiskPlanAction],
+    context: InvocationContext,
+    expires_at: datetime,
+) -> str:
+    identity = "\0".join(
+        (
+            "simajilord-high-risk-plan-v1",
+            request.authorization_event_id,
+            context.actor_id,
+            context.workspace_id or "",
+            context.origin_resource_id or "",
+            context.active_message_id or "",
+            context.active_message_edited_at or "",
+            str(request.max_actions),
+            str(request.expires_in_seconds),
+            expires_at.isoformat(),
+            *(
+                f"{action.capability}:{action.contract_id}:{action.fingerprint}"
+                for action in actions
+            ),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _dispatch_high_risk_plan_action(
+    budget: _ToolTurnBudget,
+    tool_call_id: str,
+) -> None:
+    reference = budget.high_risk_plan_action_calls.get(tool_call_id)
+    if reference is None:
+        raise AgentToolError("The high-risk plan action binding was lost.")
+    authorization_event_id, action_index = reference
+    plan = budget.high_risk_plans.get(authorization_event_id)
+    if plan is None or not 0 <= action_index < len(plan.actions):
+        raise AgentToolError("The high-risk plan is no longer active.")
+    if datetime.now(UTC) >= plan.expires_at:
+        _stop_high_risk_plan(
+            plan,
+            status=AgentHighRiskPlanStatus.EXPIRED,
+            error_code="agent.high_risk_plan_expired",
+        )
+        raise AgentToolError("The high-risk plan expired before dispatch.")
+    action = plan.actions[action_index]
+    if action.status is not AgentHighRiskPlanActionStatus.PENDING:
+        raise AgentToolError("The high-risk plan action slot is not pending.")
+    action.status = AgentHighRiskPlanActionStatus.DISPATCHED
+    action.tool_call_id = tool_call_id
+    plan.status = AgentHighRiskPlanStatus.RUNNING
+
+
+async def _finalize_high_risk_plan_action(
+    trace: _ToolTraceState,
+    *,
+    succeeded: bool,
+    error_code: str | None,
+    tool_output: str | None,
+) -> AgentHighRiskPlanStatusUpdate | None:
+    budget = trace.budget
+    if budget is None:
+        return None
+    update = await _record_high_risk_plan_action_outcome(
+        budget,
+        tool_call_id=trace.call_id,
+        succeeded=succeeded,
+        error_code=error_code,
+        action_receipt_id=trace.action_receipt_id,
+        external_effect_id=trace.external_effect_id,
+        tool_output=tool_output,
+    )
+    if update is not None:
+        trace.high_risk_plan_id = update.plan_id
+        reference_position = next(
+            (action.position for action in update.actions if action.tool_call_id == trace.call_id),
+            None,
+        )
+        trace.high_risk_plan_action_position = reference_position
+    return update
+
+
+async def _record_high_risk_plan_action_outcome(
+    budget: _ToolTurnBudget,
+    *,
+    tool_call_id: str,
+    succeeded: bool,
+    error_code: str | None,
+    action_receipt_id: str | None = None,
+    external_effect_id: str | None = None,
+    tool_output: str | None = None,
+) -> AgentHighRiskPlanStatusUpdate | None:
+    """Commit one action outcome and stop every remaining slot after a failure."""
+
+    reference = budget.high_risk_plan_action_calls.pop(tool_call_id, None)
+    if reference is None:
+        return None
+    authorization_event_id, action_index = reference
+    plan = budget.high_risk_plans.get(authorization_event_id)
+    if plan is None or not 0 <= action_index < len(plan.actions):
+        return None
+    action = plan.actions[action_index]
+    if action.status is AgentHighRiskPlanActionStatus.PENDING:
+        # The exact plan slot was selected, but request validation or another
+        # host precondition failed before the external-effect boundary. It is
+        # still a failed plan action and must not become a reusable retry slot.
+        action.tool_call_id = tool_call_id
+        action.status = AgentHighRiskPlanActionStatus.FAILED
+        action.error_code = error_code or "agent.high_risk_plan_dispatch_not_recorded"
+        _stop_high_risk_plan(
+            plan,
+            status=AgentHighRiskPlanStatus.STOPPED,
+            error_code="agent.high_risk_plan_not_run_after_failure",
+        )
+    elif action.status is AgentHighRiskPlanActionStatus.DISPATCHED:
+        prior_terminal_status = (
+            plan.status
+            if plan.status
+            in {
+                AgentHighRiskPlanStatus.STOPPED,
+                AgentHighRiskPlanStatus.EXPIRED,
+            }
+            else None
+        )
+        action.action_receipt_id = action_receipt_id
+        action.external_effect_id = external_effect_id
+        if succeeded:
+            action.status = AgentHighRiskPlanActionStatus.SUCCEEDED
+            if prior_terminal_status is not None:
+                plan.status = prior_terminal_status
+            elif not _capture_plan_result_bindings(plan, action, tool_output):
+                _stop_high_risk_plan(
+                    plan,
+                    status=AgentHighRiskPlanStatus.STOPPED,
+                    error_code="agent.high_risk_plan_result_unavailable",
+                )
+            else:
+                plan.status = (
+                    AgentHighRiskPlanStatus.COMPLETED
+                    if all(
+                        item.status is AgentHighRiskPlanActionStatus.SUCCEEDED
+                        for item in plan.actions
+                    )
+                    else AgentHighRiskPlanStatus.RUNNING
+                )
+        else:
+            action.status = AgentHighRiskPlanActionStatus.FAILED
+            action.error_code = error_code or "agent.high_risk_plan_action_failed"
+            _stop_high_risk_plan(
+                plan,
+                status=(prior_terminal_status or AgentHighRiskPlanStatus.STOPPED),
+                error_code="agent.high_risk_plan_not_run_after_failure",
+            )
+    update = _high_risk_plan_status_update(plan)
+    await _notify_high_risk_plan_status(budget, plan)
+    return update
+
+
+def _stop_high_risk_plan(
+    plan: _BoundHighRiskPlan,
+    *,
+    status: AgentHighRiskPlanStatus,
+    error_code: str,
+) -> None:
+    plan.status = status
+    for action in plan.actions:
+        if action.status is AgentHighRiskPlanActionStatus.PENDING:
+            action.status = AgentHighRiskPlanActionStatus.NOT_RUN
+            action.error_code = error_code
+
+
+def _high_risk_plan_status_update(
+    plan: _BoundHighRiskPlan,
+) -> AgentHighRiskPlanStatusUpdate:
+    return AgentHighRiskPlanStatusUpdate(
+        plan_id=plan.plan_id,
+        binding_sha256=plan.binding_sha256,
+        status=plan.status,
+        actions=tuple(
+            AgentHighRiskPlanActionOutcome(
+                position=action.position,
+                capability=action.capability,
+                public_action=action.presentation.public_action,
+                public_target=action.presentation.public_target,
+                status=action.status,
+                tool_call_id=action.tool_call_id,
+                action_receipt_id=action.action_receipt_id,
+                external_effect_id=action.external_effect_id,
+                error_code=action.error_code,
+            )
+            for action in plan.actions
+        ),
+    )
+
+
+async def _notify_high_risk_plan_status(
+    budget: _ToolTurnBudget,
+    plan: _BoundHighRiskPlan,
+) -> None:
+    callback = budget.on_high_risk_plan_status
+    if callback is None:
+        return
+    try:
+        await callback(_high_risk_plan_status_update(plan))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "High-risk plan status callback failed plan=%s request=%s",
+            plan.plan_id,
+            budget.context.request_id,
+        )
+
+
+async def _discard_registered_high_risk_plan(
+    budget: _ToolTurnBudget,
+    plan: _BoundHighRiskPlan,
+) -> None:
+    """Make a confirmed-but-unregistered provider call visibly terminal."""
+
+    if budget.high_risk_plans.get(plan.authorization_event_id) is plan:
+        budget.high_risk_plans.pop(plan.authorization_event_id, None)
+    _stop_high_risk_plan(
+        plan,
+        status=AgentHighRiskPlanStatus.STOPPED,
+        error_code="agent.high_risk_plan_registration_failed",
+    )
+    await _notify_high_risk_plan_status(budget, plan)
+
+
+def _high_risk_plan_tool_output(plan: _BoundHighRiskPlan) -> str:
+    return json.dumps(
+        {
+            "plan_id": plan.plan_id,
+            "binding_sha256": plan.binding_sha256,
+            "status": plan.status.value,
+            "max_actions": plan.max_actions,
+            "expires_at": plan.expires_at.isoformat(),
+            "actions": [
+                {
+                    "position": action.position,
+                    "capability": action.capability,
+                    "status": action.status.value,
+                    "arguments_sha256": action.fingerprint,
+                }
+                for action in plan.actions
+            ],
+            "failure_policy": "stop_without_retry_or_rollback",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _high_risk_plan_status_reason(plan: _BoundHighRiskPlan) -> str:
+    statuses = ", ".join(f"{action.position}={action.status.value}" for action in plan.actions)
+    return (
+        f"The confirmed plan is {plan.status.value} ({statuses}). "
+        "No remaining action will run or retry automatically."
+    )
+
+
+def _tool_error_with_high_risk_plan_status(
+    text: str,
+    update: AgentHighRiskPlanStatusUpdate,
+) -> str:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = {"error": {"reason": text[:800]}}
+    if not isinstance(payload, dict):
+        payload = {"error": {"reason": "The plan action failed."}}
+    payload["high_risk_plan"] = {
+        "plan_id": update.plan_id,
+        "status": update.status.value,
+        "actions": [
+            {
+                "position": action.position,
+                "capability": action.capability,
+                "status": action.status.value,
+                "action_receipt_id": action.action_receipt_id,
+                "external_effect_id": action.external_effect_id,
+                "error_code": action.error_code,
+            }
+            for action in update.actions
+        ],
+        "automatic_retry": False,
+        "automatic_rollback": False,
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 async def _confirm_high_risk_action(
     budget: _ToolTurnBudget,
     *,
     capability_name: str,
     arguments: object,
     context: InvocationContext,
+    tool_call_id: str | None = None,
 ) -> tuple[str, str] | None:
     """Require a requester-only host confirmation before the external dispatch."""
 
@@ -4799,6 +5773,19 @@ async def _confirm_high_risk_action(
         arguments,
         context,
     )
+    if tool_call_id is not None and tool_call_id in budget.high_risk_plan_action_calls:
+        return None
+    authorization_event_id = (
+        arguments.get("authorization_event_id") if isinstance(arguments, dict) else None
+    )
+    if isinstance(authorization_event_id, str):
+        plan = budget.high_risk_plans.get(authorization_event_id)
+        if plan is not None and any(
+            action.status is AgentHighRiskPlanActionStatus.PENDING
+            and secrets.compare_digest(action.fingerprint, fingerprint)
+            for action in plan.actions
+        ):
+            return None
     if fingerprint in budget.confirmed_high_risk_actions:
         return None
     if fingerprint in budget.denied_high_risk_actions:
@@ -4927,10 +5914,7 @@ def _evidence_plan_gap(
                 "source.search or source.read successfully before answering."
             ),
         )
-    if (
-        budget.capability_discovery_required
-        and budget.capability_discovery_searches == 0
-    ):
+    if budget.capability_discovery_required and budget.capability_discovery_searches == 0:
         return (
             "agent.capability_discovery_required",
             (
@@ -4970,6 +5954,18 @@ def _capability_discovery_tool_failure(
             ),
         )
     if tool_name == "capability_search":
+        if any(
+            plan.status
+            in {
+                AgentHighRiskPlanStatus.CONFIRMED,
+                AgentHighRiskPlanStatus.RUNNING,
+            }
+            for plan in budget.high_risk_plans.values()
+        ):
+            return (
+                "agent.high_risk_plan_in_progress",
+                "Finish the confirmed bounded plan before starting another capability search.",
+            )
         if budget.capability_discovery_pending or (
             budget.capability_discovery_name is not None
             and not budget.capability_discovery_contract_used
@@ -4992,13 +5988,33 @@ def _capability_discovery_tool_failure(
             budget.capability_discovery_name is not None
             and not budget.capability_discovery_contract_used
         ):
-            return (
-                "agent.capability_contract_pending",
-                (
-                    "Use the currently described contract before loading or resolving "
-                    "another capability."
-                ),
+            requested_name = arguments.get("name") if isinstance(arguments, dict) else None
+            current_is_plan_contract = budget.capability_discovery_name == "turn.high_risk_plan"
+            requested_is_plan_contract = requested_name == "turn.high_risk_plan"
+            requested_is_new_action_contract = (
+                requested_name in AGENT_HIGH_RISK_CAPABILITIES
+                and requested_name not in budget.capability_discovery_contracts
+                and len(budget.capability_discovery_contracts) < MAX_HIGH_RISK_PLAN_ACTIONS
             )
+            can_extend_high_risk_plan = (
+                tool_name == "capability_describe"
+                and (
+                    budget.capability_discovery_name in AGENT_HIGH_RISK_CAPABILITIES
+                    or current_is_plan_contract
+                )
+                and requested_name != budget.capability_discovery_name
+                and (requested_is_plan_contract or requested_is_new_action_contract)
+            )
+            if not can_extend_high_risk_plan:
+                return (
+                    "agent.capability_contract_pending",
+                    (
+                        "Use the currently described contract, or for one bounded "
+                        "multi-action plan describe each additional distinct high-risk "
+                        "capability from this same catalog before calling "
+                        "turn.high_risk_plan."
+                    ),
+                )
         catalog_id = arguments.get("catalog_id") if isinstance(arguments, dict) else None
         if catalog_id != budget.capability_discovery_catalog_id:
             return (
@@ -5008,6 +6024,28 @@ def _capability_discovery_tool_failure(
         return None
     if tool_name != "capability_invoke":
         return None
+    contract_id = arguments.get("contract_id") if isinstance(arguments, dict) else None
+    if isinstance(capability_name, str) and isinstance(contract_id, str):
+        for plan in budget.high_risk_plans.values():
+            next_action = next(
+                (
+                    action
+                    for action in plan.actions
+                    if action.status is AgentHighRiskPlanActionStatus.PENDING
+                ),
+                None,
+            )
+            if (
+                plan.status
+                in {
+                    AgentHighRiskPlanStatus.CONFIRMED,
+                    AgentHighRiskPlanStatus.RUNNING,
+                }
+                and next_action is not None
+                and next_action.capability == capability_name
+                and secrets.compare_digest(next_action.contract_id, contract_id)
+            ):
+                return None
     if budget.capability_discovery_name is None:
         return (
             "agent.capability_contract_required",
@@ -5021,7 +6059,6 @@ def _capability_discovery_tool_failure(
             "agent.capability_contract_mismatch",
             "Invoke only the capability whose one contract was just described.",
         )
-    contract_id = arguments.get("contract_id") if isinstance(arguments, dict) else None
     if contract_id != budget.capability_discovery_contract_id:
         return (
             "agent.capability_contract_mismatch",
@@ -5054,6 +6091,7 @@ def _record_capability_discovery_result(
         budget.capability_discovery_name = None
         budget.capability_discovery_contract_id = None
         budget.capability_discovery_contract_used = False
+        budget.capability_discovery_contracts.clear()
         return
     if tool_name == "capability_describe":
         if payload.get("catalog_id") != budget.capability_discovery_catalog_id:
@@ -5065,6 +6103,8 @@ def _record_capability_discovery_result(
         budget.capability_discovery_name = name
         budget.capability_discovery_contract_id = contract_id
         budget.capability_discovery_contract_used = False
+        if name in AGENT_HIGH_RISK_CAPABILITIES:
+            budget.capability_discovery_contracts[name] = contract_id
     elif tool_name == "capability_resolution":
         if payload.get("catalog_id") != budget.capability_discovery_catalog_id:
             return
@@ -5074,6 +6114,7 @@ def _record_capability_discovery_result(
         budget.capability_discovery_name = None
         budget.capability_discovery_contract_id = None
         budget.capability_discovery_contract_used = False
+        budget.capability_discovery_contracts.clear()
     elif tool_name == "capability_invoke":
         if budget.capability_discovery_name is None:
             return
@@ -5155,6 +6196,7 @@ def _require_evidence_plan_refresh_after_context(budget: _ToolTurnBudget) -> Non
     budget.capability_discovery_name = None
     budget.capability_discovery_contract_id = None
     budget.capability_discovery_contract_used = False
+    budget.capability_discovery_contracts.clear()
 
 
 def _memory_evidence_failure(
@@ -5221,15 +6263,8 @@ def _memory_evidence_failure(
                     f"message read in this turn: {message_id}."
                 ),
             )
-        claimed_revision = (
-            locator.get("message_edited_at")
-            if locator is not None
-            else None
-        )
-        if (
-            claimed_revision is not None
-            and claimed_revision != state.edited_at_iso
-        ):
+        claimed_revision = locator.get("message_edited_at") if locator is not None else None
+        if claimed_revision is not None and claimed_revision != state.edited_at_iso:
             return (
                 "memory.source_message_revision_mismatch",
                 (
@@ -5581,13 +6616,9 @@ def _record_discord_disclosure_observations(
         candidates.append(file_record)
     memory_records = payload.get("memories")
     if isinstance(memory_records, list):
-        candidates.extend(
-            item for item in memory_records if isinstance(item, dict)
-        )
+        candidates.extend(item for item in memory_records if isinstance(item, dict))
     provenance_candidates = [
-        item.get("provenance")
-        for item in candidates
-        if isinstance(item.get("provenance"), dict)
+        item.get("provenance") for item in candidates if isinstance(item.get("provenance"), dict)
     ]
     for provenance in provenance_candidates:
         assert isinstance(provenance, dict)
@@ -5615,13 +6646,9 @@ def _record_discord_disclosure_observations(
                     resources = []
                 else:
                     origin_visibility = "restricted"
-                    resources = [
-                        [origin_guild_id, origin_channel_id, origin_visibility]
-                    ]
+                    resources = [[origin_guild_id, origin_channel_id, origin_visibility]]
             else:
-                resources = [
-                    [origin_guild_id, origin_channel_id, origin_visibility]
-                ]
+                resources = [[origin_guild_id, origin_channel_id, origin_visibility]]
         for resource in resources:
             if not isinstance(resource, list) or len(resource) != 3:
                 continue
@@ -5637,8 +6664,7 @@ def _record_discord_disclosure_observations(
                 and channel_id == budget.context.origin_resource_id
             )
             same_guild_public = (
-                guild_id == budget.context.workspace_id
-                and visibility == "guild_public"
+                guild_id == budget.context.workspace_id and visibility == "guild_public"
             )
             observation = DisclosureObservation(
                 source_workspace_id=guild_id,
@@ -5648,9 +6674,7 @@ def _record_discord_disclosure_observations(
                     visibility,
                 ),
                 relation_to_origin=(
-                    "same_or_narrower"
-                    if same_origin or same_guild_public
-                    else "uncertain"
+                    "same_or_narrower" if same_origin or same_guild_public else "uncertain"
                 ),
             )
             if observation not in budget.discord_disclosure_observations:
@@ -5681,26 +6705,26 @@ def _record_discord_disclosure_observations(
         )
         if observation not in budget.discord_disclosure_observations:
             budget.discord_disclosure_observations.append(observation)
-    missing_required_label = (
-        len(budget.discord_disclosure_observations) == observation_count
-        and (
-            (tracked_discord_read and capability_name not in {
+    missing_required_label = len(budget.discord_disclosure_observations) == observation_count and (
+        (
+            tracked_discord_read
+            and capability_name
+            not in {
                 "discord.read_messages",
                 "discord.search_messages",
-            })
-            or (
-                tracked_discord_read
-                and capability_name
-                in {"discord.read_messages", "discord.search_messages"}
-                and (not isinstance(messages, list) or bool(messages))
-            )
-            or (tracked_actor_private and capability_name != "files.list")
-            or (
-                tracked_actor_private
-                and capability_name == "files.list"
-                and isinstance(file_records, list)
-                and bool(file_records)
-            )
+            }
+        )
+        or (
+            tracked_discord_read
+            and capability_name in {"discord.read_messages", "discord.search_messages"}
+            and (not isinstance(messages, list) or bool(messages))
+        )
+        or (tracked_actor_private and capability_name != "files.list")
+        or (
+            tracked_actor_private
+            and capability_name == "files.list"
+            and isinstance(file_records, list)
+            and bool(file_records)
         )
     )
     if output_truncated or missing_required_label:
@@ -5776,9 +6800,7 @@ def _record_guild_metadata_disclosure_observations(
             source_resource_id=f"guild:{guild_id}:{metadata_kind}",
             visibility=visibility,
             relation_to_origin=(
-                "same_or_narrower"
-                if guild_id == budget.context.workspace_id
-                else "uncertain"
+                "same_or_narrower" if guild_id == budget.context.workspace_id else "uncertain"
             ),
         )
         if observation not in budget.discord_disclosure_observations:
@@ -5831,9 +6853,7 @@ def _record_truncated_disclosure_observation(
                 resource_ids.append(value)
         channel_ids = arguments.get("channel_ids")
         if isinstance(channel_ids, list):
-            resource_ids.extend(
-                value for value in channel_ids if isinstance(value, str) and value
-            )
+            resource_ids.extend(value for value in channel_ids if isinstance(value, str) and value)
     if not resource_ids:
         resource_ids.append(
             (
@@ -5989,16 +7009,9 @@ def _web_search_mode(context: InvocationContext) -> str:
 
     if AGENT_WEB_GRANT not in context.grants:
         return "disabled"
-    if (
-        context.agent_trigger == "autonomous"
-        and context.policy_id == "discord-autonomy-strict-v1"
-    ):
+    if context.agent_trigger == "autonomous" and context.policy_id == "discord-autonomy-strict-v1":
         return "disabled"
-    return (
-        "disabled"
-        if context.information_flow_mode == "enforce"
-        else "live"
-    )
+    return "disabled" if context.information_flow_mode == "enforce" else "live"
 
 
 def _object(value: object, label: str) -> dict[str, object]:

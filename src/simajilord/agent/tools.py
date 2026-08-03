@@ -88,6 +88,8 @@ class AgentToolOutput:
 
     text: str
     image_url: str | None = None
+    action_receipt_id: str | None = None
+    external_effect_id: str | None = None
 
     def __len__(self) -> int:
         return len(self.text)
@@ -146,10 +148,7 @@ class AgentToolCatalog:
         for label, values in policy_sequences.items():
             duplicates = _duplicates(values)
             if duplicates:
-                raise AgentToolError(
-                    f"Agent {label} contains duplicates: "
-                    + ", ".join(duplicates)
-                )
+                raise AgentToolError(f"Agent {label} contains duplicates: " + ", ".join(duplicates))
         self._required_grants = dict(required_grants or {})
         self._eager_capabilities = (
             frozenset(self._allowed_capabilities)
@@ -170,12 +169,7 @@ class AgentToolCatalog:
         unknown_destructive = self._destructive_capabilities - allowed
         unknown_images = self._image_output_capabilities - allowed
         if unknown_eager or unknown_writes or unknown_destructive or unknown_images:
-            unknown = sorted(
-                unknown_eager
-                | unknown_writes
-                | unknown_destructive
-                | unknown_images
-            )
+            unknown = sorted(unknown_eager | unknown_writes | unknown_destructive | unknown_images)
             raise AgentToolError(
                 "Agent tool policies reference capabilities outside the allowlist: "
                 + ", ".join(unknown)
@@ -203,9 +197,7 @@ class AgentToolCatalog:
                     "Agent write capabilities require an explicit Action policy: "
                     + ", ".join(sorted(unclassified_writes))
                 )
-        unmanaged_destructive = (
-            self._destructive_capabilities - self._write_capabilities
-        )
+        unmanaged_destructive = self._destructive_capabilities - self._write_capabilities
         if unmanaged_destructive:
             raise AgentToolError(
                 "Destructive capabilities must also be declared as writes: "
@@ -253,11 +245,7 @@ class AgentToolCatalog:
             tool_name=tool_name,
             arguments=arguments,
         )
-        return (
-            capability_name
-            if capability_name in self._write_capabilities
-            else None
-        )
+        return capability_name if capability_name in self._write_capabilities else None
 
     def authorization_event_id_for_call(
         self,
@@ -267,10 +255,13 @@ class AgentToolCatalog:
     ) -> str | None:
         """Return the exact event whose actor must authorize one resolved write."""
 
-        if self.write_capability_for_call(
-            tool_name=tool_name,
-            arguments=arguments,
-        ) is None:
+        if (
+            self.write_capability_for_call(
+                tool_name=tool_name,
+                arguments=arguments,
+            )
+            is None
+        ):
             return None
         if not isinstance(arguments, dict):
             return None
@@ -290,10 +281,49 @@ class AgentToolCatalog:
 
         if capability_name not in self._write_capabilities:
             return False
-        return (
-            self._registry.endpoint(capability_name).descriptor.idempotency
-            == "idempotent_write"
+        return self._registry.endpoint(capability_name).descriptor.idempotency == "idempotent_write"
+
+    def validate_planned_write(
+        self,
+        *,
+        capability_name: str,
+        arguments: object,
+        contract_id: str,
+        context: InvocationContext,
+    ) -> None:
+        """Validate one deferred write contract and request without invoking it."""
+
+        if capability_name not in self._write_capabilities:
+            raise AgentToolError("A high-risk plan can contain only managed writes.")
+        if not self._is_available(capability_name, context):
+            raise AgentToolError(
+                "A planned capability is unavailable under the current grants and approvals."
+            )
+        endpoint = self._validated_endpoint(capability_name, context)
+        available_catalog = tuple(
+            item
+            for item in self._registry.all()
+            if (
+                item.descriptor.name in self._allowed_capabilities
+                and self._unavailable_reason(item.descriptor.name, context) is None
+            )
         )
+        catalog_id = _capability_catalog_id(
+            available_catalog,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        expected_contract_id = _capability_contract_id(
+            catalog_id,
+            capability_name,
+            context=context,
+            secret=self._discovery_secret,
+        )
+        if not secrets.compare_digest(contract_id, expected_contract_id):
+            raise AgentToolError(
+                "A planned capability contract is missing, stale, or belongs to another capability."
+            )
+        _build_dataclass(endpoint.request_type, arguments)
 
     def capability_for_call(
         self,
@@ -305,11 +335,7 @@ class AgentToolCatalog:
 
         if tool_name == _INVOKE_TOOL and isinstance(arguments, dict):
             name = arguments.get("name")
-            return (
-                name
-                if isinstance(name, str) and name in self._allowed_capabilities
-                else None
-            )
+            return name if isinstance(name, str) and name in self._allowed_capabilities else None
         return self._aliases.get(tool_name)
 
     def trace_metadata_for_call(
@@ -415,11 +441,7 @@ class AgentToolCatalog:
             tool_name=tool_name,
             arguments=arguments,
         )
-        return (
-            _tool_alias(capability_name)
-            if capability_name is not None
-            else tool_name
-        )
+        return _tool_alias(capability_name) if capability_name is not None else tool_name
 
     def capability_arguments_for_call(
         self,
@@ -573,9 +595,7 @@ class AgentToolCatalog:
             raise AgentToolError("Capability list arguments must be an object.")
         unknown = set(arguments) - {"cursor", "limit"}
         if unknown:
-            raise AgentToolError(
-                f"Unknown capability list fields: {', '.join(sorted(unknown))}"
-            )
+            raise AgentToolError(f"Unknown capability list fields: {', '.join(sorted(unknown))}")
         raw_cursor = arguments.get("cursor")
         limit = arguments.get("limit", _MAX_CAPABILITY_SEARCH_LIMIT)
         offset = _decode_capability_list_cursor(raw_cursor)
@@ -585,8 +605,7 @@ class AgentToolCatalog:
             or not 1 <= limit <= _MAX_CAPABILITY_SEARCH_LIMIT
         ):
             raise AgentToolError(
-                "Capability list limit must be between 1 and "
-                f"{_MAX_CAPABILITY_SEARCH_LIMIT}."
+                f"Capability list limit must be between 1 and {_MAX_CAPABILITY_SEARCH_LIMIT}."
             )
         if before_invoke is not None:
             before_invoke()
@@ -601,9 +620,7 @@ class AgentToolCatalog:
         for capability_name in sorted(self._allowed_capabilities):
             reason = self._unavailable_reason(capability_name, context)
             if reason is not None:
-                unavailable_reason_counts[reason] = (
-                    unavailable_reason_counts.get(reason, 0) + 1
-                )
+                unavailable_reason_counts[reason] = unavailable_reason_counts.get(reason, 0) + 1
                 continue
             item = registered.get(capability_name)
             if item is None:
@@ -628,9 +645,7 @@ class AgentToolCatalog:
                 }
                 for item in page
             ],
-            "next_cursor": (
-                _encode_capability_list_cursor(next_offset) if has_more else None
-            ),
+            "next_cursor": (_encode_capability_list_cursor(next_offset) if has_more else None),
             "has_more": has_more,
             "total_results": len(available),
             "unavailable_reason_counts": unavailable_reason_counts,
@@ -653,9 +668,7 @@ class AgentToolCatalog:
             raise AgentToolError("Capability search arguments must be an object.")
         unknown = set(arguments) - {"query", "limit"}
         if unknown:
-            raise AgentToolError(
-                f"Unknown capability search fields: {', '.join(sorted(unknown))}"
-            )
+            raise AgentToolError(f"Unknown capability search fields: {', '.join(sorted(unknown))}")
         query = arguments.get("query", "")
         limit = arguments.get("limit")
         if not isinstance(query, str) or not query.strip():
@@ -671,8 +684,7 @@ class AgentToolCatalog:
             or not 1 <= limit <= _MAX_CAPABILITY_SEARCH_LIMIT
         ):
             raise AgentToolError(
-                "Capability search limit must be between 1 and "
-                f"{_MAX_CAPABILITY_SEARCH_LIMIT}."
+                f"Capability search limit must be between 1 and {_MAX_CAPABILITY_SEARCH_LIMIT}."
             )
         if before_invoke is not None:
             before_invoke()
@@ -690,9 +702,7 @@ class AgentToolCatalog:
         for capability_name in sorted(self._allowed_capabilities):
             reason = self._unavailable_reason(capability_name, context)
             if reason is not None:
-                unavailable_reason_counts[reason] = (
-                    unavailable_reason_counts.get(reason, 0) + 1
-                )
+                unavailable_reason_counts[reason] = unavailable_reason_counts.get(reason, 0) + 1
         for item in candidates:
             if self._unavailable_reason(item.descriptor.name, context) is None:
                 self._validated_endpoint(item.descriptor.name, context)
@@ -833,9 +843,7 @@ class AgentToolCatalog:
         if not isinstance(catalog_id, str) or not catalog_id:
             raise AgentToolError("Capability resolution catalog_id must be text.")
         if conclusion != "unavailable":
-            raise AgentToolError(
-                "Capability resolution conclusion must be unavailable."
-            )
+            raise AgentToolError("Capability resolution conclusion must be unavailable.")
         if not isinstance(reason, str) or not reason.strip():
             raise AgentToolError("Capability resolution reason must be non-empty text.")
         available_catalog = tuple(
@@ -950,8 +958,7 @@ class AgentToolCatalog:
             before_invoke()
         effect = None
         tracks_external_effect = (
-            self._action_receipts is not None
-            and capability_name in self._write_capabilities
+            self._action_receipts is not None and capability_name in self._write_capabilities
         )
         if tracks_external_effect:
             assert self._action_receipts is not None
@@ -1015,17 +1022,12 @@ class AgentToolCatalog:
                         exc_info=True,
                     )
             raise
-        if (
-            effect is not None
-            and not effect.dispatched
-            and not effect.completed_without_dispatch
-        ):
+        if effect is not None and not effect.dispatched and not effect.completed_without_dispatch:
             # A successful write without an adapter dispatch hook may already have
             # changed external state. Cross a late barrier and fail closed instead
             # of returning success or allowing an automatic replay.
             log.critical(
-                "Write returned without external effect dispatch capability=%s "
-                "request_id=%s",
+                "Write returned without external effect dispatch capability=%s request_id=%s",
                 capability_name,
                 context.request_id,
             )
@@ -1049,9 +1051,7 @@ class AgentToolCatalog:
                     response=result,
                     context=context,
                     effect_id=(
-                        effect.effect_id
-                        if effect is not None and effect.dispatched
-                        else None
+                        effect.effect_id if effect is not None and effect.dispatched else None
                     ),
                 )
             except Exception:
@@ -1097,6 +1097,10 @@ class AgentToolCatalog:
                     request=request,
                 ),
                 image_url=image_url,
+                action_receipt_id=(receipt.action_id if receipt is not None else None),
+                external_effect_id=(
+                    effect.effect_id if effect is not None and effect.dispatched else None
+                ),
             )
         visible_result = _with_action_receipt(result, receipt)
         return AgentToolOutput(
@@ -1104,7 +1108,11 @@ class AgentToolCatalog:
                 visible_result,
                 max_output_characters=max_output_characters,
                 request=request,
-            )
+            ),
+            action_receipt_id=(receipt.action_id if receipt is not None else None),
+            external_effect_id=(
+                effect.effect_id if effect is not None and effect.dispatched else None
+            ),
         )
 
     def _is_available(
@@ -1139,9 +1147,7 @@ class AgentToolCatalog:
         except CapabilityError:
             # Discord transport endpoints are attached after the core runtime is built.
             return "endpoint_unregistered"
-        if descriptor.requires_workspace and (
-            context is None or context.workspace_id is None
-        ):
+        if descriptor.requires_workspace and (context is None or context.workspace_id is None):
             return "workspace_required"
         if descriptor.approval is ApprovalMode.NEVER:
             return None
@@ -1165,21 +1171,14 @@ class AgentToolCatalog:
             and context.allowed_capabilities is not None
             and capability_name not in context.allowed_capabilities
         ):
-            raise AgentToolError(
-                f"Agent policy does not allow {capability_name} in this turn."
-            )
+            raise AgentToolError(f"Agent policy does not allow {capability_name} in this turn.")
         required_grant = self._required_grants.get(capability_name)
         if descriptor.approval is ApprovalMode.ALWAYS:
-            raise AgentToolError(
-                f"Agent catalog cannot expose always-approved {capability_name}."
-            )
-        if (
-            descriptor.approval is ApprovalMode.WHEN_REQUESTED
-            and (context is None or capability_name not in context.approvals)
+            raise AgentToolError(f"Agent catalog cannot expose always-approved {capability_name}.")
+        if descriptor.approval is ApprovalMode.WHEN_REQUESTED and (
+            context is None or capability_name not in context.approvals
         ):
-            raise AgentToolError(
-                f"Agent catalog lacks turn approval for {capability_name}."
-            )
+            raise AgentToolError(f"Agent catalog lacks turn approval for {capability_name}.")
         if (
             capability_name in self._destructive_capabilities
             and descriptor.risk is not RiskLevel.DESTRUCTIVE
@@ -1197,15 +1196,11 @@ class AgentToolCatalog:
                 f"Agent catalog cannot expose unmanaged destructive {capability_name}."
             )
         if descriptor.risk is RiskLevel.EXTERNAL and required_grant is None:
-            raise AgentToolError(
-                f"Agent external catalog requires a grant for {capability_name}."
-            )
+            raise AgentToolError(f"Agent external catalog requires a grant for {capability_name}.")
         if descriptor.risk in {RiskLevel.WRITE, RiskLevel.DESTRUCTIVE} and (
             capability_name not in self._write_capabilities or required_grant is None
         ):
-            raise AgentToolError(
-                f"Agent catalog cannot expose unapproved write {capability_name}."
-            )
+            raise AgentToolError(f"Agent catalog cannot expose unapproved write {capability_name}.")
         return endpoint
 
 
@@ -1222,21 +1217,15 @@ def _descriptor_metadata(descriptor: CapabilityDescriptor) -> Mapping[str, objec
         "timeout_seconds": descriptor.timeout_seconds,
         "user_visible_effect": descriptor.user_visible_effect,
         "disclosure_class": (
-            descriptor.disclosure_class.value
-            if descriptor.disclosure_class is not None
-            else None
+            descriptor.disclosure_class.value if descriptor.disclosure_class is not None else None
         ),
         "egress": (
             {
                 "provider": descriptor.egress.provider,
-                "field_kinds": tuple(
-                    item.value for item in descriptor.egress.field_kinds
-                ),
+                "field_kinds": tuple(item.value for item in descriptor.egress.field_kinds),
                 "sink_audience": descriptor.egress.sink_audience.value,
                 "consent": descriptor.egress.consent.value,
-                "source_resource_fields": (
-                    descriptor.egress.source_resource_fields
-                ),
+                "source_resource_fields": (descriptor.egress.source_resource_fields),
             }
             if descriptor.egress is not None
             else None
@@ -1451,9 +1440,7 @@ def _capability_catalog_id(
     """Return an opaque proof bound to this runtime, request, and full catalog."""
 
     names = sorted(item.descriptor.name for item in endpoints)
-    payload = "\0".join(
-        ("catalog", _capability_discovery_scope(context), *names)
-    ).encode("utf-8")
+    payload = "\0".join(("catalog", _capability_discovery_scope(context), *names)).encode("utf-8")
     digest = hmac.new(secret, payload, hashlib.sha256).hexdigest()[:32]
     return f"{_CAPABILITY_CATALOG_ID_PREFIX}{digest}"
 
@@ -1522,10 +1509,7 @@ def _capability_catalog_index(
         name = item.descriptor.name
         namespace, _, _ = name.partition(".")
         grouped.setdefault(namespace, []).append(name)
-    return {
-        namespace: tuple(local_names)
-        for namespace, local_names in sorted(grouped.items())
-    }
+    return {namespace: tuple(local_names) for namespace, local_names in sorted(grouped.items())}
 
 
 def _invoke_spec() -> Mapping[str, object]:
@@ -1616,8 +1600,7 @@ def _tool_input_schema(
     properties = dict(cast(Mapping[str, object], schema["properties"]))
     if _AUTHORIZATION_EVENT_ID in properties:
         raise AgentToolError(
-            f"{model.__name__} shadows the reserved "
-            f"{_AUTHORIZATION_EVENT_ID} field."
+            f"{model.__name__} shadows the reserved {_AUTHORIZATION_EVENT_ID} field."
         )
     properties[_AUTHORIZATION_EVENT_ID] = {
         "type": "string",
@@ -1636,11 +1619,7 @@ def _tool_input_schema(
 def _without_authorization_event_id(arguments: object) -> object:
     if not isinstance(arguments, dict) or _AUTHORIZATION_EVENT_ID not in arguments:
         return arguments
-    return {
-        key: value
-        for key, value in arguments.items()
-        if key != _AUTHORIZATION_EVENT_ID
-    }
+    return {key: value for key, value in arguments.items() if key != _AUTHORIZATION_EVENT_ID}
 
 
 def _annotation_schema(annotation: object) -> Mapping[str, object]:
@@ -1648,9 +1627,7 @@ def _annotation_schema(annotation: object) -> Mapping[str, object]:
     arguments = get_args(annotation)
     if origin is Literal:
         if not arguments or not all(isinstance(item, str) for item in arguments):
-            raise AgentToolError(
-                f"Unsupported dynamic tool literal annotation: {annotation!r}"
-            )
+            raise AgentToolError(f"Unsupported dynamic tool literal annotation: {annotation!r}")
         return {"type": "string", "enum": list(arguments)}
     if origin in (Union, types.UnionType):
         non_none = tuple(item for item in arguments if item is not type(None))
@@ -1858,19 +1835,14 @@ def _bounded_content_mapping(
     offset_value = value.get("offset")
     if not isinstance(offset_value, int) or isinstance(offset_value, bool):
         offset_value = _request_integer(request, "offset")
-    has_offset_continuation = (
-        offset_value is not None
-        and ("next_offset" in value or _request_has_field(request, "offset"))
+    has_offset_continuation = offset_value is not None and (
+        "next_offset" in value or _request_has_field(request, "offset")
     )
     protected = {
         "truncated",
         "reason",
         content_key,
-        *(
-            ("offset", "next_offset", "complete")
-            if has_offset_continuation
-            else ()
-        ),
+        *(("offset", "next_offset", "complete") if has_offset_continuation else ()),
     }
     payload = _drop_optional_fields_to_fit(
         payload,
@@ -1921,11 +1893,7 @@ def _bounded_content_mapping(
             lower = midpoint + 1
         else:
             upper = midpoint - 1
-    if (
-        original_content
-        and not best[content_key]
-        and has_offset_continuation
-    ):
+    if original_content and not best[content_key] and has_offset_continuation:
         # A supported budget always has room for progress once optional metadata is gone.
         one_character = candidate(1)
         if len(_encode_json(one_character)) <= max_output_characters:
@@ -1981,8 +1949,7 @@ def _bounded_list_mapping(
         if not compact:
             return list(items)
         return [
-            _compact_json_value(item, string_limit=96, list_limit=4, depth=0)[0]
-            for item in items
+            _compact_json_value(item, string_limit=96, list_limit=4, depth=0)[0] for item in items
         ]
 
     def candidate(items: list[object]) -> dict[str, object]:
@@ -2050,9 +2017,7 @@ def _bounded_list_mapping(
             best = proposed
         else:
             projected_item = (
-                _capability_match_projection(
-                    selected(1)[0]
-                )
+                _capability_match_projection(selected(1)[0])
                 if list_key == "matches"
                 else _identity_projection(compact_item[0])
             )
@@ -2089,11 +2054,7 @@ def _bounded_structured_value(
             list_limit=list_limit,
             depth=0,
         )
-        payload = (
-            dict(compact)
-            if isinstance(compact, Mapping)
-            else {"value": compact}
-        )
+        payload = dict(compact) if isinstance(compact, Mapping) else {"value": compact}
         payload["truncated"] = True
         payload["reason"] = "agent_tool_output_budget"
         encoded = _encode_json(payload)
@@ -2371,10 +2332,7 @@ def _with_action_receipt(
     if receipt is None:
         return result
     if dataclasses.is_dataclass(result) and not isinstance(result, type):
-        visible = {
-            field.name: getattr(result, field.name)
-            for field in dataclasses.fields(result)
-        }
+        visible = {field.name: getattr(result, field.name) for field in dataclasses.fields(result)}
         if "action_receipt" in visible:
             raise AgentToolError("Capability response shadows action_receipt.")
         visible["action_receipt"] = receipt

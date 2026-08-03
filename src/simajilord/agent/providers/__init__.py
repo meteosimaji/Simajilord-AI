@@ -2,6 +2,7 @@
 
 from .base import (
     AgentHighRiskConfirmationCallback,
+    AgentHighRiskPlanStatusCallback,
     AgentProgressCallback,
     AgentProvider,
     AgentProviderThreadBindingSink,
@@ -13,6 +14,7 @@ from .codex import CodexAppServerProvider
 
 __all__ = [
     "AgentHighRiskConfirmationCallback",
+    "AgentHighRiskPlanStatusCallback",
     "AgentProgressCallback",
     "AgentProvider",
     "AgentProviderThreadBindingSink",

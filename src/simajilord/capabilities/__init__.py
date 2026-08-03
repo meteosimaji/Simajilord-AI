@@ -60,6 +60,15 @@ from .focus_timer import (
     FocusTimerResponse,
     build_focus_timer_endpoints,
 )
+from .high_risk_plan import (
+    MAX_HIGH_RISK_PLAN_ACTIONS,
+    HighRiskPlanActionRequest,
+    HighRiskPlanRequest,
+    HighRiskPlanResponse,
+    build_high_risk_plan_endpoint,
+    high_risk_plan_request_from_arguments,
+    validate_high_risk_plan_request,
+)
 from .image import (
     ImageGenerateRequest,
     ImageGenerateResponse,
@@ -149,6 +158,7 @@ from .web import (
 )
 
 __all__ = [
+    "MAX_HIGH_RISK_PLAN_ACTIONS",
     "AudioAutoLeaveRequest",
     "AudioControlRequest",
     "AudioControlResponse",
@@ -197,6 +207,9 @@ __all__ = [
     "FocusTimerListRequest",
     "FocusTimerListResponse",
     "FocusTimerResponse",
+    "HighRiskPlanActionRequest",
+    "HighRiskPlanRequest",
+    "HighRiskPlanResponse",
     "ImageGenerateRequest",
     "ImageGenerateResponse",
     "ImageStatusRequest",
@@ -247,6 +260,7 @@ __all__ = [
     "build_feedback_endpoint",
     "build_file_endpoints",
     "build_focus_timer_endpoints",
+    "build_high_risk_plan_endpoint",
     "build_image_endpoints",
     "build_isolated_shell_endpoint",
     "build_media_save_endpoint",
@@ -262,4 +276,6 @@ __all__ = [
     "build_utility_endpoints",
     "build_web_endpoints",
     "discord_workspace_for_context",
+    "high_risk_plan_request_from_arguments",
+    "validate_high_risk_plan_request",
 ]

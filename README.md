@@ -265,14 +265,24 @@ with Discord's generic “interaction failed” banner.
   moderation, destructive operations, role/channel/policy mutation, persistent read-aloud,
   direct messages, destructive connectors, and shell execution require a requester-only Discord
   confirmation bound to the exact capability, canonical arguments, target context, active
-  message revision, short expiry, and one use. The shared channel card contains only a fixed
+  message revision, short expiry, and one direct dispatch or one fixed bounded plan. The shared
+  channel card contains only a fixed
   operation label, a non-sensitive target class, the binding prefix, and expiry. Pressing
   **Review privately** opens a requester-only ephemeral card with the complete structured target,
   expected state, requested change, audience, external transfer, reversibility, and any sensitive
   DM body, shell argv, connector payload, or moderation reason; a separate button there performs
   the final confirmation. No field is truncated: details that cannot fit Discord's complete-review
-  limits fail closed and require a narrower or operator-reviewed workflow. `legacy_event` is an
-  explicit rollback mode
+  limits fail closed and require a narrower or operator-reviewed workflow. For two through eight
+  high-risk writes authorized by the same exact event, `turn.high_risk_plan` binds one private
+  confirmation to every action in order, each current opaque capability contract and argument
+  fingerprint, a hard ceiling equal to the displayed action count, and a 30–300 second expiry.
+  A later action may use only a named bounded string result from an earlier action through a typed
+  `$plan_result` reference; fixed targets and values remain exact. Each dispatched action records
+  its tool-call, Action Receipt, and external-effect IDs. The first failure leaves earlier
+  successes intact, marks the remainder `not_run`, and permits neither automatic retry nor
+  rollback. Changed order, target, arguments, added actions, stale contracts, edits, and expired
+  plans fail closed; the existing single-action bound-once path remains unchanged. `legacy_event`
+  is an explicit rollback mode
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
   context compaction, exact-message verification, progressive status updates, and corrective
   retries after failed writes. Native `contextCompaction` lifecycle events renew the inactivity
@@ -346,6 +356,9 @@ with Discord's generic “interaction failed” banner.
   `legacy_unknown` and never infer the historical actor as executor. An autonomous reply records
   the BOT as executor and records source humans separately as trigger
   actors; producing an event no longer attributes service-principal execution to that person.
+  A bounded high-risk plan also journals body-free per-action status and the corresponding
+  tool-call, receipt, and external-effect IDs; exact private arguments are not copied into that
+  status log.
   If a final confirmation follows a substantive write in the same turn,
   ID-less Undo prefers that write; a reply-only turn instead removes its latest host post.
   The bounded `.data/agent_actions.sqlite3` ledger retains at most 2,000 records, at most 100 per

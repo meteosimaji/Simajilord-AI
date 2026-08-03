@@ -37,6 +37,7 @@ from .errors import (
 )
 from .providers import (
     AgentHighRiskConfirmationCallback,
+    AgentHighRiskPlanStatusCallback,
     AgentProgressCallback,
     AgentProvider,
     ProviderTurnResult,
@@ -137,15 +138,24 @@ class AgentService:
         context: InvocationContext,
         on_progress: AgentProgressCallback | None,
         on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None,
+        on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None,
     ) -> ProviderTurnResult:
         """Keep read-only provider implementations source-compatible."""
 
-        if on_high_risk_confirmation is None:
+        if on_high_risk_confirmation is None and on_high_risk_plan_status is None:
             return await self.provider.respond(
                 provider_thread_id=provider_thread_id,
                 event_prompt=event_prompt,
                 context=context,
                 on_progress=on_progress,
+            )
+        if on_high_risk_plan_status is None:
+            return await self.provider.respond(
+                provider_thread_id=provider_thread_id,
+                event_prompt=event_prompt,
+                context=context,
+                on_progress=on_progress,
+                on_high_risk_confirmation=on_high_risk_confirmation,
             )
         return await self.provider.respond(
             provider_thread_id=provider_thread_id,
@@ -153,6 +163,7 @@ class AgentService:
             context=context,
             on_progress=on_progress,
             on_high_risk_confirmation=on_high_risk_confirmation,
+            on_high_risk_plan_status=on_high_risk_plan_status,
         )
 
     def runtime_metrics(self) -> dict[str, int]:
@@ -208,8 +219,7 @@ class AgentService:
             workspace_count, _ = await self.store.request_window(
                 actor_id=None,
                 workspace_id=workspace_id,
-                since=now
-                - timedelta(seconds=self.limits.per_workspace_window_seconds),
+                since=now - timedelta(seconds=self.limits.per_workspace_window_seconds),
                 excluded_actor_ids=self.limits.rate_limit_exempt_actor_ids,
                 included_triggers=frozenset({trigger}),
             )
@@ -262,6 +272,7 @@ class AgentService:
         *,
         on_progress: AgentProgressCallback | None = None,
         on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
+        on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None = None,
     ) -> AgentResponse:
         cached = await self.store.completed_response(request.event_id)
         if cached is not None:
@@ -287,9 +298,7 @@ class AgentService:
                         return cached
                     conversation = await self.store.conversation(request.conversation_id)
                     provider_thread_id = (
-                        conversation.provider_thread_id
-                        if conversation is not None
-                        else None
+                        conversation.provider_thread_id if conversation is not None else None
                     )
                     context = InvocationContext(
                         actor_id=request.actor_id,
@@ -315,9 +324,7 @@ class AgentService:
                         read_scope_mode=request.read_scope_mode,
                         information_flow_mode=request.information_flow_mode.value,
                         file_workspace_mode=request.file_workspace_mode.value,
-                        high_risk_authorization_mode=(
-                            request.high_risk_authorization_mode.value
-                        ),
+                        high_risk_authorization_mode=(request.high_risk_authorization_mode.value),
                         executor_principal_id=request.executor_principal_id,
                         delegator_principal_id=request.delegator_principal_id,
                         trigger_actor_ids=request.trigger_actor_ids,
@@ -326,9 +333,7 @@ class AgentService:
                         allowed_capabilities=request.allowed_capabilities,
                     )
                     if on_progress is not None:
-                        await on_progress(
-                            AgentProgressUpdate(AgentProgressStage.STARTING)
-                        )
+                        await on_progress(AgentProgressUpdate(AgentProgressStage.STARTING))
                     origin_key = (request.workspace_id, request.channel_id)
                     async with self._admission_lock:
                         self._active_origins[origin_key] = (request, 0)
@@ -337,14 +342,13 @@ class AgentService:
                             provider_thread_id=provider_thread_id,
                             event_prompt=_event_prompt(
                                 request,
-                                max_response_characters=(
-                                    self.limits.max_response_characters
-                                ),
+                                max_response_characters=(self.limits.max_response_characters),
                                 runtime_model=self.model,
                             ),
                             context=context,
                             on_progress=on_progress,
                             on_high_risk_confirmation=on_high_risk_confirmation,
+                            on_high_risk_plan_status=on_high_risk_plan_status,
                         )
                     except AgentThreadError:
                         await self.store.rotate(
@@ -355,32 +359,26 @@ class AgentService:
                             provider_thread_id=None,
                             event_prompt=_event_prompt(
                                 request,
-                                max_response_characters=(
-                                    self.limits.max_response_characters
-                                ),
+                                max_response_characters=(self.limits.max_response_characters),
                                 runtime_model=self.model,
                                 continuity_reset_reason="saved_thread_unavailable",
                             ),
                             context=context,
                             on_progress=on_progress,
                             on_high_risk_confirmation=on_high_risk_confirmation,
+                            on_high_risk_plan_status=on_high_risk_plan_status,
                         )
                     finally:
                         async with self._admission_lock:
                             active = self._active_origins.get(origin_key)
-                            if (
-                                active is not None
-                                and active[0].event_id == request.event_id
-                            ):
+                            if active is not None and active[0].event_id == request.event_id:
                                 self._active_origins.pop(origin_key, None)
                                 self._clear_follow_up_counts(
                                     origin_key,
                                     original_event_id=request.event_id,
                                 )
                     provider_content = result.content.strip()
-                    response_truncated = (
-                        len(provider_content) > self.limits.max_response_characters
-                    )
+                    response_truncated = len(provider_content) > self.limits.max_response_characters
                     content = _bounded_text(
                         provider_content,
                         self.limits.max_response_characters,
@@ -405,9 +403,7 @@ class AgentService:
                         terminal = await self.store.completed_response(request.event_id)
                         if terminal is not None:
                             return terminal
-                        raise RuntimeError(
-                            "Agent turn could not enter a durable completed state."
-                        )
+                        raise RuntimeError("Agent turn could not enter a durable completed state.")
                     await self.journal.append(
                         kind="agent.turn.completed",
                         actor_id=request.actor_id,
@@ -422,9 +418,7 @@ class AgentService:
                             "model": result.model,
                             "provider_response_characters": len(provider_content),
                             "response_characters": len(content),
-                            "response_character_budget": (
-                                self.limits.max_response_characters
-                            ),
+                            "response_character_budget": (self.limits.max_response_characters),
                             "response_truncated": response_truncated,
                             "delivery_disposition": (
                                 "agent_tool"
@@ -437,17 +431,11 @@ class AgentService:
                             ),
                             "usage": {
                                 "input_tokens": result.usage.input_tokens,
-                                "cached_input_tokens": (
-                                    result.usage.cached_input_tokens
-                                ),
+                                "cached_input_tokens": (result.usage.cached_input_tokens),
                                 "output_tokens": result.usage.output_tokens,
-                                "reasoning_output_tokens": (
-                                    result.usage.reasoning_output_tokens
-                                ),
+                                "reasoning_output_tokens": (result.usage.reasoning_output_tokens),
                                 "total_tokens": result.usage.total_tokens,
-                                "model_context_window": (
-                                    result.usage.model_context_window
-                                ),
+                                "model_context_window": (result.usage.model_context_window),
                             },
                         },
                     )
@@ -649,9 +637,7 @@ class AgentService:
                     read_scope_mode=request.read_scope_mode,
                     information_flow_mode=request.information_flow_mode.value,
                     file_workspace_mode=request.file_workspace_mode.value,
-                    high_risk_authorization_mode=(
-                        request.high_risk_authorization_mode.value
-                    ),
+                    high_risk_authorization_mode=(request.high_risk_authorization_mode.value),
                     executor_principal_id=request.executor_principal_id,
                     delegator_principal_id=request.delegator_principal_id,
                     trigger_actor_ids=request.trigger_actor_ids,
@@ -665,9 +651,7 @@ class AgentService:
                             request,
                             active_task_id=original.task_id,
                             original_actor_id=original.actor_id,
-                            max_response_characters=(
-                                self.limits.max_response_characters
-                            ),
+                            max_response_characters=(self.limits.max_response_characters),
                         ),
                         context=route_context,
                     )
@@ -684,8 +668,7 @@ class AgentService:
                     decision = selected
                     route_reason = f"model_selected_{selected.value}"
             if decision is AgentTaskRouteDecision.CANCEL and not (
-                request.actor_id == original.actor_id
-                or ACTION_UNDO_ANY_GRANT in request.grants
+                request.actor_id == original.actor_id or ACTION_UNDO_ANY_GRANT in request.grants
             ):
                 if selected is not None and route_context is not None:
                     try:
@@ -697,8 +680,7 @@ class AgentService:
                         )
                     except Exception:
                         log.exception(
-                            "Provider unauthorized cancel rejection failed "
-                            "candidate=%s",
+                            "Provider unauthorized cancel rejection failed candidate=%s",
                             request.event_id,
                         )
                 decision = AgentTaskRouteDecision.SEPARATE
@@ -723,8 +705,7 @@ class AgentService:
                         )
                     except Exception:
                         log.exception(
-                            "Provider route rejection acknowledgement failed "
-                            "candidate=%s",
+                            "Provider route rejection acknowledgement failed candidate=%s",
                             request.event_id,
                         )
                 decision = AgentTaskRouteDecision.SEPARATE
@@ -739,6 +720,7 @@ class AgentService:
                 )
             except BaseException:
                 if selected is not None and route_context is not None:
+
                     async def reject_uncommitted_route() -> None:
                         await routing_provider.confirm_candidate_route(
                             event_id=request.event_id,
@@ -747,9 +729,7 @@ class AgentService:
                             context=route_context,
                         )
 
-                    await finish_async_cleanup(
-                        reject_uncommitted_route()
-                    )
+                    await finish_async_cleanup(reject_uncommitted_route())
                 raise
             if selected is not None and route_context is not None:
                 confirmed = await routing_provider.confirm_candidate_route(
@@ -780,11 +760,9 @@ class AgentService:
                             request,
                             original=original,
                         ):
-                            recovered = (
-                                await self.store.default_task_candidate_to_separate(
-                                    request.event_id,
-                                    reason="active_task_cancel_race",
-                                )
+                            recovered = await self.store.default_task_candidate_to_separate(
+                                request.event_id,
+                                reason="active_task_cancel_race",
                             )
                             if not recovered:
                                 raise AgentProviderError(
@@ -882,9 +860,7 @@ class AgentService:
                     "task_id": original.task_id,
                     "reason": "follow_up_cancelled",
                     "candidate_event_id": candidate.event_id,
-                    "candidate_public_reference_id": (
-                        candidate.public_reference_id
-                    ),
+                    "candidate_public_reference_id": (candidate.public_reference_id),
                 },
             )
         except Exception:
@@ -927,8 +903,7 @@ class AgentService:
                     self._workspace_turn_slots[slot_key] = turn_slot
                 activate_immediately = (
                     not turn_slot.locked()
-                    and self._active_turns + self._ready_pending_turns
-                    < active_limit
+                    and self._active_turns + self._ready_pending_turns < active_limit
                 )
                 actor_pending = self._pending_turns_by_actor.get(
                     request.actor_id,
@@ -1217,9 +1192,7 @@ class AgentService:
             token_limit = max(
                 1,
                 token_limit
-                - self._interactive_reserved_capacity(
-                    self.limits.max_tokens_per_24_hours
-                ),
+                - self._interactive_reserved_capacity(self.limits.max_tokens_per_24_hours),
             )
         usage, token_release_anchor = await self.store.token_budget_window(
             now - timedelta(hours=24),
@@ -1239,6 +1212,7 @@ class AgentService:
                     24 * 60 * 60,
                 ),
             )
+
 
 def _event_prompt(
     request: AgentRequest,

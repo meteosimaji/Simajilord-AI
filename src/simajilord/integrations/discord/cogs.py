@@ -52,6 +52,9 @@ from simajilord.agent import (
     AgentBusyError,
     AgentEvent,
     AgentHighRiskConfirmation,
+    AgentHighRiskPlanActionStatus,
+    AgentHighRiskPlanStatus,
+    AgentHighRiskPlanStatusUpdate,
     AgentRateLimitError,
     AgentRequest,
     AgentTaskRouteDecision,
@@ -272,17 +275,21 @@ class AgentHighRiskConfirmationView(SafeView):
         *,
         requester_id: int,
         binding_sha256: str,
-        private_embed: discord.Embed,
         timeout: float,
+        private_embed: discord.Embed | None = None,
+        private_embeds: tuple[discord.Embed, ...] = (),
+        confirm_label: str = "Confirm exact action",
     ) -> None:
         super().__init__(timeout=timeout)
+        if (private_embed is None) == (not private_embeds):
+            raise ValueError("provide exactly one private embed form")
         self.requester_id = requester_id
         self.binding_sha256 = binding_sha256
-        self.private_embed = private_embed
+        self.private_embeds = (private_embed,) if private_embed is not None else private_embeds
+        self.private_embed = self.private_embeds[0]
+        self.confirm_label = confirm_label
         self.message: discord.Message | None = None
-        self._decision: asyncio.Future[bool] = (
-            asyncio.get_running_loop().create_future()
-        )
+        self._decision: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id:
@@ -340,13 +347,22 @@ class AgentHighRiskConfirmationView(SafeView):
             parent=self,
             requester_id=self.requester_id,
             timeout=float(self.timeout or 0),
+            confirm_label=self.confirm_label,
         )
-        await interaction.response.send_message(
-            embed=self.private_embed,
-            view=private_view,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        if len(self.private_embeds) == 1:
+            await interaction.response.send_message(
+                embed=self.private_embed,
+                view=private_view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embeds=list(self.private_embeds),
+                view=private_view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     @discord.ui.button(
         label="Do not run",
@@ -370,10 +386,17 @@ class AgentHighRiskPrivateConfirmationView(SafeView):
         parent: AgentHighRiskConfirmationView,
         requester_id: int,
         timeout: float,
+        confirm_label: str,
     ) -> None:
         super().__init__(timeout=timeout)
         self.parent = parent
         self.requester_id = requester_id
+        for item in self.children:
+            if (
+                isinstance(item, discord.ui.Button)
+                and item.custom_id == "simajilord:agent:confirm-high-risk-private"
+            ):
+                item.label = confirm_label
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id:
@@ -432,10 +455,13 @@ def _high_risk_public_embed(
     """Render only non-sensitive fixed summaries into the shared channel."""
 
     external_egress = proposal.confirmation_kind == "external_egress"
+    high_risk_plan = proposal.confirmation_kind == "high_risk_plan"
     return command_embed(
         (
             "External transfer needs private review"
             if external_egress
+            else "High-risk plan needs private review"
+            if high_risk_plan
             else "High-risk action needs private review"
         ),
         description=(
@@ -453,6 +479,11 @@ def _high_risk_public_embed(
                 "Target",
                 proposal.presentation.public_target,
                 inline=False,
+            ),
+            *(
+                (EmbedField("Hard action ceiling", str(proposal.max_actions)),)
+                if high_risk_plan
+                else ()
             ),
             EmbedField(
                 "Expires",
@@ -485,11 +516,7 @@ def _high_risk_private_embed(
         ),
     )
     embed = command_embed(
-        (
-            "Review exact external transfer"
-            if external_egress
-            else "Review exact high-risk action"
-        ),
+        ("Review exact external transfer" if external_egress else "Review exact high-risk action"),
         description=(
             "Nothing below is truncated. Confirm only if every target, value, "
             "audience, transfer, and reversibility statement matches your intent."
@@ -500,6 +527,105 @@ def _high_risk_private_embed(
     if len(embed) > 5_900 or len(fields) > 25:
         raise ValueError("high-risk detail cannot be displayed completely")
     return embed
+
+
+def _high_risk_private_embeds(
+    proposal: AgentHighRiskConfirmation,
+    *,
+    expires_at: datetime,
+) -> tuple[discord.Embed, ...]:
+    """Render one exact action or every action of one bounded private plan."""
+
+    if proposal.confirmation_kind != "high_risk_plan":
+        return (_high_risk_private_embed(proposal, expires_at=expires_at),)
+    overview_fields = (
+        *(
+            EmbedField(field.name, field.value, inline=False)
+            for field in proposal.presentation.review_fields
+        ),
+        EmbedField("Hard action ceiling", str(proposal.max_actions), inline=False),
+        EmbedField("Exact plan binding", proposal.binding_sha256, inline=False),
+        EmbedField(
+            "Expires",
+            discord.utils.format_dt(expires_at, style="R"),
+            inline=False,
+        ),
+    )
+    overview = command_embed(
+        "Review exact bounded high-risk plan",
+        description=(
+            "Every action is fixed below. Confirm only if the order, every exact "
+            "target and value, impact, audience, transfer, and reversibility match "
+            "your intent. The first failure leaves the remainder not run."
+        ),
+        fields=overview_fields,
+        tone=EmbedTone.WARNING,
+    )
+    embeds: list[discord.Embed] = [overview]
+    for action in proposal.plan_actions:
+        action_fields = (
+            EmbedField("Capability", action.capability, inline=False),
+            *(
+                EmbedField(field.name, field.value, inline=False)
+                for field in action.presentation.review_fields
+            ),
+            EmbedField(
+                "Exact arguments binding",
+                action.arguments_sha256,
+                inline=False,
+            ),
+        )
+        action_embed = command_embed(
+            f"Action {action.position} of {proposal.max_actions}",
+            description=(
+                f"{action.presentation.public_action} — {action.presentation.public_target}"
+            ),
+            fields=action_fields,
+            tone=EmbedTone.WARNING,
+        )
+        if len(action_embed) > 5_900 or len(action_fields) > 25:
+            raise ValueError("high-risk plan action cannot be displayed completely")
+        embeds.append(action_embed)
+    if sum(len(embed) for embed in embeds) > 5_900 or len(overview_fields) > 25 or len(embeds) > 10:
+        raise ValueError("high-risk plan cannot be displayed completely")
+    return tuple(embeds)
+
+
+def _high_risk_plan_status_embed(
+    update: AgentHighRiskPlanStatusUpdate,
+) -> discord.Embed:
+    """Show only public-safe action summaries and terminal status in-channel."""
+
+    fields = tuple(
+        EmbedField(
+            f"{action.position}. {action.public_action}",
+            f"{action.public_target} · {action.status.value}",
+            inline=False,
+        )
+        for action in update.actions
+    )
+    title = (
+        "High-risk plan completed"
+        if update.status is AgentHighRiskPlanStatus.COMPLETED
+        else "High-risk plan stopped"
+        if update.status in {AgentHighRiskPlanStatus.STOPPED, AgentHighRiskPlanStatus.EXPIRED}
+        else "High-risk plan running"
+        if update.status is AgentHighRiskPlanStatus.RUNNING
+        else "High-risk plan confirmed"
+    )
+    return command_embed(
+        title,
+        description=(
+            "No automatic retry or rollback is performed. Receipt and effect IDs are "
+            "kept in the audit log for each dispatched action."
+        ),
+        fields=fields,
+        tone=(
+            EmbedTone.SUCCESS
+            if update.status is AgentHighRiskPlanStatus.COMPLETED
+            else EmbedTone.WARNING
+        ),
+    )
 
 
 class SafeModal(discord.ui.Modal):
@@ -567,9 +693,7 @@ _ERROR_MESSAGES = {
     "feedback.details_required": "Describe what happened or what would help.",
     "feedback.details_too_long": "Feedback details must be at most 4,000 characters.",
     "feedback.title_too_long": "The feedback title must be at most 160 characters.",
-    "feedback.expected_too_long": (
-        "Expected behaviour must be at most 2,000 characters."
-    ),
+    "feedback.expected_too_long": ("Expected behaviour must be at most 2,000 characters."),
     "feedback.requester_mismatch": "Only the person who opened this form may submit it.",
     "local_media.cache_full": (
         "The local media store is full. Finish or remove queued local files first."
@@ -968,8 +1092,7 @@ def _read_aloud_audience_allowed(
     if relation == "same_or_narrower":
         return True
     log.warning(
-        "Read-aloud audience check failed mode=%s guild=%s source=%s "
-        "destination=%s relation=%s",
+        "Read-aloud audience check failed mode=%s guild=%s source=%s destination=%s relation=%s",
         mode,
         getattr(guild, "id", None),
         getattr(source, "id", None),
@@ -3139,8 +3262,7 @@ async def handle_interaction_error(
             await interaction.response.send_message(embed=embed, ephemeral=True)
     except discord.NotFound:
         log.warning(
-            "Could not publish interaction error because the response expired "
-            "request_id=%s",
+            "Could not publish interaction error because the response expired request_id=%s",
             interaction.id,
         )
     except discord.DiscordException:
@@ -3480,9 +3602,7 @@ async def _complete_focus_timer(
         if current.focus_session and current.restore_content_mode is not None:
             active_focus = tuple(
                 active
-                for active in await runtime.focus_timer.active(
-                    workspace_id=current.workspace_id
-                )
+                for active in await runtime.focus_timer.active(workspace_id=current.workspace_id)
                 if active.focus_session and active.timer_id != current.timer_id
             )
             if not active_focus:
@@ -4503,9 +4623,7 @@ def _read_aloud_route_preflight(
         inspections.append(inspection)
         for check in inspection.listeners:
             current = listener_relations.get(check.member_id)
-            if current is None or relation_priority[check.relation] > relation_priority[
-                current[1]
-            ]:
+            if current is None or relation_priority[check.relation] > relation_priority[current[1]]:
                 listener_relations[check.member_id] = (
                     check.display_name,
                     check.relation,
@@ -4524,9 +4642,7 @@ def _read_aloud_route_preflight(
         "unresolved": ("?", "could not be resolved safely"),
     }
     lines = []
-    for member_id, (display_name, listener_relation) in sorted(
-        listener_relations.items()
-    ):
+    for member_id, (display_name, listener_relation) in sorted(listener_relations.items()):
         symbol, explanation = labels[listener_relation]
         listener_label = f"<@{member_id}>"
         if display_name:
@@ -4565,9 +4681,7 @@ def _read_aloud_ready_embed(
         fields=(
             EmbedField(
                 "Reading from",
-                "\n".join(
-                    f"<#{channel_id}>" for channel_id in configured.text_channel_ids
-                ),
+                "\n".join(f"<#{channel_id}>" for channel_id in configured.text_channel_ids),
                 inline=False,
             ),
             EmbedField(
@@ -4724,9 +4838,7 @@ class ReadAloudReconnectView(SafeView):
                     description=(
                         "Every current listener must be proven able to read every source."
                     ),
-                    fields=(
-                        EmbedField("Audience preflight", audience_preflight, inline=False),
-                    ),
+                    fields=(EmbedField("Audience preflight", audience_preflight, inline=False),),
                     tone=EmbedTone.WARNING,
                 ),
                 ephemeral=True,
@@ -4837,14 +4949,11 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 raise UserError("audio.same_voice_required")
             existing_route = _active_read_aloud_route(self.runtime, str(guild.id))
             preflight_source_ids = self.selected_channel_ids
-            if (
-                existing_route is not None
-                and existing_route.audio_destination_id == str(self.destination_id)
+            if existing_route is not None and existing_route.audio_destination_id == str(
+                self.destination_id
             ):
                 preflight_source_ids = tuple(
-                    dict.fromkeys(
-                        (*existing_route.text_channel_ids, *self.selected_channel_ids)
-                    )
+                    dict.fromkeys((*existing_route.text_channel_ids, *self.selected_channel_ids))
                 )
             relation, audience_preflight = _read_aloud_route_preflight(
                 guild,
@@ -6519,11 +6628,7 @@ def synthetic_media_embed(
                 inline=False,
             )
         )
-    cache_line = (
-        "Cached result · no additional request"
-        if response.cached
-        else "New analysis"
-    )
+    cache_line = "Cached result · no additional request" if response.cached else "New analysis"
     sample_name = {
         "image": " image",
         "video": " frames",
@@ -7067,9 +7172,7 @@ class TranslationLanguagePickerView(SafeView):
         source: str = language if self.mode == "source" else self.source_language
         target: str = language if self.mode == "target" else self.target_language
         if source.casefold() == target.casefold():
-            next_mode: Literal["source", "target"] = (
-                "source" if self.mode == "target" else "target"
-            )
+            next_mode: Literal["source", "target"] = "source" if self.mode == "target" else "target"
             title = (
                 "Choose the source language"
                 if next_mode == "source"
@@ -8866,10 +8969,7 @@ def discord_conversation_id(
     if not 1 <= compatibility_epoch <= 10_000:
         raise ValueError("compatibility epoch must be between 1 and 10000")
     scope = f"guild:{guild_id}" if guild_id is not None else "direct"
-    base = (
-        f"discord:v{compatibility_epoch}:"
-        f"{scope}:channel:{channel_id}:actor:{actor_id}"
-    )
+    base = f"discord:v{compatibility_epoch}:{scope}:channel:{channel_id}:actor:{actor_id}"
     if not grants:
         return base
     profile = "+".join(sorted(grants))
@@ -8965,13 +9065,7 @@ def _agent_grants(
         and autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
     )
     grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
-    if (
-        not autonomous
-        and (
-            memory_curator
-            or actor_id in settings.agent_admin_user_ids
-        )
-    ):
+    if not autonomous and (memory_curator or actor_id in settings.agent_admin_user_ids):
         grants.add(AGENT_MEMORY_CURATOR_GRANT)
     if not autonomous:
         grants.add(AGENT_FEEDBACK_GRANT)
@@ -9013,8 +9107,7 @@ def _agent_grants(
         # regardless of their configured mode or the BOT principal's admin ID.
         shell_access = settings.agent_isolated_shell_access
         if shell_access is AgentFeatureAccess.EVERYONE or (
-            shell_access is AgentFeatureAccess.ADMINS
-            and actor_id in settings.agent_admin_user_ids
+            shell_access is AgentFeatureAccess.ADMINS and actor_id in settings.agent_admin_user_ids
         ):
             grants.add(AGENT_SHELL_GRANT)
         connector_access = settings.agent_connector_access
@@ -9238,10 +9331,7 @@ def _autonomy_allowed_capabilities(
         for endpoint in runtime.registry.all()
         if (
             endpoint.descriptor.egress is None
-            and (
-                endpoint.descriptor.name in reads
-                or endpoint.descriptor.name in writes
-            )
+            and (endpoint.descriptor.name in reads or endpoint.descriptor.name in writes)
         )
     )
 
@@ -9289,9 +9379,7 @@ def _pending_host_invocation_context(
     """Restore only persisted host-delivery authority after any restart."""
 
     principal_kind: AgentPrincipalKind = (
-        pending.principal_kind
-        if pending.principal_kind is not None
-        else "legacy_unknown"
+        pending.principal_kind if pending.principal_kind is not None else "legacy_unknown"
     )
     return InvocationContext(
         actor_id=pending.actor_id,
@@ -9357,6 +9445,7 @@ class AgentCog(commands.Cog):
         self.runtime = runtime
         self._started_at = datetime.now(UTC)
         self._active_progress: dict[str, AgentProgressMessage] = {}
+        self._high_risk_plan_messages: dict[str, discord.Message] = {}
         self._host_delivery_locks = KeyedAsyncLockPool()
         self._host_delivery_wakeup = asyncio.Event()
         self._host_delivery_task: asyncio.Task[None] | None = None
@@ -9368,10 +9457,7 @@ class AgentCog(commands.Cog):
                 self._host_delivery_loop(),
                 name="simajilord-agent-host-delivery",
             )
-        if (
-            self._interrupted_recovery_task is None
-            or self._interrupted_recovery_task.done()
-        ):
+        if self._interrupted_recovery_task is None or self._interrupted_recovery_task.done():
             self._interrupted_recovery_task = asyncio.create_task(
                 self._recover_interrupted_mentions(),
                 name="simajilord-agent-interrupted-recovery",
@@ -9388,6 +9474,7 @@ class AgentCog(commands.Cog):
         )
         self._host_delivery_task = None
         self._interrupted_recovery_task = None
+        self._high_risk_plan_messages.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -9415,10 +9502,7 @@ class AgentCog(commands.Cog):
             return
         await self._handle_mention(
             payload.message,
-            event_id=(
-                f"discord:message-edit:{payload.message_id}:"
-                f"{edited_at.isoformat()}"
-            ),
+            event_id=(f"discord:message-edit:{payload.message_id}:{edited_at.isoformat()}"),
             occurred_at=edited_at,
             message_edited_at=edited_at,
         )
@@ -9447,16 +9531,23 @@ class AgentCog(commands.Cog):
         ):
             return False
         external_egress = proposal.confirmation_kind == "external_egress"
-        timeout = float(
+        high_risk_plan = proposal.confirmation_kind == "high_risk_plan"
+        configured_timeout = float(
             self.runtime.settings.agent_high_risk_confirmation_timeout_seconds
         )
-        expires_at = datetime.now(UTC) + timedelta(seconds=timeout)
+        expires_at = proposal.expires_at or (
+            datetime.now(UTC) + timedelta(seconds=configured_timeout)
+        )
+        remaining_seconds = (expires_at - datetime.now(UTC)).total_seconds()
+        if remaining_seconds <= 0:
+            return False
+        timeout = min(configured_timeout, remaining_seconds)
         try:
             public_embed = _high_risk_public_embed(
                 proposal,
                 expires_at=expires_at,
             )
-            private_embed = _high_risk_private_embed(
+            private_embeds = _high_risk_private_embeds(
                 proposal,
                 expires_at=expires_at,
             )
@@ -9471,8 +9562,10 @@ class AgentCog(commands.Cog):
         view = AgentHighRiskConfirmationView(
             requester_id=requester_id,
             binding_sha256=proposal.binding_sha256,
-            private_embed=private_embed,
             timeout=timeout,
+            private_embed=(private_embeds[0] if len(private_embeds) == 1 else None),
+            private_embeds=(private_embeds if len(private_embeds) > 1 else ()),
+            confirm_label=("Confirm exact plan" if high_risk_plan else "Confirm exact action"),
         )
         try:
             confirmation_message = await channel.send(
@@ -9492,9 +9585,7 @@ class AgentCog(commands.Cog):
         revision_valid = False
         if confirmed:
             try:
-                authorization_message = await channel.fetch_message(
-                    authorization_message_id
-                )
+                authorization_message = await channel.fetch_message(authorization_message_id)
             except discord.DiscordException:
                 authorization_message = None
             if authorization_message is not None:
@@ -9505,8 +9596,7 @@ class AgentCog(commands.Cog):
                 )
                 revision_valid = (
                     authorization_message.author.id == requester_id
-                    and actual_revision
-                    == proposal.authorization_message_edited_at
+                    and actual_revision == proposal.authorization_message_edited_at
                 )
         accepted = confirmed and revision_valid
         try:
@@ -9517,19 +9607,19 @@ class AgentCog(commands.Cog):
                     else f"agent.{'egress' if external_egress else 'high_risk'}.rejected"
                 ),
                 actor_id=proposal.requester_principal_id,
-                workspace_id=(
-                    str(source.guild.id) if source.guild is not None else None
-                ),
+                workspace_id=(str(source.guild.id) if source.guild is not None else None),
                 transport="agent",
                 request_id=proposal.authorization_message_id,
                 payload={
                     "capability": proposal.capability,
                     "binding_sha256": proposal.binding_sha256,
                     "authorization_message_id": proposal.authorization_message_id,
-                    "authorization_message_edited_at": (
-                        proposal.authorization_message_edited_at
-                    ),
+                    "authorization_message_edited_at": (proposal.authorization_message_edited_at),
                     "confirmation_kind": proposal.confirmation_kind,
+                    "plan_id": proposal.plan_id,
+                    "action_count": len(proposal.plan_actions),
+                    "max_actions": proposal.max_actions,
+                    "expires_at": expires_at.isoformat(),
                     "confirmed": accepted,
                     "revision_valid": revision_valid,
                 },
@@ -9541,6 +9631,8 @@ class AgentCog(commands.Cog):
                 proposal.capability,
             )
             accepted = False
+        if accepted and proposal.plan_id is not None:
+            self._high_risk_plan_messages[proposal.plan_id] = confirmation_message
         with suppress(discord.DiscordException):
             await confirmation_message.edit(
                 embed=command_embed(
@@ -9549,6 +9641,10 @@ class AgentCog(commands.Cog):
                         if accepted and external_egress
                         else "External transfer stopped"
                         if external_egress
+                        else "High-risk plan confirmed"
+                        if accepted and high_risk_plan
+                        else "High-risk plan stopped"
+                        if high_risk_plan
                         else "High-risk action confirmed"
                         if accepted
                         else "High-risk action stopped"
@@ -9567,6 +9663,62 @@ class AgentCog(commands.Cog):
                 view=view,
             )
         return accepted
+
+    async def _update_high_risk_plan_status(
+        self,
+        update: AgentHighRiskPlanStatusUpdate,
+    ) -> None:
+        """Persist body-free action outcomes and refresh the confirmation card."""
+
+        message = self._high_risk_plan_messages.get(update.plan_id)
+        try:
+            await self.runtime.journal.append(
+                kind="agent.high_risk_plan.status",
+                actor_id=None,
+                workspace_id=(
+                    str(message.guild.id)
+                    if message is not None and message.guild is not None
+                    else None
+                ),
+                transport="agent",
+                request_id=None,
+                payload={
+                    "plan_id": update.plan_id,
+                    "binding_sha256": update.binding_sha256,
+                    "status": update.status.value,
+                    "actions": [
+                        {
+                            "position": action.position,
+                            "capability": action.capability,
+                            "status": action.status.value,
+                            "tool_call_id": action.tool_call_id,
+                            "action_receipt_id": action.action_receipt_id,
+                            "external_effect_id": action.external_effect_id,
+                            "error_code": action.error_code,
+                        }
+                        for action in update.actions
+                    ],
+                },
+            )
+        except Exception:
+            log.exception(
+                "Could not persist high-risk plan status plan=%s",
+                update.plan_id,
+            )
+        if message is not None:
+            with suppress(discord.DiscordException):
+                await message.edit(
+                    embed=_high_risk_plan_status_embed(update),
+                    view=None,
+                )
+        if update.status in {
+            AgentHighRiskPlanStatus.COMPLETED,
+            AgentHighRiskPlanStatus.STOPPED,
+            AgentHighRiskPlanStatus.EXPIRED,
+        } and not any(
+            action.status is AgentHighRiskPlanActionStatus.DISPATCHED for action in update.actions
+        ):
+            self._high_risk_plan_messages.pop(update.plan_id, None)
 
     async def _handle_mention(
         self,
@@ -9640,17 +9792,14 @@ class AgentCog(commands.Cog):
         task_id = (
             existing_request.task_id
             if existing_request is not None
-            else await self.runtime.agent_store.task_id_for_event(event_id)
-            or new_agent_task_id()
+            else await self.runtime.agent_store.task_id_for_event(event_id) or new_agent_task_id()
         )
         conversation_id = discord_conversation_id(
             guild_id=message.guild.id if message.guild else None,
             channel_id=message.channel.id,
             actor_id=actor_id,
             grants=grants,
-            compatibility_epoch=(
-                self.runtime.settings.agent_conversation_compatibility_epoch
-            ),
+            compatibility_epoch=(self.runtime.settings.agent_conversation_compatibility_epoch),
         )
         request = AgentRequest(
             conversation_id=(
@@ -9674,13 +9823,9 @@ class AgentCog(commands.Cog):
             task_id=task_id,
             principal_kind="requester",
             read_scope_mode="requester_live",
-            information_flow_mode=(
-                self.runtime.settings.agent_information_flow_mode
-            ),
+            information_flow_mode=(self.runtime.settings.agent_information_flow_mode),
             file_workspace_mode=self.runtime.settings.agent_file_workspace_mode,
-            high_risk_authorization_mode=(
-                self.runtime.settings.agent_high_risk_authorization_mode
-            ),
+            high_risk_authorization_mode=(self.runtime.settings.agent_high_risk_authorization_mode),
             executor_principal_id=str(bot_user.id),
             delegator_principal_id=actor_id,
             trigger_actor_ids=(actor_id,),
@@ -9723,15 +9868,14 @@ class AgentCog(commands.Cog):
             response = await agent.respond(
                 request,
                 on_progress=progress.update,
-                on_high_risk_confirmation=lambda proposal: (
-                    self._confirm_high_risk_action(message, proposal)
+                on_high_risk_confirmation=lambda proposal: self._confirm_high_risk_action(
+                    message, proposal
                 ),
+                on_high_risk_plan_status=self._update_high_risk_plan_status,
             )
         except asyncio.CancelledError:
-            snapshot = (
-                await self.runtime.agent_store.task_snapshot_by_public_reference_id(
-                    request.public_reference_id
-                )
+            snapshot = await self.runtime.agent_store.task_snapshot_by_public_reference_id(
+                request.public_reference_id
             )
             if snapshot is not None and snapshot.state == "cancelled":
                 await progress.cancelled()
@@ -9743,10 +9887,8 @@ class AgentCog(commands.Cog):
                 message.id,
                 request.public_reference_id,
             )
-            persisted_reference_id = (
-                await self.runtime.agent_store.public_reference_id_for_event(
-                    request.event_id
-                )
+            persisted_reference_id = await self.runtime.agent_store.public_reference_id_for_event(
+                request.event_id
             )
             await progress.fail(
                 _agent_error_text(
@@ -9756,9 +9898,7 @@ class AgentCog(commands.Cog):
             )
         else:
             chunks = await progress.prepare(response.content)
-            pending = await self.runtime.agent_store.pending_host_delivery(
-                request.event_id
-            )
+            pending = await self.runtime.agent_store.pending_host_delivery(request.event_id)
             if pending is None:
                 if _agent_response_uses_host_delivery(response.content):
                     log.error(
@@ -9781,8 +9921,7 @@ class AgentCog(commands.Cog):
                     # The completed model response remains in SQLite and the
                     # recovery loop will retry without re-running any tools.
                     log.exception(
-                        "Agent response delivery deferred request=%s reference=%s "
-                        "channel=%s",
+                        "Agent response delivery deferred request=%s reference=%s channel=%s",
                         request.event_id,
                         request.public_reference_id,
                         request.channel_id,
@@ -9867,8 +10006,7 @@ class AgentCog(commands.Cog):
                 )
                 if skipped:
                     log.warning(
-                        "Interrupted mention no longer qualified for processing "
-                        "request=%s",
+                        "Interrupted mention no longer qualified for processing request=%s",
                         request.event_id,
                     )
             except asyncio.CancelledError:
@@ -9931,8 +10069,7 @@ class AgentCog(commands.Cog):
                         error_type="RecoverySourceUnavailable",
                     )
                     log.warning(
-                        "Task candidate source is unavailable event=%s channel=%s "
-                        "message=%s",
+                        "Task candidate source is unavailable event=%s channel=%s message=%s",
                         candidate.event_id,
                         candidate.channel_id,
                         candidate.source_message_id,
@@ -9976,9 +10113,7 @@ class AgentCog(commands.Cog):
             self._host_delivery_wakeup.clear()
             had_failure = False
             try:
-                pending = await self.runtime.agent_store.pending_host_deliveries(
-                    limit=100
-                )
+                pending = await self.runtime.agent_store.pending_host_deliveries(limit=100)
                 recovery_candidates: dict[
                     str,
                     tuple[discord.Message, ...],
@@ -10006,9 +10141,7 @@ class AgentCog(commands.Cog):
                 had_failure = True
                 log.exception("Agent host delivery recovery query failed")
 
-            retry_delay = (
-                min(30.0, retry_delay * 2) if had_failure else 1.0
-            )
+            retry_delay = min(30.0, retry_delay * 2) if had_failure else 1.0
             with suppress(TimeoutError):
                 await asyncio.wait_for(
                     self._host_delivery_wakeup.wait(),
@@ -10078,14 +10211,10 @@ class AgentCog(commands.Cog):
                 event_id=pending.event_id,
                 purpose="response",
             )
-            unreceipted = tuple(
-                record for record in records if record.receipted_at is None
-            )
+            unreceipted = tuple(record for record in records if record.receipted_at is None)
             if unreceipted:
                 message_ids = tuple(
-                    record.message_id
-                    for record in records
-                    if record.message_id is not None
+                    record.message_id for record in records if record.message_id is not None
                 )
                 if len(message_ids) != len(records):
                     raise RuntimeError("agent host delivery message evidence is incomplete")
@@ -10104,9 +10233,7 @@ class AgentCog(commands.Cog):
                         chunk_index=record.chunk_index,
                     )
 
-            if not await self.runtime.agent_store.complete_host_delivery(
-                pending.event_id
-            ):
+            if not await self.runtime.agent_store.complete_host_delivery(pending.event_id):
                 raise RuntimeError("agent host delivery did not reach terminal state")
 
     async def _agent_host_channel(
@@ -10150,8 +10277,7 @@ class AgentCog(commands.Cog):
             return records
         candidates = (
             list(recovery_candidates[pending.channel_id])
-            if recovery_candidates is not None
-            and pending.channel_id in recovery_candidates
+            if recovery_candidates is not None and pending.channel_id in recovery_candidates
             else None
         )
         if candidates is None:
@@ -10172,11 +10298,7 @@ class AgentCog(commands.Cog):
 
         # Identical chunks are valid. Never let hash fallback reuse a message
         # that is already durable evidence for another chunk.
-        used_ids = {
-            int(record.message_id)
-            for record in records
-            if record.message_id is not None
-        }
+        used_ids = {int(record.message_id) for record in records if record.message_id is not None}
         reconciled: list[AgentHostDeliveryRecord] = []
         for record in records:
             if record.message_id is not None:
@@ -10191,8 +10313,7 @@ class AgentCog(commands.Cog):
                 (
                     candidate
                     for candidate in candidates
-                    if candidate.id not in used_ids
-                    and str(candidate.nonce or "") == nonce
+                    if candidate.id not in used_ids and str(candidate.nonce or "") == nonce
                 ),
                 None,
             )
@@ -10248,10 +10369,7 @@ async def _agent_request_replay_barrier_reason(
     """Conservatively refuse whole-turn replay after any durable write attempt."""
 
     action_receipts = getattr(runtime, "action_receipts", None)
-    if (
-        action_receipts is not None
-        and await action_receipts.request_has_replay_barrier(request_id)
-    ):
+    if action_receipts is not None and await action_receipts.request_has_replay_barrier(request_id):
         return "external_effect_ledger"
     journal = getattr(runtime, "journal", None)
     if journal is None:
@@ -10336,10 +10454,7 @@ class ObservationCog(commands.Cog):
         raw_edited_at = payload.data.get("edited_timestamp")
         content_changed = "content" in payload.data
         attachments_changed = "attachments" in payload.data
-        if (
-            not isinstance(raw_edited_at, str)
-            or not (content_changed or attachments_changed)
-        ):
+        if not isinstance(raw_edited_at, str) or not (content_changed or attachments_changed):
             return
         occurred_at = discord.utils.parse_time(raw_edited_at)
         if occurred_at is None:
@@ -10361,13 +10476,9 @@ class ObservationCog(commands.Cog):
         )
         bot_user = self.bot.user
         current_mentions = getattr(current, "mentions", ())
-        mentions_bot_after = (
-            bot_user in current_mentions if bot_user is not None else False
-        )
+        mentions_bot_after = bot_user in current_mentions if bot_user is not None else False
         mentions_bot_before = (
-            cached is not None
-            and bot_user is not None
-            and bot_user in cached.mentions
+            cached is not None and bot_user is not None and bot_user in cached.mentions
         )
         mentions_bot = mentions_bot_before or mentions_bot_after
         event_payload: dict[str, object] = {
@@ -10394,9 +10505,7 @@ class ObservationCog(commands.Cog):
             return
         await self._enqueue(
             kind=AutonomyEventKind.MESSAGE_EDIT,
-            deduplication_key=(
-                f"message-edit:{payload.message_id}:{occurred_at.isoformat()}"
-            ),
+            deduplication_key=(f"message-edit:{payload.message_id}:{occurred_at.isoformat()}"),
             workspace_id=str(payload.guild_id),
             channel_id=str(payload.channel_id),
             actor_id=author_id,
@@ -10413,9 +10522,8 @@ class ObservationCog(commands.Cog):
         if payload.guild_id is None or not self._enabled_for(payload.guild_id):
             return
         bot_user = self.bot.user
-        if (
-            (bot_user is not None and payload.user_id == bot_user.id)
-            or (payload.member is not None and payload.member.bot)
+        if (bot_user is not None and payload.user_id == bot_user.id) or (
+            payload.member is not None and payload.member.bot
         ):
             return
         occurred_at = datetime.now(UTC)
@@ -10432,8 +10540,7 @@ class ObservationCog(commands.Cog):
             workspace_id=str(payload.guild_id),
             transport="discord",
             request_id=(
-                f"reaction:{payload.message_id}:{payload.user_id}:"
-                f"{occurred_at.isoformat()}"
+                f"reaction:{payload.message_id}:{payload.user_id}:{occurred_at.isoformat()}"
             ),
             payload=event_payload,
         )
@@ -10491,11 +10598,7 @@ class ObservationCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        if (
-            member.bot
-            or before.channel == after.channel
-            or not self._enabled_for(member.guild.id)
-        ):
+        if member.bot or before.channel == after.channel or not self._enabled_for(member.guild.id):
             return
         channel = after.channel or before.channel
         if channel is None:
@@ -10504,12 +10607,8 @@ class ObservationCog(commands.Cog):
         event_payload: dict[str, object] = {
             "channel_id": str(channel.id),
             "source_actor_id": str(member.id),
-            "before_channel_id": (
-                str(before.channel.id) if before.channel is not None else None
-            ),
-            "after_channel_id": (
-                str(after.channel.id) if after.channel is not None else None
-            ),
+            "before_channel_id": (str(before.channel.id) if before.channel is not None else None),
+            "after_channel_id": (str(after.channel.id) if after.channel is not None else None),
         }
         await self.runtime.journal.append(
             kind=AutonomyEventKind.VOICE_STATE_UPDATE.value,
@@ -10809,20 +10908,14 @@ class AgentAutonomyCog(commands.Cog):
             (operation_task, heartbeat),
             return_when=asyncio.FIRST_COMPLETED,
         )
-        if operation_task in done and (
-            heartbeat not in done or operation_wins_tie
-        ):
+        if operation_task in done and (heartbeat not in done or operation_wins_tie):
             return await operation_task
         operation_task.cancel()
         await asyncio.gather(operation_task, return_exceptions=True)
         if heartbeat.cancelled():
-            raise AutonomyLeaseLostError(
-                "Autonomy lease heartbeat ended before the operation"
-            )
+            raise AutonomyLeaseLostError("Autonomy lease heartbeat ended before the operation")
         await heartbeat
-        raise AutonomyLeaseLostError(
-            "Autonomy lease heartbeat stopped unexpectedly"
-        )
+        raise AutonomyLeaseLostError("Autonomy lease heartbeat stopped unexpectedly")
 
     async def _heartbeat(self, batch: AutonomyEventBatch) -> None:
         lease_until = batch.lease_until
@@ -10843,8 +10936,7 @@ class AgentAutonomyCog(commands.Cog):
                     remaining = (lease_until - datetime.now(UTC)).total_seconds()
                     if remaining <= 0:
                         raise AutonomyLeaseLostError(
-                            f"Autonomy lease renewal failed until expiry: "
-                            f"{batch.batch_id}"
+                            f"Autonomy lease renewal failed until expiry: {batch.batch_id}"
                         ) from exc
                     log.exception(
                         "Autonomy lease heartbeat failed batch=%s remaining=%s",
@@ -10867,8 +10959,7 @@ class AgentAutonomyCog(commands.Cog):
                 delay = min(30, 2 ** min(attempt, 5))
                 attempt += 1
                 log.exception(
-                    "Autonomous agent batch ACK failed; retrying batch=%s "
-                    "delay=%s",
+                    "Autonomous agent batch ACK failed; retrying batch=%s delay=%s",
                     batch.batch_id,
                     delay,
                 )
@@ -11038,10 +11129,7 @@ class AgentAutonomyCog(commands.Cog):
         batch: AutonomyEventBatch,
         *,
         channel: (
-            discord.TextChannel
-            | discord.Thread
-            | discord.VoiceChannel
-            | discord.StageChannel
+            discord.TextChannel | discord.Thread | discord.VoiceChannel | discord.StageChannel
         ),
         target: discord.Message | None,
         messages: tuple[str, ...],
@@ -11082,9 +11170,7 @@ class AgentAutonomyCog(commands.Cog):
             except discord.Forbidden as exc:
                 raise _AutonomyTerminalDrop("channel_not_postable") from exc
             except discord.DiscordException as exc:
-                raise RuntimeError(
-                    "Saved autonomy delivery is temporarily unavailable"
-                ) from exc
+                raise RuntimeError("Saved autonomy delivery is temporarily unavailable") from exc
             self._validate_reconciled_message(
                 batch,
                 record,
@@ -11094,21 +11180,14 @@ class AgentAutonomyCog(commands.Cog):
             resolved[record.chunk_index] = candidate
 
         if missing:
-            unresolved = {
-                (record.chunk_index, record.purpose): record
-                for record in missing
-            }
+            unresolved = {(record.chunk_index, record.purpose): record for record in missing}
             # A previously persisted chunk can have the same body as a later
             # missing chunk. Only the event-owned nonce may recover an unsaved
             # message; a content hash alone could claim an unrelated bot post.
             used_message_ids = {
-                int(record.message_id)
-                for record in records
-                if record.message_id is not None
+                int(record.message_id) for record in records if record.message_id is not None
             }
-            search_after = min(
-                record.prepared_at for record in missing
-            ) - timedelta(minutes=1)
+            search_after = min(record.prepared_at for record in missing) - timedelta(minutes=1)
             try:
                 async for candidate in channel.history(
                     limit=_AUTONOMY_DELIVERY_RECOVERY_LIMIT,
@@ -11122,8 +11201,7 @@ class AgentAutonomyCog(commands.Cog):
                         (
                             item
                             for item in unresolved.values()
-                            if candidate.id not in used_message_ids
-                            and nonce == item.nonce
+                            if candidate.id not in used_message_ids and nonce == item.nonce
                         ),
                         None,
                     )
@@ -11137,17 +11215,13 @@ class AgentAutonomyCog(commands.Cog):
                     )
                     resolved[matched_record.chunk_index] = candidate
                     used_message_ids.add(candidate.id)
-                    unresolved.pop(
-                        (matched_record.chunk_index, matched_record.purpose)
-                    )
+                    unresolved.pop((matched_record.chunk_index, matched_record.purpose))
                     if not unresolved:
                         break
             except discord.Forbidden as exc:
                 raise _AutonomyTerminalDrop("channel_not_postable") from exc
             except discord.DiscordException as exc:
-                raise RuntimeError(
-                    "Recent autonomy deliveries could not be reconciled"
-                ) from exc
+                raise RuntimeError("Recent autonomy deliveries could not be reconciled") from exc
 
         records_by_index = {record.chunk_index: record for record in records}
         delivered_records: list[AutonomyDeliveryRecord] = []
@@ -11186,9 +11260,7 @@ class AgentAutonomyCog(commands.Cog):
         )
         if pending_receipts:
             message_ids = tuple(
-                record.message_id
-                for record in delivered_records
-                if record.message_id is not None
+                record.message_id for record in delivered_records if record.message_id is not None
             )
             if len(message_ids) != len(delivered_records):
                 raise AutonomyDeliveryConflictError(
@@ -11218,11 +11290,10 @@ class AgentAutonomyCog(commands.Cog):
         bot_user_id: int,
     ) -> None:
         nonce = getattr(message, "nonce", None)
-        if message.author.id != bot_user_id or (
-            nonce is not None and str(nonce) != record.nonce
-        ) or (
-            hashlib.sha256(message.content.encode()).hexdigest()
-            != record.content_sha256
+        if (
+            message.author.id != bot_user_id
+            or (nonce is not None and str(nonce) != record.nonce)
+            or (hashlib.sha256(message.content.encode()).hexdigest() != record.content_sha256)
         ):
             raise AutonomyDeliveryConflictError(
                 f"Autonomy delivery reconciliation conflict for "
@@ -11267,9 +11338,7 @@ class AgentAutonomyCog(commands.Cog):
             except (discord.NotFound, discord.Forbidden) as exc:
                 raise _AutonomyTerminalDrop("channel_not_messageable") from exc
             except discord.DiscordException as exc:
-                raise RuntimeError(
-                    "Autonomy response channel is temporarily unavailable"
-                ) from exc
+                raise RuntimeError("Autonomy response channel is temporarily unavailable") from exc
         if not isinstance(
             channel,
             (
@@ -11297,10 +11366,7 @@ class AgentAutonomyCog(commands.Cog):
                     and not permission_enabled(permissions, "connect")
                 )
             )
-        ) or (
-            isinstance(channel, discord.Thread)
-            and (channel.archived or channel.locked)
-        ):
+        ) or (isinstance(channel, discord.Thread) and (channel.archived or channel.locked)):
             raise _AutonomyTerminalDrop("channel_not_postable")
         bot_user = self.bot.user
         if bot_user is None:
@@ -11345,17 +11411,14 @@ class AgentAutonomyCog(commands.Cog):
             or new_agent_public_reference_id()
         )
         task_id = (
-            await self.runtime.agent_store.task_id_for_event(batch.batch_id)
-            or new_agent_task_id()
+            await self.runtime.agent_store.task_id_for_event(batch.batch_id) or new_agent_task_id()
         )
         conversation_id = discord_conversation_id(
             guild_id=int(workspace_id) if workspace_id else None,
             channel_id=int(channel_id),
             actor_id=autonomy_actor_id,
             grants=grants,
-            compatibility_epoch=(
-                self.runtime.settings.agent_conversation_compatibility_epoch
-            ),
+            compatibility_epoch=(self.runtime.settings.agent_conversation_compatibility_epoch),
         )
         request = AgentRequest(
             conversation_id=task_scoped_conversation_id(
@@ -11379,22 +11442,12 @@ class AgentAutonomyCog(commands.Cog):
                 if autonomy_policy_mode is AgentAutonomyPolicyMode.STRICT
                 else "service_live"
             ),
-            information_flow_mode=(
-                self.runtime.settings.agent_information_flow_mode
-            ),
+            information_flow_mode=(self.runtime.settings.agent_information_flow_mode),
             file_workspace_mode=self.runtime.settings.agent_file_workspace_mode,
-            high_risk_authorization_mode=(
-                self.runtime.settings.agent_high_risk_authorization_mode
-            ),
+            high_risk_authorization_mode=(self.runtime.settings.agent_high_risk_authorization_mode),
             executor_principal_id=autonomy_actor_id,
             trigger_actor_ids=tuple(
-                sorted(
-                    {
-                        event.actor_id
-                        for event in batch.events
-                        if event.actor_id is not None
-                    }
-                )
+                sorted({event.actor_id for event in batch.events if event.actor_id is not None})
             ),
             policy_id=f"discord-autonomy-{autonomy_policy_mode.value}-v1",
             allowed_capabilities=allowed_capabilities,
@@ -11420,9 +11473,7 @@ class AgentAutonomyCog(commands.Cog):
             except discord.Forbidden as exc:
                 raise _AutonomyTerminalDrop("channel_not_postable") from exc
             except discord.DiscordException as exc:
-                raise RuntimeError(
-                    "Autonomy reply target is temporarily unavailable"
-                ) from exc
+                raise RuntimeError("Autonomy reply target is temporarily unavailable") from exc
         host_post_context = _agent_invocation_context(request)
         try:
             await self._deliver_response(

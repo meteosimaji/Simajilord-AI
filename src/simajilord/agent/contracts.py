@@ -317,6 +317,26 @@ class AgentHighRiskAuthorizationMode(StrEnum):
     LEGACY_EVENT = "legacy_event"
 
 
+class AgentHighRiskPlanActionStatus(StrEnum):
+    """Host-observed lifecycle for one action in a confirmed bounded plan."""
+
+    PENDING = "pending"
+    DISPATCHED = "dispatched"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    NOT_RUN = "not_run"
+
+
+class AgentHighRiskPlanStatus(StrEnum):
+    """Aggregate lifecycle shown without exposing private action arguments."""
+
+    CONFIRMED = "confirmed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    STOPPED = "stopped"
+    EXPIRED = "expired"
+
+
 class AgentResponseStatus(StrEnum):
     """Stable outcome exposed to transport adapters."""
 
@@ -398,11 +418,54 @@ class AgentHighRiskPresentation:
             raise ValueError("high-risk public target must be 1 to 300 characters")
         if not 1 <= len(self.review_fields) <= 8:
             raise ValueError("high-risk review must contain 1 to 8 fields")
-        review_characters = sum(
-            len(field.name) + len(field.value) for field in self.review_fields
-        )
+        review_characters = sum(len(field.name) + len(field.value) for field in self.review_fields)
         if review_characters > 4_800:
             raise ValueError("high-risk review exceeds the complete-display limit")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHighRiskPlanAction:
+    """One exact action shown inside a requester-private plan review."""
+
+    position: int
+    capability: str
+    arguments_sha256: str
+    presentation: AgentHighRiskPresentation
+
+    def __post_init__(self) -> None:
+        if self.position < 1:
+            raise ValueError("high-risk plan action positions must be positive")
+        if not 1 <= len(self.capability) <= 200:
+            raise ValueError("high-risk plan capability must be 1 to 200 characters")
+        if len(self.arguments_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.arguments_sha256
+        ):
+            raise ValueError("high-risk plan action hash must be lowercase SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHighRiskPlanActionOutcome:
+    """Body-free IDs and status for one action after confirmation."""
+
+    position: int
+    capability: str
+    public_action: str
+    public_target: str
+    status: AgentHighRiskPlanActionStatus
+    tool_call_id: str | None = None
+    action_receipt_id: str | None = None
+    external_effect_id: str | None = None
+    error_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHighRiskPlanStatusUpdate:
+    """Transport-neutral, body-free progress for one confirmed plan."""
+
+    plan_id: str
+    binding_sha256: str
+    status: AgentHighRiskPlanStatus
+    actions: tuple[AgentHighRiskPlanActionOutcome, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,9 +478,30 @@ class AgentHighRiskConfirmation:
     requester_principal_id: str
     authorization_message_id: str
     authorization_message_edited_at: str | None
-    confirmation_kind: Literal["high_risk_action", "external_egress"] = (
-        "high_risk_action"
-    )
+    confirmation_kind: Literal[
+        "high_risk_action",
+        "high_risk_plan",
+        "external_egress",
+    ] = "high_risk_action"
+    plan_id: str | None = None
+    plan_actions: tuple[AgentHighRiskPlanAction, ...] = ()
+    max_actions: int = 1
+    expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.confirmation_kind == "high_risk_plan":
+            if self.plan_id is None or not self.plan_actions:
+                raise ValueError("high-risk plan confirmation requires a plan and actions")
+            if self.max_actions != len(self.plan_actions):
+                raise ValueError("high-risk plan max_actions must equal its fixed actions")
+            if tuple(action.position for action in self.plan_actions) != tuple(
+                range(1, len(self.plan_actions) + 1)
+            ):
+                raise ValueError("high-risk plan actions must be ordered contiguously")
+            if self.expires_at is None or self.expires_at.tzinfo is None:
+                raise ValueError("high-risk plan confirmation requires an aware expiry")
+        elif self.plan_id is not None or self.plan_actions or self.max_actions != 1:
+            raise ValueError("single confirmations cannot carry plan state")
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,9 +525,7 @@ class AgentRequest:
     public_reference_id: str
     task_id: str = field(default_factory=new_agent_task_id)
     principal_kind: Literal["requester", "service", "system"] = "requester"
-    read_scope_mode: Literal[
-        "resource_ids", "requester_live", "service_live"
-    ] = "resource_ids"
+    read_scope_mode: Literal["resource_ids", "requester_live", "service_live"] = "resource_ids"
     information_flow_mode: AgentInformationFlowMode = AgentInformationFlowMode.ENFORCE
     file_workspace_mode: AgentFileWorkspaceMode = AgentFileWorkspaceMode.ACTOR_TASK
     high_risk_authorization_mode: AgentHighRiskAuthorizationMode = (

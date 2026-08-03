@@ -10,15 +10,16 @@ from simajilord.core import InvocationContext
 
 from ..contracts import (
     AgentHighRiskConfirmation,
+    AgentHighRiskPlanStatusUpdate,
     AgentProgressUpdate,
     AgentTaskRouteDecision,
     AgentTokenUsage,
 )
 
 AgentProgressCallback = Callable[[AgentProgressUpdate], Awaitable[None]]
-AgentHighRiskConfirmationCallback = Callable[
-    [AgentHighRiskConfirmation], Awaitable[bool]
-]
+AgentHighRiskConfirmationCallback = Callable[[AgentHighRiskConfirmation], Awaitable[bool]]
+AgentHighRiskPlanStatusCallback = Callable[[AgentHighRiskPlanStatusUpdate], Awaitable[None]]
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderTurnResult:
@@ -43,6 +44,7 @@ class AgentProvider(Protocol):
         context: InvocationContext,
         on_progress: AgentProgressCallback | None = None,
         on_high_risk_confirmation: AgentHighRiskConfirmationCallback | None = None,
+        on_high_risk_plan_status: AgentHighRiskPlanStatusCallback | None = None,
     ) -> ProviderTurnResult: ...
 
     async def close(self) -> None: ...
