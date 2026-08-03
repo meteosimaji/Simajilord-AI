@@ -77,8 +77,9 @@ with Discord's generic “interaction failed” banner.
 - Durable requester attribution and a bounded recently-played history
 - Automatic read-aloud from text channels, threads, and voice-channel chats with persistent
   many-conversations-to-one-voice routing
-- Eager read-aloud voice preparation after `/join` and whenever a listener returns, avoiding
-  a first-message connection delay
+- Explicit read-aloud voice preparation after the requester selects **Start**. If that connection
+  fails after the route is saved, a requester-only, destination-bound **Reconnect** button remains
+  valid for five minutes; passive messages and voice-state changes never authorize a join
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
   `say` fallback; long messages are sentence-chunked and joined without truncation, while
   raw URLs and Discord mention markup are normalized before synthesis
@@ -86,8 +87,11 @@ with Discord's generic “interaction failed” banner.
   the music stream; standalone speech is used only as an overlay-failure fallback
 - Opt-in VC-member-only read aloud, short-burst merging and spam suppression, plus durable
   server and user voice presets. Before each queued or delivered utterance, the default
-  `enforce` policy verifies that every current listener can read the source; incomplete member
-  state fails closed. `audit` and `disabled` remain explicit compatibility modes
+  `enforce` policy snapshots the destination's low-level voice-state IDs, resolves only those
+  current listeners, verifies source permissions/private-thread membership, and snapshots again.
+  Missing listener principals or join/leave races fail closed without requiring a complete guild
+  member cache. Route setup shows listener-by-listener preflight results; `audit` and `disabled`
+  remain explicit compatibility modes
 - Restart-safe Focus Timers with retryable text delivery, optional VC-aware speech, and
   temporary read-aloud focus mode
 - Bounded video/audio downloads across the vendored provider's built-in public-site extractors

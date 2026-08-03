@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
@@ -113,6 +114,29 @@ DiscordAudienceRelation: TypeAlias = Literal[
     "uncertain",
 ]
 DiscordVisibility: TypeAlias = Literal["guild_public", "restricted", "uncertain"]
+ReadAloudListenerRelation: TypeAlias = Literal[
+    "allowed",
+    "broader",
+    "unresolved",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAloudListenerCheck:
+    """One current voice-state principal checked against a text source."""
+
+    member_id: int
+    display_name: str | None
+    relation: ReadAloudListenerRelation
+
+
+@dataclass(frozen=True, slots=True)
+class ReadAloudAudienceInspection:
+    """Stable listener snapshot and its source-audience relation."""
+
+    relation: DiscordAudienceRelation
+    listeners: tuple[ReadAloudListenerCheck, ...]
+    stable: bool
 
 
 def channel_visibility(
@@ -159,22 +183,82 @@ def read_aloud_audience_relation(
 ) -> DiscordAudienceRelation:
     """Prove every current human voice listener can read the text source."""
 
-    member_count = guild.member_count
-    cache_complete = guild.chunked is True or (
-        isinstance(member_count, int)
-        and not isinstance(member_count, bool)
-        and len(guild.members) >= member_count
+    return inspect_read_aloud_audience(guild, source, destination).relation
+
+
+def inspect_read_aloud_audience(
+    guild: discord.Guild,
+    source: DiscordReadableChannel,
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> ReadAloudAudienceInspection:
+    """Inspect only current voice states and fail closed on missing principals or races."""
+
+    initial_ids = _voice_state_member_ids(destination)
+    if initial_ids is None:
+        return ReadAloudAudienceInspection(
+            relation="uncertain",
+            listeners=(),
+            stable=False,
+        )
+
+    bot_member = guild.me
+    checks: list[ReadAloudListenerCheck] = []
+    for member_id in initial_ids:
+        member = guild.get_member(member_id)
+        if member is None and bot_member is not None and bot_member.id == member_id:
+            member = bot_member
+        if member is None:
+            checks.append(
+                ReadAloudListenerCheck(
+                    member_id=member_id,
+                    display_name=None,
+                    relation="unresolved",
+                )
+            )
+            continue
+        if member.bot:
+            continue
+        readable = can_read_messages(source, member) and can_read_private_thread(
+            source,
+            member,
+        )
+        checks.append(
+            ReadAloudListenerCheck(
+                member_id=member_id,
+                display_name=member.display_name,
+                relation="allowed" if readable else "broader",
+            )
+        )
+
+    final_ids = _voice_state_member_ids(destination)
+    stable = final_ids is not None and final_ids == initial_ids
+    if any(check.relation == "broader" for check in checks):
+        relation: DiscordAudienceRelation = "broader"
+    elif not stable or any(check.relation == "unresolved" for check in checks):
+        relation = "uncertain"
+    else:
+        relation = "same_or_narrower"
+    return ReadAloudAudienceInspection(
+        relation=relation,
+        listeners=tuple(checks),
+        stable=stable,
     )
-    if not cache_complete:
-        return "uncertain"
-    listeners = tuple(member for member in destination.members if not member.bot)
-    if any(
-        not can_read_messages(source, listener)
-        or not can_read_private_thread(source, listener)
-        for listener in listeners
-    ):
-        return "broader"
-    return "same_or_narrower"
+
+
+def _voice_state_member_ids(
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> tuple[int, ...] | None:
+    """Return the exact low-level voice-state population without using Member cache."""
+
+    voice_states = destination.voice_states
+    if not isinstance(voice_states, Mapping):
+        return None
+    member_ids: list[int] = []
+    for member_id in voice_states:
+        if not isinstance(member_id, int) or isinstance(member_id, bool):
+            return None
+        member_ids.append(member_id)
+    return tuple(sorted(member_ids))
 
 
 def _effective_reader_ids(

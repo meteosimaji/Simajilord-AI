@@ -73,6 +73,7 @@ from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, LoopMode, QueueSnapshot
 from simajilord.integrations.discord.bot import SimajilordDiscordBot
 from simajilord.integrations.discord.capabilities import (
+    DiscordConnectVoiceRequest,
     DiscordImportAttachmentRequest,
     DiscordSendFileRequest,
     DiscordServerResponse,
@@ -118,6 +119,7 @@ from simajilord.integrations.discord.cogs import (
     ReadAloudChannelSelect,
     ReadAloudChannelSelectView,
     ReadAloudCog,
+    ReadAloudReconnectView,
     SafeView,
     SystemCog,
     TranslationCog,
@@ -167,6 +169,7 @@ from simajilord.integrations.discord.permissions import (
 )
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox
+from simajilord.services.read_aloud import ReadAloudMode, ReadAloudRoute
 from simajilord.services.translation import TranslationPreference
 
 
@@ -2116,18 +2119,26 @@ async def test_join_self_service_is_limited_to_current_channel_and_voice(
     runtime = Mock(spec=SimajilordRuntime)
     runtime.registry = Mock()
     runtime.registry.invoke = AsyncMock(return_value=response)
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
     guild = Mock(spec=discord.Guild)
     guild.id = 1
     source = Mock(spec=discord.TextChannel)
     source.id = 50
     voice = Mock(spec=discord.VoiceChannel)
     voice.id = 55
+    voice.voice_states = {7: object()}
     guild.get_channel_or_thread.return_value = source
     guild.get_channel.return_value = voice
     member = Mock(spec=discord.Member)
+    member.id = 7
+    member.bot = False
+    member.display_name = "Requester"
     member.guild_permissions.manage_guild = False
     bot = Mock(spec=discord.Member)
+    bot.id = 99
+    bot.bot = True
     guild.me = bot
+    guild.get_member.side_effect = {7: member, 99: bot}.get
     source.permissions_for.return_value = discord.Permissions(
         view_channel=True,
         read_message_history=True,
@@ -2206,6 +2217,7 @@ async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
     runtime.registry = Mock()
     runtime.registry.invoke = AsyncMock(return_value=response)
     runtime.read_aloud.get.return_value = None
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
     guild = Mock(spec=discord.Guild)
     guild.id = 1
     source_one = Mock(spec=discord.TextChannel)
@@ -2214,10 +2226,17 @@ async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
     source_two.id = 51
     voice = Mock(spec=discord.VoiceChannel)
     voice.id = 55
+    voice.voice_states = {7: object()}
     bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
     member = Mock(spec=discord.Member)
+    member.id = 7
+    member.bot = False
+    member.display_name = "Requester"
     member.guild_permissions.manage_guild = False
     guild.me = bot_member
+    guild.get_member.side_effect = {7: member, 99: bot_member}.get
     guild.get_channel_or_thread.side_effect = lambda channel_id: {
         50: source_one,
         51: source_two,
@@ -2273,6 +2292,65 @@ async def test_multi_channel_join_is_atomic_and_limited_to_current_voice(
     assert result == response
     delegated_request = runtime.registry.invoke.await_args.args[1]
     assert delegated_request == request
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_route_setup_fails_closed_on_unresolved_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    source.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {8: object()}
+    member = Mock(spec=discord.Member)
+    member.guild_permissions = discord.Permissions(administrator=True)
+    bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
+    guild.me = bot_member
+    guild.get_member.return_value = None
+    guild.get_channel_or_thread.return_value = source
+    guild.get_channel.return_value = voice
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(cast(discord.Client, object()), runtime)
+    }
+
+    with pytest.raises(UserError, match=r"read_aloud\.audience_forbidden"):
+        await endpoint_by_name["discord.manage_read_aloud"].invoke(
+            ReadAloudRequest(
+                action=ReadAloudAction.CONFIGURE,
+                text_channel_id="50",
+                audio_destination_id="55",
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="1",
+                transport="discord",
+                request_id="event",
+            ),
+        )
+
+    runtime.registry.invoke.assert_not_awaited()
 
 
 def test_advanced_music_commands_are_not_duplicated_as_a_slash_group() -> None:
@@ -3158,22 +3236,55 @@ async def test_join_selection_is_staged_until_start_is_pressed() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.registry = Mock()
     runtime.registry.invoke = AsyncMock(side_effect=(configured, object()))
+    runtime.settings = SimpleNamespace(
+        read_aloud_audience_mode="enforce",
+        tts_provider="say",
+        tts_voice="Kyoko",
+    )
     selector = ReadAloudChannelSelect(
         runtime,
         requester_id=7,
         destination_id=55,
         default_values=(),
     )
-    selected_one = Mock()
+    selected_one = Mock(spec=discord.TextChannel)
     selected_one.id = 50
-    selected_two = Mock()
+    selected_two = Mock(spec=discord.TextChannel)
     selected_two.id = 51
     selector._values = [selected_one, selected_two]
     interaction = Mock(spec=discord.Interaction)
     interaction.id = 90
     interaction.guild_id = 1
     interaction.channel_id = 50
-    interaction.user.id = 7
+    requester = Mock(spec=discord.Member)
+    requester.id = 7
+    requester.bot = False
+    requester.display_name = "Requester"
+    interaction.user = requester
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = Mock(spec=discord.Member)
+    guild.me.id = 99
+    guild.me.bot = True
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {7: object(), 99: object()}
+    requester.voice = SimpleNamespace(channel=voice)
+    guild.get_channel.return_value = voice
+    guild.get_channel_or_thread.side_effect = lambda channel_id: {
+        50: selected_one,
+        51: selected_two,
+    }.get(channel_id)
+    guild.get_member.side_effect = {7: requester, 99: guild.me}.get
+    interaction.guild = guild
+    selected_one.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    selected_two.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
     interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
     interaction.edit_original_response = AsyncMock()
@@ -3196,6 +3307,336 @@ async def test_join_selection_is_staged_until_start_is_pressed() -> None:
     embed = interaction.edit_original_response.await_args.kwargs["embed"]
     assert embed.title == "Read aloud is ready"
     assert any(field.name == "Connection" and field.value == "Ready" for field in embed.fields)
+    audience_field = next(field for field in embed.fields if field.name == "Audience preflight")
+    assert "<@7>" in audience_field.value
+    assert "can read every selected source" in audience_field.value
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_start_preflight_names_unreadable_listener_before_saving() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
+    selector = ReadAloudChannelSelect(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    selector.selected_channel_ids = ("50",)
+    requester = Mock(spec=discord.Member)
+    requester.id = 7
+    requester.bot = False
+    requester.display_name = "Requester"
+    denied = Mock(spec=discord.Member)
+    denied.id = 8
+    denied.bot = False
+    denied.display_name = "Denied"
+    bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    source.permissions_for.side_effect = lambda member: discord.Permissions(
+        view_channel=member.id != 8,
+        read_message_history=member.id != 8,
+    )
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {7: object(), 8: object(), 99: object()}
+    requester.voice = SimpleNamespace(channel=voice)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = bot_member
+    guild.get_member.side_effect = {7: requester, 8: denied, 99: bot_member}.get
+    guild.get_channel.return_value = voice
+    guild.get_channel_or_thread.return_value = source
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 90
+    interaction.guild_id = 1
+    interaction.guild = guild
+    interaction.user = requester
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await selector.commit(interaction)
+
+    runtime.registry.invoke.assert_not_awaited()
+    update = interaction.edit_original_response.await_args.kwargs
+    assert update["embed"].title == "Read aloud was not saved"
+    audience_field = next(
+        field for field in update["embed"].fields if field.name == "Audience preflight"
+    )
+    assert "<@8>" in audience_field.value
+    assert "cannot read at least one selected source" in audience_field.value
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_start_failure_shows_saved_route_and_explicit_reconnect() -> None:
+    configured = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(
+        side_effect=(configured, UserError("discord.voice_connect_failed"))
+    )
+    runtime.settings = SimpleNamespace(
+        read_aloud_audience_mode="enforce",
+        tts_provider="say",
+        tts_voice="Kyoko",
+    )
+    selector = ReadAloudChannelSelect(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    selector.selected_channel_ids = ("50",)
+    requester = Mock(spec=discord.Member)
+    requester.id = 7
+    requester.bot = False
+    requester.display_name = "Requester"
+    bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    source.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {7: object(), 99: object()}
+    requester.voice = SimpleNamespace(channel=voice)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = bot_member
+    guild.get_member.side_effect = {7: requester, 99: bot_member}.get
+    guild.get_channel.return_value = voice
+    guild.get_channel_or_thread.return_value = source
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 90
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.guild = guild
+    interaction.user = requester
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    interaction.original_response = AsyncMock(return_value=None)
+
+    await selector.commit(interaction)
+
+    assert [call.args[0] for call in runtime.registry.invoke.await_args_list] == [
+        "discord.manage_read_aloud",
+        "discord.connect_voice",
+    ]
+    update = interaction.edit_original_response.await_args.kwargs
+    assert update["embed"].title == "Read aloud route saved · voice disconnected"
+    assert "new channel message will not make the bot join" in update[
+        "embed"
+    ].description
+    assert "retry when the next message" not in update["embed"].description.lower()
+    assert isinstance(update["view"], ReadAloudReconnectView)
+    assert any(
+        field.name == "Route" and field.value == "Saved"
+        for field in update["embed"].fields
+    )
+    assert any(
+        field.name == "Connection" and field.value.startswith("Disconnected")
+        for field in update["embed"].fields
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_reconnect_failure_then_success_is_target_bound() -> None:
+    configured = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    route = ReadAloudRoute("1", "50", "55", ReadAloudMode.QUEUE)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(
+        side_effect=(UserError("discord.voice_connect_failed"), object())
+    )
+    runtime.read_aloud.get.return_value = route
+    runtime.settings = SimpleNamespace(
+        read_aloud_audience_mode="enforce",
+        tts_provider="say",
+        tts_voice="Kyoko",
+    )
+    requester = Mock(spec=discord.Member)
+    requester.id = 7
+    requester.bot = False
+    requester.display_name = "Requester"
+    bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    source.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {7: object(), 99: object()}
+    requester.voice = SimpleNamespace(channel=voice)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = bot_member
+    guild.get_member.side_effect = {7: requester, 99: bot_member}.get
+    guild.get_channel.return_value = voice
+    guild.get_channel_or_thread.return_value = source
+    view = ReadAloudReconnectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        configured=configured,
+        audience_preflight="initial",
+    )
+    button = next(
+        item
+        for item in view.children
+        if isinstance(item, discord.ui.Button) and item.label == "Reconnect"
+    )
+
+    def interaction(interaction_id: int) -> Mock:
+        current = Mock(spec=discord.Interaction)
+        current.id = interaction_id
+        current.guild_id = 1
+        current.channel_id = 50
+        current.guild = guild
+        current.user = requester
+        current.response.defer = AsyncMock()
+        current.response.send_message = AsyncMock()
+        current.edit_original_response = AsyncMock()
+        return current
+
+    failed = interaction(91)
+    await button.callback(failed)
+
+    failed_update = failed.edit_original_response.await_args.kwargs
+    assert failed_update["embed"].title == (
+        "Read aloud route saved · voice disconnected"
+    )
+    assert failed_update["view"] is view
+    assert view.is_finished() is False
+
+    succeeded = interaction(92)
+    await button.callback(succeeded)
+
+    success_update = succeeded.edit_original_response.await_args.kwargs
+    assert success_update["embed"].title == "Read aloud is ready"
+    assert success_update["view"] is None
+    assert view.is_finished() is True
+    assert [call.args[0] for call in runtime.registry.invoke.await_args_list] == [
+        "discord.connect_voice",
+        "discord.connect_voice",
+    ]
+    for call in runtime.registry.invoke.await_args_list:
+        assert call.args[1] == DiscordConnectVoiceRequest(channel_id="55")
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_reconnect_rejects_wrong_absent_different_and_expired_requester() -> None:
+    configured = ReadAloudResponse(
+        action=ReadAloudAction.ADD_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode="queue",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.settings = SimpleNamespace(
+        read_aloud_audience_mode="enforce",
+        tts_provider="say",
+        tts_voice="Kyoko",
+    )
+
+    def interaction(user_id: int, channel: object | None) -> Mock:
+        current = Mock(spec=discord.Interaction)
+        current.id = 100 + user_id
+        member = Mock(spec=discord.Member)
+        member.id = user_id
+        member.voice = None if channel is None else SimpleNamespace(channel=channel)
+        current.user = member
+        current.response.send_message = AsyncMock()
+        return current
+
+    wrong_view = ReadAloudReconnectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        configured=configured,
+        audience_preflight="initial",
+    )
+    wrong = interaction(8, None)
+    assert await wrong_view.interaction_check(wrong) is False
+    assert "Only the requester" in wrong.response.send_message.await_args.args[0]
+
+    absent_view = ReadAloudReconnectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        configured=configured,
+        audience_preflight="initial",
+    )
+    absent = interaction(7, None)
+    absent_button = next(
+        item for item in absent_view.children if isinstance(item, discord.ui.Button)
+    )
+    await absent_button.callback(absent)
+    assert "Join the selected voice channel" in absent.response.send_message.await_args.args[0]
+
+    other_voice = Mock(spec=discord.VoiceChannel)
+    other_voice.id = 56
+    different_view = ReadAloudReconnectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        configured=configured,
+        audience_preflight="initial",
+    )
+    different = interaction(7, other_voice)
+    different_button = next(
+        item for item in different_view.children if isinstance(item, discord.ui.Button)
+    )
+    await different_button.callback(different)
+    assert "Join the selected voice channel" in (
+        different.response.send_message.await_args.args[0]
+    )
+
+    expired_view = ReadAloudReconnectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        configured=configured,
+        audience_preflight="initial",
+    )
+    expired_view.expires_at = 0.0
+    expired = interaction(7, other_voice)
+    expired_button = next(
+        item for item in expired_view.children if isinstance(item, discord.ui.Button)
+    )
+    await expired_button.callback(expired)
+    assert "expired" in expired.response.send_message.await_args.args[0]
+    runtime.registry.invoke.assert_not_awaited()
 
 
 @pytest.mark.asyncio

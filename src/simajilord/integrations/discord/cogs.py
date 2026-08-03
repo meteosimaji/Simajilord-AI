@@ -217,10 +217,12 @@ from .help_catalog import (
 )
 from .local_media import attachment_can_play, import_discord_attachment
 from .permissions import (
+    DiscordAudienceRelation,
+    ReadAloudAudienceInspection,
     RequesterPrincipal,
     ServicePrincipal,
+    inspect_read_aloud_audience,
     permission_enabled,
-    read_aloud_audience_relation,
     readable_for_requester,
     readable_for_service,
 )
@@ -506,6 +508,9 @@ _ERROR_MESSAGES = {
     "read_aloud.source_channel_required": "Choose a conversation source.",
     "read_aloud.source_channel_limit": "Choose between 1 and 25 source channels.",
     "read_aloud.source_channels_required": "Choose at least one source channel.",
+    "read_aloud.audience_forbidden": (
+        "A current voice listener cannot be proven able to read every selected source."
+    ),
     "read_aloud.dictionary_surface_required": "Provide the written form.",
     "read_aloud.dictionary_surface_too_long": "Written form must be at most 100 characters.",
     "read_aloud.dictionary_reading_required": "Provide its pronunciation.",
@@ -763,6 +768,12 @@ def _active_read_aloud_route(
     return route if isinstance(route, ReadAloudRoute) else None
 
 
+def _read_aloud_listener_policy_mode(runtime: SimajilordRuntime) -> str:
+    raw_mode = getattr(runtime.settings, "read_aloud_audience_mode", "enforce")
+    mode = getattr(raw_mode, "value", raw_mode)
+    return mode if mode in {"enforce", "audit", "disabled"} else "enforce"
+
+
 def _read_aloud_audience_allowed(
     runtime: SimajilordRuntime,
     message: discord.Message,
@@ -770,12 +781,7 @@ def _read_aloud_audience_allowed(
 ) -> bool:
     """Apply the reversible listener-audience policy before speech is queued."""
 
-    raw_mode = getattr(runtime.settings, "read_aloud_audience_mode", "enforce")
-    mode = getattr(raw_mode, "value", raw_mode)
-    if mode not in {"enforce", "audit", "disabled"}:
-        mode = "enforce"
-    if mode == "disabled":
-        return True
+    mode = _read_aloud_listener_policy_mode(runtime)
     guild = message.guild
     source = message.channel
     if guild is None or not isinstance(
@@ -788,9 +794,18 @@ def _read_aloud_audience_allowed(
             discord.StageChannel,
         ),
     ):
-        relation = "uncertain"
+        inspection = ReadAloudAudienceInspection(
+            relation="uncertain",
+            listeners=(),
+            stable=False,
+        )
     else:
-        relation = read_aloud_audience_relation(guild, source, destination)
+        inspection = inspect_read_aloud_audience(guild, source, destination)
+    if not inspection.listeners:
+        return False
+    if mode == "disabled":
+        return True
+    relation = inspection.relation
     if relation == "same_or_narrower":
         return True
     log.warning(
@@ -4295,6 +4310,301 @@ _READ_ALOUD_CHANNEL_TYPES = [
     discord.ChannelType.public_thread,
     discord.ChannelType.private_thread,
 ]
+_READ_ALOUD_RECONNECT_TIMEOUT_SECONDS = 300.0
+
+
+def _read_aloud_route_preflight(
+    guild: discord.Guild,
+    source_ids: tuple[str, ...],
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> tuple[DiscordAudienceRelation, str]:
+    """Summarize the exact current listeners across every selected source."""
+
+    inspections: list[ReadAloudAudienceInspection] = []
+    listener_relations: dict[int, tuple[str | None, str]] = {}
+    relation_priority = {"allowed": 0, "unresolved": 1, "broader": 2}
+    for source_id in source_ids:
+        try:
+            resolved_id = int(source_id)
+        except ValueError as exc:
+            raise UserError("discord.channel_id_invalid") from exc
+        source = guild.get_channel_or_thread(resolved_id)
+        if not isinstance(
+            source,
+            (
+                discord.TextChannel,
+                discord.Thread,
+                discord.ForumChannel,
+                discord.VoiceChannel,
+                discord.StageChannel,
+            ),
+        ):
+            raise UserError("discord.message_channel_unavailable")
+        inspection = inspect_read_aloud_audience(guild, source, destination)
+        inspections.append(inspection)
+        for check in inspection.listeners:
+            current = listener_relations.get(check.member_id)
+            if current is None or relation_priority[check.relation] > relation_priority[
+                current[1]
+            ]:
+                listener_relations[check.member_id] = (
+                    check.display_name,
+                    check.relation,
+                )
+
+    if any(inspection.relation == "broader" for inspection in inspections):
+        relation: DiscordAudienceRelation = "broader"
+    elif any(inspection.relation == "uncertain" for inspection in inspections):
+        relation = "uncertain"
+    else:
+        relation = "same_or_narrower"
+
+    labels = {
+        "allowed": ("✓", "can read every selected source"),
+        "broader": ("✕", "cannot read at least one selected source"),
+        "unresolved": ("?", "could not be resolved safely"),
+    }
+    lines = []
+    for member_id, (display_name, listener_relation) in sorted(
+        listener_relations.items()
+    ):
+        symbol, explanation = labels[listener_relation]
+        listener_label = f"<@{member_id}>"
+        if display_name:
+            escaped_name = discord.utils.escape_markdown(
+                _compact_panel_text(display_name, maximum=64)
+            )
+            if escaped_name:
+                listener_label = f"**{escaped_name}** (<@{member_id}>)"
+        lines.append(f"{symbol} {listener_label} · {explanation}")
+    if not lines:
+        lines.append("✓ No current human voice listeners to compare.")
+    if any(not inspection.stable for inspection in inspections):
+        lines.append("? The listener set changed or could not be read consistently.")
+
+    visible_lines: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        additional = len(line) + (1 if visible_lines else 0)
+        if used + additional > 960:
+            visible_lines.append(f"… {len(lines) - index} more result(s)")
+            break
+        visible_lines.append(line)
+        used += additional
+    return relation, "\n".join(visible_lines)
+
+
+def _read_aloud_ready_embed(
+    runtime: SimajilordRuntime,
+    configured: ReadAloudResponse,
+    *,
+    audience_preflight: str,
+) -> discord.Embed:
+    return command_embed(
+        "Read aloud is ready",
+        description="New messages from the selected channels will be spoken automatically.",
+        fields=(
+            EmbedField(
+                "Reading from",
+                "\n".join(
+                    f"<#{channel_id}>" for channel_id in configured.text_channel_ids
+                ),
+                inline=False,
+            ),
+            EmbedField(
+                "Speaking in",
+                f"<#{configured.audio_destination_id}>",
+            ),
+            EmbedField("Connection", "Ready"),
+            EmbedField("Audience preflight", audience_preflight, inline=False),
+            EmbedField("Voice", _speech_voice_label(runtime)),
+        ),
+        tone=EmbedTone.SUCCESS,
+    )
+
+
+def _read_aloud_disconnected_embed(
+    runtime: SimajilordRuntime,
+    configured: ReadAloudResponse,
+    error: Exception,
+    *,
+    request_id: str,
+    audience_preflight: str,
+) -> discord.Embed:
+    return command_embed(
+        "Read aloud route saved · voice disconnected",
+        description=(
+            "The route is saved, but a new channel message will not make the bot join. "
+            "While you are in the selected voice channel, press **Reconnect** within "
+            "five minutes. If it expires, reopen **Read aloud**."
+        ),
+        fields=(
+            EmbedField("Route", "Saved"),
+            EmbedField(
+                "Speaking in",
+                f"<#{configured.audio_destination_id}>",
+            ),
+            EmbedField(
+                "Connection",
+                f"Disconnected · {error_message(error, request_id=request_id)}",
+                inline=False,
+            ),
+            EmbedField("Audience preflight", audience_preflight, inline=False),
+            EmbedField("Voice", _speech_voice_label(runtime)),
+        ),
+        tone=EmbedTone.WARNING,
+    )
+
+
+class ReadAloudReconnectView(SafeView):
+    """One requester-only, target-bound, short-lived voice reconnect consent."""
+
+    def __init__(
+        self,
+        runtime: SimajilordRuntime,
+        *,
+        requester_id: int,
+        destination_id: int,
+        configured: ReadAloudResponse,
+        audience_preflight: str,
+        timeout: float = _READ_ALOUD_RECONNECT_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.runtime = runtime
+        self.requester_id = requester_id
+        self.destination_id = destination_id
+        self.configured = configured
+        self.audience_preflight = audience_preflight
+        self.expires_at = time.monotonic() + timeout
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the requester can reconnect this read-aloud route.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        self.stop()
+        if self.message is not None:
+            with suppress(discord.DiscordException):
+                await self.message.edit(view=self)
+
+    async def _reject(self, interaction: discord.Interaction, message: str) -> None:
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @discord.ui.button(
+        label="Reconnect",
+        style=discord.ButtonStyle.primary,
+        custom_id="simajilord:readaloud:reconnect",
+    )
+    async def reconnect_button(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button[ReadAloudReconnectView],
+    ) -> None:
+        if time.monotonic() >= self.expires_at:
+            self.stop()
+            await self._reject(
+                interaction,
+                "This reconnect consent expired. Reopen Read aloud to choose the route again.",
+            )
+            return
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await self._reject(interaction, "Could not resolve you in this server.")
+            return
+        member_channel = member.voice.channel if member.voice is not None else None
+        if (
+            not isinstance(member_channel, (discord.VoiceChannel, discord.StageChannel))
+            or member_channel.id != self.destination_id
+        ):
+            await self._reject(
+                interaction,
+                "Join the selected voice channel before reconnecting.",
+            )
+            return
+        guild = interaction.guild
+        if guild is None:
+            await self._reject(interaction, "This server is no longer available.")
+            return
+        route = _active_read_aloud_route(self.runtime, str(guild.id))
+        if (
+            route is None
+            or route.audio_destination_id != str(self.destination_id)
+            or route.text_channel_ids != self.configured.text_channel_ids
+            or route.mode.value != self.configured.mode
+        ):
+            await self._reject(
+                interaction,
+                "The saved route changed. Reopen Read aloud before connecting.",
+            )
+            return
+        destination = guild.get_channel(self.destination_id)
+        if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
+            await self._reject(interaction, "The selected voice channel is unavailable.")
+            return
+        relation, audience_preflight = _read_aloud_route_preflight(
+            guild,
+            route.text_channel_ids,
+            destination,
+        )
+        if (
+            _read_aloud_listener_policy_mode(self.runtime) == "enforce"
+            and relation != "same_or_narrower"
+        ):
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Reconnect blocked by audience preflight",
+                    description=(
+                        "Every current listener must be proven able to read every source."
+                    ),
+                    fields=(
+                        EmbedField("Audience preflight", audience_preflight, inline=False),
+                    ),
+                    tone=EmbedTone.WARNING,
+                ),
+                ephemeral=True,
+            )
+            return
+        try:
+            await interaction.response.defer()
+            await self.runtime.registry.invoke(
+                "discord.connect_voice",
+                DiscordConnectVoiceRequest(channel_id=str(self.destination_id)),
+                invocation_context(interaction),
+            )
+            await interaction.edit_original_response(
+                embed=_read_aloud_ready_embed(
+                    self.runtime,
+                    self.configured,
+                    audience_preflight=audience_preflight,
+                ),
+                view=None,
+            )
+            self.stop()
+        except Exception as exc:
+            log.exception(
+                "Explicit read-aloud reconnect failed guild=%s channel=%s",
+                interaction.guild_id,
+                self.destination_id,
+            )
+            await interaction.edit_original_response(
+                embed=_read_aloud_disconnected_embed(
+                    self.runtime,
+                    self.configured,
+                    exc,
+                    request_id=str(interaction.id),
+                    audience_preflight=audience_preflight,
+                ),
+                view=self,
+            )
 
 
 class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
@@ -4341,11 +4651,71 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 ephemeral=True,
             )
             return
-        configured: ReadAloudResponse | None = None
+        audience_preflight = "Audience preflight did not complete."
         try:
             await interaction.response.defer()
             if not self.selected_channel_ids:
                 raise UserError("read_aloud.source_channels_required")
+            guild = interaction.guild
+            if guild is None:
+                raise UserError("workspace.required")
+            destination = guild.get_channel(self.destination_id)
+            if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
+                raise UserError("discord.voice_channel_unavailable")
+            member = interaction.user
+            member_destination = (
+                member.voice.channel
+                if isinstance(member, discord.Member) and member.voice is not None
+                else None
+            )
+            if (
+                not isinstance(
+                    member_destination,
+                    (discord.VoiceChannel, discord.StageChannel),
+                )
+                or member_destination.id != self.destination_id
+            ):
+                raise UserError("audio.same_voice_required")
+            existing_route = _active_read_aloud_route(self.runtime, str(guild.id))
+            preflight_source_ids = self.selected_channel_ids
+            if (
+                existing_route is not None
+                and existing_route.audio_destination_id == str(self.destination_id)
+            ):
+                preflight_source_ids = tuple(
+                    dict.fromkeys(
+                        (*existing_route.text_channel_ids, *self.selected_channel_ids)
+                    )
+                )
+            relation, audience_preflight = _read_aloud_route_preflight(
+                guild,
+                preflight_source_ids,
+                destination,
+            )
+            if (
+                _read_aloud_listener_policy_mode(self.runtime) == "enforce"
+                and relation != "same_or_narrower"
+            ):
+                await interaction.edit_original_response(
+                    embed=command_embed(
+                        "Read aloud was not saved",
+                        description=(
+                            "Every current listener must be proven able to read every "
+                            "selected source. Adjust the listeners or sources, then press "
+                            "**Start** again."
+                        ),
+                        fields=(
+                            EmbedField(
+                                "Audience preflight",
+                                audience_preflight,
+                                inline=False,
+                            ),
+                        ),
+                        tone=EmbedTone.WARNING,
+                    ),
+                    view=self.view,
+                )
+                return
             configured = cast(
                 ReadAloudResponse,
                 await self.runtime.registry.invoke(
@@ -4358,77 +4728,69 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                     invocation_context(interaction),
                 ),
             )
+        except Exception as exc:
+            await send_error(interaction, exc)
+            return
+
+        try:
             await self.runtime.registry.invoke(
                 "discord.connect_voice",
                 DiscordConnectVoiceRequest(channel_id=str(self.destination_id)),
                 invocation_context(interaction),
             )
-            await interaction.edit_original_response(
-                embed=command_embed(
-                    "Read aloud is ready",
-                    description=(
-                        "New messages from the selected channels will be spoken automatically."
-                    ),
-                    fields=(
-                        EmbedField(
-                            "Reading from",
-                            "\n".join(
-                                f"<#{channel_id}>" for channel_id in configured.text_channel_ids
-                            ),
-                            inline=False,
-                        ),
-                        EmbedField(
-                            "Speaking in",
-                            f"<#{configured.audio_destination_id}>",
-                        ),
-                        EmbedField("Connection", "Ready"),
-                        EmbedField("Voice", _speech_voice_label(self.runtime)),
-                    ),
-                    tone=EmbedTone.SUCCESS,
-                ),
-                view=None,
-            )
-            dashboard = getattr(
-                interaction.client,
-                _MUSIC_DASHBOARD_ATTRIBUTE,
-                None,
-            )
-            session = self.runtime.audio.find(str(interaction.guild_id))
-            if isinstance(dashboard, MusicDashboardManager) and session is not None:
-                await dashboard.publish(session)
         except Exception as exc:
-            if configured is None:
-                await send_error(interaction, exc)
-                return
             log.exception(
                 "Read-aloud route was saved but eager voice connection failed guild=%s channel=%s",
                 interaction.guild_id,
                 self.destination_id,
             )
-            await interaction.edit_original_response(
-                embed=command_embed(
-                    "Read aloud was saved",
-                    description=(
-                        "The channels are configured, but the voice connection is not ready yet. "
-                        "Simajilord will retry when the next message arrives."
-                    ),
-                    fields=(
-                        EmbedField(
-                            "Speaking in",
-                            f"<#{configured.audio_destination_id}>",
-                        ),
-                        EmbedField(
-                            "Connection",
-                            error_message(
-                                exc,
-                                request_id=str(interaction.id),
-                            ),
-                        ),
-                    ),
-                    tone=EmbedTone.WARNING,
-                ),
-                view=None,
+            reconnect_view = ReadAloudReconnectView(
+                self.runtime,
+                requester_id=self.requester_id,
+                destination_id=self.destination_id,
+                configured=configured,
+                audience_preflight=audience_preflight,
             )
+            await interaction.edit_original_response(
+                embed=_read_aloud_disconnected_embed(
+                    self.runtime,
+                    configured,
+                    exc,
+                    request_id=str(interaction.id),
+                    audience_preflight=audience_preflight,
+                ),
+                view=reconnect_view,
+            )
+            try:
+                response_message = await interaction.original_response()
+            except discord.DiscordException:
+                response_message = None
+            if isinstance(response_message, discord.Message):
+                reconnect_view.message = response_message
+            return
+
+        await interaction.edit_original_response(
+            embed=_read_aloud_ready_embed(
+                self.runtime,
+                configured,
+                audience_preflight=audience_preflight,
+            ),
+            view=None,
+        )
+        dashboard = getattr(
+            interaction.client,
+            _MUSIC_DASHBOARD_ATTRIBUTE,
+            None,
+        )
+        session = self.runtime.audio.find(str(interaction.guild_id))
+        if isinstance(dashboard, MusicDashboardManager) and session is not None:
+            try:
+                await dashboard.publish(session)
+            except Exception:
+                log.exception(
+                    "Read-aloud dashboard refresh failed after voice connected guild=%s",
+                    interaction.guild_id,
+                )
 
 
 class ReadAloudChannelSelectView(SafeView):
@@ -4620,6 +4982,34 @@ class ReadAloudCog(commands.Cog):
             if selected_voice is None:
                 raise UserError("discord.voice_join_required")
 
+            relation, audience_preflight = _read_aloud_route_preflight(
+                member.guild,
+                (str(selected_text.id),),
+                selected_voice,
+            )
+            if (
+                _read_aloud_listener_policy_mode(self.runtime) == "enforce"
+                and relation != "same_or_narrower"
+            ):
+                await interaction.response.send_message(
+                    embed=command_embed(
+                        "Read aloud was not configured",
+                        description=(
+                            "Every current listener must be proven able to read the source."
+                        ),
+                        fields=(
+                            EmbedField(
+                                "Audience preflight",
+                                audience_preflight,
+                                inline=False,
+                            ),
+                        ),
+                        tone=EmbedTone.WARNING,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
             response = cast(
                 ReadAloudResponse,
                 await self.runtime.registry.invoke(
@@ -4640,10 +5030,16 @@ class ReadAloudCog(commands.Cog):
                         EmbedField("Source", selected_text.mention),
                         EmbedField("Speaking in", selected_voice.mention),
                         EmbedField("Music behaviour", _read_aloud_mode_label(response.mode)),
+                        EmbedField(
+                            "Audience preflight",
+                            audience_preflight,
+                            inline=False,
+                        ),
                         EmbedField("Voice", _speech_voice_label(self.runtime)),
                     ),
                     tone=EmbedTone.SUCCESS,
-                )
+                ),
+                ephemeral=True,
             )
         except Exception as exc:
             await send_error(interaction, exc)
@@ -5310,7 +5706,7 @@ class ReadAloudCog(commands.Cog):
         if not isinstance(
             destination,
             (discord.VoiceChannel, discord.StageChannel),
-        ) or not any(not listener.bot for listener in destination.members):
+        ):
             return
         if not _read_aloud_audience_allowed(self.runtime, message, destination):
             return
@@ -5375,8 +5771,6 @@ class ReadAloudCog(commands.Cog):
         if not isinstance(
             destination,
             (discord.VoiceChannel, discord.StageChannel),
-        ) or not any(
-            not listener.bot for listener in destination.members
         ) or not _read_aloud_audience_allowed(
             self.runtime,
             message,

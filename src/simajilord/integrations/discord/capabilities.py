@@ -104,6 +104,7 @@ from .local_media import attachment_can_play, import_discord_attachment
 from .permissions import (
     RequesterPrincipal,
     ServicePrincipal,
+    inspect_read_aloud_audience,
     read_aloud_audience_relation,
     readable_for_requester,
     readable_for_service,
@@ -4340,6 +4341,8 @@ def build_discord_endpoints(
                 )
             if not self_service_allowed:
                 raise UserError("discord.manage_guild_required")
+        audience_sources: list[DiscordReadableChannel] = []
+        audience_destination: discord.VoiceChannel | discord.StageChannel | None = None
         if request.action is ReadAloudAction.ADD_SOURCES:
             source_ids = tuple(dict.fromkeys(request.text_channel_ids))
             if not 1 <= len(source_ids) <= 25:
@@ -4352,9 +4355,11 @@ def build_discord_endpoints(
                     raise UserError("discord.message_channel_unavailable")
                 if guild.me is None or not _can_read_messages(source, guild.me):
                     raise UserError("discord.message_channel_unavailable")
+                audience_sources.append(source)
             voice = guild.get_channel(_snowflake(request.audio_destination_id, "voice channel"))
             if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_required")
+            audience_destination = voice
         elif request.action in {
             ReadAloudAction.CONFIGURE,
             ReadAloudAction.ADD_SOURCE,
@@ -4369,10 +4374,43 @@ def build_discord_endpoints(
             voice = guild.get_channel(_snowflake(request.audio_destination_id, "voice channel"))
             if not isinstance(voice, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_required")
+            audience_sources.append(source)
+            audience_destination = voice
         elif request.action is ReadAloudAction.REMOVE_SOURCE:
             if request.text_channel_id is None:
                 raise UserError("read_aloud.source_channel_required")
             _message_channel(guild, request.text_channel_id)
+        if audience_destination is not None:
+            if request.action in {
+                ReadAloudAction.ADD_SOURCES,
+                ReadAloudAction.ADD_SOURCE,
+            }:
+                current_route = runtime.read_aloud.get(str(guild.id))
+                if (
+                    current_route is not None
+                    and current_route.audio_destination_id == str(audience_destination.id)
+                ):
+                    known_source_ids = {source.id for source in audience_sources}
+                    for existing_source_id in current_route.text_channel_ids:
+                        existing_source = _message_channel(guild, existing_source_id)
+                        if existing_source.id in known_source_ids:
+                            continue
+                        if not _can_read_messages(existing_source, member):
+                            raise UserError("discord.message_channel_unavailable")
+                        if guild.me is None or not _can_read_messages(
+                            existing_source,
+                            guild.me,
+                        ):
+                            raise UserError("discord.message_channel_unavailable")
+                        audience_sources.append(existing_source)
+                        known_source_ids.add(existing_source.id)
+            _enforce_read_aloud_route_audience(
+                runtime,
+                context,
+                guild,
+                tuple(audience_sources),
+                audience_destination,
+            )
         response = await runtime.registry.invoke(
             "speech.manage_read_aloud",
             request,
@@ -6447,6 +6485,7 @@ def build_discord_endpoints(
                 expected_errors=(
                     "discord.member_required",
                     "discord.voice_channel_required",
+                    "read_aloud.audience_forbidden",
                     "read_aloud.source_channel_limit",
                 ),
                 timeout_seconds=20,
@@ -6996,6 +7035,44 @@ def _enforce_voice_listener_audience(
     )
     if mode == "enforce":
         raise UserError("discord.information_flow_forbidden")
+
+
+def _enforce_read_aloud_route_audience(
+    runtime: SimajilordRuntime,
+    context: InvocationContext,
+    guild: discord.Guild,
+    sources: tuple[DiscordReadableChannel, ...],
+    destination: discord.VoiceChannel | discord.StageChannel,
+) -> None:
+    """Reject a persistent route whose current listener audience is unproven."""
+
+    raw_mode = getattr(runtime.settings, "read_aloud_audience_mode", "enforce")
+    mode = getattr(raw_mode, "value", raw_mode)
+    if mode not in {"enforce", "audit", "disabled"}:
+        mode = "enforce"
+    if mode == "disabled":
+        return
+    violations = tuple(
+        (source.id, inspection.relation)
+        for source in sources
+        if (
+            inspection := inspect_read_aloud_audience(guild, source, destination)
+        ).relation
+        != "same_or_narrower"
+    )
+    if not violations:
+        return
+    log.warning(
+        "Read-aloud route audience preflight failed mode=%s request=%s "
+        "guild=%s destination=%s sources=%s",
+        mode,
+        context.request_id,
+        guild.id,
+        destination.id,
+        violations,
+    )
+    if mode == "enforce":
+        raise UserError("read_aloud.audience_forbidden")
 
 
 def _enforce_information_flow_to_guild(

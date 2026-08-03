@@ -1600,14 +1600,16 @@ async def test_agent_speech_rejects_listener_who_cannot_read_origin() -> None:
         display_name="Requester",
         voice=SimpleNamespace(channel=destination),
     )
-    listener = SimpleNamespace(id=8, bot=False)
+    listener = SimpleNamespace(id=8, bot=False, display_name="Listener")
     destination.members = [actor, listener]
+    destination.voice_states = {7: object(), 8: object()}
     source.permissions_for.side_effect = lambda member: SimpleNamespace(
         administrator=False,
         view_channel=member.id == actor.id,
         read_message_history=member.id == actor.id,
     )
-    guild.get_member.return_value = actor
+    guild.get_member.side_effect = {7: actor, 8: listener}.get
+    guild.me = None
     guild.get_channel_or_thread.return_value = source
     guild.members = [actor, listener]
     guild.member_count = 2

@@ -14,6 +14,9 @@ from simajilord.integrations.discord.cogs import (
     _read_aloud_audience_allowed,
 )
 from simajilord.integrations.discord.permissions import (
+    ReadAloudAudienceInspection,
+    ReadAloudListenerCheck,
+    inspect_read_aloud_audience,
     read_aloud_audience_relation,
 )
 from simajilord.integrations.discord.read_aloud import (
@@ -38,39 +41,109 @@ def _read_permissions(*, readable: bool) -> discord.Permissions:
 
 
 def test_read_aloud_audience_relation_requires_every_current_listener() -> None:
-    allowed = SimpleNamespace(id=10, bot=False)
-    denied = SimpleNamespace(id=11, bot=False)
-    bot = SimpleNamespace(id=12, bot=True)
-    guild = SimpleNamespace(
-        members=[allowed, denied, bot],
-        member_count=3,
-        chunked=True,
-    )
+    allowed = SimpleNamespace(id=10, bot=False, display_name="Allowed")
+    denied = SimpleNamespace(id=11, bot=False, display_name="Denied")
+    bot = SimpleNamespace(id=12, bot=True, display_name="Bot")
+    guild = Mock(spec=discord.Guild)
+    guild.me = bot
+    guild.get_member.side_effect = {10: allowed, 11: denied, 12: bot}.get
     source = Mock(spec=discord.TextChannel)
     source.permissions_for.side_effect = lambda member: _read_permissions(
         readable=member is not denied
     )
     destination = Mock(spec=discord.VoiceChannel)
-    destination.members = [allowed, denied, bot]
+    destination.voice_states = {10: object(), 11: object(), 12: object()}
 
     assert (
         read_aloud_audience_relation(guild, source, destination) == "broader"
     )
 
-    destination.members = [allowed, bot]
+    destination.voice_states = {10: object(), 12: object()}
     assert (
         read_aloud_audience_relation(guild, source, destination)
         == "same_or_narrower"
     )
 
 
-def test_read_aloud_audience_relation_fails_closed_on_incomplete_cache() -> None:
-    guild = SimpleNamespace(members=[], member_count=2, chunked=False)
+def test_read_aloud_audience_relation_ignores_unrelated_incomplete_guild_cache() -> None:
+    listener = SimpleNamespace(id=10, bot=False, display_name="Listener")
+    bot = SimpleNamespace(id=12, bot=True, display_name="Bot")
+    guild = Mock(spec=discord.Guild)
+    guild.members = []
+    guild.member_count = 100
+    guild.chunked = False
+    guild.me = bot
+    guild.get_member.side_effect = {10: listener, 12: bot}.get
+    source = Mock(spec=discord.TextChannel)
+    source.permissions_for.return_value = _read_permissions(readable=True)
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.voice_states = {10: object(), 12: object()}
+
+    assert (
+        read_aloud_audience_relation(guild, source, destination)
+        == "same_or_narrower"
+    )
+
+
+def test_read_aloud_audience_relation_fails_closed_on_unresolved_listener() -> None:
+    bot = SimpleNamespace(id=12, bot=True, display_name="Bot")
+    guild = Mock(spec=discord.Guild)
+    guild.me = bot
+    guild.get_member.return_value = None
     source = Mock(spec=discord.TextChannel)
     destination = Mock(spec=discord.VoiceChannel)
-    destination.members = []
+    destination.voice_states = {10: object(), 12: object()}
 
-    assert read_aloud_audience_relation(guild, source, destination) == "uncertain"
+    inspection = inspect_read_aloud_audience(guild, source, destination)
+
+    assert inspection.relation == "uncertain"
+    assert inspection.listeners == (
+        ReadAloudListenerCheck(
+            member_id=10,
+            display_name=None,
+            relation="unresolved",
+        ),
+    )
+
+
+def test_read_aloud_audience_relation_fails_closed_on_listener_race() -> None:
+    listener = SimpleNamespace(id=10, bot=False, display_name="Listener")
+    guild = Mock(spec=discord.Guild)
+    guild.me = None
+    guild.get_member.return_value = listener
+    source = Mock(spec=discord.TextChannel)
+    source.permissions_for.return_value = _read_permissions(readable=True)
+
+    class RacingDestination:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def voice_states(self) -> dict[int, object]:
+            self.reads += 1
+            return {10: object()} if self.reads == 1 else {10: object(), 11: object()}
+
+    destination = cast(discord.VoiceChannel, RacingDestination())
+
+    inspection = inspect_read_aloud_audience(guild, source, destination)
+
+    assert inspection.relation == "uncertain"
+    assert inspection.stable is False
+
+
+def test_read_aloud_audience_relation_checks_private_thread_membership() -> None:
+    listener = SimpleNamespace(id=10, bot=False, display_name="Listener")
+    guild = Mock(spec=discord.Guild)
+    guild.me = None
+    guild.get_member.return_value = listener
+    source = Mock(spec=discord.Thread)
+    source.type = discord.ChannelType.private_thread
+    source.members = []
+    source.permissions_for.return_value = _read_permissions(readable=True)
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.voice_states = {10: object()}
+
+    assert read_aloud_audience_relation(guild, source, destination) == "broader"
 
 
 def test_read_aloud_audience_policy_is_reversible(
@@ -86,8 +159,18 @@ def test_read_aloud_audience_policy_is_reversible(
         SimpleNamespace(guild=guild, channel=source),
     )
     monkeypatch.setattr(
-        "simajilord.integrations.discord.cogs.read_aloud_audience_relation",
-        lambda *_: "broader",
+        "simajilord.integrations.discord.cogs.inspect_read_aloud_audience",
+        lambda *_: ReadAloudAudienceInspection(
+            relation="broader",
+            listeners=(
+                ReadAloudListenerCheck(
+                    member_id=7,
+                    display_name="Listener",
+                    relation="broader",
+                ),
+            ),
+            stable=True,
+        ),
     )
 
     for mode, allowed in (
@@ -100,6 +183,43 @@ def test_read_aloud_audience_policy_is_reversible(
             SimpleNamespace(settings=SimpleNamespace(read_aloud_audience_mode=mode)),
         )
         assert _read_aloud_audience_allowed(runtime, message, destination) is allowed
+
+
+def test_read_aloud_audience_policy_blocks_unresolved_listener_in_enforce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Mock(spec=discord.TextChannel)
+    source.id = 2
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 3
+    message = cast(
+        discord.Message,
+        SimpleNamespace(guild=SimpleNamespace(id=1), channel=source),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs.inspect_read_aloud_audience",
+        lambda *_: ReadAloudAudienceInspection(
+            relation="uncertain",
+            listeners=(
+                ReadAloudListenerCheck(
+                    member_id=7,
+                    display_name=None,
+                    relation="unresolved",
+                ),
+            ),
+            stable=True,
+        ),
+    )
+    runtime = cast(
+        SimajilordRuntime,
+        SimpleNamespace(
+            settings=SimpleNamespace(
+                read_aloud_audience_mode=ReadAloudAudienceMode.ENFORCE
+            )
+        ),
+    )
+
+    assert _read_aloud_audience_allowed(runtime, message, destination) is False
 
 
 def _message(
@@ -288,6 +408,7 @@ async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
     destination = Mock(spec=discord.VoiceChannel)
     destination.id = 55
     destination.members = []
+    destination.voice_states = {}
     guild = Mock(spec=discord.Guild)
     guild.id = 1
     guild.get_channel.return_value = destination
@@ -329,6 +450,57 @@ async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
     await cog.on_message(message)
 
     runtime.audio.get_or_create.assert_not_called()
+    runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_message_content_does_not_reconnect_with_an_allowed_listener(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure(ReadAloudRoute("1", "2", "55", ReadAloudMode.QUEUE))
+    listener = SimpleNamespace(id=7, bot=False, display_name="Listener")
+    bot_member = SimpleNamespace(id=99, bot=True, display_name="Bot")
+    source = Mock(spec=discord.TextChannel)
+    source.id = 2
+    source.permissions_for.return_value = _read_permissions(readable=True)
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    destination.voice_states = {7: object(), 99: object()}
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = bot_member
+    guild.get_member.side_effect = {7: listener, 99: bot_member}.get
+    guild.get_channel.return_value = destination
+    author = SimpleNamespace(id=10, bot=False)
+    message = cast(
+        discord.Message,
+        SimpleNamespace(id=99, guild=guild, channel=source, author=author),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings = SimpleNamespace(read_aloud_audience_mode="enforce")
+    runtime.read_aloud = service
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.audio = Mock()
+    runtime.audio.connect = AsyncMock()
+    session = Mock()
+    session.voice_activation_required = False
+    session.current = None
+    session.output.connected = False
+    runtime.audio.get_or_create.return_value = session
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+
+    await cog._deliver_read_aloud(
+        message,
+        ReadAloudMessageText(
+            (SpeechSegment(SpeechSegmentKind.BODY, "接続しない"),),
+            "Message",
+        ),
+    )
+
+    runtime.audio.get_or_create.assert_called_once()
+    runtime.audio.connect.assert_not_awaited()
     runtime.registry.invoke.assert_not_awaited()
 
 
