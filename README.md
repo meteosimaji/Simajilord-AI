@@ -320,6 +320,9 @@ with Discord's generic “interaction failed” banner.
   receipt ID or resolves the same actor's most recent undoable action; repeating the same Undo
   does not execute the inverse twice. Destructive operations or writes that would require
   retaining deleted content/file bodies are explicitly receipted as non-undoable.
+  Undoing a newly created role also fetches the complete live guild-channel set and refuses to
+  delete while any category, text, voice, stage, forum, or thread parent overwrite still targets
+  that role. Threads inherit their parent channel overwrites; an incomplete API read fails closed.
   Final replies and autonomous host posts are also receipted after each Discord send using only
   channel/message IDs, even though they bypass the model tool catalog. If ledger persistence
   fails, their already-sent delivery evidence stays pending and only receipt persistence is

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import discord
 import pytest
@@ -57,6 +57,40 @@ def _endpoints(client: discord.Client) -> dict[str, object]:
             Mock(spec=SimajilordRuntime),
         )
     }
+
+
+def _created_role_undo_harness(
+    channels: list[object],
+) -> tuple[dict[str, object], Mock, Mock]:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    guild.owner_id = 1
+    guild.chunked = True
+    guild.member_count = 2
+    actor = Mock(spec=discord.Member)
+    actor.id = 7
+    actor.guild = guild
+    actor.guild_permissions = discord.Permissions(manage_roles=True)
+    actor.top_role = MagicMock(spec=discord.Role)
+    actor.top_role.__le__.return_value = False
+    bot = Mock(spec=discord.Member)
+    bot.id = 99
+    bot.guild = guild
+    bot.guild_permissions = discord.Permissions(manage_roles=True)
+    bot.top_role = MagicMock(spec=discord.Role)
+    bot.top_role.__le__.return_value = False
+    guild.get_member.return_value = actor
+    guild.me = bot
+    guild.members = [actor, bot]
+    role = Mock(spec=discord.Role)
+    role.id = 40
+    role.members = []
+    role.delete = AsyncMock()
+    guild.get_role.return_value = role
+    guild.fetch_channels = AsyncMock(return_value=channels)
+    client.get_guild.return_value = guild
+    return _endpoints(cast(discord.Client, client)), guild, role
 
 
 def test_act_capabilities_are_unique_discoverable_and_explicitly_classified() -> None:
@@ -563,6 +597,138 @@ async def test_created_role_undo_rejects_a_modified_role() -> None:
                 workspace_id="10",
                 transport="agent",
                 request_id="undo:role",
+            ),
+        )
+
+    role.delete.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "channel_type",
+    (
+        discord.CategoryChannel,
+        discord.TextChannel,
+        discord.VoiceChannel,
+        discord.StageChannel,
+        discord.ForumChannel,
+    ),
+    ids=("category", "text", "voice", "stage", "forum"),
+)
+@pytest.mark.asyncio
+async def test_created_role_undo_rejects_live_channel_overwrite_reference(
+    channel_type: type[object],
+) -> None:
+    channel = Mock(spec=channel_type)
+    endpoints, _guild, role = _created_role_undo_harness([channel])
+    channel.overwrites = {
+        role: discord.PermissionOverwrite(view_channel=True),
+    }
+
+    with pytest.raises(UserError, match=r"action\.undo_target_in_use"):
+        await endpoints["discord.delete_created_role"].invoke(
+            DiscordCreatedRoleDeleteRequest(role_id="40"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="undo:role:overwrite",
+            ),
+        )
+
+    role.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_created_role_undo_checks_thread_parent_overwrite() -> None:
+    parent = Mock(spec=discord.ForumChannel)
+    thread = Mock(spec=discord.Thread)
+    parent.id = 20
+    thread.parent_id = parent.id
+    endpoints, guild, role = _created_role_undo_harness([parent])
+    guild.threads = [thread]
+    parent.overwrites = {
+        role: discord.PermissionOverwrite(view_channel=True),
+    }
+
+    with pytest.raises(UserError, match=r"action\.undo_target_in_use"):
+        await endpoints["discord.delete_created_role"].invoke(
+            DiscordCreatedRoleDeleteRequest(role_id="40"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="undo:role:thread-parent",
+            ),
+        )
+
+    role.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_created_role_undo_checks_synced_category_overwrite() -> None:
+    category = Mock(spec=discord.CategoryChannel)
+    child = Mock(spec=discord.TextChannel)
+    category.id = 20
+    child.category_id = category.id
+    child.permissions_synced = True
+    endpoints, _guild, role = _created_role_undo_harness([category, child])
+    overwrite = discord.PermissionOverwrite(view_channel=True)
+    category.overwrites = {role: overwrite}
+    child.overwrites = {role: overwrite}
+
+    with pytest.raises(UserError, match=r"action\.undo_target_in_use"):
+        await endpoints["discord.delete_created_role"].invoke(
+            DiscordCreatedRoleDeleteRequest(role_id="40"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="undo:role:synced-category",
+            ),
+        )
+
+    role.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_created_role_undo_succeeds_after_overwrite_is_removed() -> None:
+    channel = Mock(spec=discord.TextChannel)
+    channel.overwrites = {}
+    endpoints, guild, role = _created_role_undo_harness([channel])
+
+    response = await endpoints["discord.delete_created_role"].invoke(
+        DiscordCreatedRoleDeleteRequest(role_id="40"),
+        InvocationContext(
+            actor_id="7",
+            workspace_id="10",
+            transport="agent",
+            request_id="undo:role:overwrite-removed",
+        ),
+    )
+
+    assert response.deleted is True
+    guild.fetch_channels.assert_awaited_once_with()
+    role.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_created_role_undo_fails_closed_when_channel_state_is_unavailable() -> None:
+    endpoints, guild, role = _created_role_undo_harness([])
+    guild.fetch_channels.side_effect = discord.DiscordException(
+        "channel lookup failed"
+    )
+
+    with pytest.raises(
+        UserError,
+        match=r"action\.undo_target_state_uncertain",
+    ):
+        await endpoints["discord.delete_created_role"].invoke(
+            DiscordCreatedRoleDeleteRequest(role_id="40"),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="10",
+                transport="agent",
+                request_id="undo:role:channel-fetch-failed",
             ),
         )
 

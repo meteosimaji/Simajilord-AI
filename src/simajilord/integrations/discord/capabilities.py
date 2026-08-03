@@ -9,7 +9,7 @@ import io
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
@@ -3364,6 +3364,8 @@ def build_discord_endpoints(
         for member in (actor, bot):
             _require_guild_permission(member, "manage_roles")
             _require_role_above(member, role)
+        if await _role_has_channel_overwrite_reference(guild, role):
+            raise UserError("action.undo_target_in_use")
         await role.delete(reason=_audit_reason("Undo created role", context))
         return DiscordCreatedEntityDeleteResponse(request.role_id, True)
 
@@ -5602,6 +5604,13 @@ def build_discord_endpoints(
                 approval=ApprovalMode.ALWAYS,
                 requires_workspace=True,
                 idempotency="idempotent_write",
+                expected_errors=(
+                    "action.undo_conflict",
+                    "action.undo_target_in_use",
+                    "action.undo_target_state_uncertain",
+                    "discord.manage_roles_required",
+                    "discord.role_hierarchy_forbidden",
+                ),
             ),
             DiscordCreatedRoleDeleteRequest,
             DiscordCreatedEntityDeleteResponse,
@@ -7852,6 +7861,46 @@ def _role_undo_fingerprint(role: discord.Role) -> str:
             "display_icon": str(display_icon) if display_icon is not None else None,
         }
     )
+
+
+async def _role_has_channel_overwrite_reference(
+    guild: discord.Guild,
+    role: discord.Role,
+) -> bool:
+    """Check the complete live set of overwrite-bearing guild channels.
+
+    Discord threads do not have independent permission overwrites; they inherit
+    the parent text/forum/media channel. ``fetch_channels`` therefore covers the
+    relevant state for categories, thread parents, text, voice, stage, and forum
+    channels without trusting the gateway cache.
+    """
+
+    try:
+        channels = await guild.fetch_channels()
+    except discord.DiscordException as exc:
+        raise UserError("action.undo_target_state_uncertain") from exc
+    try:
+        for channel in channels:
+            overwrites = channel.overwrites
+            if not isinstance(overwrites, Mapping):
+                raise TypeError("channel overwrites are not a mapping")
+            for target in overwrites:
+                if getattr(target, "id", None) != role.id:
+                    continue
+                if isinstance(target, discord.Role):
+                    return True
+                if isinstance(target, discord.Object):
+                    target_type = target.type
+                    if target_type is discord.Role:
+                        return True
+                    if target_type in {discord.Member, discord.User}:
+                        continue
+                elif isinstance(target, (discord.Member, discord.User)):
+                    continue
+                raise TypeError("overwrite target type is unresolved")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise UserError("action.undo_target_state_uncertain") from exc
+    return False
 
 
 def _channel_undo_fingerprint(channel: discord.TextChannel) -> str:
