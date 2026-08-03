@@ -754,6 +754,33 @@ _ERROR_MESSAGES = {
     "discord.information_flow_forbidden": (
         "This action could reveal information to a wider or unverified audience."
     ),
+    "discord.audience_snapshot_uncertain": (
+        "The complete Discord audience could not be verified. Try again after the member "
+        "and thread caches are available."
+    ),
+    "discord.audience_expansion_confirmation_required": (
+        "Inspect and confirm the exact private-thread audience before adding this member."
+    ),
+    "discord.audience_expansion_changed": (
+        "The private-thread audience changed after inspection. Inspect it again."
+    ),
+    "discord.audience_expansion_expired": (
+        "The private-thread audience inspection expired. Inspect it again."
+    ),
+    "files.publication_confirmation_required": (
+        "Inspect and confirm the exact file-sharing target before publishing this copy."
+    ),
+    "files.publication_confirmation_expired": (
+        "The file-sharing target inspection expired. Inspect it again."
+    ),
+    "files.publication_audience_changed": (
+        "The source file or sharing audience changed. Inspect the target again."
+    ),
+    "files.publication_target_mismatch": (
+        "That file copy is bound to a different Discord target."
+    ),
+    "files.publication_expired": "That file-sharing copy has expired.",
+    "files.publication_revoked": "That file-sharing copy was revoked.",
     "discord.bulk_delete_message_too_old": (
         "Bulk delete cannot include messages that are 14 days old or older."
     ),

@@ -139,6 +139,27 @@ class ReadAloudAudienceInspection:
     stable: bool
 
 
+@dataclass(frozen=True, slots=True)
+class DiscordChannelAudienceInspection:
+    """Exact human reader IDs when the guild member cache is complete."""
+
+    reader_ids: tuple[int, ...]
+    complete: bool
+
+
+def inspect_channel_audience(
+    guild: discord.Guild,
+    channel: DiscordReadableChannel,
+) -> DiscordChannelAudienceInspection:
+    """Return a bounded, host-only reader snapshot for audience authorization."""
+
+    readers, complete = _effective_reader_ids(guild, channel)
+    return DiscordChannelAudienceInspection(
+        reader_ids=tuple(sorted(readers)),
+        complete=complete,
+    )
+
+
 def channel_visibility(
     guild: discord.Guild,
     channel: DiscordReadableChannel,

@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import io
 import json
 import logging
 import re
+import secrets
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -90,6 +92,7 @@ from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import (
     WorkspaceFileProvenance,
+    WorkspaceFilePublication,
     WorkspaceFileRecord,
 )
 from simajilord.services.quote import (
@@ -108,6 +111,7 @@ from .local_media import (
 from .permissions import (
     RequesterPrincipal,
     ServicePrincipal,
+    inspect_channel_audience,
     inspect_read_aloud_audience,
     read_aloud_audience_relation,
     readable_for_requester,
@@ -160,6 +164,30 @@ _CUSTOM_EMOJI_MEDIA_MAX_BYTES = 5_000_000
 _QUOTE_AVATAR_MAX_BYTES = 8_000_000
 _UNCHANGED_CHANNEL_TOPIC = "__simajilord_unchanged_topic__"
 _NO_EXPECTED_STRING_STATE = "__simajilord_no_expected_state__"
+_AUDIENCE_EXPANSION_TOKEN_TTL = timedelta(minutes=5)
+_FILE_PUBLICATION_MAX_TTL = timedelta(days=30)
+
+
+@dataclass(frozen=True, slots=True)
+class _ThreadAudienceExpansion:
+    target_display_name: str
+    source_reader_ids: tuple[int, ...]
+    expanded_reader_ids: tuple[int, ...]
+    retained_history_exposed: bool
+    revision: str
+    target_present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _FilePublishAudience:
+    source_filename: str
+    source_sha256: str
+    source_sensitivity: str
+    source_reader_count: int
+    target_display_name: str
+    target_reader_ids: tuple[int, ...]
+    new_reader_count: int
+    target_revision: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1173,6 +1201,108 @@ class DiscordSendFilesResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class FilePublishTargetInspectRequest:
+    source_path: str
+    channel_id: str
+    expires_at_iso: str
+    reason: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FilePublishTargetInspectResponse:
+    source_path: str
+    source_filename: str
+    source_sha256: str
+    source_sensitivity: str
+    source_reader_count: int
+    target_channel_id: str
+    target_display_name: str
+    target_reader_count: int
+    new_reader_count: int
+    target_audience_revision: str
+    publication_expires_at: str
+    audience_expansion_token: str
+    audience_expansion_expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class FilePublishCopyRequest:
+    source_path: str
+    channel_id: str
+    expires_at_iso: str
+    reason: str
+    expected_source_sha256: str
+    expected_source_sensitivity: str
+    expected_source_reader_count: int
+    expected_target_display_name: str
+    expected_target_reader_count: int
+    expected_new_reader_count: int
+    expected_target_audience_revision: str
+    audience_expansion_token: str
+    audience_expansion_expires_at: str
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FilePublishCopyResponse:
+    publication_id: str
+    source_filename: str
+    target_channel_id: str
+    target_display_name: str
+    expires_at_iso: str
+    revision: int
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FilePublicationRevokeRequest:
+    publication_id: str
+    expected_revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class FilePublicationRevokeResponse:
+    publication_id: str
+    revision: int
+    active: bool
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendPublishedFileRequest:
+    publication_id: str
+    channel_id: str
+    expected_revision: int
+    caption: str = ""
+    description: str = ""
+    spoiler: bool = False
+    guild_id: str | None = dataclass_field(
+        default=None,
+        metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
+    )
+    reply_to_message_id: str | None = None
+    silent: bool = False
+    purpose: DiscordDeliveryPurpose = "requested_action"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordSendPublishedFileResponse:
+    publication_id: str
+    message_id: str
+    channel_id: str
+    filename: str
+    size_bytes: int
+    guild_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordSendMessageResponse:
     message_id: str
     channel_id: str
@@ -1249,6 +1379,13 @@ class DiscordThreadMemberRequest:
     reason: str = ""
     evidence_message_ids: tuple[str, ...] = ()
     expected_present: bool | None = None
+    expected_target_display_name: str | None = None
+    expected_source_reader_count: int | None = None
+    expected_expanded_reader_count: int | None = None
+    expected_retained_history_exposed: bool | None = None
+    expected_audience_revision: str | None = None
+    audience_expansion_token: str | None = None
+    audience_expansion_expires_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1257,6 +1394,29 @@ class DiscordThreadMemberResponse:
     user_id: str
     present: bool
     changed: bool = True
+    audience_revision: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadAudienceInspectRequest:
+    thread_id: str
+    user_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordThreadAudienceInspectResponse:
+    thread_id: str
+    thread_name: str
+    target_user_id: str
+    target_display_name: str
+    source_reader_count: int
+    expanded_reader_count: int
+    new_reader_count: int
+    retained_history_exposed: bool
+    expansion_required: bool
+    audience_revision: str
+    audience_expansion_token: str
+    audience_expansion_expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1473,6 +1633,8 @@ def build_discord_endpoints(
     client: discord.Client,
     runtime: SimajilordRuntime,
 ) -> tuple[CapabilityEndpoint, ...]:
+    audience_authorization_secret = secrets.token_bytes(32)
+
     async def inspect_server(
         request: DiscordServerRequest,
         context: InvocationContext,
@@ -3271,6 +3433,77 @@ def build_discord_endpoints(
             old_archived=old_archived,
         )
 
+    def thread_audience_payload(
+        context: InvocationContext,
+        guild: discord.Guild,
+        thread: discord.Thread,
+        target: discord.Member,
+        expansion: _ThreadAudienceExpansion,
+        expires_at: str,
+    ) -> dict[str, object]:
+        return {
+            "kind": "private_thread_member_v1",
+            "actor_id": context.actor_id,
+            "request_id": context.request_id,
+            "guild_id": str(guild.id),
+            "thread_id": str(thread.id),
+            "target_user_id": str(target.id),
+            "target_display_name": expansion.target_display_name,
+            "source_reader_count": len(expansion.source_reader_ids),
+            "expanded_reader_count": len(expansion.expanded_reader_ids),
+            "retained_history_exposed": expansion.retained_history_exposed,
+            "audience_revision": expansion.revision,
+            "expires_at": expires_at,
+        }
+
+    async def inspect_thread_audience_expansion(
+        request: DiscordThreadAudienceInspectRequest,
+        context: InvocationContext,
+    ) -> DiscordThreadAudienceInspectResponse:
+        guild = _guild(client, context)
+        _assert_origin_guild(context, guild)
+        thread = guild.get_thread(_snowflake(request.thread_id, "channel"))
+        if thread is None:
+            raise UserError("discord.thread_not_found")
+        if thread.type is not discord.ChannelType.private_thread:
+            raise UserError("discord.private_thread_required")
+        actor, bot = await _write_members(guild, context)
+        for member in (actor, bot):
+            _require_channel_permissions(thread, member, "manage_threads")
+        target = await _guild_member(guild, request.user_id)
+        expansion = await _thread_audience_expansion(guild, thread, target)
+        expires_at = (
+            datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL
+        ).isoformat()
+        payload = thread_audience_payload(
+            context,
+            guild,
+            thread,
+            target,
+            expansion,
+            expires_at,
+        )
+        return DiscordThreadAudienceInspectResponse(
+            thread_id=str(thread.id),
+            thread_name=thread.name,
+            target_user_id=str(target.id),
+            target_display_name=expansion.target_display_name,
+            source_reader_count=len(expansion.source_reader_ids),
+            expanded_reader_count=len(expansion.expanded_reader_ids),
+            new_reader_count=(
+                len(expansion.expanded_reader_ids)
+                - len(expansion.source_reader_ids)
+            ),
+            retained_history_exposed=expansion.retained_history_exposed,
+            expansion_required=expansion.retained_history_exposed,
+            audience_revision=expansion.revision,
+            audience_expansion_token=_audience_expansion_token(
+                audience_authorization_secret,
+                payload,
+            ),
+            audience_expansion_expires_at=expires_at,
+        )
+
     async def set_thread_member(
         request: DiscordThreadMemberRequest,
         context: InvocationContext,
@@ -3287,24 +3520,79 @@ def build_discord_endpoints(
         for member in (actor, bot):
             _require_channel_permissions(thread, member, "manage_threads")
         target = await _guild_member(guild, request.user_id)
-        existing = any(item.id == target.id for item in thread.members)
+        expansion = (
+            await _thread_audience_expansion(guild, thread, target)
+            if thread.type is discord.ChannelType.private_thread
+            else None
+        )
+        existing = (
+            expansion.target_present
+            if expansion is not None
+            else target.id in await _thread_member_ids(thread)
+        )
         if existing == present:
             await context.complete_external_effect_without_dispatch()
             return DiscordThreadMemberResponse(
-                request.thread_id, request.user_id, present, changed=False
+                request.thread_id,
+                request.user_id,
+                present,
+                changed=False,
+                audience_revision=(
+                    expansion.revision if expansion is not None else None
+                ),
             )
         if (
             present
-            and isinstance(thread, discord.Thread)
-            and thread.type is discord.ChannelType.private_thread
+            and expansion is not None
+            and expansion.retained_history_exposed
             and context.information_flow_mode != "disabled"
         ):
-            _handle_information_flow_violations(
-                context,
-                guild,
-                thread,
-                [(str(guild.id), str(thread.id), "broader")],
-            )
+            try:
+                if (
+                    request.expected_target_display_name
+                    != expansion.target_display_name
+                    or not _exact_integer(
+                        request.expected_source_reader_count,
+                        len(expansion.source_reader_ids),
+                    )
+                    or not _exact_integer(
+                        request.expected_expanded_reader_count,
+                        len(expansion.expanded_reader_ids),
+                    )
+                    or request.expected_retained_history_exposed is not True
+                    or request.expected_audience_revision != expansion.revision
+                    or request.audience_expansion_expires_at is None
+                ):
+                    raise UserError("discord.audience_expansion_changed")
+                expires_at = _future_datetime(
+                    request.audience_expansion_expires_at,
+                    error_code="discord.audience_expansion_expired",
+                    maximum=_AUDIENCE_EXPANSION_TOKEN_TTL,
+                ).isoformat()
+                _require_audience_expansion_token(
+                    audience_authorization_secret,
+                    thread_audience_payload(
+                        context,
+                        guild,
+                        thread,
+                        target,
+                        expansion,
+                        expires_at,
+                    ),
+                    request.audience_expansion_token,
+                    error_code="discord.audience_expansion_confirmation_required",
+                )
+            except UserError:
+                if context.information_flow_mode == "enforce":
+                    raise
+                log.warning(
+                    "Private thread audience expansion is unconfirmed in audit mode "
+                    "request=%s thread=%s target=%s revision=%s",
+                    context.request_id,
+                    thread.id,
+                    target.id,
+                    expansion.revision,
+                )
         if (
             request.expected_present is not None
             and existing != request.expected_present
@@ -3315,7 +3603,12 @@ def build_discord_endpoints(
             await thread.add_user(target)
         else:
             await thread.remove_user(target)
-        return DiscordThreadMemberResponse(request.thread_id, request.user_id, present)
+        return DiscordThreadMemberResponse(
+            request.thread_id,
+            request.user_id,
+            present,
+            audience_revision=(expansion.revision if expansion is not None else None),
+        )
 
     async def add_thread_member(
         request: DiscordThreadMemberRequest,
@@ -3940,6 +4233,342 @@ def build_discord_endpoints(
             emoji=emoji,
             reacted=False,
             changed=already_reacted,
+        )
+
+    def file_publish_payload(
+        context: InvocationContext,
+        guild: discord.Guild,
+        channel: DiscordMessageChannel,
+        *,
+        source_path: str,
+        reason: str,
+        publication_expires_at: str,
+        token_expires_at: str,
+        audience: _FilePublishAudience,
+        provenance: WorkspaceFileProvenance,
+    ) -> dict[str, object]:
+        return {
+            "kind": "file_publish_copy_v1",
+            "actor_id": context.actor_id,
+            "request_id": context.request_id,
+            "source_workspace_id": file_workspace_id(context),
+            "source_path": source_path,
+            "source_sha256": audience.source_sha256,
+            "source_provenance_revision": _file_provenance_revision(provenance),
+            "source_sensitivity": audience.source_sensitivity,
+            "source_reader_count": audience.source_reader_count,
+            "target_workspace_id": str(guild.id),
+            "target_resource_id": str(channel.id),
+            "target_display_name": audience.target_display_name,
+            "target_reader_ids": [str(item) for item in audience.target_reader_ids],
+            "new_reader_count": audience.new_reader_count,
+            "target_audience_revision": audience.target_revision,
+            "reason": reason,
+            "publication_expires_at": publication_expires_at,
+            "token_expires_at": token_expires_at,
+        }
+
+    async def inspect_file_publish_target(
+        request: FilePublishTargetInspectRequest,
+        context: InvocationContext,
+    ) -> FilePublishTargetInspectResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if context.workspace_id is None:
+            raise UserError("files.workspace_required")
+        reason = _publication_reason(request.reason)
+        publication_expires_at = _future_datetime(
+            request.expires_at_iso,
+            error_code="files.publication_expiry_invalid",
+            maximum=_FILE_PUBLICATION_MAX_TTL,
+        ).isoformat()
+        guild, channel, _actor, _bot = await _authorized_write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages", "attach_files"),
+            enforce_information_flow=False,
+        )
+        source_filename, content, provenance = await asyncio.to_thread(
+            runtime.files.snapshot_for_actor_delivery_with_provenance,
+            file_workspace_id(context),
+            context.actor_id,
+            request.source_path,
+        )
+        audience = await _file_publish_audience(
+            context,
+            guild,
+            channel,
+            source_filename=source_filename,
+            content=content,
+            provenance=provenance,
+        )
+        token_expires_at = (
+            datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL
+        ).isoformat()
+        payload = file_publish_payload(
+            context,
+            guild,
+            channel,
+            source_path=request.source_path,
+            reason=reason,
+            publication_expires_at=publication_expires_at,
+            token_expires_at=token_expires_at,
+            audience=audience,
+            provenance=provenance,
+        )
+        return FilePublishTargetInspectResponse(
+            source_path=request.source_path,
+            source_filename=source_filename,
+            source_sha256=audience.source_sha256,
+            source_sensitivity=audience.source_sensitivity,
+            source_reader_count=audience.source_reader_count,
+            target_channel_id=str(channel.id),
+            target_display_name=audience.target_display_name,
+            target_reader_count=len(audience.target_reader_ids),
+            new_reader_count=audience.new_reader_count,
+            target_audience_revision=audience.target_revision,
+            publication_expires_at=publication_expires_at,
+            audience_expansion_token=_audience_expansion_token(
+                audience_authorization_secret,
+                payload,
+            ),
+            audience_expansion_expires_at=token_expires_at,
+        )
+
+    async def publish_file_copy(
+        request: FilePublishCopyRequest,
+        context: InvocationContext,
+    ) -> FilePublishCopyResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if context.workspace_id is None:
+            raise UserError("files.workspace_required")
+        reason = _publication_reason(request.reason)
+        publication_expires_at = _future_datetime(
+            request.expires_at_iso,
+            error_code="files.publication_expiry_invalid",
+            maximum=_FILE_PUBLICATION_MAX_TTL,
+        ).isoformat()
+        token_expires_at = _future_datetime(
+            request.audience_expansion_expires_at,
+            error_code="files.publication_confirmation_expired",
+            maximum=_AUDIENCE_EXPANSION_TOKEN_TTL,
+        ).isoformat()
+        guild, channel, _actor, _bot = await _authorized_write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages", "attach_files"),
+            enforce_information_flow=False,
+        )
+        source_filename, content, provenance = await asyncio.to_thread(
+            runtime.files.snapshot_for_actor_delivery_with_provenance,
+            file_workspace_id(context),
+            context.actor_id,
+            request.source_path,
+        )
+        audience = await _file_publish_audience(
+            context,
+            guild,
+            channel,
+            source_filename=source_filename,
+            content=content,
+            provenance=provenance,
+        )
+        if (
+            request.expected_source_sha256 != audience.source_sha256
+            or request.expected_source_sensitivity != audience.source_sensitivity
+            or not _exact_integer(
+                request.expected_source_reader_count,
+                audience.source_reader_count,
+            )
+            or request.expected_target_display_name != audience.target_display_name
+            or not _exact_integer(
+                request.expected_target_reader_count,
+                len(audience.target_reader_ids),
+            )
+            or not _exact_integer(
+                request.expected_new_reader_count,
+                audience.new_reader_count,
+            )
+            or request.expected_target_audience_revision != audience.target_revision
+        ):
+            raise UserError(
+                "files.publication_audience_changed",
+                safe_alternatives=(
+                    "inspect the exact target again",
+                    "publish a redacted copy",
+                    "use a narrower private thread",
+                ),
+            )
+        _require_audience_expansion_token(
+            audience_authorization_secret,
+            file_publish_payload(
+                context,
+                guild,
+                channel,
+                source_path=request.source_path,
+                reason=reason,
+                publication_expires_at=publication_expires_at,
+                token_expires_at=token_expires_at,
+                audience=audience,
+                provenance=provenance,
+            ),
+            request.audience_expansion_token,
+            error_code="files.publication_confirmation_required",
+        )
+        await context.dispatch_external_effect()
+        publication = cast(
+            WorkspaceFilePublication,
+            await asyncio.to_thread(
+                runtime.files.publish_copy_for_actor,
+                file_workspace_id(context),
+                context.actor_id,
+                request.source_path,
+                expected_sha256=audience.source_sha256,
+                target_workspace_id=str(guild.id),
+                target_resource_id=str(channel.id),
+                target_display_name=audience.target_display_name,
+                target_audience_revision=audience.target_revision,
+                reason=reason,
+                expires_at=publication_expires_at,
+            ),
+        )
+        return FilePublishCopyResponse(
+            publication_id=publication.publication_id,
+            source_filename=source_filename,
+            target_channel_id=publication.target_resource_id,
+            target_display_name=publication.target_display_name,
+            expires_at_iso=publication.expires_at,
+            revision=publication.revision,
+            active=publication.active,
+        )
+
+    async def revoke_file_publication(
+        request: FilePublicationRevokeRequest,
+        context: InvocationContext,
+    ) -> FilePublicationRevokeResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if not isinstance(request.expected_revision, int) or isinstance(
+            request.expected_revision,
+            bool,
+        ):
+            raise UserError("files.publication_revision_conflict")
+        publication = await asyncio.to_thread(
+            runtime.files.get_publication_for_actor,
+            request.publication_id,
+            context.actor_id,
+        )
+        if publication.revoked_at is not None:
+            await context.complete_external_effect_without_dispatch()
+            return FilePublicationRevokeResponse(
+                publication_id=publication.publication_id,
+                revision=publication.revision,
+                active=False,
+                changed=False,
+            )
+        if publication.revision != request.expected_revision:
+            raise UserError("files.publication_revision_conflict")
+        await context.dispatch_external_effect()
+        updated, changed = await asyncio.to_thread(
+            runtime.files.revoke_publication_for_actor,
+            request.publication_id,
+            context.actor_id,
+            expected_revision=request.expected_revision,
+        )
+        return FilePublicationRevokeResponse(
+            publication_id=updated.publication_id,
+            revision=updated.revision,
+            active=updated.active,
+            changed=changed,
+        )
+
+    async def send_published_file(
+        request: DiscordSendPublishedFileRequest,
+        context: InvocationContext,
+    ) -> DiscordSendPublishedFileResponse:
+        if runtime.files is None:
+            raise UserError("files.disabled")
+        if len(request.caption) > 2_000:
+            raise UserError("discord.file_caption_too_long")
+        if len(request.description) > 1_024:
+            raise UserError("discord.file_description_too_long")
+        guild, channel, _actor, _bot = await _authorized_write_message_channel(
+            client,
+            context,
+            request.channel_id,
+            guild_id=request.guild_id,
+            required_permissions=("send_messages", "attach_files"),
+            enforce_information_flow=False,
+        )
+        filename, content, _provenance, publication = await asyncio.to_thread(
+            runtime.files.snapshot_publication_for_actor,
+            request.publication_id,
+            context.actor_id,
+            target_workspace_id=str(guild.id),
+            target_resource_id=str(channel.id),
+            expected_revision=request.expected_revision,
+        )
+        current_reader_ids = await _exact_channel_reader_ids(guild, channel)
+        current_revision = _audience_revision(
+            kind="file_publication_target_v1",
+            guild_id=guild.id,
+            resource_id=channel.id,
+            reader_ids=current_reader_ids,
+        )
+        if current_revision != publication.target_audience_revision:
+            raise UserError(
+                "files.publication_audience_changed",
+                safe_alternatives=(
+                    "revoke this copy and inspect the target again",
+                    "send a redacted copy",
+                    "use a narrower private thread",
+                ),
+            )
+        if len(content) > guild.filesize_limit:
+            raise UserError("discord.file_too_large")
+        reply = (
+            await _fetch_message_for_write(channel, request.reply_to_message_id)
+            if request.reply_to_message_id is not None
+            else None
+        )
+        file = discord.File(
+            io.BytesIO(content),
+            filename=filename,
+            spoiler=request.spoiler,
+            description=request.description or None,
+        )
+        try:
+            send_arguments: dict[str, Any] = {
+                "allowed_mentions": discord.AllowedMentions.none(),
+                "nonce": _discord_write_nonce(context, "published-attachment"),
+                "suppress_embeds": True,
+                "file": file,
+            }
+            if reply is not None:
+                send_arguments["reference"] = reply
+                send_arguments["mention_author"] = False
+            if request.silent:
+                send_arguments["silent"] = True
+            await context.dispatch_external_effect()
+            message = await channel.send(request.caption or None, **send_arguments)
+        except discord.Forbidden as exc:
+            raise UserError("discord.file_send_forbidden") from exc
+        except discord.DiscordException as exc:
+            raise UserError("discord.file_send_failed") from exc
+        finally:
+            file.close()
+        return DiscordSendPublishedFileResponse(
+            publication_id=publication.publication_id,
+            message_id=str(message.id),
+            channel_id=str(channel.id),
+            filename=filename,
+            size_bytes=len(content),
+            guild_id=str(guild.id),
         )
 
     async def send_files(
@@ -5662,6 +6291,39 @@ def build_discord_endpoints(
             DiscordThreadResponse,
             update_thread,
         ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.inspect_thread_audience_expansion",
+                summary=(
+                    "Inspect the exact current and post-add human audience for one "
+                    "private-thread member addition. Copy every returned expected field, "
+                    "token, and expiry into discord.add_thread_member; the host rejects "
+                    "stale or changed snapshots in enforce mode."
+                ),
+                risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "private thread",
+                    "audience expansion",
+                    "member access review",
+                    "非公開スレッド",
+                    "閲覧者確認",
+                    "追加範囲",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.thread_not_found",
+                    "discord.private_thread_required",
+                    "discord.audience_snapshot_uncertain",
+                ),
+                timeout_seconds=15,
+            ),
+            DiscordThreadAudienceInspectRequest,
+            DiscordThreadAudienceInspectResponse,
+            inspect_thread_audience_expansion,
+        ),
         *(
             endpoint(
                 CapabilityDescriptor(
@@ -5680,7 +6342,11 @@ def build_discord_endpoints(
             for name, summary, keywords, handler in (
                 (
                     "discord.add_thread_member",
-                    "Add one server member to a Discord thread.",
+                    (
+                        "Add one server member to a Discord thread. Before a private-thread "
+                        "audience expansion, call discord.inspect_thread_audience_expansion "
+                        "and copy its exact expected fields and short-lived token."
+                    ),
                     (
                         "discord",
                         "thread",
@@ -6088,6 +6754,160 @@ def build_discord_endpoints(
             DiscordDeleteOwnMessagesRequest,
             DiscordDeleteOwnMessagesResponse,
             delete_own_messages,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="files.inspect_publish_target",
+                summary=(
+                    "Inspect one actor-owned file and the exact human audience of one "
+                    "Discord target before creating a target-bound publication copy. "
+                    "Copy all returned expected fields, token, and expiries into "
+                    "files.publish_copy."
+                ),
+                risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "files",
+                    "publish",
+                    "share",
+                    "target audience",
+                    "ファイル共有",
+                    "公開先確認",
+                    "共有範囲",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.not_found",
+                    "files.publication_expiry_invalid",
+                    "files.publication_reason_required",
+                    "files.publication_source_uncertain",
+                    "discord.audience_snapshot_uncertain",
+                ),
+                timeout_seconds=15,
+            ),
+            FilePublishTargetInspectRequest,
+            FilePublishTargetInspectResponse,
+            inspect_file_publish_target,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="files.publish_copy",
+                summary=(
+                    "Create an immutable, revocable file copy bound to the exact Discord "
+                    "channel audience previously returned by files.inspect_publish_target. "
+                    "The original file and its provenance remain unchanged."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "files",
+                    "publish copy",
+                    "share file",
+                    "target-bound copy",
+                    "ファイル共有",
+                    "公開コピー",
+                    "対象限定",
+                    "共有先限定の公開コピーを作る",
+                ),
+                side_effects=(
+                    "Creates one separately audited local copy with an exact Discord "
+                    "target, expiry, and revision.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.not_found",
+                    "files.publication_confirmation_required",
+                    "files.publication_confirmation_expired",
+                    "files.publication_audience_changed",
+                    "files.publication_expiry_invalid",
+                    "files.publication_reason_required",
+                ),
+                timeout_seconds=15,
+                user_visible_effect=(
+                    "Creates a revocable file copy usable only for the confirmed Discord target."
+                ),
+            ),
+            FilePublishCopyRequest,
+            FilePublishCopyResponse,
+            publish_file_copy,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="files.revoke_publication",
+                summary=(
+                    "Revoke one actor-owned publication copy by opaque publication ID and "
+                    "expected revision. Existing Discord messages are not deleted."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "files",
+                    "revoke publication",
+                    "revoke published file copy",
+                    "stop sharing",
+                    "共有解除",
+                    "公開取り消し",
+                    "公開コピーの再利用を取り消す",
+                ),
+                side_effects=("Prevents future use of one publication copy.",),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "files.publication_not_found",
+                    "files.publication_revision_conflict",
+                ),
+                timeout_seconds=10,
+                user_visible_effect="Stops future sends of one published copy.",
+            ),
+            FilePublicationRevokeRequest,
+            FilePublicationRevokeResponse,
+            revoke_file_publication,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.send_published_file",
+                summary=(
+                    "Send one active publication copy only to its exact confirmed Discord "
+                    "channel. The host rechecks expiry, revocation, revision, current "
+                    "audience, requester access, and bot permissions immediately before send."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "discord",
+                    "send published file",
+                    "deliver shared copy",
+                    "公開コピー送信",
+                    "共有ファイルを送る",
+                    "対象限定コピーをDiscordへ配信する",
+                ),
+                side_effects=(
+                    "Creates one Discord message containing the target-bound attachment.",
+                ),
+                requires_workspace=True,
+                idempotency="non_idempotent_write",
+                expected_errors=(
+                    "files.publication_not_found",
+                    "files.publication_target_mismatch",
+                    "files.publication_revision_conflict",
+                    "files.publication_revoked",
+                    "files.publication_expired",
+                    "files.publication_audience_changed",
+                    "discord.file_too_large",
+                    "discord.file_send_forbidden",
+                ),
+                timeout_seconds=30,
+                user_visible_effect=(
+                    "Posts one confirmed, target-bound file copy in Discord."
+                ),
+            ),
+            DiscordSendPublishedFileRequest,
+            DiscordSendPublishedFileResponse,
+            send_published_file,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -7267,9 +8087,6 @@ def _enforce_file_provenance_to_guild(
         return
     allowed = (
         provenance is not None
-        and provenance.declassified_at is not None
-    ) or (
-        provenance is not None
         and provenance.sensitivity == "guild_public"
         and all(
             workspace_id == str(destination_guild.id)
@@ -7300,9 +8117,7 @@ def _enforce_file_provenance_to_unknown_audience(
 ) -> None:
     """Treat a durable file as restricted until explicitly declassified."""
 
-    if context.information_flow_mode == "disabled" or (
-        provenance is not None and provenance.declassified_at is not None
-    ):
+    if context.information_flow_mode == "disabled":
         return
     log.warning(
         "Discord unknown-audience file provenance check failed mode=%s "
@@ -7332,8 +8147,6 @@ def _enforce_file_provenance_to_destination(
     for provenance in provenances:
         if provenance is None:
             violations.append(("file", "unlabelled", "uncertain"))
-            continue
-        if provenance.declassified_at is not None:
             continue
         if provenance.unlabelled_input or provenance.sources_truncated:
             violations.append(("file", "provenance", "uncertain"))
@@ -7863,6 +8676,27 @@ async def _write_message_channel(
     guild_id: str | None = None,
     required_permissions: tuple[str, ...] = (),
 ) -> tuple[discord.Guild, DiscordMessageChannel, discord.Member, discord.Member]:
+    return await _authorized_write_message_channel(
+        client,
+        context,
+        channel_id,
+        guild_id=guild_id,
+        required_permissions=required_permissions,
+        enforce_information_flow=True,
+    )
+
+
+async def _authorized_write_message_channel(
+    client: discord.Client,
+    context: InvocationContext,
+    channel_id: str,
+    *,
+    guild_id: str | None = None,
+    required_permissions: tuple[str, ...] = (),
+    enforce_information_flow: bool,
+) -> tuple[discord.Guild, DiscordMessageChannel, discord.Member, discord.Member]:
+    """Resolve an exact writable target, optionally before an explicit IFC review."""
+
     guild = _write_guild_for_channel(
         client,
         context,
@@ -7871,7 +8705,8 @@ async def _write_message_channel(
     )
     _assert_agent_update_scope(context, channel_id)
     channel = _message_channel(guild, channel_id)
-    _enforce_information_flow_to_destination(client, context, guild, channel)
+    if enforce_information_flow:
+        _enforce_information_flow_to_destination(client, context, guild, channel)
     actor, bot = await _write_members(guild, context)
     for member in (actor, bot):
         if not _can_read_messages(channel, member) or not _can_read_private_thread(
@@ -8187,6 +9022,247 @@ def _timeout_state_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         raise UserError("discord.timeout_invalid")
     return parsed.astimezone(UTC)
+
+
+def _future_datetime(
+    value: str,
+    *,
+    error_code: str,
+    maximum: timedelta,
+) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UserError(error_code) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise UserError(error_code)
+    normalized = parsed.astimezone(UTC)
+    now = datetime.now(UTC)
+    if not now < normalized <= now + maximum:
+        raise UserError(error_code)
+    return normalized
+
+
+def _publication_reason(value: str) -> str:
+    reason = " ".join(value.split())
+    if not reason or len(reason) > 400:
+        raise UserError("files.publication_reason_required")
+    return reason
+
+
+def _exact_integer(value: object, expected: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
+def _audience_revision(
+    *,
+    kind: str,
+    guild_id: int,
+    resource_id: int,
+    reader_ids: tuple[int, ...],
+    target_user_id: int | None = None,
+    expanded_reader_ids: tuple[int, ...] = (),
+) -> str:
+    payload = {
+        "kind": kind,
+        "guild_id": str(guild_id),
+        "resource_id": str(resource_id),
+        "reader_ids": [str(item) for item in reader_ids],
+        "target_user_id": (
+            str(target_user_id) if target_user_id is not None else None
+        ),
+        "expanded_reader_ids": [str(item) for item in expanded_reader_ids],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_provenance_revision(provenance: WorkspaceFileProvenance) -> str:
+    payload = {
+        "owner_actor_ids": provenance.owner_actor_ids,
+        "origin_guild_id": provenance.origin_guild_id,
+        "origin_channel_id": provenance.origin_channel_id,
+        "origin_message_id": provenance.origin_message_id,
+        "origin_visibility": provenance.origin_visibility,
+        "created_task_id": provenance.created_task_id,
+        "sensitivity": provenance.sensitivity,
+        "source_resources": provenance.source_resources,
+        "unlabelled_input": provenance.unlabelled_input,
+        "sources_truncated": provenance.sources_truncated,
+        "publication_id": provenance.publication_id,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _audience_expansion_token(
+    secret: bytes,
+    payload: Mapping[str, object],
+) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "aex_" + hmac.new(secret, encoded, hashlib.sha256).hexdigest()
+
+
+def _require_audience_expansion_token(
+    secret: bytes,
+    payload: Mapping[str, object],
+    supplied: str | None,
+    *,
+    error_code: str,
+) -> None:
+    expected = _audience_expansion_token(secret, payload)
+    if supplied is None or not secrets.compare_digest(expected, supplied):
+        raise UserError(
+            error_code,
+            safe_alternatives=(
+                "answer in the source channel",
+                "use a narrower private thread",
+                "publish a redacted copy",
+                "ask a server administrator to approve the exact audience",
+            ),
+        )
+
+
+async def _exact_channel_reader_ids(
+    guild: discord.Guild,
+    channel: DiscordReadableChannel,
+    *,
+    private_thread_member_ids: frozenset[int] | None = None,
+) -> tuple[int, ...]:
+    inspection = inspect_channel_audience(guild, channel)
+    if not inspection.complete:
+        raise UserError("discord.audience_snapshot_uncertain")
+    if (
+        not isinstance(channel, discord.Thread)
+        or channel.type is not discord.ChannelType.private_thread
+    ):
+        return inspection.reader_ids
+    member_ids = (
+        private_thread_member_ids
+        if private_thread_member_ids is not None
+        else await _thread_member_ids(channel)
+    )
+    readers: list[int] = []
+    for member in guild.members:
+        if member.bot or not _can_read_messages(channel, member):
+            continue
+        permissions = channel.permissions_for(member)
+        if (
+            _permission_enabled(permissions, "administrator")
+            or _permission_enabled(permissions, "manage_threads")
+            or member.id in member_ids
+        ):
+            readers.append(member.id)
+    return tuple(sorted(readers))
+
+
+async def _thread_member_ids(
+    thread: discord.Thread,
+) -> frozenset[int]:
+    try:
+        thread_members = await thread.fetch_members()
+    except discord.DiscordException as exc:
+        raise UserError("discord.audience_snapshot_uncertain") from exc
+    return frozenset(item.id for item in thread_members)
+
+
+async def _thread_audience_expansion(
+    guild: discord.Guild,
+    thread: discord.Thread,
+    target: discord.Member,
+) -> _ThreadAudienceExpansion:
+    member_ids = await _thread_member_ids(thread)
+    source_reader_ids = await _exact_channel_reader_ids(
+        guild,
+        thread,
+        private_thread_member_ids=member_ids,
+    )
+    guild_member_ids = {member.id for member in guild.members}
+    if not target.bot and target.id not in guild_member_ids:
+        raise UserError("discord.audience_snapshot_uncertain")
+    expanded = set(source_reader_ids)
+    if not target.bot and _can_read_messages(thread, target):
+        expanded.add(target.id)
+    expanded_reader_ids = tuple(sorted(expanded))
+    retained_history_exposed = target.id not in source_reader_ids and target.id in expanded
+    return _ThreadAudienceExpansion(
+        target_display_name=target.display_name,
+        source_reader_ids=source_reader_ids,
+        expanded_reader_ids=expanded_reader_ids,
+        retained_history_exposed=retained_history_exposed,
+        revision=_audience_revision(
+            kind="private_thread_member_v1",
+            guild_id=guild.id,
+            resource_id=thread.id,
+            reader_ids=source_reader_ids,
+            target_user_id=target.id,
+            expanded_reader_ids=expanded_reader_ids,
+        ),
+        target_present=target.id in member_ids,
+    )
+
+
+def _channel_display_name(channel: DiscordReadableChannel) -> str:
+    name = getattr(channel, "name", None)
+    if isinstance(name, str) and name.strip():
+        return f"#{name.strip()}"
+    return f"Discord channel {channel.id}"
+
+
+async def _file_publish_audience(
+    context: InvocationContext,
+    guild: discord.Guild,
+    channel: DiscordReadableChannel,
+    *,
+    source_filename: str,
+    content: bytes,
+    provenance: WorkspaceFileProvenance,
+) -> _FilePublishAudience:
+    if provenance.unlabelled_input or provenance.sources_truncated:
+        raise UserError("files.publication_source_uncertain")
+    if provenance.publication_id is not None:
+        raise UserError("files.publication_source_copy_forbidden")
+    try:
+        actor_id = int(context.actor_id)
+    except ValueError as exc:
+        raise UserError("discord.agent_principal_invalid") from exc
+    if provenance.owner_actor_ids != (context.actor_id,):
+        raise UserError("files.publication_source_uncertain")
+    target_reader_ids = await _exact_channel_reader_ids(guild, channel)
+    if actor_id not in target_reader_ids:
+        raise UserError("discord.agent_write_channel_forbidden")
+    target_revision = _audience_revision(
+        kind="file_publication_target_v1",
+        guild_id=guild.id,
+        resource_id=channel.id,
+        reader_ids=target_reader_ids,
+    )
+    return _FilePublishAudience(
+        source_filename=source_filename,
+        source_sha256=hashlib.sha256(content).hexdigest(),
+        source_sensitivity=provenance.sensitivity,
+        source_reader_count=1,
+        target_display_name=_channel_display_name(channel),
+        target_reader_ids=target_reader_ids,
+        new_reader_count=len(set(target_reader_ids) - {actor_id}),
+        target_revision=target_revision,
+    )
 
 
 def _reaction_emoji(value: str) -> str:

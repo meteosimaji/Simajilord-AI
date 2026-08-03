@@ -19,6 +19,7 @@ from .feedback import (
 from .files import (
     AgentFileSandbox,
     WorkspaceFileProvenance,
+    WorkspaceFilePublication,
     WorkspaceFileRecord,
     WorkspaceReadResult,
     WorkspaceVisibility,
@@ -132,6 +133,7 @@ __all__ = [
     "WorkspaceComputeService",
     "WorkspaceDownloadResult",
     "WorkspaceFileProvenance",
+    "WorkspaceFilePublication",
     "WorkspaceFileRecord",
     "WorkspaceReadResult",
     "WorkspaceVisibility",

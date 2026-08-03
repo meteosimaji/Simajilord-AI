@@ -461,6 +461,7 @@ class SimajilordRuntime:
                 "discord.list_reaction_users",
                 "discord.list_poll_voters",
                 "discord.list_thread_members",
+                "discord.inspect_thread_audience_expansion",
                 "discord.list_platform_resources",
                 "discord.get_message",
                 "discord.list_channels",
@@ -611,9 +612,13 @@ class SimajilordRuntime:
                     "files.read",
                     "files.write_text",
                     "files.replace_text",
+                    "files.inspect_publish_target",
+                    "files.publish_copy",
+                    "files.revoke_publication",
                     "discord.import_attachment",
                     "discord.send_file",
                     "discord.send_files",
+                    "discord.send_published_file",
                 )
                 agent_capabilities.extend(file_capabilities)
                 required_grants.update({name: AGENT_FILE_GRANT for name in file_capabilities})
@@ -681,9 +686,12 @@ class SimajilordRuntime:
                         (
                             "files.write_text",
                             "files.replace_text",
+                            "files.publish_copy",
+                            "files.revoke_publication",
                             "discord.import_attachment",
                             "discord.send_file",
                             "discord.send_files",
+                            "discord.send_published_file",
                             "media.save",
                         )
                         if files is not None

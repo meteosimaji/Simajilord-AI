@@ -7,6 +7,7 @@ import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -301,6 +302,130 @@ def test_uncertain_and_multi_owner_provenance_survives_restart(
     assert multi is not None
     assert multi.owner_actor_ids == ("actor-a", "actor-b")
     assert multi.sensitivity == "uncertain"
+
+
+def test_target_bound_publication_preserves_source_and_rejects_other_targets(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    source = WorkspaceFileProvenance(
+        owner_actor_ids=("7",),
+        origin_guild_id="10",
+        origin_channel_id="20",
+        origin_visibility="restricted",
+        sensitivity="restricted",
+        source_resources=(("10", "20", "restricted"),),
+    )
+    original = sandbox.import_bytes(
+        "10",
+        "report.txt",
+        b"private report",
+        provenance=source,
+    )
+    expires_at = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    publication = sandbox.publish_copy_for_actor(
+        "10",
+        "7",
+        "report.txt",
+        expected_sha256=original.sha256,
+        target_workspace_id="10",
+        target_resource_id="21",
+        target_display_name="#review",
+        target_audience_revision="a" * 64,
+        reason="Share the reviewed report",
+        expires_at=expires_at,
+    )
+
+    unchanged = sandbox.list_for_actor("10", "7")[0]
+    assert unchanged.provenance == source
+    assert unchanged.sha256 == original.sha256
+    assert publication.source_path == "report.txt"
+    assert publication.target_resource_id == "21"
+    filename, content, copied_provenance, loaded = (
+        sandbox.snapshot_publication_for_actor(
+            publication.publication_id,
+            "7",
+            target_workspace_id="10",
+            target_resource_id="21",
+            expected_revision=1,
+        )
+    )
+    assert filename == "report.txt"
+    assert content == b"private report"
+    assert copied_provenance.publication_id == publication.publication_id
+    assert loaded == publication
+
+    with pytest.raises(UserError, match=r"files\.publication_target_mismatch"):
+        sandbox.snapshot_publication_for_actor(
+            publication.publication_id,
+            "7",
+            target_workspace_id="10",
+            target_resource_id="22",
+            expected_revision=1,
+        )
+
+    revoked, changed = sandbox.revoke_publication_for_actor(
+        publication.publication_id,
+        "7",
+        expected_revision=1,
+    )
+    assert changed
+    assert revoked.revision == 2
+    assert revoked.revoked_at is not None
+    with pytest.raises(UserError, match=r"files\.publication_revoked"):
+        sandbox.snapshot_publication_for_actor(
+            publication.publication_id,
+            "7",
+            target_workspace_id="10",
+            target_resource_id="21",
+            expected_revision=2,
+        )
+
+
+def test_expired_publication_copy_cannot_be_reused(tmp_path: Path) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    provenance = WorkspaceFileProvenance(owner_actor_ids=("7",))
+    source = sandbox.import_bytes(
+        "10",
+        "brief.txt",
+        b"brief",
+        provenance=provenance,
+    )
+    publication = sandbox.publish_copy_for_actor(
+        "10",
+        "7",
+        "brief.txt",
+        expected_sha256=source.sha256,
+        target_workspace_id="10",
+        target_resource_id="21",
+        target_display_name="#review",
+        target_audience_revision="b" * 64,
+        reason="Temporary review",
+        expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    )
+    with sqlite3.connect(sandbox._provenance_path) as connection:
+        connection.execute(
+            """
+            UPDATE file_publications
+            SET published_at = ?, expires_at = ?
+            WHERE publication_id = ?
+            """,
+            (
+                (datetime.now(UTC) - timedelta(minutes=2)).isoformat(),
+                (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                publication.publication_id,
+            ),
+        )
+
+    with pytest.raises(UserError, match=r"files\.publication_expired"):
+        sandbox.snapshot_publication_for_actor(
+            publication.publication_id,
+            "7",
+            target_workspace_id="10",
+            target_resource_id="21",
+            expected_revision=1,
+        )
 
 
 def test_file_provenance_persists_and_cannot_be_downgraded(

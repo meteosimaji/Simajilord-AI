@@ -132,6 +132,7 @@ _FINAL_DELIVERY_CAPABILITIES = frozenset(
         "discord.send_embed",
         "discord.send_file",
         "discord.send_files",
+        "discord.send_published_file",
         "discord.send_message",
         "discord.speak",
     }
@@ -4248,6 +4249,7 @@ def _blocking_write_capability(
             "discord.send_embed",
             "discord.send_file",
             "discord.send_files",
+            "discord.send_published_file",
             "discord.send_message",
         }
         and isinstance(arguments, dict)
@@ -4529,6 +4531,14 @@ def _information_flow_write_failure(
     """Block audience expansion and unknown external sinks in enforce mode."""
 
     if budget.context.information_flow_mode != "enforce":
+        return None
+    if capability_name in {
+        "files.publish_copy",
+        "files.revoke_publication",
+        "discord.send_published_file",
+    }:
+        # These handlers replace ambient publication with a host-calculated,
+        # target-bound, expiring authority and recheck it at dispatch time.
         return None
     observations = budget.discord_disclosure_observations
     if not observations:
@@ -4817,6 +4827,8 @@ def _external_egress_fingerprint(
 
 
 def _information_flow_blocks_origin(budget: _ToolTurnBudget) -> bool:
+    if "discord.send_published_file" in budget.final_delivery_successes:
+        return False
     return budget.context.information_flow_mode == "enforce" and any(
         observation.relation_to_origin != "same_or_narrower"
         for observation in budget.discord_disclosure_observations
@@ -6303,6 +6315,38 @@ def _user_error_reason(code: str) -> str:
         "action.undo_target_state_uncertain": (
             "The current target state could not be verified safely, so Undo was not applied."
         ),
+        "discord.audience_expansion_confirmation_required": (
+            "The private-thread audience expansion lacks the exact host snapshot. Inspect "
+            "the target again, or answer in the source channel, use a narrower thread, "
+            "publish a redacted copy, or ask an administrator to approve it."
+        ),
+        "discord.audience_expansion_changed": (
+            "The private-thread target or reader audience changed after inspection. Inspect "
+            "the exact target again before asking for confirmation."
+        ),
+        "discord.audience_expansion_expired": (
+            "The private-thread audience inspection expired. Inspect the exact target again."
+        ),
+        "files.publication_confirmation_required": (
+            "The file publication lacks the exact host-calculated target snapshot. Inspect "
+            "the target again, use a narrower thread, or publish a redacted copy."
+        ),
+        "files.publication_confirmation_expired": (
+            "The file publication target inspection expired. Inspect the target again."
+        ),
+        "files.publication_audience_changed": (
+            "The source file or target audience changed after inspection. Revoke any stale "
+            "copy and inspect the exact target again."
+        ),
+        "files.publication_expired": (
+            "This target-bound file copy has expired and cannot be sent again."
+        ),
+        "files.publication_revoked": (
+            "This target-bound file copy was revoked and cannot be sent again."
+        ),
+        "files.publication_target_mismatch": (
+            "This file copy is bound to a different exact Discord target."
+        ),
     }
     return explanations.get(
         code,
@@ -6622,8 +6666,6 @@ def _record_discord_disclosure_observations(
     ]
     for provenance in provenance_candidates:
         assert isinstance(provenance, dict)
-        if provenance.get("declassified_at") is not None:
-            continue
         if (
             provenance.get("unlabelled_input") is True
             or provenance.get("sources_truncated") is True

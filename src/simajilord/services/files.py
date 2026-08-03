@@ -10,10 +10,11 @@ import re
 import sqlite3
 import tempfile
 import threading
+import uuid
 import zipfile
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypeAlias, cast
@@ -64,6 +65,82 @@ WorkspaceSourceVisibility: TypeAlias = Literal[
     "restricted",
     "uncertain",
 ]
+WorkspacePublicationTargetKind: TypeAlias = Literal["discord_channel"]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceFilePublication:
+    """Target-bound, revocable authority for one immutable file copy."""
+
+    publication_id: str
+    source_workspace_id: str
+    source_path: str
+    source_sha256: str
+    copy_workspace_id: str
+    copy_path: str
+    target_kind: WorkspacePublicationTargetKind
+    target_workspace_id: str
+    target_resource_id: str
+    target_display_name: str
+    target_audience_revision: str
+    published_by_actor_id: str
+    reason: str
+    published_at: str
+    expires_at: str
+    revision: int = 1
+    revoked_at: str | None = None
+    revoked_by: str | None = None
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"pub_[0-9a-f]{32}", self.publication_id):
+            raise ValueError("invalid file publication ID")
+        if self.target_kind != "discord_channel":
+            raise ValueError("unsupported file publication target")
+        scalar_values = (
+            self.source_workspace_id,
+            self.copy_workspace_id,
+            self.target_workspace_id,
+            self.target_resource_id,
+            self.target_display_name,
+            self.published_by_actor_id,
+            self.reason,
+            self.published_at,
+            self.expires_at,
+            self.revoked_at,
+            self.revoked_by,
+        )
+        if any(
+            value is not None and (not value or len(value) > 500)
+            for value in scalar_values
+        ):
+            raise ValueError("file publication values must be bounded")
+        if not self.source_path or len(self.source_path) > 2_400:
+            raise ValueError("file publication source path must be bounded")
+        if not self.copy_path or len(self.copy_path) > 2_400:
+            raise ValueError("file publication copy path must be bounded")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.source_sha256):
+            raise ValueError("invalid file publication source hash")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.target_audience_revision):
+            raise ValueError("invalid file publication audience revision")
+        if self.revision < 1:
+            raise ValueError("file publication revision must be positive")
+        published_at = _publication_datetime(self.published_at)
+        expires_at = _publication_datetime(self.expires_at)
+        if expires_at <= published_at:
+            raise ValueError("file publication expiry must follow publication")
+        if (self.revoked_at is None) != (self.revoked_by is None):
+            raise ValueError("file publication revocation fields must be paired")
+        if self.revoked_at is not None:
+            _publication_datetime(self.revoked_at)
+
+    @property
+    def active(self) -> bool:
+        """Return whether this authority is usable at the current instant."""
+
+        return (
+            self.revoked_at is None
+            and datetime.now(UTC) < _publication_datetime(self.expires_at)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +161,7 @@ class WorkspaceFileProvenance:
     sources_truncated: bool = False
     declassified_at: str | None = None
     declassified_by: str | None = None
+    publication_id: str | None = None
 
     def __post_init__(self) -> None:
         normalized_owners = tuple(sorted(set(self.owner_actor_ids)))
@@ -95,6 +173,7 @@ class WorkspaceFileProvenance:
             self.created_task_id,
             self.declassified_at,
             self.declassified_by,
+            self.publication_id,
         )
         if any(
             value is not None and len(value) > 200 for value in scalar_values
@@ -115,6 +194,11 @@ class WorkspaceFileProvenance:
             for item in self.source_resources
         ):
             raise ValueError("file provenance source resources must be bounded")
+        if self.publication_id is not None and not re.fullmatch(
+            r"pub_[0-9a-f]{32}",
+            self.publication_id,
+        ):
+            raise ValueError("invalid file provenance publication ID")
         if (
             len(normalized_owners) != 1
             or self.unlabelled_input
@@ -861,6 +945,205 @@ class AgentFileSandbox:
             assert provenance is not None
             return path.name, path.read_bytes(), provenance
 
+    def publish_copy_for_actor(
+        self,
+        source_workspace_id: str,
+        actor_id: str,
+        source_path: str,
+        *,
+        expected_sha256: str,
+        target_workspace_id: str,
+        target_resource_id: str,
+        target_display_name: str,
+        target_audience_revision: str,
+        reason: str,
+        expires_at: str,
+    ) -> WorkspaceFilePublication:
+        """Create an immutable copy whose authority is limited to one target."""
+
+        if not reason.strip() or len(reason) > 500:
+            raise UserError("files.publication_reason_required")
+        expiry = _publication_datetime_or_error(expires_at)
+        now = datetime.now(UTC)
+        if expiry <= now:
+            raise UserError("files.publication_expired")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+            raise UserError("files.hash_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", target_audience_revision):
+            raise UserError("files.publication_audience_invalid")
+        filename, content, source_provenance = (
+            self.snapshot_for_actor_delivery_with_provenance(
+                source_workspace_id,
+                actor_id,
+                source_path,
+            )
+        )
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise UserError("files.hash_conflict")
+
+        publication_id = f"pub_{uuid.uuid4().hex}"
+        copy_workspace_id = f"publication:{target_workspace_id}"
+        copy_path = f"{publication_id}/{filename}"
+        publication = WorkspaceFilePublication(
+            publication_id=publication_id,
+            source_workspace_id=source_workspace_id,
+            source_path=source_path,
+            source_sha256=actual_sha256,
+            copy_workspace_id=copy_workspace_id,
+            copy_path=copy_path,
+            target_kind="discord_channel",
+            target_workspace_id=target_workspace_id,
+            target_resource_id=target_resource_id,
+            target_display_name=target_display_name,
+            target_audience_revision=target_audience_revision,
+            published_by_actor_id=actor_id,
+            reason=reason.strip(),
+            published_at=now.isoformat(),
+            expires_at=expiry.isoformat(),
+        )
+        copy_provenance = replace(
+            source_provenance,
+            publication_id=publication_id,
+            declassified_at=None,
+            declassified_by=None,
+        )
+        with self.locked_workspace(copy_workspace_id):
+            self._validate_import_bytes_unlocked(
+                copy_workspace_id,
+                copy_path,
+                content,
+                provenance=copy_provenance,
+            )
+            self._import_bytes_unlocked(
+                copy_workspace_id,
+                copy_path,
+                content,
+                provenance=copy_provenance,
+            )
+            try:
+                self._store_publication(publication)
+            except Exception:
+                copy_scope = self._scope_path(copy_workspace_id)
+                self._path(copy_scope, copy_path).unlink(missing_ok=True)
+                self._delete_provenance(copy_workspace_id, copy_path)
+                raise
+        return publication
+
+    def get_publication_for_actor(
+        self,
+        publication_id: str,
+        actor_id: str,
+    ) -> WorkspaceFilePublication:
+        """Resolve publication metadata without exposing another actor's record."""
+
+        publication = self._load_publication(publication_id)
+        if publication is None or publication.published_by_actor_id != actor_id:
+            raise UserError("files.publication_not_found")
+        return publication
+
+    def snapshot_publication_for_actor(
+        self,
+        publication_id: str,
+        actor_id: str,
+        *,
+        target_workspace_id: str,
+        target_resource_id: str,
+        expected_revision: int,
+    ) -> tuple[str, bytes, WorkspaceFileProvenance, WorkspaceFilePublication]:
+        """Read a copy only while its exact target authority remains active."""
+
+        if not isinstance(expected_revision, int) or isinstance(
+            expected_revision,
+            bool,
+        ):
+            raise UserError("files.publication_revision_conflict")
+        publication = self.get_publication_for_actor(publication_id, actor_id)
+        if (
+            publication.target_workspace_id != target_workspace_id
+            or publication.target_resource_id != target_resource_id
+        ):
+            raise UserError("files.publication_target_mismatch")
+        if publication.revision != expected_revision:
+            raise UserError("files.publication_revision_conflict")
+        if publication.revoked_at is not None:
+            raise UserError("files.publication_revoked")
+        if datetime.now(UTC) >= _publication_datetime(publication.expires_at):
+            raise UserError("files.publication_expired")
+        with self.locked_workspace(publication.copy_workspace_id):
+            latest = self.get_publication_for_actor(publication_id, actor_id)
+            if latest != publication:
+                raise UserError("files.publication_revision_conflict")
+            path = self.path_for_delivery(
+                publication.copy_workspace_id,
+                publication.copy_path,
+            )
+            content = path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != publication.source_sha256:
+                raise UserError("files.publication_copy_changed")
+            provenance = self._load_provenance(
+                publication.copy_workspace_id,
+                publication.copy_path,
+            )
+            if provenance is None or provenance.publication_id != publication_id:
+                raise UserError("files.provenance_invalid")
+            return path.name, content, provenance, publication
+
+    def revoke_publication_for_actor(
+        self,
+        publication_id: str,
+        actor_id: str,
+        *,
+        expected_revision: int,
+    ) -> tuple[WorkspaceFilePublication, bool]:
+        """Revoke one publication with compare-and-set, preserving its audit row."""
+
+        if not isinstance(expected_revision, int) or isinstance(
+            expected_revision,
+            bool,
+        ):
+            raise UserError("files.publication_revision_conflict")
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM file_publications WHERE publication_id = ?",
+                (publication_id,),
+            ).fetchone()
+            publication = _publication_from_row(row) if row is not None else None
+            if publication is None or publication.published_by_actor_id != actor_id:
+                raise UserError("files.publication_not_found")
+            if publication.revoked_at is not None:
+                return publication, False
+            if publication.revision != expected_revision:
+                raise UserError("files.publication_revision_conflict")
+            revoked_at = datetime.now(UTC).isoformat()
+            next_revision = publication.revision + 1
+            connection.execute(
+                """
+                UPDATE file_publications
+                SET revision = ?, revoked_at = ?, revoked_by = ?
+                WHERE publication_id = ? AND revision = ? AND revoked_at IS NULL
+                """,
+                (
+                    next_revision,
+                    revoked_at,
+                    actor_id,
+                    publication_id,
+                    expected_revision,
+                ),
+            )
+            updated = replace(
+                publication,
+                revision=next_revision,
+                revoked_at=revoked_at,
+                revoked_by=actor_id,
+            )
+        return updated, True
+
     def set_provenance(
         self,
         workspace_id: str,
@@ -984,6 +1267,7 @@ class AgentFileSandbox:
                     sources_truncated INTEGER NOT NULL DEFAULT 0,
                     declassified_at TEXT,
                     declassified_by TEXT,
+                    publication_id TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (workspace_id, relative_path)
                 )
@@ -999,6 +1283,7 @@ class AgentFileSandbox:
                 "owner_actor_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "unlabelled_input": "INTEGER NOT NULL DEFAULT 0",
                 "sources_truncated": "INTEGER NOT NULL DEFAULT 0",
+                "publication_id": "TEXT",
             }
             for name, declaration in additions.items():
                 if name not in columns:
@@ -1047,6 +1332,41 @@ class AgentFileSandbox:
                         str(relative_path),
                     ),
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_publications (
+                    publication_id TEXT PRIMARY KEY,
+                    source_workspace_id TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    copy_workspace_id TEXT NOT NULL,
+                    copy_path TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_workspace_id TEXT NOT NULL,
+                    target_resource_id TEXT NOT NULL,
+                    target_display_name TEXT NOT NULL,
+                    target_audience_revision TEXT NOT NULL,
+                    published_by_actor_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    revoked_at TEXT,
+                    revoked_by TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS file_publications_actor_target
+                ON file_publications (
+                    published_by_actor_id,
+                    target_workspace_id,
+                    target_resource_id,
+                    published_at
+                )
+                """
+            )
         self._provenance_path.chmod(0o600)
 
     def _load_provenance(
@@ -1064,7 +1384,7 @@ class AgentFileSandbox:
                        origin_channel_id, origin_message_id, origin_visibility,
                        created_task_id, sensitivity, source_resources_json,
                        unlabelled_input, sources_truncated, declassified_at,
-                       declassified_by
+                       declassified_by, publication_id
                 FROM file_provenance
                 WHERE workspace_id = ? AND relative_path = ?
                 """,
@@ -1107,6 +1427,7 @@ class AgentFileSandbox:
                 sources_truncated=bool(row[10]),
                 declassified_at=str(row[11]) if row[11] is not None else None,
                 declassified_by=str(row[12]) if row[12] is not None else None,
+                publication_id=str(row[13]) if row[13] is not None else None,
             )
         except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise UserError("files.provenance_invalid") from exc
@@ -1134,8 +1455,9 @@ class AgentFileSandbox:
                     origin_visibility, created_task_id, sensitivity,
                     source_resources_json, unlabelled_input,
                     sources_truncated, declassified_at, declassified_by,
+                    publication_id,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workspace_id, relative_path) DO UPDATE SET
                     owner_actor_id = excluded.owner_actor_id,
                     owner_actor_ids_json = excluded.owner_actor_ids_json,
@@ -1150,6 +1472,7 @@ class AgentFileSandbox:
                     sources_truncated = excluded.sources_truncated,
                     declassified_at = excluded.declassified_at,
                     declassified_by = excluded.declassified_by,
+                    publication_id = excluded.publication_id,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1180,9 +1503,69 @@ class AgentFileSandbox:
                     int(payload["sources_truncated"]),
                     payload["declassified_at"],
                     payload["declassified_by"],
+                    payload["publication_id"],
                     datetime.now(UTC).isoformat(),
                 ),
             )
+
+    def _store_publication(self, publication: WorkspaceFilePublication) -> None:
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.execute(
+                """
+                INSERT INTO file_publications (
+                    publication_id, source_workspace_id, source_path,
+                    source_sha256, copy_workspace_id, copy_path, target_kind,
+                    target_workspace_id, target_resource_id, target_display_name,
+                    target_audience_revision, published_by_actor_id, reason,
+                    published_at, expires_at, revision, revoked_at, revoked_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    publication.publication_id,
+                    publication.source_workspace_id,
+                    publication.source_path,
+                    publication.source_sha256,
+                    publication.copy_workspace_id,
+                    publication.copy_path,
+                    publication.target_kind,
+                    publication.target_workspace_id,
+                    publication.target_resource_id,
+                    publication.target_display_name,
+                    publication.target_audience_revision,
+                    publication.published_by_actor_id,
+                    publication.reason,
+                    publication.published_at,
+                    publication.expires_at,
+                    publication.revision,
+                    publication.revoked_at,
+                    publication.revoked_by,
+                ),
+            )
+
+    def _load_publication(
+        self,
+        publication_id: str,
+    ) -> WorkspaceFilePublication | None:
+        if not re.fullmatch(r"pub_[0-9a-f]{32}", publication_id):
+            raise UserError("files.publication_not_found")
+        with self._provenance_lock, sqlite3.connect(
+            self._provenance_path,
+            timeout=5.0,
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM file_publications WHERE publication_id = ?",
+                (publication_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return _publication_from_row(row)
+        except (TypeError, ValueError) as exc:
+            raise UserError("files.publication_invalid") from exc
 
     def _delete_provenance(
         self,
@@ -1197,6 +1580,54 @@ class AgentFileSandbox:
                 "DELETE FROM file_provenance WHERE workspace_id = ? AND relative_path = ?",
                 (workspace_id, relative_path),
             )
+
+
+def _publication_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("file publication time must include a timezone")
+    return parsed.astimezone(UTC)
+
+
+def _publication_datetime_or_error(value: str) -> datetime:
+    try:
+        return _publication_datetime(value)
+    except (TypeError, ValueError) as exc:
+        raise UserError("files.publication_expiry_invalid") from exc
+
+
+def _publication_from_row(row: sqlite3.Row) -> WorkspaceFilePublication:
+    return WorkspaceFilePublication(
+        publication_id=str(row["publication_id"]),
+        source_workspace_id=str(row["source_workspace_id"]),
+        source_path=str(row["source_path"]),
+        source_sha256=str(row["source_sha256"]),
+        copy_workspace_id=str(row["copy_workspace_id"]),
+        copy_path=str(row["copy_path"]),
+        target_kind=cast(
+            WorkspacePublicationTargetKind,
+            str(row["target_kind"]),
+        ),
+        target_workspace_id=str(row["target_workspace_id"]),
+        target_resource_id=str(row["target_resource_id"]),
+        target_display_name=str(row["target_display_name"]),
+        target_audience_revision=str(row["target_audience_revision"]),
+        published_by_actor_id=str(row["published_by_actor_id"]),
+        reason=str(row["reason"]),
+        published_at=str(row["published_at"]),
+        expires_at=str(row["expires_at"]),
+        revision=int(row["revision"]),
+        revoked_at=(
+            str(row["revoked_at"])
+            if row["revoked_at"] is not None
+            else None
+        ),
+        revoked_by=(
+            str(row["revoked_by"])
+            if row["revoked_by"] is not None
+            else None
+        ),
+    )
 
 
 def _provenance_visibility(value: str) -> WorkspaceVisibility:

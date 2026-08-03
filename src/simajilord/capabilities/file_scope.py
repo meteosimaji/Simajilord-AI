@@ -108,7 +108,7 @@ def provenance_observations(
 ) -> tuple[DisclosureObservation, ...]:
     """Restore Discord source labels when a later tool reads a workspace file."""
 
-    if provenance is None or provenance.declassified_at is not None:
+    if provenance is None:
         return ()
     observations: list[DisclosureObservation] = []
     for workspace_id, resource_id, visibility in provenance.source_resources:

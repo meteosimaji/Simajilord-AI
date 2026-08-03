@@ -143,6 +143,10 @@ DISCOVERY_CASES: dict[str, tuple[str, str]] = {
         "このスレッドの名前を変更して",
         "rename this Discord thread",
     ),
+    "discord.inspect_thread_audience_expansion": (
+        "非公開スレッドへ追加する前に閲覧者の広がりを確認して",
+        "inspect the audience expansion before adding a private thread member",
+    ),
     "discord.add_thread_member": (
         "田中さんをこのスレッドに招待して",
         "invite this member into the thread",
@@ -210,6 +214,22 @@ DISCOVERY_CASES: dict[str, tuple[str, str]] = {
     "discord.send_file": (
         "このファイルを一つ添付して送って",
         "send this one workspace file as an attachment",
+    ),
+    "files.inspect_publish_target": (
+        "ファイル共有前に公開先の閲覧者を確認して",
+        "inspect the exact target audience before sharing this file",
+    ),
+    "files.publish_copy": (
+        "共有先限定の公開コピーを作って",
+        "create a file copy bound to the confirmed sharing target",
+    ),
+    "files.revoke_publication": (
+        "公開コピーの再利用を取り消して",
+        "revoke published file copy",
+    ),
+    "discord.send_published_file": (
+        "対象限定コピーをDiscordへ配信して",
+        "send the confirmed published copy to its bound Discord channel",
     ),
     "discord.create_poll": (
         "この質問で投票アンケートを作って",
@@ -485,10 +505,10 @@ def _contains_japanese(value: str) -> bool:
     )
 
 
-def test_all_106_discord_capabilities_have_one_explicit_discovery_classification() -> None:
+def test_all_111_discord_transport_capabilities_have_discovery_classification() -> None:
     registry, names = _discord_registry()
 
-    assert len(names) == 106
+    assert len(names) == 111
     assert len(names) == len(set(names))
     assert set(names) == set(DISCOVERY_CASES) | INTERNAL_DISCORD_CAPABILITIES
     assert not set(DISCOVERY_CASES) & INTERNAL_DISCORD_CAPABILITIES
@@ -506,7 +526,7 @@ def test_all_106_discord_capabilities_have_one_explicit_discovery_classification
 
 
 @pytest.mark.asyncio
-async def test_runtime_exposes_exactly_the_100_model_facing_discord_capabilities(
+async def test_runtime_exposes_exactly_the_105_model_facing_transport_capabilities(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -523,14 +543,12 @@ async def test_runtime_exposes_exactly_the_100_model_facing_discord_capabilities
     assert runtime.agent is not None
     provider = cast(CodexAppServerProvider, runtime.agent.provider)
 
-    exposed_discord_capabilities = {
-        name
-        for name in provider.tools.allowed_capabilities
-        if name.startswith("discord.")
-    }
+    exposed_transport_capabilities = set(provider.tools.allowed_capabilities).intersection(
+        set(DISCOVERY_CASES) | INTERNAL_DISCORD_CAPABILITIES
+    )
 
-    assert exposed_discord_capabilities == set(DISCOVERY_CASES)
-    assert exposed_discord_capabilities.isdisjoint(INTERNAL_DISCORD_CAPABILITIES)
+    assert exposed_transport_capabilities == set(DISCOVERY_CASES)
+    assert exposed_transport_capabilities.isdisjoint(INTERNAL_DISCORD_CAPABILITIES)
     await runtime.close()
 
 

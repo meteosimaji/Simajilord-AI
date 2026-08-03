@@ -41,7 +41,10 @@ _SPECS: dict[str, _PresentationSpec] = {
         "Add a thread member",
         "One Discord thread audience",
         target_keys=("thread_id", "user_id"),
-        audience="The selected user may gain access to the thread and its retained history.",
+        audience=(
+            "For a private thread, the host-calculated expected fields show the exact "
+            "reader-count expansion and whether retained history becomes visible."
+        ),
     ),
     "discord.assign_role": _PresentationSpec(
         "Assign a role",
@@ -266,6 +269,20 @@ _SPECS: dict[str, _PresentationSpec] = {
         "One Discord thread",
         target_keys=("thread_id",),
         audience="Archiving or renaming changes how server members find or use the thread.",
+    ),
+    "files.publish_copy": _PresentationSpec(
+        "Publish a target-bound file copy",
+        "One exact Discord channel audience",
+        target_keys=("source_path", "channel_id", "guild_id"),
+        payload_keys=("expires_at_iso",),
+        audience=(
+            "The host-calculated expected fields show the target name, exact reader "
+            "count, newly added readers, source sensitivity, and audience revision."
+        ),
+        external_transfer=(
+            "This action creates a local revocable copy; Discord receives the bytes only "
+            "if discord.send_published_file is later called for the same target."
+        ),
     ),
     "system.shell": _PresentationSpec(
         "Run an isolated local command",

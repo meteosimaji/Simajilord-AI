@@ -78,7 +78,7 @@ def test_platform_capability_names_are_unique_and_cover_resource_families() -> N
         cast(SimajilordRuntime, Mock(spec=SimajilordRuntime)),
     )
 
-    assert len(endpoints) == 106
+    assert len(endpoints) == 111
     assert {
         "discord.list_members",
         "discord.inspect_channel",

@@ -339,6 +339,13 @@ def _thread_member(
     return selected
 
 
+def _published_file_copy(
+    _request: object,
+    response: object,
+) -> Mapping[str, object]:
+    return _selected_values(response, ("publication_id", "revision"))
+
+
 def _role_member(
     request: object,
     response: object,
@@ -566,6 +573,7 @@ _REVERSIBLE_POLICIES = (
             "discord.reply_message",
             "discord.send_file",
             "discord.send_files",
+            "discord.send_published_file",
             "discord.post_expanded_message",
             "discord.create_quote_image",
             "discord.create_poll",
@@ -632,10 +640,10 @@ _REVERSIBLE_POLICIES = (
         undo_arguments=_thread_member,
     ),
     ActionPolicy(
-        capability="discord.remove_thread_member",
-        classification=ActionClassification.FULLY_REVERSIBLE,
-        undo_capability="discord.add_thread_member",
-        undo_arguments=_thread_member,
+        capability="files.publish_copy",
+        classification=ActionClassification.COMPENSATING,
+        undo_capability="files.revoke_publication",
+        undo_arguments=_published_file_copy,
     ),
     ActionPolicy(
         capability="discord.assign_role",
@@ -757,6 +765,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "files.download_url",
         "files.write_text",
         "files.replace_text",
+        "files.revoke_publication",
         "feedback.create",
         "image.generate",
         "media.download",
@@ -829,6 +838,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "discord.read_aloud_dictionary_remove",
         "discord.read_aloud_exclusion_set",
         "discord.manage_read_aloud",
+        "discord.remove_thread_member",
     }
 )
 

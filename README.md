@@ -147,7 +147,7 @@ with Discord's generic “interaction failed” banner.
   only provider, field kinds, policy decision, and an opaque policy reference. Hive attachment
   bytes are materialized by the host after consent and never enter the model tool arguments.
   Egress capabilities use metadata-only invocation audit records
-- The Discord adapter currently registers 106 typed capability endpoints covering the bot-visible
+- The Discord adapter currently registers 111 typed capability endpoints covering the bot-visible
   conversation, moderation, audio, and common server-management areas listed below. This is a
   broad capability catalog, not a one-to-one implementation of every route in Discord's official
   REST API: six endpoints are internal compatibility/Undo helpers, and file or synthetic-media
@@ -181,11 +181,19 @@ with Discord's generic “interaction failed” banner.
   download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text
   content in chunks, edit text, and send a selected result back to Discord. Durable provenance
   records the complete bounded owner set, origin server/channel/message, source visibility,
-  creating task, sensitivity, truncation/unknown-input taint, and any explicit declassification
-  fields before restricted bytes become visible. `actor` and the former `guild_shared` scope are
+  creating task, sensitivity, and truncation/unknown-input taint. Legacy global declassification
+  fields remain readable for migration but never grant publication authority. `actor` and the
+  former `guild_shared` scope are
   reversible operator modes. Even in `guild_shared`, model-facing list/read/write/import/send and
   compute paths require the current actor's exact single-owner label; unlabelled legacy files and
   multi-owner results stay hidden and are never implicitly shared or declassified.
+  An explicit `files.publish_copy` flow first inspects the exact current Discord target audience,
+  then creates a separate immutable copy whose ledger binds publisher, reason, target, audience
+  revision, expiry, and revocation state; the original bytes and provenance remain unchanged.
+  `discord.send_published_file` rechecks the same target, live readers, expiry, revision, and
+  revocation immediately before delivery. A private-thread member addition uses the same
+  short-lived host snapshot and shows the target, reader-count expansion, and retained-history
+  exposure in the existing requester-private high-risk review.
   PDF reads select
   1–20 pages at a time and return `total_pages` plus `next_page`; character-level `next_offset`
   continues within the selected page range, so documents longer than 20 pages remain readable

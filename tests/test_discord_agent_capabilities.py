@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -34,9 +35,16 @@ from simajilord.integrations.discord.capabilities import (
     DiscordSearchMessagesRequest,
     DiscordSendEmbedRequest,
     DiscordSendMessageRequest,
+    DiscordSendPublishedFileRequest,
+    DiscordThreadAudienceInspectRequest,
+    DiscordThreadMemberRequest,
+    FilePublicationRevokeRequest,
+    FilePublishCopyRequest,
+    FilePublishTargetInspectRequest,
     build_discord_endpoints,
 )
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
 
 
 def _endpoint_map(client: discord.Client) -> dict[str, object]:
@@ -1291,6 +1299,231 @@ async def test_restricted_source_cannot_flow_to_broader_destination() -> None:
         replace(context, information_flow_mode="audit"),
     )
     assert response.message_id == "31"
+
+
+@pytest.mark.asyncio
+async def test_private_thread_member_requires_exact_host_audience_snapshot() -> None:
+    client = Mock(spec=discord.Client)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False, display_name="Requester")
+    target = SimpleNamespace(id=8, bot=False, display_name="Reviewer")
+    bot = SimpleNamespace(id=99, bot=True, display_name="Simajilord")
+    guild.members = [actor, target, bot]
+    guild.member_count = 3
+    guild.chunked = True
+    guild.me = bot
+    guild.get_member.side_effect = {7: actor, 8: target, 99: bot}.get
+    thread = Mock(spec=discord.Thread)
+    thread.id = 21
+    thread.name = "private-review"
+    thread.type = discord.ChannelType.private_thread
+    thread.members = [actor]
+    thread.fetch_members = AsyncMock(return_value=[SimpleNamespace(id=7)])
+    thread.add_user = AsyncMock()
+
+    def thread_permissions(member: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(
+            view_channel=True,
+            read_message_history=True,
+            send_messages_in_threads=True,
+            administrator=False,
+            manage_threads=member.id in {7, 99},
+        )
+
+    thread.permissions_for.side_effect = thread_permissions
+    guild.get_thread.return_value = thread
+    client.get_guild.return_value = guild
+    endpoints = _endpoint_map(cast(discord.Client, client))
+    context = _agent_context()
+
+    inspection = await endpoints[
+        "discord.inspect_thread_audience_expansion"
+    ].invoke(
+        DiscordThreadAudienceInspectRequest(thread_id="21", user_id="8"),
+        context,
+    )
+    assert inspection.source_reader_count == 1
+    assert inspection.expanded_reader_count == 2
+    assert inspection.new_reader_count == 1
+    assert inspection.retained_history_exposed is True
+
+    with pytest.raises(
+        UserError,
+        match=r"discord\.audience_expansion_changed",
+    ):
+        await endpoints["discord.add_thread_member"].invoke(
+            DiscordThreadMemberRequest(thread_id="21", user_id="8"),
+            context,
+        )
+    thread.add_user.assert_not_awaited()
+
+    response = await endpoints["discord.add_thread_member"].invoke(
+        DiscordThreadMemberRequest(
+            thread_id="21",
+            user_id="8",
+            reason="Invite reviewer",
+            expected_target_display_name=inspection.target_display_name,
+            expected_source_reader_count=inspection.source_reader_count,
+            expected_expanded_reader_count=inspection.expanded_reader_count,
+            expected_retained_history_exposed=(
+                inspection.retained_history_exposed
+            ),
+            expected_audience_revision=inspection.audience_revision,
+            audience_expansion_token=inspection.audience_expansion_token,
+            audience_expansion_expires_at=(
+                inspection.audience_expansion_expires_at
+            ),
+        ),
+        context,
+    )
+
+    assert response.present is True
+    assert response.audience_revision == inspection.audience_revision
+    thread.add_user.assert_awaited_once_with(target)
+
+
+@pytest.mark.asyncio
+async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = replace(_agent_context(), file_workspace_mode="guild_shared")
+    source = sandbox.import_bytes(
+        "10",
+        "private.txt",
+        b"private bytes",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("7",),
+            sensitivity="actor_private",
+        ),
+    )
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = sandbox
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False, display_name="Requester")
+    reader = SimpleNamespace(id=8, bot=False, display_name="Reader")
+    bot = SimpleNamespace(id=99, bot=True, display_name="Simajilord")
+    guild.members = [actor, reader, bot]
+    guild.member_count = 3
+    guild.chunked = True
+    guild.filesize_limit = 25 * 1024 * 1024
+    guild.me = bot
+    guild.get_member.side_effect = {7: actor, 8: reader, 99: bot}.get
+    target = Mock(spec=discord.TextChannel)
+    target.id = 20
+    target.name = "review"
+    other = Mock(spec=discord.TextChannel)
+    other.id = 21
+    other.name = "other"
+    permissions = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        attach_files=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    target.permissions_for.return_value = permissions
+    other.permissions_for.return_value = permissions
+    target.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    other.send = AsyncMock(return_value=SimpleNamespace(id=32))
+    guild.get_channel_or_thread.side_effect = lambda channel_id: {
+        20: target,
+        21: other,
+    }.get(channel_id)
+    client.get_guild.return_value = guild
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(
+            cast(discord.Client, client),
+            runtime,
+        )
+    }
+    publication_expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    inspection = await endpoints["files.inspect_publish_target"].invoke(
+        FilePublishTargetInspectRequest(
+            source_path="private.txt",
+            channel_id="20",
+            expires_at_iso=publication_expiry,
+            reason="Share for review",
+        ),
+        context,
+    )
+    assert inspection.source_sha256 == source.sha256
+    assert inspection.target_reader_count == 2
+    assert inspection.new_reader_count == 1
+
+    publication = await endpoints["files.publish_copy"].invoke(
+        FilePublishCopyRequest(
+            source_path="private.txt",
+            channel_id="20",
+            expires_at_iso=publication_expiry,
+            reason="Share for review",
+            expected_source_sha256=inspection.source_sha256,
+            expected_source_sensitivity=inspection.source_sensitivity,
+            expected_source_reader_count=inspection.source_reader_count,
+            expected_target_display_name=inspection.target_display_name,
+            expected_target_reader_count=inspection.target_reader_count,
+            expected_new_reader_count=inspection.new_reader_count,
+            expected_target_audience_revision=(
+                inspection.target_audience_revision
+            ),
+            audience_expansion_token=inspection.audience_expansion_token,
+            audience_expansion_expires_at=(
+                inspection.audience_expansion_expires_at
+            ),
+        ),
+        context,
+    )
+    assert sandbox.list_for_actor("10", "7")[0].provenance is not None
+    assert (
+        sandbox.list_for_actor("10", "7")[0].provenance.publication_id
+        is None
+    )
+
+    with pytest.raises(UserError, match=r"files\.publication_target_mismatch"):
+        await endpoints["discord.send_published_file"].invoke(
+            DiscordSendPublishedFileRequest(
+                publication_id=publication.publication_id,
+                channel_id="21",
+                expected_revision=publication.revision,
+            ),
+            context,
+        )
+    other.send.assert_not_awaited()
+
+    sent = await endpoints["discord.send_published_file"].invoke(
+        DiscordSendPublishedFileRequest(
+            publication_id=publication.publication_id,
+            channel_id="20",
+            expected_revision=publication.revision,
+        ),
+        context,
+    )
+    assert sent.message_id == "31"
+    target.send.assert_awaited_once()
+
+    revoked = await endpoints["files.revoke_publication"].invoke(
+        FilePublicationRevokeRequest(
+            publication_id=publication.publication_id,
+            expected_revision=publication.revision,
+        ),
+        context,
+    )
+    assert revoked.active is False
+    with pytest.raises(UserError, match=r"files\.publication_revoked"):
+        await endpoints["discord.send_published_file"].invoke(
+            DiscordSendPublishedFileRequest(
+                publication_id=publication.publication_id,
+                channel_id="20",
+                expected_revision=revoked.revision,
+            ),
+            context,
+        )
 
 
 @pytest.mark.asyncio
