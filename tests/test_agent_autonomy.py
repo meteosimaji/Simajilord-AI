@@ -22,6 +22,8 @@ from simajilord.agent import (
     AgentFileWorkspaceMode,
     AgentHighRiskAuthorizationMode,
     AgentHighRiskConfirmation,
+    AgentHighRiskPresentation,
+    AgentHighRiskReviewField,
     AgentInformationFlowMode,
     AgentRequest,
     AgentTrigger,
@@ -50,6 +52,8 @@ from simajilord.core import ApprovalMode, CapabilityRegistry, InvocationContext
 from simajilord.integrations.discord.cogs import (
     AgentAutonomyCog,
     AgentCog,
+    AgentHighRiskConfirmationView,
+    AgentHighRiskPrivateConfirmationView,
     ObservationCog,
     _agent_delivery_nonce,
     _agent_invocation_context,
@@ -82,6 +86,24 @@ def _post_permissions(*, can_send: bool = True) -> SimpleNamespace:
         send_messages=can_send,
         send_messages_in_threads=can_send,
         connect=True,
+    )
+
+
+def _high_risk_presentation(
+    *,
+    action: str = "Ban a member",
+    target: str = "One server member",
+    detail: str = 'user_id: "9"',
+) -> AgentHighRiskPresentation:
+    return AgentHighRiskPresentation(
+        public_action=action,
+        public_target=target,
+        review_fields=(
+            AgentHighRiskReviewField("Exact target", detail),
+            AgentHighRiskReviewField("Audience and visibility", "One server"),
+            AgentHighRiskReviewField("External transfer", "Discord API"),
+            AgentHighRiskReviewField("Reversibility", "No automatic Undo"),
+        ),
     )
 
 
@@ -184,7 +206,9 @@ async def test_high_risk_host_confirmation_rechecks_message_revision(
     )
     proposal = AgentHighRiskConfirmation(
         capability="discord.ban_member",
-        arguments_json='{"user_id":"9"}',
+        presentation=_high_risk_presentation(
+            detail='user_id: "9"\nreason: "private moderation detail"'
+        ),
         binding_sha256="a" * 64,
         requester_principal_id="7",
         authorization_message_id="20",
@@ -203,6 +227,97 @@ async def test_high_risk_host_confirmation_rechecks_message_revision(
     assert runtime.journal.append.await_args.kwargs["payload"][
         "revision_valid"
     ] is False
+    public_payload = json.dumps(
+        channel.send.await_args.kwargs["embed"].to_dict(),
+        ensure_ascii=False,
+    )
+    assert "private moderation detail" not in public_payload
+    sent_view = channel.send.await_args.kwargs["view"]
+    assert isinstance(sent_view, AgentHighRiskConfirmationView)
+    assert "private moderation detail" in json.dumps(
+        sent_view.private_embed.to_dict(),
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_high_risk_details_and_final_confirm_are_requester_private() -> None:
+    private_embed = discord.Embed(description="complete private payload")
+    view = AgentHighRiskConfirmationView(
+        requester_id=7,
+        binding_sha256="a" * 64,
+        private_embed=private_embed,
+        timeout=120,
+    )
+    assert [
+        child.label
+        for child in view.children
+        if isinstance(child, discord.ui.Button)
+    ] == ["Review privately", "Do not run"]
+
+    wrong = Mock(spec=discord.Interaction)
+    wrong.user = SimpleNamespace(id=8)
+    wrong.response.send_message = AsyncMock()
+    assert await view.interaction_check(wrong) is False
+    assert wrong.response.send_message.await_args.kwargs["ephemeral"] is True
+
+    review = Mock(spec=discord.Interaction)
+    review.user = SimpleNamespace(id=7)
+    review.response.send_message = AsyncMock()
+    review_button = next(
+        child
+        for child in view.children
+        if isinstance(child, discord.ui.Button)
+        and child.label == "Review privately"
+    )
+    await review_button.callback(review)
+    private_response = review.response.send_message.await_args.kwargs
+    assert private_response["ephemeral"] is True
+    assert private_response["embed"] is private_embed
+    private_view = private_response["view"]
+    assert isinstance(private_view, AgentHighRiskPrivateConfirmationView)
+
+    wrong_private = Mock(spec=discord.Interaction)
+    wrong_private.user = SimpleNamespace(id=8)
+    wrong_private.response.send_message = AsyncMock()
+    assert await private_view.interaction_check(wrong_private) is False
+    assert wrong_private.response.send_message.await_args.kwargs["ephemeral"] is True
+
+    confirm = Mock(spec=discord.Interaction)
+    confirm.user = SimpleNamespace(id=7)
+    confirm.response.is_done = Mock(return_value=False)
+    confirm.response.defer = AsyncMock()
+    confirm.edit_original_response = AsyncMock()
+    confirm_button = next(
+        child
+        for child in private_view.children
+        if isinstance(child, discord.ui.Button)
+        and child.label == "Confirm exact action"
+    )
+    await confirm_button.callback(confirm)
+
+    assert await view.wait_for_decision() is True
+    confirm.response.defer.assert_awaited_once_with()
+    confirm.edit_original_response.assert_awaited_once_with(view=private_view)
+
+
+@pytest.mark.asyncio
+async def test_high_risk_public_review_timeout_fails_closed() -> None:
+    view = AgentHighRiskConfirmationView(
+        requester_id=7,
+        binding_sha256="a" * 64,
+        private_embed=discord.Embed(description="private"),
+        timeout=120,
+    )
+
+    await view.on_timeout()
+
+    assert await view.wait_for_decision() is False
+    assert all(
+        child.disabled
+        for child in view.children
+        if isinstance(child, discord.ui.Button)
+    )
 
 
 @pytest.mark.asyncio
@@ -235,9 +350,10 @@ async def test_external_egress_confirmation_uses_body_free_ui_and_audit(
     )
     proposal = AgentHighRiskConfirmation(
         capability="web.search",
-        arguments_json=(
-            '{"field_kinds":["query"],"provider":"configured_web_search",'
-            '"sink_audience":"external_public","source_labels":["restricted"]}'
+        presentation=_high_risk_presentation(
+            action="Transfer labelled data to an external provider",
+            target="One configured external provider",
+            detail="provider: configured_web_search",
         ),
         binding_sha256="b" * 64,
         requester_principal_id="7",
@@ -253,8 +369,9 @@ async def test_external_egress_confirmation_uses_body_free_ui_and_audit(
 
     assert accepted is True
     sent_embed = channel.send.await_args.kwargs["embed"]
-    assert sent_embed.title == "Confirm external data transfer"
-    assert "content is intentionally hidden" in sent_embed.description
+    assert sent_embed.title == "External transfer needs private review"
+    assert "complete details are intentionally absent" in sent_embed.description
+    assert "configured_web_search" not in json.dumps(sent_embed.to_dict())
     assert runtime.journal.append.await_args.kwargs["kind"] == (
         "agent.egress.confirmed"
     )
@@ -295,7 +412,7 @@ async def test_high_risk_host_confirmation_fails_closed_when_journal_fails(
     )
     proposal = AgentHighRiskConfirmation(
         capability="discord.ban_member",
-        arguments_json='{"user_id":"9"}',
+        presentation=_high_risk_presentation(),
         binding_sha256="a" * 64,
         requester_principal_id="7",
         authorization_message_id="20",

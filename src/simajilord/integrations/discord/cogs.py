@@ -265,18 +265,20 @@ class SafeView(discord.ui.View):
 
 
 class AgentHighRiskConfirmationView(SafeView):
-    """One requester-only, expiring confirmation for an exact action binding."""
+    """Public-safe entry point for one requester-private exact review."""
 
     def __init__(
         self,
         *,
         requester_id: int,
         binding_sha256: str,
+        private_embed: discord.Embed,
         timeout: float,
     ) -> None:
         super().__init__(timeout=timeout)
         self.requester_id = requester_id
         self.binding_sha256 = binding_sha256
+        self.private_embed = private_embed
         self.message: discord.Message | None = None
         self._decision: asyncio.Future[bool] = (
             asyncio.get_running_loop().create_future()
@@ -319,16 +321,32 @@ class AgentHighRiskConfirmationView(SafeView):
                 await self.message.edit(view=self)
 
     @discord.ui.button(
-        label="Confirm exact action",
-        style=discord.ButtonStyle.danger,
-        custom_id="simajilord:agent:confirm-high-risk",
+        label="Review privately",
+        style=discord.ButtonStyle.primary,
+        custom_id="simajilord:agent:review-high-risk",
     )
-    async def confirm_button(
+    async def review_button(
         self,
         interaction: discord.Interaction,
         _: discord.ui.Button[AgentHighRiskConfirmationView],
     ) -> None:
-        await self._finish(True, interaction=interaction)
+        if self._decision.done():
+            await interaction.response.send_message(
+                "This review has expired or already finished.",
+                ephemeral=True,
+            )
+            return
+        private_view = AgentHighRiskPrivateConfirmationView(
+            parent=self,
+            requester_id=self.requester_id,
+            timeout=float(self.timeout or 0),
+        )
+        await interaction.response.send_message(
+            embed=self.private_embed,
+            view=private_view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @discord.ui.button(
         label="Do not run",
@@ -341,6 +359,147 @@ class AgentHighRiskConfirmationView(SafeView):
         _: discord.ui.Button[AgentHighRiskConfirmationView],
     ) -> None:
         await self._finish(False, interaction=interaction)
+
+
+class AgentHighRiskPrivateConfirmationView(SafeView):
+    """Final requester-only controls attached only to an ephemeral detail card."""
+
+    def __init__(
+        self,
+        *,
+        parent: AgentHighRiskConfirmationView,
+        requester_id: int,
+        timeout: float,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.parent = parent
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the requester can confirm this action.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _finish_private(
+        self,
+        decision: bool,
+        interaction: discord.Interaction,
+    ) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await self.parent._finish(decision, interaction=None)
+        self.stop()
+        with suppress(discord.DiscordException):
+            await interaction.edit_original_response(view=self)
+
+    @discord.ui.button(
+        label="Confirm exact action",
+        style=discord.ButtonStyle.danger,
+        custom_id="simajilord:agent:confirm-high-risk-private",
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[AgentHighRiskPrivateConfirmationView],
+    ) -> None:
+        await self._finish_private(True, interaction)
+
+    @discord.ui.button(
+        label="Do not run",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:agent:reject-high-risk-private",
+    )
+    async def reject_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button[AgentHighRiskPrivateConfirmationView],
+    ) -> None:
+        await self._finish_private(False, interaction)
+
+
+def _high_risk_public_embed(
+    proposal: AgentHighRiskConfirmation,
+    *,
+    expires_at: datetime,
+) -> discord.Embed:
+    """Render only non-sensitive fixed summaries into the shared channel."""
+
+    external_egress = proposal.confirmation_kind == "external_egress"
+    return command_embed(
+        (
+            "External transfer needs private review"
+            if external_egress
+            else "High-risk action needs private review"
+        ),
+        description=(
+            "The complete details are intentionally absent from this channel. "
+            "Only the requester can open the private review and then make the "
+            "final decision."
+        ),
+        fields=(
+            EmbedField(
+                "Operation",
+                proposal.presentation.public_action,
+                inline=False,
+            ),
+            EmbedField(
+                "Target",
+                proposal.presentation.public_target,
+                inline=False,
+            ),
+            EmbedField(
+                "Expires",
+                discord.utils.format_dt(expires_at, style="R"),
+            ),
+            EmbedField("Binding", proposal.binding_sha256[:16]),
+        ),
+        tone=EmbedTone.WARNING,
+    )
+
+
+def _high_risk_private_embed(
+    proposal: AgentHighRiskConfirmation,
+    *,
+    expires_at: datetime,
+) -> discord.Embed:
+    """Render every exact review field without truncation in an ephemeral card."""
+
+    external_egress = proposal.confirmation_kind == "external_egress"
+    fields = (
+        *(
+            EmbedField(field.name, field.value, inline=False)
+            for field in proposal.presentation.review_fields
+        ),
+        EmbedField("Exact binding", proposal.binding_sha256, inline=False),
+        EmbedField(
+            "Expires",
+            discord.utils.format_dt(expires_at, style="R"),
+            inline=False,
+        ),
+    )
+    embed = command_embed(
+        (
+            "Review exact external transfer"
+            if external_egress
+            else "Review exact high-risk action"
+        ),
+        description=(
+            "Nothing below is truncated. Confirm only if every target, value, "
+            "audience, transfer, and reversibility statement matches your intent."
+        ),
+        fields=fields,
+        tone=EmbedTone.WARNING,
+    )
+    if len(embed) > 5_900 or len(fields) > 25:
+        raise ValueError("high-risk detail cannot be displayed completely")
+    return embed
 
 
 class SafeModal(discord.ui.Modal):
@@ -9287,42 +9446,37 @@ class AgentCog(commands.Cog):
             ),
         ):
             return False
-        arguments = proposal.arguments_json.replace("```", "`​``")
         external_egress = proposal.confirmation_kind == "external_egress"
-        description = (
-            (
-                "A labelled source is about to be sent to an external provider. "
-                "The content is intentionally hidden here; confirm only if the "
-                "provider and field categories match your intent.\n\n"
-                if external_egress
-                else (
-                    "A high-risk capability is ready to run. Confirm only if this "
-                    "exact target and change match your intent.\n\n"
-                )
-            )
-            + f"Capability: `{proposal.capability}`\n"
-            + f"Binding: `{proposal.binding_sha256[:16]}`\n"
-            + f"```json\n{arguments}\n```"
-        )
         timeout = float(
             self.runtime.settings.agent_high_risk_confirmation_timeout_seconds
         )
+        expires_at = datetime.now(UTC) + timedelta(seconds=timeout)
+        try:
+            public_embed = _high_risk_public_embed(
+                proposal,
+                expires_at=expires_at,
+            )
+            private_embed = _high_risk_private_embed(
+                proposal,
+                expires_at=expires_at,
+            )
+        except ValueError:
+            log.exception(
+                "High-risk confirmation detail is not completely displayable "
+                "request=%s capability=%s",
+                proposal.authorization_message_id,
+                proposal.capability,
+            )
+            return False
         view = AgentHighRiskConfirmationView(
             requester_id=requester_id,
             binding_sha256=proposal.binding_sha256,
+            private_embed=private_embed,
             timeout=timeout,
         )
         try:
             confirmation_message = await channel.send(
-                embed=command_embed(
-                    (
-                        "Confirm external data transfer"
-                        if external_egress
-                        else "Confirm high-risk action"
-                    ),
-                    description=description,
-                    tone=EmbedTone.WARNING,
-                ),
+                embed=public_embed,
                 view=view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )

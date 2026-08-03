@@ -67,6 +67,8 @@ from ..contracts import (
     AGENT_NO_ACTION_CONTENT,
     AGENT_WEB_GRANT,
     AgentHighRiskConfirmation,
+    AgentHighRiskPresentation,
+    AgentHighRiskReviewField,
     AgentProgressStage,
     AgentProgressUpdate,
     AgentTaskRouteDecision,
@@ -80,6 +82,7 @@ from ..errors import (
     AgentToolError,
     AgentUnavailableError,
 )
+from ..high_risk import HighRiskPresentationError, high_risk_presentation
 from ..tools import AgentToolCatalog
 from .base import (
     AgentHighRiskConfirmationCallback,
@@ -4547,22 +4550,44 @@ async def _enforce_external_egress(
         budget.discord_disclosure_observations,
     ):
         source_labels.add("unlabelled")
-    confirmation_metadata = json.dumps(
-        {
-            "provider": descriptor.provider,
-            "field_kinds": [item.value for item in descriptor.field_kinds],
-            "sink_audience": descriptor.sink_audience.value,
-            "source_labels": sorted(source_labels),
-        },
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
     try:
+        presentation = AgentHighRiskPresentation(
+            public_action="Transfer labelled data to an external provider",
+            public_target="One configured external provider",
+            review_fields=(
+                AgentHighRiskReviewField(
+                    name="Provider",
+                    value=descriptor.provider,
+                ),
+                AgentHighRiskReviewField(
+                    name="Field categories",
+                    value=", ".join(item.value for item in descriptor.field_kinds),
+                ),
+                AgentHighRiskReviewField(
+                    name="Source visibility",
+                    value=", ".join(sorted(source_labels)),
+                ),
+                AgentHighRiskReviewField(
+                    name="Destination audience",
+                    value=descriptor.sink_audience.value,
+                ),
+                AgentHighRiskReviewField(
+                    name="External transfer",
+                    value=(
+                        "The labelled field categories are sent to the listed "
+                        "provider; source bodies remain hidden from the public card."
+                    ),
+                ),
+                AgentHighRiskReviewField(
+                    name="Reversibility",
+                    value="A completed provider transfer cannot be automatically undone.",
+                ),
+            ),
+        )
         confirmed = await callback(
             AgentHighRiskConfirmation(
                 capability=capability_name,
-                arguments_json=confirmation_metadata,
+                presentation=presentation,
                 binding_sha256=fingerprint,
                 requester_principal_id=requester_principal_id,
                 authorization_message_id=authorization_message_id,
@@ -4798,11 +4823,17 @@ async def _confirm_high_risk_action(
             "A concrete Discord message revision is required for confirmation.",
         )
     try:
-        arguments_json = _high_risk_arguments_json(arguments)
+        presentation = high_risk_presentation(capability_name, arguments)
+    except HighRiskPresentationError as exc:
+        return (
+            "agent.high_risk_confirmation_unreviewable",
+            str(exc),
+        )
+    try:
         confirmed = await callback(
             AgentHighRiskConfirmation(
                 capability=capability_name,
-                arguments_json=arguments_json,
+                presentation=presentation,
                 binding_sha256=fingerprint,
                 requester_principal_id=requester_principal_id,
                 authorization_message_id=authorization_message_id,
@@ -4826,30 +4857,6 @@ async def _confirm_high_risk_action(
         )
     budget.confirmed_high_risk_actions.add(fingerprint)
     return None
-
-
-def _high_risk_arguments_json(arguments: object) -> str:
-    sanitized = (
-        {
-            key: value
-            for key, value in arguments.items()
-            if key not in {"authorization_event_id", "contract_id"}
-        }
-        if isinstance(arguments, dict)
-        else arguments
-    )
-    try:
-        encoded = json.dumps(
-            sanitized,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    except (TypeError, ValueError) as exc:
-        raise AgentToolError("High-risk capability arguments must be JSON values.") from exc
-    if len(encoded) <= 1_500:
-        return encoded
-    return f"{encoded[:1_450]}\n… [truncated; verify SHA-256]"
 
 
 def _evidence_plan_readiness_reason(

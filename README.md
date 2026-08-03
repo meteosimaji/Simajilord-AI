@@ -265,7 +265,14 @@ with Discord's generic “interaction failed” banner.
   moderation, destructive operations, role/channel/policy mutation, persistent read-aloud,
   direct messages, destructive connectors, and shell execution require a requester-only Discord
   confirmation bound to the exact capability, canonical arguments, target context, active
-  message revision, short expiry, and one use. `legacy_event` is an explicit rollback mode
+  message revision, short expiry, and one use. The shared channel card contains only a fixed
+  operation label, a non-sensitive target class, the binding prefix, and expiry. Pressing
+  **Review privately** opens a requester-only ephemeral card with the complete structured target,
+  expected state, requested change, audience, external transfer, reversibility, and any sensitive
+  DM body, shell argv, connector payload, or moderation reason; a separate button there performs
+  the final confirmation. No field is truncated: details that cannot fit Discord's complete-review
+  limits fail closed and require a narrower or operator-reviewed workflow. `legacy_event` is an
+  explicit rollback mode
 - Bounded per-server FIFO AI-turn queues with durable conversation IDs, Codex-native retained
   context compaction, exact-message verification, progressive status updates, and corrective
   retries after failed writes. Native `contextCompaction` lifecycle events renew the inactivity

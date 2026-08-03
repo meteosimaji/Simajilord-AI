@@ -370,11 +370,47 @@ class AgentProgressUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentHighRiskReviewField:
+    """One complete requester-private field; values are never truncated."""
+
+    name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.name) <= 100:
+            raise ValueError("high-risk review field names must be 1 to 100 characters")
+        if not 1 <= len(self.value) <= 950:
+            raise ValueError("high-risk review field values must be 1 to 950 characters")
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHighRiskPresentation:
+    """Public-safe summary plus the complete requester-private review payload."""
+
+    public_action: str
+    public_target: str
+    review_fields: tuple[AgentHighRiskReviewField, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.public_action) <= 100:
+            raise ValueError("high-risk public action must be 1 to 100 characters")
+        if not 1 <= len(self.public_target) <= 300:
+            raise ValueError("high-risk public target must be 1 to 300 characters")
+        if not 1 <= len(self.review_fields) <= 8:
+            raise ValueError("high-risk review must contain 1 to 8 fields")
+        review_characters = sum(
+            len(field.name) + len(field.value) for field in self.review_fields
+        )
+        if review_characters > 4_800:
+            raise ValueError("high-risk review exceeds the complete-display limit")
+
+
+@dataclass(frozen=True, slots=True)
 class AgentHighRiskConfirmation:
     """Concrete host-rendered proposal bound to one exact, body-free hash."""
 
     capability: str
-    arguments_json: str
+    presentation: AgentHighRiskPresentation
     binding_sha256: str
     requester_principal_id: str
     authorization_message_id: str

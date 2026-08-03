@@ -7445,13 +7445,17 @@ async def test_restricted_egress_requires_body_free_host_consent_and_audit(
         assert len(proposals) == 1
         proposal = proposals[0]
         assert proposal.confirmation_kind == "external_egress"
-        assert secret_query not in proposal.arguments_json
-        assert json.loads(proposal.arguments_json) == {
-            "field_kinds": ["query"],
-            "provider": "configured_web_search",
-            "sink_audience": "external_public",
-            "source_labels": ["restricted"],
+        assert secret_query not in proposal.presentation.public_action
+        assert secret_query not in proposal.presentation.public_target
+        review = {
+            field.name: field.value
+            for field in proposal.presentation.review_fields
         }
+        assert review["Provider"] == "configured_web_search"
+        assert review["Field categories"] == "query"
+        assert review["Destination audience"] == "external_public"
+        assert review["Source visibility"] == "restricted"
+        assert secret_query not in json.dumps(review)
         events = await journal.recent(limit=20)
         finished = next(item for item in events if item.kind == "agent.tool.finished")
         assert finished.payload["egress_provider"] == "configured_web_search"
@@ -7704,7 +7708,12 @@ async def test_high_risk_confirmation_binds_exact_revision_and_arguments() -> No
     assert proposal.authorization_message_edited_at == (
         "2026-08-03T00:00:00+00:00"
     )
-    assert "authorization_event_id" not in proposal.arguments_json
+    review_text = "\n".join(
+        field.value for field in proposal.presentation.review_fields
+    )
+    assert "authorization_event_id" not in review_text
+    assert "target" in review_text
+    assert "confirmed moderation action" in review_text
     assert len(proposal.binding_sha256) == 64
 
     changed = _bind_high_risk_authorization(
@@ -7755,6 +7764,42 @@ async def test_high_risk_confirmation_fails_closed_without_host_callback() -> No
 
     assert failure is not None
     assert failure[0] == "agent.high_risk_confirmation_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_oversize_high_risk_detail_fails_closed_without_confirmation() -> None:
+    confirm = AsyncMock(return_value=True)
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        active_message_id="message",
+        requester_principal_id="requester",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=1,
+        output_characters_remaining=1_000,
+        on_progress=None,
+        required_message_id="message",
+        on_high_risk_confirmation=confirm,
+    )
+
+    failure = await _confirm_high_risk_action(
+        budget,
+        capability_name="discord.send_direct_message",
+        arguments={
+            "user_id": "target",
+            "content": "s" * 1_000,
+            "authorization_event_id": "auth",
+        },
+        context=context,
+    )
+
+    assert failure is not None
+    assert failure[0] == "agent.high_risk_confirmation_unreviewable"
+    confirm.assert_not_awaited()
 
 
 @pytest.mark.asyncio
