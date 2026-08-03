@@ -90,6 +90,7 @@ def test_runtime_composes_before_discord_starts_the_event_loop(
         "memory.remember",
         "memory.update",
         "memory.forget",
+        "memory.review",
     } <= set(capability_names)
     asyncio.run(runtime.close())
 

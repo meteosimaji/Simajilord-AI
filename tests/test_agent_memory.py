@@ -2,25 +2,31 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from simajilord.agent import (
+    AGENT_MEMORY_CURATOR_GRANT,
     AGENT_MEMORY_GRANT,
     AGENT_MEMORY_WRITE_CAPABILITIES,
     NON_UNDOABLE_ACTION_CAPABILITIES,
     ActionClassification,
+    ActionReceiptStore,
     AgentMemoryBasis,
     AgentMemoryForgetRequest,
     AgentMemoryRememberRequest,
+    AgentMemoryReviewDecision,
+    AgentMemoryReviewRequest,
+    AgentMemoryReviewState,
     AgentMemoryScope,
     AgentMemorySearchRequest,
     AgentMemoryService,
     AgentMemorySourceLocator,
     AgentMemoryStore,
     AgentMemoryUpdateRequest,
+    AgentMemoryVisibility,
     action_policy,
     build_memory_endpoints,
 )
@@ -28,10 +34,33 @@ from simajilord.agent.tools import AgentToolCatalog
 from simajilord.core import (
     ApprovalMode,
     CapabilityRegistry,
+    DisclosureObservation,
     InvocationContext,
     RiskLevel,
 )
 from simajilord.core.errors import UserError
+
+_CONFIRMED_ACTION_ID = "act_" + "a" * 32
+_MEMORY_ACTION_ID = "act_" + "c" * 32
+
+
+class _ConfirmedActionEvidence:
+    async def is_confirmed_memory_evidence(
+        self,
+        *,
+        action_id: str,
+        context: InvocationContext,
+        allow_any_actor: bool,
+    ) -> bool:
+        del context, allow_any_actor
+        return action_id == _CONFIRMED_ACTION_ID
+
+
+def _service(path) -> AgentMemoryService:
+    return AgentMemoryService(
+        AgentMemoryStore(path),
+        _ConfirmedActionEvidence(),
+    )
 
 
 def _context(
@@ -40,14 +69,19 @@ def _context(
     workspace_id: str = "200",
     channel_id: str = "300",
     approvals: frozenset[str] = frozenset(),
+    resource_ids: tuple[str, ...] | None = None,
+    curator: bool = False,
 ) -> InvocationContext:
+    grants = {AGENT_MEMORY_GRANT}
+    if curator:
+        grants.add(AGENT_MEMORY_CURATOR_GRANT)
     return InvocationContext(
         actor_id=actor_id,
         workspace_id=workspace_id,
         transport="agent",
         request_id="discord:message:400",
-        resource_ids=(channel_id,),
-        grants=frozenset({AGENT_MEMORY_GRANT}),
+        resource_ids=resource_ids or (channel_id,),
+        grants=frozenset(grants),
         origin_resource_id=channel_id,
         approvals=approvals,
     )
@@ -74,6 +108,11 @@ async def _remember(
             basis=basis,
             confidence=confidence,
             ttl_days=ttl_days,
+            verified_action_id=(
+                _CONFIRMED_ACTION_ID
+                if scope is AgentMemoryScope.PROCEDURE
+                else None
+            ),
         ),
         context,
     )
@@ -84,7 +123,7 @@ async def test_memory_upserts_normalized_key_and_survives_store_restart(
     tmp_path,
 ) -> None:
     path = tmp_path / "memory.sqlite3"
-    service = AgentMemoryService(AgentMemoryStore(path))
+    service = _service(path)
     context = _context()
 
     first = await _remember(
@@ -118,7 +157,7 @@ async def test_memory_upserts_normalized_key_and_survives_store_restart(
         ),
     )
 
-    restarted = AgentMemoryService(AgentMemoryStore(path))
+    restarted = _service(path)
     found = await restarted.search(
         AgentMemorySearchRequest(
             query="日本語",
@@ -139,7 +178,7 @@ async def test_memory_migrates_and_records_verified_failure_procedure(
 ) -> None:
     path = tmp_path / "memory.sqlite3"
     context = _context()
-    service = AgentMemoryService(AgentMemoryStore(path))
+    service = _service(path)
     existing = await _remember(
         service,
         context=context,
@@ -158,7 +197,7 @@ async def test_memory_migrates_and_records_verified_failure_procedure(
             """
         )
 
-    restarted = AgentMemoryService(AgentMemoryStore(path))
+    restarted = _service(path)
     failure = await _remember(
         restarted,
         context=context,
@@ -216,7 +255,7 @@ async def test_memory_search_handles_japanese_english_and_spelling_variants(
     query: str,
     expected_key: str,
 ) -> None:
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
+    service = _service(tmp_path / "memory.sqlite3")
     context = _context()
     await _remember(
         service,
@@ -265,7 +304,7 @@ async def test_turn_context_is_bounded_requester_private_and_not_counted_as_used
     tmp_path,
 ) -> None:
     path = tmp_path / "memory.sqlite3"
-    service = AgentMemoryService(AgentMemoryStore(path))
+    service = _service(path)
     owner = _context(actor_id="100", workspace_id="200", channel_id="300")
     other_user = _context(actor_id="101", workspace_id="200", channel_id="300")
     owner_memory = await _remember(
@@ -310,12 +349,19 @@ async def test_turn_context_is_bounded_requester_private_and_not_counted_as_used
 async def test_memory_scope_is_strict_across_users_channels_and_workspaces(
     tmp_path,
 ) -> None:
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
-    original = _context(actor_id="100", workspace_id="200", channel_id="300")
+    service = _service(tmp_path / "memory.sqlite3")
+    original = _context(
+        actor_id="100",
+        workspace_id="200",
+        channel_id="300",
+        resource_ids=("300", "301"),
+        curator=True,
+    )
     other_channel = _context(
         actor_id="100",
         workspace_id="200",
         channel_id="301",
+        resource_ids=("300", "301"),
     )
     other_user = _context(
         actor_id="101",
@@ -326,6 +372,12 @@ async def test_memory_scope_is_strict_across_users_channels_and_workspaces(
         actor_id="100",
         workspace_id="201",
         channel_id="300",
+    )
+    no_source_access = _context(
+        actor_id="102",
+        workspace_id="200",
+        channel_id="301",
+        resource_ids=("301",),
     )
 
     await _remember(
@@ -371,17 +423,287 @@ async def test_memory_scope_is_strict_across_users_channels_and_workspaces(
         return {item.scope for item in result.memories}
 
     assert await visible(original) == set(AgentMemoryScope)
-    assert await visible(other_channel) == {
-        AgentMemoryScope.USER,
-        AgentMemoryScope.WORKSPACE,
-        AgentMemoryScope.PROCEDURE,
-    }
+    assert await visible(other_channel) == set(AgentMemoryScope)
     assert await visible(other_user) == {
         AgentMemoryScope.CHANNEL,
         AgentMemoryScope.WORKSPACE,
         AgentMemoryScope.PROCEDURE,
     }
+    assert await visible(no_source_access) == set()
     assert await visible(other_workspace) == set()
+
+
+@pytest.mark.asyncio
+async def test_shared_memory_requires_creator_or_curator_and_explicit_review(
+    tmp_path,
+) -> None:
+    service = _service(tmp_path / "memory.sqlite3")
+    owner = _context(actor_id="100", resource_ids=("300",))
+    intruder = _context(actor_id="101", resource_ids=("300",))
+    curator = _context(
+        actor_id="900",
+        resource_ids=("300",),
+        curator=True,
+    )
+    created = await _remember(
+        service,
+        context=owner,
+        scope=AgentMemoryScope.WORKSPACE,
+        key="workspace.release_rule",
+        summary="Use the release checklist before deployment.",
+        source_id="111",
+    )
+    assert created.memory.created_by_actor_id == "100"
+    assert created.memory.review_state is AgentMemoryReviewState.PENDING
+    assert (
+        await service.search(
+            AgentMemorySearchRequest(
+                query="release checklist",
+                scopes=(AgentMemoryScope.WORKSPACE,),
+            ),
+            intruder,
+        )
+    ).memories == ()
+    assert (
+        await service.search(
+            AgentMemorySearchRequest(
+                query="release checklist",
+                scopes=(AgentMemoryScope.WORKSPACE,),
+            ),
+            owner,
+        )
+    ).memories[0].memory_id == created.memory.memory_id
+
+    with pytest.raises(UserError) as denied_update:
+        await service.update(
+            AgentMemoryUpdateRequest(
+                memory_id=created.memory.memory_id,
+                summary="Skip the release checklist.",
+                source_message_ids=("222",),
+                confidence=1.0,
+            ),
+            intruder,
+        )
+    assert denied_update.value.code == "memory.not_found"
+    with pytest.raises(UserError) as denied_delete:
+        await service.forget(
+            AgentMemoryForgetRequest(created.memory.memory_id),
+            intruder,
+        )
+    assert denied_delete.value.code == "memory.not_found"
+
+    no_source_curator = _context(
+        actor_id="900",
+        channel_id="301",
+        resource_ids=("301",),
+        curator=True,
+    )
+    with pytest.raises(UserError) as denied_review:
+        await service.review(
+            AgentMemoryReviewRequest(
+                created.memory.memory_id,
+                AgentMemoryReviewDecision.APPROVE,
+            ),
+            no_source_curator,
+        )
+    assert denied_review.value.code == "memory.not_found"
+    with pytest.raises(UserError) as denied_curator_update:
+        await service.update(
+            AgentMemoryUpdateRequest(
+                memory_id=created.memory.memory_id,
+                summary="Replace a hidden source through curator authority.",
+                source_message_ids=("222",),
+                confidence=1.0,
+            ),
+            no_source_curator,
+        )
+    assert denied_curator_update.value.code == "memory.not_found"
+    with pytest.raises(UserError) as denied_curator_upsert:
+        await _remember(
+            service,
+            context=no_source_curator,
+            scope=AgentMemoryScope.WORKSPACE,
+            key="workspace.release_rule",
+            summary="Replace a hidden record through a matching shared key.",
+            source_id="223",
+        )
+    assert denied_curator_upsert.value.code == "memory.not_found"
+    with pytest.raises(UserError) as denied_curator_delete:
+        await service.forget(
+            AgentMemoryForgetRequest(created.memory.memory_id),
+            no_source_curator,
+        )
+    assert denied_curator_delete.value.code == "memory.not_found"
+
+    reviewed = await service.review(
+        AgentMemoryReviewRequest(
+            created.memory.memory_id,
+            AgentMemoryReviewDecision.APPROVE,
+        ),
+        curator,
+    )
+    assert reviewed.memory.review_state is AgentMemoryReviewState.APPROVED
+    assert reviewed.memory.reviewed_by_actor_id == "900"
+    assert (
+        await service.search(
+            AgentMemorySearchRequest(
+                query="release checklist",
+                scopes=(AgentMemoryScope.WORKSPACE,),
+            ),
+            intruder,
+        )
+    ).memories[0].memory_id == created.memory.memory_id
+
+    updated = await service.update(
+        AgentMemoryUpdateRequest(
+            memory_id=created.memory.memory_id,
+            summary="Use the current release checklist before deployment.",
+            source_message_ids=("333",),
+            confidence=1.0,
+        ),
+        owner,
+    )
+    assert updated.memory.review_state is AgentMemoryReviewState.PENDING
+    assert updated.memory.reviewed_by_actor_id is None
+    forgotten = await service.forget(
+        AgentMemoryForgetRequest(created.memory.memory_id),
+        owner,
+    )
+    assert forgotten.forgotten is True
+
+
+@pytest.mark.asyncio
+async def test_memory_persists_source_audience_and_revision(tmp_path) -> None:
+    context = replace(
+        _context(curator=True),
+        active_message_id="111",
+        active_message_edited_at="2026-08-03T01:02:03+00:00",
+        disclosure_observations=(
+            DisclosureObservation(
+                source_workspace_id="200",
+                source_resource_id="300",
+                visibility="restricted",
+                relation_to_origin="same_or_narrower",
+            ),
+        ),
+    )
+    service = _service(tmp_path / "memory.sqlite3")
+    created = await _remember(
+        service,
+        context=context,
+        scope=AgentMemoryScope.WORKSPACE,
+        key="workspace.restricted",
+        summary="Use the restricted release channel as the source of truth.",
+        source_id="111",
+    )
+
+    assert created.memory.source_message_locators[0].message_edited_at == (
+        "2026-08-03T01:02:03+00:00"
+    )
+    assert created.memory.provenance.origin_visibility is (
+        AgentMemoryVisibility.RESTRICTED
+    )
+    assert created.memory.provenance.source_resources == (
+        ("200", "300", AgentMemoryVisibility.RESTRICTED),
+    )
+    assert created.memory.provenance.unlabelled_input is False
+
+
+@pytest.mark.asyncio
+async def test_procedure_memory_requires_confirmed_non_memory_action(
+    tmp_path,
+) -> None:
+    memory_path = tmp_path / "memory.sqlite3"
+    without_ledger = AgentMemoryService(AgentMemoryStore(memory_path))
+    request = AgentMemoryRememberRequest(
+        scope=AgentMemoryScope.PROCEDURE,
+        key="procedure.publish",
+        summary="Send the verified result, then retain its Action Receipt.",
+        source_message_ids=("111",),
+        basis=AgentMemoryBasis.VERIFIED_SUCCESS,
+        confidence=1.0,
+    )
+    with pytest.raises(UserError) as missing:
+        await without_ledger.remember(request, _context())
+    assert missing.value.code == "memory.verified_action_required"
+
+    action_store = ActionReceiptStore(tmp_path / "actions.sqlite3")
+    action_context = replace(
+        _context(),
+        request_id="discord:message:action-source",
+        provider_thread_id="thread",
+        provider_turn_id="turn",
+        tool_call_id="tool-call",
+    )
+    await action_store.add(
+        action_id=_CONFIRMED_ACTION_ID,
+        capability="discord.send_message",
+        context=action_context,
+        target_ids=(("channel_id", "300"),),
+        classification=ActionClassification.NON_UNDOABLE,
+        undo_capability=None,
+        undo_arguments=None,
+    )
+    effect = await action_store.plan_external_effect(
+        capability="discord.send_message",
+        context=action_context,
+    )
+    await action_store.dispatch_external_effect(effect.effect_id)
+    await action_store.confirm_external_effect(
+        effect.effect_id,
+        action_id=_CONFIRMED_ACTION_ID,
+    )
+    service = AgentMemoryService(AgentMemoryStore(memory_path), action_store)
+    remembered = await service.remember(
+        replace(request, verified_action_id=_CONFIRMED_ACTION_ID),
+        _context(),
+    )
+    assert remembered.memory.verified_action_id == _CONFIRMED_ACTION_ID
+
+    with pytest.raises(UserError) as wrong_actor:
+        await service.remember(
+            replace(
+                request,
+                key="procedure.other_actor",
+                verified_action_id=_CONFIRMED_ACTION_ID,
+            ),
+            _context(actor_id="101"),
+        )
+    assert wrong_actor.value.code == "memory.verified_action_invalid"
+
+    memory_action_context = replace(
+        action_context,
+        request_id="discord:message:memory-action",
+        tool_call_id="memory-tool-call",
+    )
+    await action_store.add(
+        action_id=_MEMORY_ACTION_ID,
+        capability="memory.remember",
+        context=memory_action_context,
+        target_ids=(),
+        classification=ActionClassification.NON_UNDOABLE,
+        undo_capability=None,
+        undo_arguments=None,
+    )
+    memory_effect = await action_store.plan_external_effect(
+        capability="memory.remember",
+        context=memory_action_context,
+    )
+    await action_store.dispatch_external_effect(memory_effect.effect_id)
+    await action_store.confirm_external_effect(
+        memory_effect.effect_id,
+        action_id=_MEMORY_ACTION_ID,
+    )
+    with pytest.raises(UserError) as self_referential:
+        await service.remember(
+            replace(
+                request,
+                key="procedure.self_referential",
+                verified_action_id=_MEMORY_ACTION_ID,
+            ),
+            _context(),
+        )
+    assert self_referential.value.code == "memory.verified_action_invalid"
 
 
 @pytest.mark.asyncio
@@ -389,7 +711,7 @@ async def test_memory_search_filters_basis_confidence_time_and_paginates(
     tmp_path,
 ) -> None:
     path = tmp_path / "memory.sqlite3"
-    service = AgentMemoryService(AgentMemoryStore(path))
+    service = _service(path)
     context = _context()
     for index, confidence in enumerate((0.81, 0.9, 1.0), start=1):
         await _remember(
@@ -503,7 +825,7 @@ async def test_memory_search_filters_basis_confidence_time_and_paginates(
 async def test_memory_update_and_forget_enforce_original_scope(
     tmp_path,
 ) -> None:
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
+    service = _service(tmp_path / "memory.sqlite3")
     owner = _context(actor_id="100", channel_id="300")
     intruder = _context(actor_id="101", channel_id="300")
     created = await _remember(
@@ -630,7 +952,7 @@ async def test_memory_rejects_secrets_inference_low_confidence_and_bad_evidence(
     memory_request: AgentMemoryRememberRequest,
     error_code: str,
 ) -> None:
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
+    service = _service(tmp_path / "memory.sqlite3")
 
     with pytest.raises(UserError) as error:
         await service.remember(memory_request, _context())
@@ -720,6 +1042,15 @@ async def test_memory_narrow_cap_eviction_preserves_unrelated_shared_memory(
         key="shared.rule",
         summary="Shared server rule.",
         source_message_ids=("1000",),
+        source_message_locators=(
+            AgentMemorySourceLocator("1000", "300", "200"),
+        ),
+        source_resources=(
+            ("200", "300", AgentMemoryVisibility.RESTRICTED),
+        ),
+        origin_channel_id="300",
+        created_by_actor_id="100",
+        is_curator=True,
         basis=AgentMemoryBasis.USER_STATED,
         confidence=1.0,
         expires_at=None,
@@ -749,6 +1080,7 @@ async def test_memory_narrow_cap_eviction_preserves_unrelated_shared_memory(
         workspace_id="200",
         actor_id="100",
         channel_id="300",
+        resource_ids=("300",),
         now=started + timedelta(hours=1),
     )
     visible_ids = {memory.memory_id for memory in visible}
@@ -778,10 +1110,112 @@ def test_memory_schema_has_only_bounded_summary_and_source_pointers(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_memory_policy_migration_marks_legacy_shared_rows_pending(
+    tmp_path,
+) -> None:
+    path = tmp_path / "memory.sqlite3"
+    timestamp = "2026-08-01T00:00:00+00:00"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE agent_memories (
+                memory_id TEXT PRIMARY KEY,
+                locator TEXT NOT NULL UNIQUE,
+                scope TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT,
+                channel_id TEXT,
+                memory_key TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                source_message_ids_json TEXT NOT NULL,
+                source_message_locators_json TEXT NOT NULL DEFAULT '[]',
+                basis TEXT NOT NULL CHECK (
+                    basis IN ('user_stated', 'verified_success', 'verified_failure')
+                ),
+                confidence REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                expires_at TEXT
+            );
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_memories(
+                memory_id, locator, scope, workspace_id, owner_user_id,
+                channel_id, memory_key, summary, source_message_ids_json,
+                source_message_locators_json, basis, confidence, created_at,
+                updated_at, last_used_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "mem_" + "b" * 32,
+                "workspace\x1f200\x1f-\x1fworkspace.legacy",
+                "workspace",
+                "200",
+                None,
+                None,
+                "workspace.legacy",
+                "Legacy shared memory requires review.",
+                '["111"]',
+                '[{"message_id":"111","channel_id":"300","guild_id":"200"}]',
+                "user_stated",
+                1.0,
+                timestamp,
+                timestamp,
+                timestamp,
+                None,
+            ),
+        )
+
+    AgentMemoryStore(path)
+    with sqlite3.connect(path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(agent_memories)"
+            ).fetchall()
+        }
+    assert {
+        "created_by_actor_id",
+        "source_audience_json",
+        "origin_channel_id",
+        "origin_visibility",
+        "review_state",
+        "reviewed_by_actor_id",
+        "reviewed_at",
+        "verified_action_id",
+    } <= columns
+
+    service = _service(path)
+    ordinary = await service.search(
+        AgentMemorySearchRequest(
+            query="legacy",
+            scopes=(AgentMemoryScope.WORKSPACE,),
+        ),
+        _context(actor_id="100"),
+    )
+    curator = await service.search(
+        AgentMemorySearchRequest(
+            query="legacy",
+            scopes=(AgentMemoryScope.WORKSPACE,),
+        ),
+        _context(actor_id="900", curator=True),
+    )
+    assert ordinary.memories == ()
+    assert curator.memories[0].created_by_actor_id == "simajilord:legacy"
+    assert curator.memories[0].review_state is AgentMemoryReviewState.PENDING
+    assert curator.memories[0].provenance.source_resources == (
+        ("200", "300", AgentMemoryVisibility.UNCERTAIN),
+    )
+
+
+@pytest.mark.asyncio
 async def test_memory_locator_migration_backfills_channel_provenance(tmp_path) -> None:
     path = tmp_path / "memory.sqlite3"
     context = _context(workspace_id="200", channel_id="300")
-    service = AgentMemoryService(AgentMemoryStore(path))
+    service = _service(path)
     remembered = await _remember(
         service,
         context=context,
@@ -796,7 +1230,7 @@ async def test_memory_locator_migration_backfills_channel_provenance(tmp_path) -
         connection.execute(
             "ALTER TABLE agent_memories DROP COLUMN source_message_locators_json"
         )
-    restarted = AgentMemoryService(AgentMemoryStore(path))
+    restarted = _service(path)
     found = await restarted.search(
         AgentMemorySearchRequest(
             query="release checklist",
@@ -816,8 +1250,8 @@ async def test_memory_locator_migration_backfills_channel_provenance(tmp_path) -
 
 @pytest.mark.asyncio
 async def test_memory_accepts_explicit_cross_channel_source_locator(tmp_path) -> None:
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
-    context = _context()
+    service = _service(tmp_path / "memory.sqlite3")
+    context = _context(resource_ids=("300", "301"))
     response = await service.remember(
         AgentMemoryRememberRequest(
             scope=AgentMemoryScope.PROCEDURE,
@@ -828,17 +1262,39 @@ async def test_memory_accepts_explicit_cross_channel_source_locator(tmp_path) ->
                 AgentMemorySourceLocator(
                     message_id="555",
                     channel_id="301",
-                    guild_id="201",
+                    guild_id="200",
                 ),
             ),
             basis=AgentMemoryBasis.VERIFIED_SUCCESS,
+            verified_action_id=_CONFIRMED_ACTION_ID,
             confidence=1.0,
         ),
         context,
     )
 
-    assert response.memory.source_message_locators[0].guild_id == "201"
+    assert response.memory.source_message_locators[0].guild_id == "200"
     assert response.memory.source_message_locators[0].channel_id == "301"
+
+
+@pytest.mark.asyncio
+async def test_memory_rejects_cross_workspace_source_locator(tmp_path) -> None:
+    service = _service(tmp_path / "memory.sqlite3")
+    with pytest.raises(UserError) as error:
+        await service.remember(
+            AgentMemoryRememberRequest(
+                scope=AgentMemoryScope.WORKSPACE,
+                key="workspace.cross_server",
+                summary="Do not launder a source from another server.",
+                source_message_ids=("555",),
+                source_message_locators=(
+                    AgentMemorySourceLocator("555", "301", "201"),
+                ),
+                basis=AgentMemoryBasis.USER_STATED,
+                confidence=1.0,
+            ),
+            _context(resource_ids=("300", "301")),
+        )
+    assert error.value.code == "memory.source_workspace_mismatch"
 
 
 @pytest.mark.asyncio
@@ -846,7 +1302,7 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
     tmp_path,
 ) -> None:
     registry = CapabilityRegistry()
-    service = AgentMemoryService(AgentMemoryStore(tmp_path / "memory.sqlite3"))
+    service = _service(tmp_path / "memory.sqlite3")
     for item in build_memory_endpoints(service):
         registry.register(item)
     required_grants = {
@@ -855,7 +1311,9 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
             "memory.search",
             *AGENT_MEMORY_WRITE_CAPABILITIES,
         )
+        if name != "memory.review"
     }
+    required_grants["memory.review"] = AGENT_MEMORY_CURATOR_GRANT
     catalog = AgentToolCatalog(
         registry,
         ("memory.search", *AGENT_MEMORY_WRITE_CAPABILITIES),
@@ -882,6 +1340,29 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
         "memory_update",
         "capability_search",
     } <= tool_names
+    ordinary_list = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_list",
+        arguments={"limit": 25},
+        context=context,
+        max_output_characters=10_000,
+    )
+    curator_list = await catalog.invoke(
+        namespace="simajilord",
+        tool_name="capability_list",
+        arguments={"limit": 25},
+        context=replace(
+            context,
+            grants=context.grants | {AGENT_MEMORY_CURATOR_GRANT},
+        ),
+        max_output_characters=10_000,
+    )
+    assert "memory.review" not in {
+        item["name"] for item in json.loads(ordinary_list.text)["tools"]
+    }
+    assert "memory.review" in {
+        item["name"] for item in json.loads(curator_list.text)["tools"]
+    }
     memory_tool = next(
         tool
         for namespace in catalog.dynamic_specs(context)
@@ -971,6 +1452,7 @@ async def test_memory_capabilities_are_discoverable_authorized_and_receipted(
         {
             "channel_id": "300",
             "guild_id": "200",
+            "message_edited_at": None,
             "message_id": "400",
         }
     ]

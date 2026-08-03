@@ -532,15 +532,24 @@ def test_memory_evidence_requires_a_complete_read_and_matching_locator() -> None
         exact_message_reads=states,
     )
 
+    memory_arguments: dict[str, object] = {"source_message_ids": ["4"]}
     assert (
         _memory_evidence_failure(
             capability_name="memory.remember",
-            arguments={"source_message_ids": ["4"]},
+            arguments=memory_arguments,
             budget=budget,
             context=context,
         )
         is None
     )
+    assert memory_arguments["source_message_locators"] == [
+        {
+            "message_id": "4",
+            "guild_id": "1",
+            "channel_id": "2",
+            "message_edited_at": None,
+        }
+    ]
     missing = _memory_evidence_failure(
         capability_name="memory.remember",
         arguments={"source_message_ids": ["5"]},
@@ -560,6 +569,24 @@ def test_memory_evidence_requires_a_complete_read_and_matching_locator() -> None
     )
     assert mismatch is not None
     assert mismatch[0] == "memory.source_message_locator_mismatch"
+    revision_mismatch = _memory_evidence_failure(
+        capability_name="memory.update",
+        arguments={
+            "source_message_ids": ["4"],
+            "source_message_locators": [
+                {
+                    "message_id": "4",
+                    "guild_id": "1",
+                    "channel_id": "2",
+                    "message_edited_at": "2026-08-03T00:00:00+00:00",
+                }
+            ],
+        },
+        budget=budget,
+        context=context,
+    )
+    assert revision_mismatch is not None
+    assert revision_mismatch[0] == "memory.source_message_revision_mismatch"
 
 
 def test_provider_requires_gapless_exact_get_message_coverage() -> None:
@@ -6932,6 +6959,63 @@ def test_discord_visibility_observation_records_taint_without_granting_authority
     ] == [("other-guild", "private-channel", "uncertain", "broader")]
     assert set(budget.authorization_contexts) == {"auth_trigger"}
     assert budget.read_authorization_event_ids == {"auth_trigger"}
+
+
+def test_memory_search_provenance_blocks_broader_write_in_enforce_mode() -> None:
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="public-channel",
+        information_flow_mode="enforce",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="event",
+    )
+    _record_discord_disclosure_observations(
+        budget,
+        capability_name="memory.search",
+        disclosure_class=DisclosureClass.ACTOR_PRIVATE,
+        output=json.dumps(
+            {
+                "memories": [
+                    {
+                        "memory_id": "mem_" + "a" * 32,
+                        "summary": "Restricted durable summary.",
+                        "provenance": {
+                            "origin_guild_id": "guild",
+                            "origin_channel_id": "staff-channel",
+                            "origin_visibility": "restricted",
+                            "source_resources": [
+                                ["guild", "staff-channel", "restricted"]
+                            ],
+                            "unlabelled_input": False,
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert budget.discord_disclosure_observations == [
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="staff-channel",
+            visibility="restricted",
+            relation_to_origin="uncertain",
+        )
+    ]
+    failure = _information_flow_write_failure(
+        "discord.send_message",
+        budget,
+    )
+    assert failure is not None
+    assert failure[0] == "agent.information_flow_forbidden"
 
 
 def test_same_guild_metadata_class_allows_role_workflow_without_content_taint() -> None:

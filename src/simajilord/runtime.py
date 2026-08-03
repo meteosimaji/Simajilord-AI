@@ -22,6 +22,7 @@ from simajilord.agent import (
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
+    AGENT_MEMORY_CURATOR_GRANT,
     AGENT_MEMORY_GRANT,
     AGENT_MEMORY_WRITE_CAPABILITIES,
     AGENT_MESSAGE_GRANT,
@@ -459,6 +460,7 @@ class SimajilordRuntime:
                 registry=registry,
                 journal=journal,
             )
+            memory.bind_action_evidence(action_receipts)
             agent_capabilities = [
                 "action.undo",
                 "audio.history",
@@ -542,7 +544,9 @@ class SimajilordRuntime:
                 **{
                     name: AGENT_MEMORY_GRANT
                     for name in AGENT_MEMORY_WRITE_CAPABILITIES
+                    if name != "memory.review"
                 },
+                "memory.review": AGENT_MEMORY_CURATOR_GRANT,
                 "audio.history": AGENT_AUDIO_GRANT,
                 "audio.queue": AGENT_AUDIO_GRANT,
                 "audio.search": AGENT_AUDIO_GRANT,

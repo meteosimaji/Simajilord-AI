@@ -35,6 +35,7 @@ from simajilord.agent import (
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
+    AGENT_MEMORY_CURATOR_GRANT,
     AGENT_MEMORY_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
@@ -8396,6 +8397,7 @@ def _agent_grants(
     *,
     actor_id: str,
     autonomous: bool = False,
+    memory_curator: bool = False,
 ) -> frozenset[str]:
     settings = runtime.settings
     autonomy_mode = settings.agent_autonomy_mode if autonomous else None
@@ -8410,6 +8412,14 @@ def _agent_grants(
         and autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
     )
     grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
+    if (
+        not autonomous
+        and (
+            memory_curator
+            or actor_id in settings.agent_admin_user_ids
+        )
+    ):
+        grants.add(AGENT_MEMORY_CURATOR_GRANT)
     if not autonomous:
         grants.add(AGENT_FEEDBACK_GRANT)
     if not autonomous or legacy_autonomy_act:
@@ -9060,7 +9070,15 @@ class AgentCog(commands.Cog):
             )
             return
         actor_id = str(message.author.id)
-        grants = _agent_grants(self.runtime, actor_id=actor_id)
+        requester_permissions = requester_principal.member.guild_permissions
+        grants = _agent_grants(
+            self.runtime,
+            actor_id=actor_id,
+            memory_curator=(
+                permission_enabled(requester_permissions, "administrator")
+                or permission_enabled(requester_permissions, "manage_guild")
+            ),
+        )
         approvals = frozenset(AGENT_REQUESTED_WRITE_CAPABILITIES)
         public_reference_id = (
             await self.runtime.agent_store.public_reference_id_for_event(event_id)

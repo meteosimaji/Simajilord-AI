@@ -755,6 +755,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "media.save",
         "memory.forget",
         "memory.remember",
+        "memory.review",
         "memory.update",
         "speech.speak",
         "speech.manage_read_aloud",
@@ -997,6 +998,24 @@ class ActionReceiptStore:
     ) -> ExternalEffectRecord | None:
         async with self._lock:
             return await asyncio.to_thread(self._external_effect, effect_id)
+
+    async def is_confirmed_memory_evidence(
+        self,
+        *,
+        action_id: str,
+        context: InvocationContext,
+        allow_any_actor: bool,
+    ) -> bool:
+        """Validate a current external Action without claiming or mutating it."""
+
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._is_confirmed_memory_evidence,
+                action_id,
+                context.actor_id,
+                context.workspace_id,
+                allow_any_actor,
+            )
 
     async def request_has_replay_barrier(self, request_id: str) -> bool:
         """Return whether recovery must not repeat the model turn automatically."""
@@ -1430,6 +1449,48 @@ class ActionReceiptStore:
             ).fetchone()
         return _row_external_effect(row) if row is not None else None
 
+    def _is_confirmed_memory_evidence(
+        self,
+        action_id: str,
+        actor_id: str,
+        workspace_id: str | None,
+        allow_any_actor: bool,
+    ) -> bool:
+        normalized_action_id = action_id.strip()
+        if not normalized_action_id or workspace_id is None:
+            return False
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM agent_actions AS action
+                JOIN agent_external_effects AS effect
+                  ON effect.action_id = action.action_id
+                WHERE action.action_id = ?
+                  AND action.workspace_id = ?
+                  AND action.status = ?
+                  AND action.capability NOT LIKE 'memory.%'
+                  AND action.expires_at > ?
+                  AND effect.expires_at > ?
+                  AND effect.status IN (?, ?)
+                  AND (? = 1 OR action.actor_id = ?)
+                LIMIT 1
+                """,
+                (
+                    normalized_action_id,
+                    workspace_id,
+                    ActionStatus.SUCCEEDED.value,
+                    now,
+                    now,
+                    ExternalEffectStatus.CONFIRMED.value,
+                    ExternalEffectStatus.RECONCILED.value,
+                    int(allow_any_actor),
+                    actor_id,
+                ),
+            ).fetchone()
+        return row is not None
+
     def _request_has_replay_barrier(self, request_id: str) -> bool:
         normalized_request_id = request_id.strip()
         if not normalized_request_id:
@@ -1668,6 +1729,21 @@ class ActionReceiptService:
 
     async def request_has_replay_barrier(self, request_id: str) -> bool:
         return await self.store.request_has_replay_barrier(request_id)
+
+    async def is_confirmed_memory_evidence(
+        self,
+        *,
+        action_id: str,
+        context: InvocationContext,
+        allow_any_actor: bool,
+    ) -> bool:
+        """Expose only the body-free evidence predicate needed by Memory."""
+
+        return await self.store.is_confirmed_memory_evidence(
+            action_id=action_id,
+            context=context,
+            allow_any_actor=allow_any_actor,
+        )
 
     async def record_posted_message(
         self,

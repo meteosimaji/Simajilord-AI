@@ -22,6 +22,7 @@ AGENT_HIVE_GRANT = "hive_analysis"
 AGENT_IMAGE_GRANT = "image"
 AGENT_MEDIA_GRANT = "media_download"
 AGENT_MEMORY_GRANT = "memory"
+AGENT_MEMORY_CURATOR_GRANT = "memory_curator"
 AGENT_MESSAGE_GRANT = "discord_message"
 AGENT_MODERATION_GRANT = "moderation"
 AGENT_QUOTE_GRANT = "discord_quote"
@@ -82,6 +83,7 @@ AGENT_MEMORY_WRITE_CAPABILITIES = (
     "memory.remember",
     "memory.update",
     "memory.forget",
+    "memory.review",
 )
 AGENT_AUDIO_CONTROL_CAPABILITIES = (
     "discord.pause_audio",

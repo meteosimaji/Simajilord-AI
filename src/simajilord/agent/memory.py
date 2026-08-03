@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 
 from simajilord.core import (
     ApprovalMode,
@@ -25,6 +26,8 @@ from simajilord.core import (
     endpoint,
 )
 from simajilord.core.errors import UserError
+
+from .contracts import AGENT_MEMORY_CURATOR_GRANT
 
 MAX_MEMORY_KEY_CHARACTERS = 80
 MAX_MEMORY_SUMMARY_CHARACTERS = 320
@@ -209,6 +212,29 @@ class AgentMemoryBasis(StrEnum):
     VERIFIED_FAILURE = "verified_failure"
 
 
+class AgentMemoryVisibility(StrEnum):
+    """Persisted source audience label used by host information-flow policy."""
+
+    GUILD_PUBLIC = "guild_public"
+    RESTRICTED = "restricted"
+    UNCERTAIN = "uncertain"
+
+
+class AgentMemoryReviewState(StrEnum):
+    """Host-owned publication state for a shared memory."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class AgentMemoryReviewDecision(StrEnum):
+    """Explicit curator decision; the model cannot invent an approval state."""
+
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
 @dataclass(frozen=True, slots=True)
 class AgentMemorySourceLocator:
     """Message provenance only; never an authorization or permission grant."""
@@ -216,6 +242,30 @@ class AgentMemorySourceLocator:
     message_id: str
     channel_id: str | None
     guild_id: str | None
+    message_edited_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMemoryProvenance:
+    """Body-free audience provenance understood by the provider policy."""
+
+    origin_guild_id: str
+    origin_channel_id: str | None
+    origin_visibility: AgentMemoryVisibility
+    source_resources: tuple[tuple[str, str, AgentMemoryVisibility], ...]
+    unlabelled_input: bool
+
+
+class AgentMemoryActionEvidence(Protocol):
+    """Narrow port for checking one confirmed, non-memory external action."""
+
+    async def is_confirmed_memory_evidence(
+        self,
+        *,
+        action_id: str,
+        context: InvocationContext,
+        allow_any_actor: bool,
+    ) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,11 +277,17 @@ class AgentMemoryRecord:
     workspace_id: str
     owner_user_id: str | None
     channel_id: str | None
+    created_by_actor_id: str
     key: str
     summary: str
     source_message_ids: tuple[str, ...]
     source_message_locators: tuple[AgentMemorySourceLocator, ...]
+    provenance: AgentMemoryProvenance
     basis: AgentMemoryBasis
+    review_state: AgentMemoryReviewState
+    reviewed_by_actor_id: str | None
+    reviewed_at: datetime | None
+    verified_action_id: str | None
     confidence: float
     created_at: datetime
     updated_at: datetime
@@ -260,8 +316,8 @@ class AgentMemorySearchRequest:
         metadata={
             "description": (
                 "Visibility filters: user is the current requester's private memory; "
-                "channel is only the current origin channel; workspace is shared in "
-                "the current guild; procedure is a guild-scoped verified workflow."
+                "channel requires current read access; workspace/procedure require "
+                "approved review plus current access to every persisted source."
             )
         },
     )
@@ -347,6 +403,15 @@ class AgentMemoryRememberRequest:
     basis: AgentMemoryBasis
     confidence: float
     ttl_days: int | None = None
+    verified_action_id: str | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Required only for procedure memory: a confirmed Action Receipt ID "
+                "from the same server and requester (or an authorized curator)."
+            )
+        },
+    )
     source_message_locators: tuple[AgentMemorySourceLocator, ...] = field(
         default=(),
         metadata={
@@ -367,6 +432,15 @@ class AgentMemoryUpdateRequest:
     source_message_ids: tuple[str, ...]
     confidence: float
     ttl_days: int | None = None
+    verified_action_id: str | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Required when updating procedure memory; it must identify a "
+                "confirmed non-memory external action."
+            )
+        },
+    )
     source_message_locators: tuple[AgentMemorySourceLocator, ...] = field(
         default=(),
         metadata={
@@ -395,6 +469,18 @@ class AgentMemoryForgetResponse:
     forgotten: bool
 
 
+@dataclass(frozen=True, slots=True)
+class AgentMemoryReviewRequest:
+    memory_id: str
+    decision: AgentMemoryReviewDecision
+
+
+@dataclass(frozen=True, slots=True)
+class AgentMemoryReviewResponse:
+    memory: AgentMemoryRecord
+    decision: AgentMemoryReviewDecision
+
+
 def _memory_table_sql(table_name: str, *, if_not_exists: bool) -> str:
     if table_name not in {"agent_memories", "agent_memories_basis_v2"}:
         raise ValueError("unexpected memory table name")
@@ -409,6 +495,7 @@ def _memory_table_sql(table_name: str, *, if_not_exists: bool) -> str:
             workspace_id TEXT NOT NULL,
             owner_user_id TEXT,
             channel_id TEXT,
+            created_by_actor_id TEXT NOT NULL,
             memory_key TEXT NOT NULL
                 CHECK (length(memory_key) BETWEEN 1 AND {MAX_MEMORY_KEY_CHARACTERS}),
             summary TEXT NOT NULL
@@ -418,6 +505,11 @@ def _memory_table_sql(table_name: str, *, if_not_exists: bool) -> str:
                 ),
             source_message_ids_json TEXT NOT NULL,
             source_message_locators_json TEXT NOT NULL DEFAULT '[]',
+            source_audience_json TEXT NOT NULL DEFAULT '[]',
+            origin_channel_id TEXT,
+            origin_visibility TEXT NOT NULL CHECK (
+                origin_visibility IN ('guild_public', 'restricted', 'uncertain')
+            ),
             basis TEXT NOT NULL CHECK (
                 basis IN (
                     'user_stated',
@@ -429,6 +521,12 @@ def _memory_table_sql(table_name: str, *, if_not_exists: bool) -> str:
                 confidence >= {MIN_MEMORY_CONFIDENCE}
                 AND confidence <= 1.0
             ),
+            review_state TEXT NOT NULL CHECK (
+                review_state IN ('pending', 'approved', 'rejected')
+            ),
+            reviewed_by_actor_id TEXT,
+            reviewed_at TEXT,
+            verified_action_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_used_at TEXT NOT NULL,
@@ -480,6 +578,12 @@ def _create_memory_indexes(connection: sqlite3.Connection) -> None:
         ON agent_memories(expires_at)
         """
     )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS agent_memories_creator_review
+        ON agent_memories(workspace_id, created_by_actor_id, review_state)
+        """
+    )
 
 
 def _migrate_memory_basis_constraint(connection: sqlite3.Connection) -> None:
@@ -495,8 +599,10 @@ def _migrate_memory_basis_constraint(connection: sqlite3.Connection) -> None:
 
     columns = (
         "memory_id, locator, scope, workspace_id, owner_user_id, channel_id, "
-        "memory_key, summary, source_message_ids_json, "
-        "source_message_locators_json, basis, confidence, created_at, "
+        "created_by_actor_id, memory_key, summary, source_message_ids_json, "
+        "source_message_locators_json, source_audience_json, origin_channel_id, "
+        "origin_visibility, basis, confidence, review_state, "
+        "reviewed_by_actor_id, reviewed_at, verified_action_id, created_at, "
         "updated_at, last_used_at, expires_at"
     )
     connection.commit()
@@ -578,6 +684,15 @@ class AgentMemoryStore:
         summary: str,
         source_message_ids: tuple[str, ...],
         source_message_locators: tuple[AgentMemorySourceLocator, ...] = (),
+        source_resources: tuple[
+            tuple[str, str, AgentMemoryVisibility], ...
+        ] = (),
+        origin_channel_id: str | None = None,
+        origin_visibility: AgentMemoryVisibility = AgentMemoryVisibility.UNCERTAIN,
+        created_by_actor_id: str | None = None,
+        is_curator: bool = False,
+        resource_ids: tuple[str, ...] = (),
+        verified_action_id: str | None = None,
         basis: AgentMemoryBasis,
         confidence: float,
         expires_at: datetime | None,
@@ -592,6 +707,15 @@ class AgentMemoryStore:
                 )
                 for message_id in source_message_ids
             )
+        if not source_resources:
+            source_resources = _uncertain_source_resources(
+                source_message_locators
+            )
+        creator_id = (
+            created_by_actor_id
+            or owner_user_id
+            or "simajilord:legacy"
+        )
         async with self._lock:
             return await asyncio.to_thread(
                 self._remember,
@@ -603,6 +727,13 @@ class AgentMemoryStore:
                 summary,
                 source_message_ids,
                 source_message_locators,
+                source_resources,
+                origin_channel_id or channel_id,
+                origin_visibility,
+                creator_id,
+                is_curator,
+                resource_ids,
+                verified_action_id,
                 basis,
                 confidence,
                 expires_at,
@@ -619,6 +750,14 @@ class AgentMemoryStore:
         summary: str,
         source_message_ids: tuple[str, ...],
         source_message_locators: tuple[AgentMemorySourceLocator, ...] = (),
+        source_resources: tuple[
+            tuple[str, str, AgentMemoryVisibility], ...
+        ] = (),
+        origin_channel_id: str | None = None,
+        origin_visibility: AgentMemoryVisibility = AgentMemoryVisibility.UNCERTAIN,
+        is_curator: bool = False,
+        resource_ids: tuple[str, ...] = (),
+        verified_action_id: str | None = None,
         confidence: float,
         expires_at: datetime | None,
         now: datetime,
@@ -632,6 +771,10 @@ class AgentMemoryStore:
                 )
                 for message_id in source_message_ids
             )
+        if not source_resources:
+            source_resources = _uncertain_source_resources(
+                source_message_locators
+            )
         async with self._lock:
             return await asyncio.to_thread(
                 self._update,
@@ -642,6 +785,12 @@ class AgentMemoryStore:
                 summary,
                 source_message_ids,
                 source_message_locators,
+                source_resources,
+                origin_channel_id or channel_id,
+                origin_visibility,
+                is_curator,
+                resource_ids,
+                verified_action_id,
                 confidence,
                 expires_at,
                 _utc(now),
@@ -654,6 +803,8 @@ class AgentMemoryStore:
         workspace_id: str,
         actor_id: str,
         channel_id: str | None,
+        is_curator: bool = False,
+        resource_ids: tuple[str, ...] = (),
         now: datetime,
     ) -> None:
         async with self._lock:
@@ -663,6 +814,29 @@ class AgentMemoryStore:
                 workspace_id,
                 actor_id,
                 channel_id,
+                is_curator,
+                resource_ids,
+                _utc(now),
+            )
+
+    async def review(
+        self,
+        *,
+        memory_id: str,
+        workspace_id: str,
+        actor_id: str,
+        resource_ids: tuple[str, ...],
+        decision: AgentMemoryReviewDecision,
+        now: datetime,
+    ) -> AgentMemoryRecord:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._review,
+                memory_id,
+                workspace_id,
+                actor_id,
+                resource_ids,
+                decision,
                 _utc(now),
             )
 
@@ -679,6 +853,8 @@ class AgentMemoryStore:
         workspace_id: str,
         actor_id: str,
         channel_id: str | None,
+        resource_ids: tuple[str, ...] = (),
+        is_curator: bool = False,
         now: datetime,
         mark_used_limit: int | None = None,
     ) -> tuple[AgentMemoryRecord, ...]:
@@ -695,6 +871,8 @@ class AgentMemoryStore:
                 workspace_id,
                 actor_id,
                 channel_id,
+                resource_ids,
+                is_curator,
                 _utc(now),
                 mark_used_limit,
             )
@@ -709,7 +887,6 @@ class AgentMemoryStore:
             connection.execute(
                 _memory_table_sql("agent_memories", if_not_exists=True)
             )
-            _create_memory_indexes(connection)
             columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -721,6 +898,31 @@ class AgentMemoryStore:
                     "ALTER TABLE agent_memories "
                     "ADD COLUMN source_message_locators_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            policy_columns = {
+                "created_by_actor_id": (
+                    "TEXT NOT NULL DEFAULT 'simajilord:legacy'"
+                ),
+                "source_audience_json": "TEXT NOT NULL DEFAULT '[]'",
+                "origin_channel_id": "TEXT",
+                "origin_visibility": "TEXT NOT NULL DEFAULT 'uncertain'",
+                "review_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "reviewed_by_actor_id": "TEXT",
+                "reviewed_at": "TEXT",
+                "verified_action_id": "TEXT",
+            }
+            for name, declaration in policy_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE agent_memories ADD COLUMN {name} {declaration}"
+                    )
+            connection.execute(
+                """
+                UPDATE agent_memories
+                SET created_by_actor_id = owner_user_id,
+                    review_state = 'approved'
+                WHERE scope = 'user' AND owner_user_id IS NOT NULL
+                """
+            )
             legacy_rows = connection.execute(
                 """
                 SELECT memory_id, workspace_id, channel_id,
@@ -755,7 +957,44 @@ class AgentMemoryStore:
                     """,
                     (_source_locators_json(locators), str(row["memory_id"])),
                 )
+            audience_rows = connection.execute(
+                """
+                SELECT memory_id, workspace_id, channel_id,
+                       source_message_locators_json
+                FROM agent_memories
+                WHERE source_audience_json = '[]'
+                """
+            ).fetchall()
+            for row in audience_rows:
+                locators = _source_locators_from_json(
+                    str(row["source_message_locators_json"])
+                )
+                resources = _uncertain_source_resources(locators)
+                origin_channel_id = (
+                    str(row["channel_id"])
+                    if row["channel_id"] is not None
+                    else (
+                        resources[0][1]
+                        if resources
+                        else None
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE agent_memories
+                    SET source_audience_json = ?, origin_channel_id = COALESCE(
+                        origin_channel_id, ?
+                    )
+                    WHERE memory_id = ?
+                    """,
+                    (
+                        _source_audience_json(resources),
+                        origin_channel_id,
+                        str(row["memory_id"]),
+                    ),
+                )
             _migrate_memory_basis_constraint(connection)
+            _create_memory_indexes(connection)
         os.chmod(self.path, 0o600)
 
     def _remember(
@@ -768,6 +1007,15 @@ class AgentMemoryStore:
         summary: str,
         source_message_ids: tuple[str, ...],
         source_message_locators: tuple[AgentMemorySourceLocator, ...],
+        source_resources: tuple[
+            tuple[str, str, AgentMemoryVisibility], ...
+        ],
+        origin_channel_id: str | None,
+        origin_visibility: AgentMemoryVisibility,
+        created_by_actor_id: str,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
+        verified_action_id: str | None,
         basis: AgentMemoryBasis,
         confidence: float,
         expires_at: datetime | None,
@@ -788,15 +1036,42 @@ class AgentMemoryStore:
             separators=(",", ":"),
         )
         source_locators_json = _source_locators_json(source_message_locators)
+        source_audience_json = _source_audience_json(source_resources)
+        if scope is AgentMemoryScope.PROCEDURE:
+            if verified_action_id is None:
+                raise UserError("memory.verified_action_required")
+        elif verified_action_id is not None:
+            raise UserError("memory.verified_action_invalid")
+        review_state = (
+            AgentMemoryReviewState.APPROVED
+            if scope is AgentMemoryScope.USER or is_curator
+            else AgentMemoryReviewState.PENDING
+        )
+        reviewed_by_actor_id = (
+            created_by_actor_id
+            if scope is not AgentMemoryScope.USER and is_curator
+            else None
+        )
+        reviewed_at = (
+            now_text if reviewed_by_actor_id is not None else None
+        )
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             self._delete_expired(connection, now_text)
             existing = connection.execute(
-                "SELECT memory_id FROM agent_memories WHERE locator = ?",
+                "SELECT * FROM agent_memories WHERE locator = ?",
                 (locator,),
             ).fetchone()
             created = existing is None
+            if existing is not None and not _row_can_mutate(
+                existing,
+                workspace_id=workspace_id,
+                actor_id=created_by_actor_id,
+                is_curator=is_curator,
+                resource_ids=resource_ids,
+            ):
+                raise UserError("memory.not_found")
             memory_id = (
                 f"mem_{uuid.uuid4().hex}"
                 if existing is None
@@ -807,10 +1082,16 @@ class AgentMemoryStore:
                     """
                     INSERT INTO agent_memories(
                         memory_id, locator, scope, workspace_id, owner_user_id,
-                        channel_id, memory_key, summary, source_message_ids_json,
-                        source_message_locators_json, basis, confidence, created_at,
-                        updated_at, last_used_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        channel_id, created_by_actor_id, memory_key, summary,
+                        source_message_ids_json, source_message_locators_json,
+                        source_audience_json, origin_channel_id,
+                        origin_visibility, basis, confidence, review_state,
+                        reviewed_by_actor_id, reviewed_at, verified_action_id,
+                        created_at, updated_at, last_used_at, expires_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         memory_id,
@@ -819,12 +1100,20 @@ class AgentMemoryStore:
                         workspace_id,
                         owner_user_id,
                         channel_id,
+                        created_by_actor_id,
                         key,
                         summary,
                         source_json,
                         source_locators_json,
+                        source_audience_json,
+                        origin_channel_id,
+                        origin_visibility.value,
                         basis.value,
                         confidence,
+                        review_state.value,
+                        reviewed_by_actor_id,
+                        reviewed_at,
+                        verified_action_id,
                         now_text,
                         now_text,
                         now_text,
@@ -836,16 +1125,26 @@ class AgentMemoryStore:
                     """
                     UPDATE agent_memories
                     SET summary = ?, source_message_ids_json = ?,
-                        source_message_locators_json = ?, basis = ?,
-                        confidence = ?, updated_at = ?, expires_at = ?
+                        source_message_locators_json = ?, source_audience_json = ?,
+                        origin_channel_id = ?, origin_visibility = ?, basis = ?,
+                        confidence = ?, review_state = ?,
+                        reviewed_by_actor_id = ?, reviewed_at = ?,
+                        verified_action_id = ?, updated_at = ?, expires_at = ?
                     WHERE memory_id = ?
                     """,
                     (
                         summary,
                         source_json,
                         source_locators_json,
+                        source_audience_json,
+                        origin_channel_id,
+                        origin_visibility.value,
                         basis.value,
                         confidence,
+                        review_state.value,
+                        reviewed_by_actor_id,
+                        reviewed_at,
+                        verified_action_id,
                         now_text,
                         expiry_text,
                         memory_id,
@@ -882,6 +1181,14 @@ class AgentMemoryStore:
         summary: str,
         source_message_ids: tuple[str, ...],
         source_message_locators: tuple[AgentMemorySourceLocator, ...],
+        source_resources: tuple[
+            tuple[str, str, AgentMemoryVisibility], ...
+        ],
+        origin_channel_id: str | None,
+        origin_visibility: AgentMemoryVisibility,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
+        verified_action_id: str | None,
         confidence: float,
         expires_at: datetime | None,
         now: datetime,
@@ -894,19 +1201,43 @@ class AgentMemoryStore:
                 "SELECT * FROM agent_memories WHERE memory_id = ?",
                 (memory_id,),
             ).fetchone()
-            if row is None or not _row_is_accessible(
+            if row is None or not _row_can_mutate(
                 row,
                 workspace_id=workspace_id,
                 actor_id=actor_id,
-                channel_id=channel_id,
+                is_curator=is_curator,
+                resource_ids=resource_ids,
             ):
                 raise UserError("memory.not_found")
+            scope = AgentMemoryScope(str(row["scope"]))
+            if scope is AgentMemoryScope.PROCEDURE:
+                if verified_action_id is None:
+                    raise UserError("memory.verified_action_required")
+            elif verified_action_id is not None:
+                raise UserError("memory.verified_action_invalid")
+            review_state = (
+                AgentMemoryReviewState.APPROVED
+                if scope is AgentMemoryScope.USER or is_curator
+                else AgentMemoryReviewState.PENDING
+            )
+            reviewed_by_actor_id = (
+                actor_id
+                if scope is not AgentMemoryScope.USER and is_curator
+                else None
+            )
+            reviewed_at = (
+                now.isoformat()
+                if reviewed_by_actor_id is not None
+                else None
+            )
             connection.execute(
                 """
                 UPDATE agent_memories
                 SET summary = ?, source_message_ids_json = ?,
-                    source_message_locators_json = ?, confidence = ?,
-                    updated_at = ?, expires_at = ?
+                    source_message_locators_json = ?, source_audience_json = ?,
+                    origin_channel_id = ?, origin_visibility = ?, confidence = ?,
+                    review_state = ?, reviewed_by_actor_id = ?, reviewed_at = ?,
+                    verified_action_id = ?, updated_at = ?, expires_at = ?
                 WHERE memory_id = ?
                 """,
                 (
@@ -917,7 +1248,14 @@ class AgentMemoryStore:
                         separators=(",", ":"),
                     ),
                     _source_locators_json(source_message_locators),
+                    _source_audience_json(source_resources),
+                    origin_channel_id,
+                    origin_visibility.value,
                     confidence,
+                    review_state.value,
+                    reviewed_by_actor_id,
+                    reviewed_at,
+                    verified_action_id,
                     now.isoformat(),
                     expires_at.isoformat() if expires_at is not None else None,
                     memory_id,
@@ -943,6 +1281,8 @@ class AgentMemoryStore:
         workspace_id: str,
         actor_id: str,
         channel_id: str | None,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
         now: datetime,
     ) -> None:
         connection = self._connect()
@@ -953,11 +1293,12 @@ class AgentMemoryStore:
                 "SELECT * FROM agent_memories WHERE memory_id = ?",
                 (memory_id,),
             ).fetchone()
-            if row is None or not _row_is_accessible(
+            if row is None or not _row_can_mutate(
                 row,
                 workspace_id=workspace_id,
                 actor_id=actor_id,
-                channel_id=channel_id,
+                is_curator=is_curator,
+                resource_ids=resource_ids,
             ):
                 raise UserError("memory.not_found")
             connection.execute(
@@ -965,6 +1306,76 @@ class AgentMemoryStore:
                 (memory_id,),
             )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _review(
+        self,
+        memory_id: str,
+        workspace_id: str,
+        actor_id: str,
+        resource_ids: tuple[str, ...],
+        decision: AgentMemoryReviewDecision,
+        now: datetime,
+    ) -> AgentMemoryRecord:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            self._delete_expired(connection, now.isoformat())
+            row = connection.execute(
+                "SELECT * FROM agent_memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["workspace_id"]) != workspace_id
+                or AgentMemoryScope(str(row["scope"]))
+                is AgentMemoryScope.USER
+                or not _row_source_audience_is_accessible(
+                    row,
+                    workspace_id=workspace_id,
+                    resource_ids=resource_ids,
+                )
+            ):
+                raise UserError("memory.not_found")
+            if (
+                decision is AgentMemoryReviewDecision.APPROVE
+                and AgentMemoryScope(str(row["scope"]))
+                is AgentMemoryScope.PROCEDURE
+                and row["verified_action_id"] is None
+            ):
+                raise UserError("memory.verified_action_required")
+            review_state = (
+                AgentMemoryReviewState.APPROVED
+                if decision is AgentMemoryReviewDecision.APPROVE
+                else AgentMemoryReviewState.REJECTED
+            )
+            connection.execute(
+                """
+                UPDATE agent_memories
+                SET review_state = ?, reviewed_by_actor_id = ?, reviewed_at = ?,
+                    updated_at = ?
+                WHERE memory_id = ?
+                """,
+                (
+                    review_state.value,
+                    actor_id,
+                    now.isoformat(),
+                    now.isoformat(),
+                    memory_id,
+                ),
+            )
+            updated = connection.execute(
+                "SELECT * FROM agent_memories WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if updated is None:
+                raise RuntimeError("reviewed memory disappeared")
+            connection.commit()
+            return _memory_from_row(updated)
         except Exception:
             connection.rollback()
             raise
@@ -983,6 +1394,8 @@ class AgentMemoryStore:
         workspace_id: str,
         actor_id: str,
         channel_id: str | None,
+        resource_ids: tuple[str, ...],
+        is_curator: bool,
         now: datetime,
         mark_used_limit: int | None,
     ) -> tuple[AgentMemoryRecord, ...]:
@@ -997,19 +1410,12 @@ class AgentMemoryStore:
                 SELECT * FROM agent_memories
                 WHERE workspace_id = ?
                   AND scope IN ({placeholders})
-                  AND (
-                    (scope = 'user' AND owner_user_id = ?)
-                    OR (scope = 'channel' AND channel_id = ?)
-                    OR scope IN ('workspace', 'procedure')
-                  )
                 ORDER BY last_used_at DESC, updated_at DESC
                 LIMIT ?
                 """,
                 (
                     workspace_id,
                     *scope_values,
-                    actor_id,
-                    channel_id,
                     min(self.max_records_per_workspace, 500),
                 ),
             ).fetchall()
@@ -1019,6 +1425,14 @@ class AgentMemoryStore:
                 tuple[int, float, str, str, str, str, sqlite3.Row]
             ] = []
             for row in rows:
+                if not _row_is_accessible(
+                    row,
+                    workspace_id=workspace_id,
+                    actor_id=actor_id,
+                    resource_ids=resource_ids,
+                    is_curator=is_curator,
+                ):
+                    continue
                 if (
                     basis is not None
                     and str(row["basis"]) != basis.value
@@ -1203,8 +1617,26 @@ class AgentMemoryStore:
 class AgentMemoryService:
     """Validate evidence and derive all scope ownership from trusted context."""
 
-    def __init__(self, store: AgentMemoryStore) -> None:
+    def __init__(
+        self,
+        store: AgentMemoryStore,
+        action_evidence: AgentMemoryActionEvidence | None = None,
+    ) -> None:
         self.store = store
+        self._action_evidence = action_evidence
+
+    def bind_action_evidence(
+        self,
+        action_evidence: AgentMemoryActionEvidence,
+    ) -> None:
+        """Bind the runtime ledger once after both services are constructed."""
+
+        if (
+            self._action_evidence is not None
+            and self._action_evidence is not action_evidence
+        ):
+            raise RuntimeError("memory action evidence is already bound")
+        self._action_evidence = action_evidence
 
     async def context_for_turn(
         self,
@@ -1226,6 +1658,8 @@ class AgentMemoryService:
             workspace_id=context.workspace_id,
             actor_id=context.actor_id,
             channel_id=context.origin_resource_id,
+            resource_ids=context.resource_ids,
+            is_curator=_is_memory_curator(context),
             now=datetime.now(UTC),
             mark_used_limit=0,
         )
@@ -1270,6 +1704,8 @@ class AgentMemoryService:
             workspace_id=workspace_id,
             actor_id=context.actor_id,
             channel_id=context.origin_resource_id,
+            resource_ids=context.resource_ids,
+            is_curator=_is_memory_curator(context),
             now=datetime.now(UTC),
             mark_used_limit=request.limit,
         )
@@ -1306,7 +1742,16 @@ class AgentMemoryService:
         )
         confidence = _validated_confidence(request.confidence)
         _validate_basis(request.scope, request.basis, summary)
+        verified_action_id = await self._verified_action_id(
+            request.verified_action_id,
+            required=request.scope is AgentMemoryScope.PROCEDURE,
+            context=context,
+        )
         owner_user_id, channel_id = _scope_owners(request.scope, context)
+        provenance = _memory_provenance(
+            context,
+            source_message_locators,
+        )
         now = datetime.now(UTC)
         record, created = await self.store.remember(
             scope=request.scope,
@@ -1317,6 +1762,13 @@ class AgentMemoryService:
             summary=summary,
             source_message_ids=source_message_ids,
             source_message_locators=source_message_locators,
+            source_resources=provenance.source_resources,
+            origin_channel_id=provenance.origin_channel_id,
+            origin_visibility=provenance.origin_visibility,
+            created_by_actor_id=context.actor_id,
+            is_curator=_is_memory_curator(context),
+            resource_ids=context.resource_ids,
+            verified_action_id=verified_action_id,
             basis=request.basis,
             confidence=confidence,
             expires_at=_expiry(request.ttl_days, now=now),
@@ -1340,6 +1792,15 @@ class AgentMemoryService:
             source_message_ids=source_message_ids,
             context=context,
         )
+        provenance = _memory_provenance(
+            context,
+            source_message_locators,
+        )
+        verified_action_id = await self._verified_action_id(
+            request.verified_action_id,
+            required=False,
+            context=context,
+        )
         confidence = _validated_confidence(request.confidence)
         now = datetime.now(UTC)
         record = await self.store.update(
@@ -1350,6 +1811,12 @@ class AgentMemoryService:
             summary=summary,
             source_message_ids=source_message_ids,
             source_message_locators=source_message_locators,
+            source_resources=provenance.source_resources,
+            origin_channel_id=provenance.origin_channel_id,
+            origin_visibility=provenance.origin_visibility,
+            is_curator=_is_memory_curator(context),
+            resource_ids=context.resource_ids,
+            verified_action_id=verified_action_id,
             confidence=confidence,
             expires_at=_expiry(request.ttl_days, now=now),
             now=now,
@@ -1369,9 +1836,54 @@ class AgentMemoryService:
             workspace_id=workspace_id,
             actor_id=context.actor_id,
             channel_id=context.origin_resource_id,
+            is_curator=_is_memory_curator(context),
+            resource_ids=context.resource_ids,
             now=datetime.now(UTC),
         )
         return AgentMemoryForgetResponse(memory_id=memory_id, forgotten=True)
+
+    async def review(
+        self,
+        request: AgentMemoryReviewRequest,
+        context: InvocationContext,
+    ) -> AgentMemoryReviewResponse:
+        workspace_id = _workspace(context)
+        if not _is_memory_curator(context):
+            raise UserError("memory.curator_required")
+        record = await self.store.review(
+            memory_id=_validated_memory_id(request.memory_id),
+            workspace_id=workspace_id,
+            actor_id=context.actor_id,
+            resource_ids=context.resource_ids,
+            decision=request.decision,
+            now=datetime.now(UTC),
+        )
+        return AgentMemoryReviewResponse(
+            memory=record,
+            decision=request.decision,
+        )
+
+    async def _verified_action_id(
+        self,
+        value: str | None,
+        *,
+        required: bool,
+        context: InvocationContext,
+    ) -> str | None:
+        if value is None:
+            if required:
+                raise UserError("memory.verified_action_required")
+            return None
+        action_id = _validated_action_id(value)
+        if self._action_evidence is None or not (
+            await self._action_evidence.is_confirmed_memory_evidence(
+                action_id=action_id,
+                context=context,
+                allow_any_actor=_is_memory_curator(context),
+            )
+        ):
+            raise UserError("memory.verified_action_invalid")
+        return action_id
 
 
 def build_memory_endpoints(
@@ -1388,7 +1900,11 @@ def build_memory_endpoints(
         "memory.source_message_locators_invalid",
         "memory.source_message_not_read",
         "memory.source_message_locator_mismatch",
+        "memory.source_message_revision_mismatch",
+        "memory.source_workspace_mismatch",
         "memory.basis_invalid",
+        "memory.verified_action_required",
+        "memory.verified_action_invalid",
         "memory.confidence_too_low",
         "memory.secret_forbidden",
         "memory.inference_forbidden",
@@ -1401,8 +1917,8 @@ def build_memory_endpoints(
                 summary=(
                     "Search paginated durable preferences, rules, and verified "
                     "procedures by text, scope, basis, time, and confidence. Returns "
-                    "memory IDs, source guild/channel/message locators, timestamps, and "
-                    "next_offset for later source retrieval, update, or explicit forget."
+                    "only records whose owner/review/source audience permits the "
+                    "requester, including provenance and review state."
                 ),
                 risk=RiskLevel.READ,
                 disclosure_class=DisclosureClass.ACTOR_PRIVATE,
@@ -1437,7 +1953,8 @@ def build_memory_endpoints(
                 summary=(
                     "Upsert one short user-stated preference/rule or verified "
                     "successful/failed procedure outcome, citing exact Discord "
-                    "message locators."
+                    "message revisions. Shared records enter review unless a curator "
+                    "creates them; procedures require a confirmed external Action."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -1465,7 +1982,8 @@ def build_memory_endpoints(
                 name="memory.update",
                 summary=(
                     "Replace the summary, evidence locators, confidence, and expiry of "
-                    "one accessible durable memory."
+                    "one memory created by the requester or governed by a curator. "
+                    "A creator edit returns shared memory to pending review."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -1500,6 +2018,44 @@ def build_memory_endpoints(
             AgentMemoryForgetRequest,
             AgentMemoryForgetResponse,
             service.forget,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="memory.review",
+                summary=(
+                    "Approve or reject one pending shared memory. Available only to "
+                    "an explicit memory curator with current access to every source."
+                ),
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=(
+                    "memory",
+                    "review",
+                    "approve",
+                    "reject",
+                    "記憶",
+                    "承認",
+                    "却下",
+                ),
+                side_effects=(
+                    "Changes whether one shared memory is published to its source audience.",
+                ),
+                requires_workspace=True,
+                idempotency="idempotent_write",
+                expected_errors=(
+                    "workspace.required",
+                    "memory.not_found",
+                    "memory.curator_required",
+                    "memory.verified_action_required",
+                ),
+                timeout_seconds=10,
+                user_visible_effect=(
+                    "Approves or rejects one shared memory and returns its review state."
+                ),
+            ),
+            AgentMemoryReviewRequest,
+            AgentMemoryReviewResponse,
+            service.review,
         ),
     )
 
@@ -1596,11 +2152,18 @@ def _validated_source_message_locators(
     context: InvocationContext,
 ) -> tuple[AgentMemorySourceLocator, ...]:
     if not values:
+        if context.origin_resource_id is None or context.workspace_id is None:
+            raise UserError("memory.source_message_locators_invalid")
         return tuple(
             AgentMemorySourceLocator(
                 message_id=message_id,
                 channel_id=context.origin_resource_id,
                 guild_id=context.workspace_id,
+                message_edited_at=(
+                    context.active_message_edited_at
+                    if message_id == context.active_message_id
+                    else None
+                ),
             )
             for message_id in source_message_ids
         )
@@ -1619,6 +2182,9 @@ def _validated_source_message_locators(
             message_id = _validated_snowflake_text(locator.message_id)
             channel_id = _validated_snowflake_text(locator.channel_id)
             guild_id = _validated_snowflake_text(locator.guild_id)
+            message_edited_at = _validated_revision(
+                locator.message_edited_at
+            )
         except (TypeError, ValueError) as exc:
             raise UserError(
                 "memory.source_message_locators_invalid",
@@ -1629,11 +2195,16 @@ def _validated_source_message_locators(
                 "memory.source_message_locators_invalid",
                 maximum=MAX_MEMORY_SOURCE_MESSAGE_IDS,
             )
+        if guild_id != context.workspace_id:
+            raise UserError("memory.source_workspace_mismatch")
+        if context.resource_ids and channel_id not in context.resource_ids:
+            raise UserError("memory.source_message_locators_invalid")
         validated.append(
             AgentMemorySourceLocator(
                 message_id=message_id or "",
                 channel_id=channel_id,
                 guild_id=guild_id,
+                message_edited_at=message_edited_at,
             )
         )
     return tuple(validated)
@@ -1662,6 +2233,7 @@ def _source_locators_json(
                 "message_id": locator.message_id,
                 "channel_id": locator.channel_id,
                 "guild_id": locator.guild_id,
+                "message_edited_at": locator.message_edited_at,
             }
             for locator in locators
         ],
@@ -1669,6 +2241,169 @@ def _source_locators_json(
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _source_locators_from_json(
+    value: str,
+) -> tuple[AgentMemorySourceLocator, ...]:
+    raw_locators = json.loads(value)
+    if not isinstance(raw_locators, list):
+        raise RuntimeError("invalid memory source message locators")
+    locators: list[AgentMemorySourceLocator] = []
+    for item in raw_locators:
+        if not isinstance(item, dict):
+            raise RuntimeError("invalid memory source message locators")
+        message_id = item.get("message_id")
+        channel_id = item.get("channel_id")
+        guild_id = item.get("guild_id")
+        message_edited_at = item.get("message_edited_at")
+        if (
+            not isinstance(message_id, str)
+            or (channel_id is not None and not isinstance(channel_id, str))
+            or (guild_id is not None and not isinstance(guild_id, str))
+            or (
+                message_edited_at is not None
+                and not isinstance(message_edited_at, str)
+            )
+        ):
+            raise RuntimeError("invalid memory source message locators")
+        locators.append(
+            AgentMemorySourceLocator(
+                message_id=message_id,
+                channel_id=channel_id,
+                guild_id=guild_id,
+                message_edited_at=message_edited_at,
+            )
+        )
+    return tuple(locators)
+
+
+def _uncertain_source_resources(
+    locators: tuple[AgentMemorySourceLocator, ...],
+) -> tuple[tuple[str, str, AgentMemoryVisibility], ...]:
+    resources: list[tuple[str, str, AgentMemoryVisibility]] = []
+    for locator in locators:
+        if locator.guild_id is None or locator.channel_id is None:
+            continue
+        resource = (
+            locator.guild_id,
+            locator.channel_id,
+            AgentMemoryVisibility.UNCERTAIN,
+        )
+        if resource not in resources:
+            resources.append(resource)
+    return tuple(resources)
+
+
+def _source_audience_json(
+    resources: tuple[tuple[str, str, AgentMemoryVisibility], ...],
+) -> str:
+    return json.dumps(
+        [
+            [workspace_id, resource_id, visibility.value]
+            for workspace_id, resource_id, visibility in resources
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _memory_provenance(
+    context: InvocationContext,
+    locators: tuple[AgentMemorySourceLocator, ...],
+) -> AgentMemoryProvenance:
+    workspace_id = _workspace(context)
+    origin_channel_id = context.origin_resource_id
+    labels: dict[tuple[str, str], AgentMemoryVisibility] = {}
+    for observation in context.disclosure_observations:
+        key = (
+            observation.source_workspace_id,
+            observation.source_resource_id,
+        )
+        visibility = AgentMemoryVisibility(observation.visibility)
+        current = labels.get(key)
+        labels[key] = (
+            visibility
+            if current is None
+            else _stricter_visibility(current, visibility)
+        )
+    source_resources: list[
+        tuple[str, str, AgentMemoryVisibility]
+    ] = []
+    source_indexes: dict[tuple[str, str], int] = {}
+    for locator in locators:
+        if locator.guild_id is None or locator.channel_id is None:
+            raise UserError("memory.source_message_locators_invalid")
+        key = (locator.guild_id, locator.channel_id)
+        visibility = labels.get(key, AgentMemoryVisibility.UNCERTAIN)
+        if key in source_indexes:
+            index = source_indexes[key]
+            prior = source_resources[index]
+            source_resources[index] = (
+                prior[0],
+                prior[1],
+                _stricter_visibility(prior[2], visibility),
+            )
+        else:
+            source_indexes[key] = len(source_resources)
+            source_resources.append((key[0], key[1], visibility))
+    origin_visibility = labels.get(
+        (workspace_id, origin_channel_id or ""),
+        AgentMemoryVisibility.UNCERTAIN,
+    )
+    return AgentMemoryProvenance(
+        origin_guild_id=workspace_id,
+        origin_channel_id=origin_channel_id,
+        origin_visibility=origin_visibility,
+        source_resources=tuple(source_resources),
+        unlabelled_input=(
+            not source_resources
+            or any(
+                item[2] is AgentMemoryVisibility.UNCERTAIN
+                for item in source_resources
+            )
+        ),
+    )
+
+
+def _stricter_visibility(
+    left: AgentMemoryVisibility,
+    right: AgentMemoryVisibility,
+) -> AgentMemoryVisibility:
+    order = {
+        AgentMemoryVisibility.GUILD_PUBLIC: 0,
+        AgentMemoryVisibility.RESTRICTED: 1,
+        AgentMemoryVisibility.UNCERTAIN: 2,
+    }
+    return left if order[left] >= order[right] else right
+
+
+def _is_memory_curator(context: InvocationContext) -> bool:
+    return AGENT_MEMORY_CURATOR_GRANT in context.grants
+
+
+def _validated_action_id(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("act_")
+        or len(value) != 36
+        or any(character not in "0123456789abcdef" for character in value[4:])
+    ):
+        raise UserError("memory.verified_action_invalid")
+    return value
+
+
+def _validated_revision(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("memory revision must be non-empty text")
+    try:
+        parsed = _optional_timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("memory revision must be RFC 3339") from exc
+    assert parsed is not None
+    return parsed.isoformat()
 
 
 def _validated_confidence(value: float) -> float:
@@ -1763,16 +2498,95 @@ def _row_is_accessible(
     *,
     workspace_id: str,
     actor_id: str,
-    channel_id: str | None,
+    resource_ids: tuple[str, ...],
+    is_curator: bool,
 ) -> bool:
     if str(row["workspace_id"]) != workspace_id:
         return False
     scope = AgentMemoryScope(str(row["scope"]))
     if scope is AgentMemoryScope.USER:
         return str(row["owner_user_id"]) == actor_id
+    review_state = AgentMemoryReviewState(str(row["review_state"]))
+    if (
+        review_state is not AgentMemoryReviewState.APPROVED
+        and str(row["created_by_actor_id"]) != actor_id
+        and not is_curator
+    ):
+        return False
     if scope is AgentMemoryScope.CHANNEL:
-        return channel_id is not None and str(row["channel_id"]) == channel_id
-    return True
+        channel_id = row["channel_id"]
+        if channel_id is None or str(channel_id) not in resource_ids:
+            return False
+    return _row_source_audience_is_accessible(
+        row,
+        workspace_id=workspace_id,
+        resource_ids=resource_ids,
+    )
+
+
+def _row_can_mutate(
+    row: sqlite3.Row,
+    *,
+    workspace_id: str,
+    actor_id: str,
+    is_curator: bool,
+    resource_ids: tuple[str, ...],
+) -> bool:
+    if str(row["workspace_id"]) != workspace_id:
+        return False
+    scope = AgentMemoryScope(str(row["scope"]))
+    if scope is AgentMemoryScope.USER:
+        return str(row["owner_user_id"]) == actor_id
+    if str(row["created_by_actor_id"]) == actor_id:
+        return True
+    return is_curator and _row_source_audience_is_accessible(
+        row,
+        workspace_id=workspace_id,
+        resource_ids=resource_ids,
+    )
+
+
+def _row_source_audience_is_accessible(
+    row: sqlite3.Row,
+    *,
+    workspace_id: str,
+    resource_ids: tuple[str, ...],
+) -> bool:
+    resources = _source_audience_from_json(
+        str(row["source_audience_json"])
+    )
+    if not resources:
+        return False
+    readable = frozenset(resource_ids)
+    return all(
+        source_workspace_id == workspace_id
+        and source_resource_id in readable
+        for source_workspace_id, source_resource_id, _visibility in resources
+    )
+
+
+def _source_audience_from_json(
+    value: str,
+) -> tuple[tuple[str, str, AgentMemoryVisibility], ...]:
+    raw_resources = json.loads(value)
+    if not isinstance(raw_resources, list):
+        raise RuntimeError("invalid memory source audience")
+    resources: list[tuple[str, str, AgentMemoryVisibility]] = []
+    for item in raw_resources:
+        if (
+            not isinstance(item, list)
+            or len(item) != 3
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+            or not isinstance(item[2], str)
+        ):
+            raise RuntimeError("invalid memory source audience")
+        try:
+            visibility = AgentMemoryVisibility(item[2])
+        except ValueError as exc:
+            raise RuntimeError("invalid memory source audience") from exc
+        resources.append((item[0], item[1], visibility))
+    return tuple(resources)
 
 
 def _memory_search_score(
@@ -1892,29 +2706,18 @@ def _memory_from_row(
         isinstance(value, str) for value in source_value
     ):
         raise RuntimeError("invalid memory source message IDs")
-    raw_locators = json.loads(str(row["source_message_locators_json"]))
-    if not isinstance(raw_locators, list):
-        raise RuntimeError("invalid memory source message locators")
-    source_locators: list[AgentMemorySourceLocator] = []
-    for value in raw_locators:
-        if not isinstance(value, dict):
-            raise RuntimeError("invalid memory source message locators")
-        message_id = value.get("message_id")
-        channel_id = value.get("channel_id")
-        guild_id = value.get("guild_id")
-        if (
-            not isinstance(message_id, str)
-            or (channel_id is not None and not isinstance(channel_id, str))
-            or (guild_id is not None and not isinstance(guild_id, str))
-        ):
-            raise RuntimeError("invalid memory source message locators")
-        source_locators.append(
-            AgentMemorySourceLocator(
-                message_id=message_id,
-                channel_id=channel_id,
-                guild_id=guild_id,
-            )
-        )
+    source_locators = _source_locators_from_json(
+        str(row["source_message_locators_json"])
+    )
+    source_resources = _source_audience_from_json(
+        str(row["source_audience_json"])
+    )
+    origin_channel_id = (
+        str(row["origin_channel_id"])
+        if row["origin_channel_id"] is not None
+        else None
+    )
+    origin_visibility = AgentMemoryVisibility(str(row["origin_visibility"]))
     return AgentMemoryRecord(
         memory_id=str(row["memory_id"]),
         scope=AgentMemoryScope(str(row["scope"])),
@@ -1927,11 +2730,41 @@ def _memory_from_row(
         channel_id=(
             str(row["channel_id"]) if row["channel_id"] is not None else None
         ),
+        created_by_actor_id=str(row["created_by_actor_id"]),
         key=str(row["memory_key"]),
         summary=str(row["summary"]),
         source_message_ids=tuple(source_value),
         source_message_locators=tuple(source_locators),
+        provenance=AgentMemoryProvenance(
+            origin_guild_id=str(row["workspace_id"]),
+            origin_channel_id=origin_channel_id,
+            origin_visibility=origin_visibility,
+            source_resources=source_resources,
+            unlabelled_input=(
+                not source_resources
+                or any(
+                    visibility is AgentMemoryVisibility.UNCERTAIN
+                    for _workspace_id, _resource_id, visibility in source_resources
+                )
+            ),
+        ),
         basis=AgentMemoryBasis(str(row["basis"])),
+        review_state=AgentMemoryReviewState(str(row["review_state"])),
+        reviewed_by_actor_id=(
+            str(row["reviewed_by_actor_id"])
+            if row["reviewed_by_actor_id"] is not None
+            else None
+        ),
+        reviewed_at=(
+            datetime.fromisoformat(str(row["reviewed_at"])).astimezone(UTC)
+            if row["reviewed_at"] is not None
+            else None
+        ),
+        verified_action_id=(
+            str(row["verified_action_id"])
+            if row["verified_action_id"] is not None
+            else None
+        ),
         confidence=float(row["confidence"]),
         created_at=datetime.fromisoformat(str(row["created_at"])).astimezone(UTC),
         updated_at=datetime.fromisoformat(str(row["updated_at"])).astimezone(UTC),

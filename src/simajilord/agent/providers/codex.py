@@ -5196,6 +5196,7 @@ def _memory_evidence_failure(
         if isinstance(raw_locators, (list, tuple))
         else {}
     )
+    verified_locators: list[dict[str, str | None]] = []
     for message_id in message_ids:
         state = budget.exact_message_reads[message_id]
         locator = locators.get(message_id)
@@ -5213,6 +5214,33 @@ def _memory_evidence_failure(
                     f"message read in this turn: {message_id}."
                 ),
             )
+        claimed_revision = (
+            locator.get("message_edited_at")
+            if locator is not None
+            else None
+        )
+        if (
+            claimed_revision is not None
+            and claimed_revision != state.edited_at_iso
+        ):
+            return (
+                "memory.source_message_revision_mismatch",
+                (
+                    "The cited message revision does not match the immutable "
+                    f"Discord revision read in this turn: {message_id}."
+                ),
+            )
+        verified_locators.append(
+            {
+                "message_id": message_id,
+                "guild_id": state.guild_id or claimed_guild_id,
+                "channel_id": state.channel_id or claimed_channel_id,
+                "message_edited_at": state.edited_at_iso,
+            }
+        )
+    # Persist only host-observed revisions. This mutates the parsed tool arguments
+    # before dataclass validation; the model cannot assert a fresher revision.
+    arguments["source_message_locators"] = verified_locators
     return None
 
 
@@ -5544,6 +5572,11 @@ def _record_discord_disclosure_observations(
     file_record = payload.get("file")
     if isinstance(file_record, dict):
         candidates.append(file_record)
+    memory_records = payload.get("memories")
+    if isinstance(memory_records, list):
+        candidates.extend(
+            item for item in memory_records if isinstance(item, dict)
+        )
     provenance_candidates = [
         item.get("provenance")
         for item in candidates

@@ -23,6 +23,7 @@ from simajilord.agent import (
     AGENT_FILE_GRANT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
+    AGENT_MEMORY_CURATOR_GRANT,
     AGENT_MESSAGE_GRANT,
     AGENT_MODERATION_GRANT,
     AGENT_REACTION_GRANT,
@@ -812,6 +813,11 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     runtime.image.provider = object()
 
     requested = _agent_grants(runtime, actor_id="7")
+    discord_curator = _agent_grants(
+        runtime,
+        actor_id="99",
+        memory_curator=True,
+    )
     runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ASSIST
     assist = _agent_grants(runtime, actor_id="99", autonomous=True)
     runtime.settings.agent_autonomy_mode = AgentAutonomyMode.ACT
@@ -855,6 +861,9 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
     assert not {AGENT_CONNECTOR_GRANT, AGENT_SHELL_GRANT} & (assist | act)
     assert ACTION_UNDO_ANY_GRANT in requested
     assert ACTION_UNDO_ANY_GRANT not in assist
+    assert AGENT_MEMORY_CURATOR_GRANT in requested
+    assert AGENT_MEMORY_CURATOR_GRANT in discord_curator
+    assert AGENT_MEMORY_CURATOR_GRANT not in (assist | act | legacy_act)
 
 
 def test_discord_moderation_grant_does_not_depend_on_hive_provider() -> None:

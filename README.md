@@ -342,10 +342,19 @@ with Discord's generic “interaction failed” banner.
   then refuses to replay that whole model turn, instead of risking a duplicate external action.
 - Durable agent memory is independent of Codex provider threads in
   `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success/failure
-  `procedure` scopes enforce same-user/same-channel/same-server visibility. Records contain only a
-  short summary, exact source Discord message IDs, confidence, timestamps, and optional expiry;
+  `procedure` scopes enforce an explicit creator, live source audience, and review policy. `user`
+  records remain requester-private. `channel` records require current read access to that channel,
+  while `workspace` and `procedure` records require current read access to every persisted source
+  channel. A non-curator can propose shared memory, but it remains `pending`; only its creator may
+  update/delete it, and creator edits return it to review. Discord members with Administrator or
+  Manage Server, plus configured agent admins, receive the separate `memory_curator` grant and may
+  approve/reject or maintain shared records only when they can still read every source. No slash
+  command is required. Records contain only a short summary, creator/review state, exact source
+  Discord message IDs and revisions, body-free audience labels, confidence, timestamps, and
+  optional expiry;
   message bodies, attachments, secret-like values, inferred profiles, and low-confidence guesses
-  are rejected. `memory.search`, `memory.remember`, and `memory.update` tools let the agent
+  are rejected. `memory.search`, `memory.remember`, `memory.update`, `memory.review`, and
+  `memory.forget` tools let the agent
   retrieve relevant context and capture at most one reusable outcome after substantive work
   without recording every turn. Recent rows are not injected into every prompt: the agent first
   reads the exact active Discord event and searches memory only when that task needs it. Search
@@ -355,9 +364,15 @@ with Discord's generic “interaction failed” banner.
   recently used accessible records. Normalized keys upsert duplicates, search updates
   `last_used_at`, and expiry plus total/workspace/user/channel/procedure caps keep the database
   bounded. Memory writes still require the exact authorizing event and return non-undoable
-  Action Receipts; forgetting is intentionally irreversible. Provider conversation continuity
-  and this distilled memory are separate, so resetting provider continuity does not turn raw
-  chat history into durable memory.
+  Action Receipts; forgetting is intentionally irreversible. A verified `procedure` also requires
+  the ID of a same-server `confirmed` or `reconciled` non-memory external effect owned by the
+  requester, unless a curator explicitly acts. Ordinary Discord text alone is not execution
+  evidence. `memory.search` returns provenance that is added to the active turn's disclosure
+  observations, so enforce mode blocks a restricted memory from being published to a broader or
+  uncertain destination. Migrated shared rows without creator/audience/Action evidence remain
+  `pending` and uncertain rather than inheriting ambient server authority. Provider conversation
+  continuity and this distilled memory are separate, so resetting provider continuity does not
+  turn raw chat history into durable memory.
 - Event-driven autonomy stores content-free message/edit/reaction/thread/voice/timer/audio
   pointers in `.data/agent_autonomy.sqlite3`. The first event opens one fixed 5–15 second
   same-channel batch window
