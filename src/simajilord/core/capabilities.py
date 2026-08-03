@@ -69,6 +69,70 @@ class DisclosureClass(StrEnum):
     UNKNOWN = "unknown"
 
 
+class EgressFieldKind(StrEnum):
+    """Body-free category of data sent beyond the local capability platform."""
+
+    QUERY = "query"
+    URL = "url"
+    PROMPT = "prompt"
+    MEDIA = "media"
+    CONNECTOR_ARGUMENTS = "connector_arguments"
+
+
+class EgressSinkAudience(StrEnum):
+    """Host knowledge about the audience receiving one external transfer."""
+
+    EXTERNAL_PUBLIC = "external_public"
+    EXTERNAL_PRIVATE = "external_private"
+    UNKNOWN = "unknown"
+
+
+class EgressConsentRequirement(StrEnum):
+    """When source labels require a host-verifiable requester decision."""
+
+    NONE = "none"
+    RESTRICTED_OR_UNCERTAIN = "restricted_or_uncertain"
+    ALWAYS = "always"
+
+
+@dataclass(frozen=True, slots=True)
+class EgressDescriptor:
+    """Typed declaration of model- or host-supplied data leaving the platform."""
+
+    provider: str
+    field_kinds: tuple[EgressFieldKind, ...]
+    sink_audience: EgressSinkAudience
+    consent: EgressConsentRequirement = (
+        EgressConsentRequirement.RESTRICTED_OR_UNCERTAIN
+    )
+    request_fields: tuple[str, ...] = ()
+    source_resource_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.provider.strip() or len(self.provider) > 100:
+            raise ValueError("egress provider must contain 1 to 100 characters")
+        if not self.field_kinds or len(set(self.field_kinds)) != len(
+            self.field_kinds
+        ):
+            raise ValueError("egress field kinds must be non-empty and unique")
+        if any(not isinstance(item, EgressFieldKind) for item in self.field_kinds):
+            raise ValueError("egress field kinds must be EgressFieldKind values")
+        if len(set(self.request_fields)) != len(self.request_fields) or any(
+            not item.strip() for item in self.request_fields
+        ):
+            raise ValueError("egress request fields must be non-empty and unique")
+        if len(set(self.source_resource_fields)) != len(
+            self.source_resource_fields
+        ) or any(not item.strip() for item in self.source_resource_fields):
+            raise ValueError(
+                "egress source resource fields must be non-empty and unique"
+            )
+        if not isinstance(self.sink_audience, EgressSinkAudience):
+            raise ValueError("egress sink audience must be an EgressSinkAudience")
+        if not isinstance(self.consent, EgressConsentRequirement):
+            raise ValueError("egress consent must be an EgressConsentRequirement")
+
+
 @dataclass(frozen=True, slots=True)
 class DisclosureObservation:
     """One source audience observed by an active model turn."""
@@ -134,6 +198,7 @@ class CapabilityDescriptor:
     user_visible_effect: str | None = None
     audit_payload: CapabilityAuditPayload = "full"
     disclosure_class: DisclosureClass | None = None
+    egress: EgressDescriptor | None = None
 
     def __post_init__(self) -> None:
         """Reject metadata that would teach an agent contradictory behavior."""
@@ -157,6 +222,13 @@ class CapabilityDescriptor:
             DisclosureClass,
         ):
             raise ValueError("disclosure_class must be a DisclosureClass")
+        if self.egress is not None and not isinstance(
+            self.egress,
+            EgressDescriptor,
+        ):
+            raise ValueError("egress must be an EgressDescriptor")
+        if self.egress is not None and self.audit_payload != "metadata":
+            raise ValueError("egress capabilities require metadata-only audit payloads")
         if (
             self.risk in {RiskLevel.WRITE, RiskLevel.DESTRUCTIVE}
             and self.idempotency == "read"
@@ -196,6 +268,18 @@ def endpoint(
     handler: Callable[[RequestT, InvocationContext], Awaitable[ResponseT]],
 ) -> CapabilityEndpoint:
     """Create a runtime-checked endpoint from a typed handler."""
+
+    request_fields = _field_names(request_type)
+    if descriptor.egress is not None:
+        declared_egress_fields = set(descriptor.egress.request_fields) | set(
+            descriptor.egress.source_resource_fields
+        )
+        unknown_egress_fields = declared_egress_fields - set(request_fields)
+        if unknown_egress_fields:
+            raise CapabilityError(
+                f"{descriptor.name} egress fields are absent from "
+                f"{request_type.__name__}: {', '.join(sorted(unknown_egress_fields))}."
+            )
 
     async def checked(request: Any, context: InvocationContext) -> Any:
         if not isinstance(request, request_type):
@@ -383,6 +467,25 @@ class CapabilityRegistry:
                 "disclosure_class": (
                     item.descriptor.disclosure_class.value
                     if item.descriptor.disclosure_class is not None
+                    else None
+                ),
+                "egress": (
+                    {
+                        "provider": item.descriptor.egress.provider,
+                        "field_kinds": tuple(
+                            field_kind.value
+                            for field_kind in item.descriptor.egress.field_kinds
+                        ),
+                        "request_fields": item.descriptor.egress.request_fields,
+                        "source_resource_fields": (
+                            item.descriptor.egress.source_resource_fields
+                        ),
+                        "sink_audience": (
+                            item.descriptor.egress.sink_audience.value
+                        ),
+                        "consent": item.descriptor.egress.consent.value,
+                    }
+                    if item.descriptor.egress is not None
                     else None
                 ),
             }

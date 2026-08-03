@@ -19,7 +19,14 @@ from time import monotonic
 from typing import Literal, cast
 
 from simajilord.capabilities.isolated_shell import discord_workspace_for_context
-from simajilord.core import DisclosureClass, DisclosureObservation, InvocationContext
+from simajilord.core import (
+    DisclosureClass,
+    DisclosureObservation,
+    EgressConsentRequirement,
+    EgressDescriptor,
+    EgressSinkAudience,
+    InvocationContext,
+)
 from simajilord.core.errors import (
     MediaError,
     ModerationError,
@@ -163,7 +170,7 @@ audiences, pagination, minimal quoting, and role IDs.
 After reading the trigger, choose the next step without stalling:
 1. For normal conversation answerable from the retrieved context, answer directly; do not search
    merely to use a tool.
-2. For current facts, use Codex web search, prefer primary sources, cross-check material claims,
+2. For current facts, use typed web tools, prefer primary sources, cross-check material claims,
    and cite URLs. Local web tools can continue long/PDF text; follow next_offset and use
    files.download_url/files.read for truncated sources when available.
 3. For Discord state, files, or actions, use a matching shown Simajilord tool.
@@ -264,6 +271,8 @@ class _ToolTurnBudget:
     used_high_risk_authorizations: set[str] = field(default_factory=set)
     confirmed_high_risk_actions: set[str] = field(default_factory=set)
     denied_high_risk_actions: set[str] = field(default_factory=set)
+    confirmed_egress_actions: set[str] = field(default_factory=set)
+    denied_egress_actions: set[str] = field(default_factory=set)
     discord_disclosure_observations: list[DisclosureObservation] = field(
         default_factory=list
     )
@@ -302,6 +311,12 @@ class _ToolTraceState:
     write: bool
     destructive: bool
     authorization_reference_id: str | None
+    egress_provider: str | None
+    egress_field_kinds: tuple[str, ...]
+    egress_sink_audience: str | None
+    egress_consent: str | None
+    egress_policy_decision: str | None
+    egress_policy_reference_id: str | None
     calls_remaining_before: int | None
     output_characters_before: int | None
     follow_up_evidence_calls_before: int | None
@@ -433,6 +448,12 @@ def _continuation_tool_budget(
         ),
         denied_high_risk_actions=(
             set(source.denied_high_risk_actions) if source is not None else set()
+        ),
+        confirmed_egress_actions=(
+            set(source.confirmed_egress_actions) if source is not None else set()
+        ),
+        denied_egress_actions=(
+            set(source.denied_egress_actions) if source is not None else set()
         ),
         discord_disclosure_observations=(
             list(source.discord_disclosure_observations) if source is not None else []
@@ -2862,6 +2883,10 @@ class CodexAppServerProvider:
             tool_name=tool_name,
             arguments=raw_params.get("arguments"),
         )
+        egress_descriptor = self.tools.egress_descriptor_for_call(
+            tool_name=tool_name,
+            arguments=raw_params.get("arguments"),
+        )
         follow_up_evidence_call = _is_follow_up_evidence_call(
             budget,
             capability_name=capability_name,
@@ -3145,6 +3170,37 @@ class CodexAppServerProvider:
         )
         if information_flow_failure is not None:
             code, reason = information_flow_failure
+            if egress_descriptor is not None:
+                trace.egress_policy_decision = "denied_information_flow"
+            if blocking_write_capability is not None:
+                budget.write_failures.append((blocking_write_capability, code))
+            await self._traced_tool_response(
+                request_id,
+                trace,
+                success=False,
+                text=_tool_error_json(
+                    code=code,
+                    reason=reason,
+                    retryable=False,
+                ),
+                outcome="rejected",
+                error_code=code,
+            )
+            return
+        egress_failure = (
+            await _enforce_external_egress(
+                budget,
+                trace=trace,
+                capability_name=capability_name,
+                arguments=capability_arguments,
+                descriptor=egress_descriptor,
+                context=tool_context,
+            )
+            if egress_descriptor is not None and capability_name is not None
+            else None
+        )
+        if egress_failure is not None:
+            code, reason = egress_failure
             if blocking_write_capability is not None:
                 budget.write_failures.append((blocking_write_capability, code))
             await self._traced_tool_response(
@@ -3583,6 +3639,10 @@ class CodexAppServerProvider:
         write = False
         destructive = False
         authorization_reference_id: str | None = None
+        egress_provider: str | None = None
+        egress_field_kinds: tuple[str, ...] = ()
+        egress_sink_audience: str | None = None
+        egress_consent: str | None = None
         if tool_name is not None:
             metadata = self.tools.trace_metadata_for_call(
                 tool_name=tool_name,
@@ -3601,6 +3661,17 @@ class CodexAppServerProvider:
                 authorization_reference_id = _opaque_tool_authorization_reference(
                     authorization_event_id
                 )
+            egress = self.tools.egress_descriptor_for_call(
+                tool_name=tool_name,
+                arguments=params.get("arguments"),
+            )
+            if egress is not None:
+                egress_provider = egress.provider
+                egress_field_kinds = tuple(
+                    field_kind.value for field_kind in egress.field_kinds
+                )
+                egress_sink_audience = egress.sink_audience.value
+                egress_consent = egress.consent.value
         context = budget.context if budget is not None else None
         return _ToolTraceState(
             budget=budget,
@@ -3616,6 +3687,14 @@ class CodexAppServerProvider:
             write=write,
             destructive=destructive,
             authorization_reference_id=authorization_reference_id,
+            egress_provider=egress_provider,
+            egress_field_kinds=egress_field_kinds,
+            egress_sink_audience=egress_sink_audience,
+            egress_consent=egress_consent,
+            egress_policy_decision=(
+                "not_evaluated" if egress_provider is not None else None
+            ),
+            egress_policy_reference_id=None,
             calls_remaining_before=(budget.calls_remaining if budget is not None else None),
             output_characters_before=(
                 budget.output_characters_remaining if budget is not None else None
@@ -3680,6 +3759,14 @@ class CodexAppServerProvider:
             "write": trace.write,
             "destructive": trace.destructive,
             "authorization_reference_id": trace.authorization_reference_id,
+            "egress_provider": trace.egress_provider,
+            "egress_field_kinds": list(trace.egress_field_kinds),
+            "egress_sink_audience": trace.egress_sink_audience,
+            "egress_consent": trace.egress_consent,
+            "egress_policy_decision": trace.egress_policy_decision,
+            "egress_policy_reference_id": (
+                trace.egress_policy_reference_id
+            ),
             "calls_remaining_before": trace.calls_remaining_before,
             "output_characters_before": trace.output_characters_before,
             "follow_up_evidence_calls_before": (trace.follow_up_evidence_calls_before),
@@ -4309,17 +4396,14 @@ def _information_flow_write_failure(
                 "that mixed-audience turn."
             ),
         )
-    unknown_sink_capabilities = {
-        "connector.write",
-        "connector.destructive",
+    unscoped_publication_capabilities = {
         "feedback.create",
-        "image.generate",
         "discord.send_direct_message",
     }
     if any(
         observation.visibility != "guild_public"
         for observation in observations
-    ) and capability_name in unknown_sink_capabilities:
+    ) and capability_name in unscoped_publication_capabilities:
         return (
             "agent.information_flow_forbidden",
             (
@@ -4328,6 +4412,255 @@ def _information_flow_write_failure(
             ),
         )
     return None
+
+
+def _external_egress_policy_decision(
+    descriptor: EgressDescriptor,
+    budget: _ToolTurnBudget,
+    arguments: object | None = None,
+) -> tuple[Literal["allow", "confirm", "deny"], str, str | None]:
+    """Resolve one external transfer without inspecting or retaining its body."""
+
+    context = budget.context
+    if (
+        context.agent_trigger == "autonomous"
+        and context.policy_id == "discord-autonomy-strict-v1"
+    ):
+        return (
+            "deny",
+            "denied_strict_autonomy",
+            "Strict autonomy does not permit external data transfer capabilities.",
+        )
+    if context.information_flow_mode == "disabled":
+        return "allow", "allowed_policy_disabled", None
+    observations = budget.discord_disclosure_observations
+    restricted_or_uncertain = any(
+        observation.visibility != "guild_public" for observation in observations
+    )
+    unlabelled_source = not observations or _egress_has_unobserved_source_resource(
+        descriptor,
+        arguments,
+        observations,
+    )
+    consent_boundary = (
+        restricted_or_uncertain
+        or unlabelled_source
+        or descriptor.sink_audience is EgressSinkAudience.UNKNOWN
+    )
+    consent_required = (
+        descriptor.consent is EgressConsentRequirement.ALWAYS
+        or consent_boundary
+    )
+    if context.information_flow_mode == "audit":
+        return (
+            "allow",
+            (
+                "audit_would_require_consent"
+                if consent_required
+                else "audit_allowed"
+            ),
+            None,
+        )
+    if not consent_required:
+        return "allow", "allowed_public_source", None
+    if descriptor.consent is EgressConsentRequirement.NONE:
+        return (
+            "deny",
+            "denied_consent_not_supported",
+            (
+                "The external sink cannot receive restricted, uncertain, or "
+                "unlabelled data under its host policy."
+            ),
+        )
+    return (
+        "confirm",
+        "confirmation_required",
+        (
+            "Restricted, uncertain, or unlabelled data requires a requester-only "
+            "confirmation before it can be sent to this external provider."
+        ),
+    )
+
+
+async def _enforce_external_egress(
+    budget: _ToolTurnBudget,
+    *,
+    trace: _ToolTraceState,
+    capability_name: str,
+    arguments: object,
+    descriptor: EgressDescriptor,
+    context: InvocationContext,
+) -> tuple[str, str] | None:
+    """Apply label-aware consent before any declared external transfer."""
+
+    fingerprint = _external_egress_fingerprint(
+        capability_name,
+        arguments,
+        descriptor,
+        context,
+        budget.discord_disclosure_observations,
+    )
+    trace.egress_policy_reference_id = _opaque_egress_policy_reference(
+        fingerprint
+    )
+    action, decision, reason = _external_egress_policy_decision(
+        descriptor,
+        budget,
+        arguments,
+    )
+    trace.egress_policy_decision = decision
+    if action == "allow":
+        return None
+    if action == "deny":
+        return (
+            "agent.egress_forbidden",
+            reason or "The host external-transfer policy denied this call.",
+        )
+    if fingerprint in budget.confirmed_egress_actions:
+        trace.egress_policy_decision = "allowed_confirmed"
+        return None
+    if fingerprint in budget.denied_egress_actions:
+        trace.egress_policy_decision = "denied_confirmation"
+        return (
+            "agent.egress_confirmation_denied",
+            "The requester rejected this exact external data transfer.",
+        )
+    callback = budget.on_high_risk_confirmation
+    authorization_message_id = context.active_message_id
+    if callback is None or authorization_message_id is None:
+        trace.egress_policy_decision = "denied_confirmation_unavailable"
+        return (
+            "agent.egress_confirmation_unavailable",
+            (
+                "This transport cannot obtain a host-verifiable confirmation for "
+                "the exact external data transfer."
+            ),
+        )
+    requester_principal_id = context.requester_principal_id or context.actor_id
+    source_labels: set[str] = {
+        observation.visibility
+        for observation in budget.discord_disclosure_observations
+    }
+    if not source_labels or _egress_has_unobserved_source_resource(
+        descriptor,
+        arguments,
+        budget.discord_disclosure_observations,
+    ):
+        source_labels.add("unlabelled")
+    confirmation_metadata = json.dumps(
+        {
+            "provider": descriptor.provider,
+            "field_kinds": [item.value for item in descriptor.field_kinds],
+            "sink_audience": descriptor.sink_audience.value,
+            "source_labels": sorted(source_labels),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    try:
+        confirmed = await callback(
+            AgentHighRiskConfirmation(
+                capability=capability_name,
+                arguments_json=confirmation_metadata,
+                binding_sha256=fingerprint,
+                requester_principal_id=requester_principal_id,
+                authorization_message_id=authorization_message_id,
+                authorization_message_edited_at=context.active_message_edited_at,
+                confirmation_kind="external_egress",
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "External egress confirmation callback failed capability=%s request=%s",
+            capability_name,
+            context.request_id,
+        )
+        confirmed = False
+    if not confirmed:
+        budget.denied_egress_actions.add(fingerprint)
+        trace.egress_policy_decision = "denied_confirmation"
+        return (
+            "agent.egress_confirmation_denied",
+            "The requester rejected this exact external data transfer.",
+        )
+    budget.confirmed_egress_actions.add(fingerprint)
+    trace.egress_policy_decision = "allowed_confirmed"
+    return None
+
+
+def _egress_has_unobserved_source_resource(
+    descriptor: EgressDescriptor,
+    arguments: object | None,
+    observations: list[DisclosureObservation],
+) -> bool:
+    """Require every declared source resource to have a prior labelled read."""
+
+    if not descriptor.source_resource_fields:
+        return False
+    if not isinstance(arguments, Mapping):
+        return True
+    observed_resource_ids = {
+        observation.source_resource_id for observation in observations
+    }
+    for field_name in descriptor.source_resource_fields:
+        raw_resource = arguments.get(field_name)
+        if not isinstance(raw_resource, str) or raw_resource not in observed_resource_ids:
+            return True
+    return False
+
+
+def _external_egress_fingerprint(
+    capability_name: str,
+    arguments: object,
+    descriptor: EgressDescriptor,
+    context: InvocationContext,
+    observations: list[DisclosureObservation],
+) -> str:
+    """Bind consent to exact arguments, destination policy, revision, and sources."""
+
+    try:
+        encoded_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentToolError("External egress arguments must be JSON values.") from exc
+    encoded_observations = json.dumps(
+        sorted(
+            (
+                observation.source_workspace_id,
+                observation.source_resource_id,
+                observation.visibility,
+                observation.relation_to_origin,
+            )
+            for observation in observations
+        ),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    identity = "\0".join(
+        (
+            "simajilord-egress-v1",
+            capability_name,
+            descriptor.provider,
+            descriptor.sink_audience.value,
+            ",".join(item.value for item in descriptor.field_kinds),
+            context.actor_id,
+            context.request_id,
+            context.workspace_id or "",
+            context.origin_resource_id or "",
+            context.active_message_id or "",
+            context.active_message_edited_at or "",
+            encoded_observations,
+            encoded_arguments,
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _information_flow_blocks_origin(budget: _ToolTurnBudget) -> bool:
@@ -5612,9 +5945,20 @@ def _import_generated_image(
 
 
 def _web_search_mode(context: InvocationContext) -> str:
-    """Use first-party live search only for an explicitly granted agent profile."""
+    """Keep native search from bypassing host egress policy in enforce/strict modes."""
 
-    return "live" if AGENT_WEB_GRANT in context.grants else "disabled"
+    if AGENT_WEB_GRANT not in context.grants:
+        return "disabled"
+    if (
+        context.agent_trigger == "autonomous"
+        and context.policy_id == "discord-autonomy-strict-v1"
+    ):
+        return "disabled"
+    return (
+        "disabled"
+        if context.information_flow_mode == "enforce"
+        else "live"
+    )
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -5655,6 +5999,11 @@ def _optional_bounded_trace_text(value: str | None) -> str | None:
 def _opaque_tool_authorization_reference(authorization_event_id: str) -> str:
     digest = hashlib.sha256(authorization_event_id.encode()).hexdigest()
     return f"authref_{digest[:20]}"
+
+
+def _opaque_egress_policy_reference(binding_sha256: str) -> str:
+    digest = hashlib.sha256(binding_sha256.encode()).hexdigest()
+    return f"egressref_{digest[:20]}"
 
 
 def _tool_output_was_truncated(text: str) -> bool:

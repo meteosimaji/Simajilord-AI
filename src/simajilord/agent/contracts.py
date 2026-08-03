@@ -369,7 +369,7 @@ class AgentProgressUpdate:
 
 @dataclass(frozen=True, slots=True)
 class AgentHighRiskConfirmation:
-    """Concrete host-rendered action proposal bound to one exact argument hash."""
+    """Concrete host-rendered proposal bound to one exact, body-free hash."""
 
     capability: str
     arguments_json: str
@@ -377,6 +377,9 @@ class AgentHighRiskConfirmation:
     requester_principal_id: str
     authorization_message_id: str
     authorization_message_edited_at: str | None
+    confirmation_kind: Literal["high_risk_action", "external_egress"] = (
+        "high_risk_action"
+    )
 
 
 @dataclass(frozen=True, slots=True)

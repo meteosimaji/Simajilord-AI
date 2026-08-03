@@ -8575,9 +8575,6 @@ _AUTONOMY_STRICT_BASE_READ_CAPABILITIES = frozenset(
         "translation.translate_batch",
         "utility.choose",
         "utility.roll",
-        "web.search",
-        "web.fetch",
-        "web.find",
         "web.status",
     }
 )
@@ -8596,7 +8593,6 @@ _AUTONOMY_EVENT_CHANNEL_READ_CAPABILITIES = frozenset(
         "discord.view_custom_emoji",
         "discord.view_image_attachment",
         "discord.view_sticker",
-        "discord.analyze_attachment",
     }
 )
 _AUTONOMY_CHANNEL_EVENT_KINDS = frozenset(
@@ -8677,7 +8673,13 @@ def _autonomy_allowed_capabilities(
     return frozenset(
         endpoint.descriptor.name
         for endpoint in runtime.registry.all()
-        if endpoint.descriptor.name in reads or endpoint.descriptor.name in writes
+        if (
+            endpoint.descriptor.egress is None
+            and (
+                endpoint.descriptor.name in reads
+                or endpoint.descriptor.name in writes
+            )
+        )
     )
 
 
@@ -8882,12 +8884,21 @@ class AgentCog(commands.Cog):
         ):
             return False
         arguments = proposal.arguments_json.replace("```", "`​``")
+        external_egress = proposal.confirmation_kind == "external_egress"
         description = (
-            "A high-risk capability is ready to run. Confirm only if this exact "
-            "target and change match your intent.\n\n"
-            f"Capability: `{proposal.capability}`\n"
-            f"Binding: `{proposal.binding_sha256[:16]}`\n"
-            f"```json\n{arguments}\n```"
+            (
+                "A labelled source is about to be sent to an external provider. "
+                "The content is intentionally hidden here; confirm only if the "
+                "provider and field categories match your intent.\n\n"
+                if external_egress
+                else (
+                    "A high-risk capability is ready to run. Confirm only if this "
+                    "exact target and change match your intent.\n\n"
+                )
+            )
+            + f"Capability: `{proposal.capability}`\n"
+            + f"Binding: `{proposal.binding_sha256[:16]}`\n"
+            + f"```json\n{arguments}\n```"
         )
         timeout = float(
             self.runtime.settings.agent_high_risk_confirmation_timeout_seconds
@@ -8900,7 +8911,11 @@ class AgentCog(commands.Cog):
         try:
             confirmation_message = await channel.send(
                 embed=command_embed(
-                    "Confirm high-risk action",
+                    (
+                        "Confirm external data transfer"
+                        if external_egress
+                        else "Confirm high-risk action"
+                    ),
                     description=description,
                     tone=EmbedTone.WARNING,
                 ),
@@ -8939,9 +8954,9 @@ class AgentCog(commands.Cog):
         try:
             await self.runtime.journal.append(
                 kind=(
-                    "agent.high_risk.confirmed"
+                    f"agent.{'egress' if external_egress else 'high_risk'}.confirmed"
                     if accepted
-                    else "agent.high_risk.rejected"
+                    else f"agent.{'egress' if external_egress else 'high_risk'}.rejected"
                 ),
                 actor_id=proposal.requester_principal_id,
                 workspace_id=(
@@ -8956,6 +8971,7 @@ class AgentCog(commands.Cog):
                     "authorization_message_edited_at": (
                         proposal.authorization_message_edited_at
                     ),
+                    "confirmation_kind": proposal.confirmation_kind,
                     "confirmed": accepted,
                     "revision_valid": revision_valid,
                 },
@@ -8970,7 +8986,15 @@ class AgentCog(commands.Cog):
         with suppress(discord.DiscordException):
             await confirmation_message.edit(
                 embed=command_embed(
-                    "High-risk action confirmed" if accepted else "High-risk action stopped",
+                    (
+                        "External transfer confirmed"
+                        if accepted and external_egress
+                        else "External transfer stopped"
+                        if external_egress
+                        else "High-risk action confirmed"
+                        if accepted
+                        else "High-risk action stopped"
+                    ),
                     description=(
                         "The exact binding was confirmed and will now be rechecked "
                         "against live permissions."

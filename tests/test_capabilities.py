@@ -9,6 +9,9 @@ from simajilord.core import (
     CapabilityDescriptor,
     CapabilityRegistry,
     DisclosureClass,
+    EgressDescriptor,
+    EgressFieldKind,
+    EgressSinkAudience,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -90,6 +93,59 @@ def test_read_descriptor_requires_explicit_disclosure_class() -> None:
             "Invalid class.",
             RiskLevel.READ,
             disclosure_class="channel_scoped_content",  # type: ignore[arg-type]
+        )
+
+
+def test_egress_descriptor_is_typed_and_bound_to_request_schema() -> None:
+    async def handler(request: Request, _: InvocationContext) -> Response:
+        return Response(request.value)
+
+    declared = endpoint(
+        CapabilityDescriptor(
+            "test.egress",
+            "Send one query.",
+            RiskLevel.EXTERNAL,
+            audit_payload="metadata",
+            egress=EgressDescriptor(
+                provider="test_provider",
+                field_kinds=(EgressFieldKind.QUERY,),
+                request_fields=("value",),
+                source_resource_fields=("value",),
+                sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+            ),
+        ),
+        Request,
+        Response,
+        handler,
+    )
+    registry = CapabilityRegistry()
+    registry.register(declared)
+    assert registry.manifest()[0]["egress"] == {
+        "provider": "test_provider",
+        "field_kinds": ("query",),
+        "request_fields": ("value",),
+        "source_resource_fields": ("value",),
+        "sink_audience": "external_public",
+        "consent": "restricted_or_uncertain",
+    }
+
+    with pytest.raises(CapabilityError, match="egress fields are absent"):
+        endpoint(
+            CapabilityDescriptor(
+                "test.invalid_egress",
+                "Invalid transfer declaration.",
+                RiskLevel.EXTERNAL,
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="test_provider",
+                    field_kinds=(EgressFieldKind.QUERY,),
+                    request_fields=("missing",),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+                ),
+            ),
+            Request,
+            Response,
+            handler,
         )
 
 

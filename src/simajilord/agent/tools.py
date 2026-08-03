@@ -24,6 +24,7 @@ from simajilord.core import (
     CapabilityDescriptor,
     CapabilityRegistry,
     DisclosureClass,
+    EgressDescriptor,
     InvocationContext,
     RiskLevel,
 )
@@ -384,6 +385,22 @@ class AgentToolCatalog:
         if capability_name is None:
             return None
         return self._registry.endpoint(capability_name).descriptor.disclosure_class
+
+    def egress_descriptor_for_call(
+        self,
+        *,
+        tool_name: str,
+        arguments: object,
+    ) -> EgressDescriptor | None:
+        """Return the host-declared external-transfer contract for one call."""
+
+        capability_name = self.capability_for_call(
+            tool_name=tool_name,
+            arguments=arguments,
+        )
+        if capability_name is None:
+            return None
+        return self._registry.endpoint(capability_name).descriptor.egress
 
     def canonical_tool_name_for_call(
         self,
@@ -1150,6 +1167,21 @@ def _descriptor_metadata(descriptor: CapabilityDescriptor) -> Mapping[str, objec
             if descriptor.disclosure_class is not None
             else None
         ),
+        "egress": (
+            {
+                "provider": descriptor.egress.provider,
+                "field_kinds": tuple(
+                    item.value for item in descriptor.egress.field_kinds
+                ),
+                "sink_audience": descriptor.egress.sink_audience.value,
+                "consent": descriptor.egress.consent.value,
+                "source_resource_fields": (
+                    descriptor.egress.source_resource_fields
+                ),
+            }
+            if descriptor.egress is not None
+            else None
+        ),
     }
 
 
@@ -1175,6 +1207,13 @@ def _descriptor_description(descriptor: CapabilityDescriptor) -> str:
         constraints.append(f"timeout: {descriptor.timeout_seconds:g}s")
     if descriptor.user_visible_effect:
         constraints.append(f"visible effect: {descriptor.user_visible_effect}")
+    if descriptor.egress is not None:
+        constraints.append(
+            "external transfer: "
+            f"{descriptor.egress.provider} / "
+            f"{descriptor.egress.sink_audience.value} / "
+            + ", ".join(item.value for item in descriptor.egress.field_kinds)
+        )
     if descriptor.expected_errors:
         constraints.append("expected errors: " + ", ".join(descriptor.expected_errors))
     return f"{descriptor.summary} Operational metadata: {'; '.join(constraints)}."

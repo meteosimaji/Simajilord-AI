@@ -53,6 +53,7 @@ from simajilord.agent.providers.codex import (
     _continuation_tool_budget,
     _encode_app_server_message,
     _ExactMessageReadState,
+    _external_egress_policy_decision,
     _information_flow_write_failure,
     _is_final_delivery,
     _last_write_failure,
@@ -82,6 +83,9 @@ from simajilord.core import (
     CapabilityRegistry,
     DisclosureClass,
     DisclosureObservation,
+    EgressDescriptor,
+    EgressFieldKind,
+    EgressSinkAudience,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -7149,6 +7153,415 @@ def test_discord_read_without_embedded_label_uses_exact_channel_scope() -> None:
     ]
 
 
+def test_external_egress_policy_uses_source_labels_and_strict_autonomy() -> None:
+    descriptor = EgressDescriptor(
+        provider="configured_web_search",
+        field_kinds=(EgressFieldKind.QUERY,),
+        request_fields=("subject",),
+        sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+    )
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        origin_resource_id="general",
+        information_flow_mode="enforce",
+    )
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="event",
+    )
+
+    assert _external_egress_policy_decision(descriptor, budget)[:2] == (
+        "confirm",
+        "confirmation_required",
+    )
+    budget.discord_disclosure_observations.append(
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="general",
+            visibility="guild_public",
+            relation_to_origin="same_or_narrower",
+        )
+    )
+    assert _external_egress_policy_decision(descriptor, budget) == (
+        "allow",
+        "allowed_public_source",
+        None,
+    )
+    budget.discord_disclosure_observations.append(
+        DisclosureObservation(
+            source_workspace_id="guild",
+            source_resource_id="staff",
+            visibility="restricted",
+            relation_to_origin="same_or_narrower",
+        )
+    )
+    action, decision, reason = _external_egress_policy_decision(
+        descriptor,
+        budget,
+    )
+    assert (action, decision) == ("confirm", "confirmation_required")
+    assert reason is not None
+
+    unknown_sink = replace(
+        descriptor,
+        provider="reviewed_connector",
+        sink_audience=EgressSinkAudience.UNKNOWN,
+    )
+    unlabelled_budget = replace(
+        budget,
+        discord_disclosure_observations=[],
+    )
+    assert _external_egress_policy_decision(unknown_sink, unlabelled_budget)[:2] == (
+        "confirm",
+        "confirmation_required",
+    )
+    assert _external_egress_policy_decision(unknown_sink, budget)[:2] == (
+        "confirm",
+        "confirmation_required",
+    )
+
+    targeted = replace(
+        descriptor,
+        provider="hive",
+        source_resource_fields=("channel_id",),
+        sink_audience=EgressSinkAudience.EXTERNAL_PRIVATE,
+    )
+    public_only_budget = replace(
+        budget,
+        discord_disclosure_observations=budget.discord_disclosure_observations[:1],
+    )
+    assert _external_egress_policy_decision(
+        targeted,
+        public_only_budget,
+        {"channel_id": "staff"},
+    )[:2] == ("confirm", "confirmation_required")
+    assert _external_egress_policy_decision(
+        targeted,
+        public_only_budget,
+        {"channel_id": "general"},
+    ) == ("allow", "allowed_public_source", None)
+
+    strict_context = replace(
+        context,
+        agent_trigger="autonomous",
+        principal_kind="service",
+        policy_id="discord-autonomy-strict-v1",
+    )
+    strict_budget = replace(budget, context=strict_context)
+    assert _external_egress_policy_decision(descriptor, strict_budget)[:2] == (
+        "deny",
+        "denied_strict_autonomy",
+    )
+
+
+@pytest.mark.asyncio
+async def test_restricted_egress_requires_body_free_host_consent_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    proposals: list[AgentHighRiskConfirmation] = []
+    registry = CapabilityRegistry()
+
+    async def search(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.subject)
+        return WriteResponse(job_id="searched")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                name="test.egress",
+                summary="Send one query to a test search provider.",
+                risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="configured_web_search",
+                    field_kinds=(EgressFieldKind.QUERY,),
+                    request_fields=("subject",),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+                ),
+            ),
+            WriteRequest,
+            WriteResponse,
+            search,
+        )
+    )
+    journal = EventJournal(tmp_path / "egress-events.sqlite3")
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-egress",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(
+            registry,
+            ("test.egress",),
+            required_grants={"test.egress": "web"},
+        ),
+        trace_sink=journal,
+    )
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({"web"}),
+        origin_resource_id="staff",
+        active_message_id="message",
+        requester_principal_id="requester",
+    )
+
+    async def confirm(proposal: AgentHighRiskConfirmation) -> bool:
+        proposals.append(proposal)
+        return True
+
+    budget = _ToolTurnBudget(
+        context=context,
+        calls_remaining=2,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="message",
+        on_high_risk_confirmation=confirm,
+        discord_disclosure_observations=[
+            DisclosureObservation(
+                source_workspace_id="guild",
+                source_resource_id="staff",
+                visibility="restricted",
+                relation_to_origin="same_or_narrower",
+            )
+        ],
+    )
+    provider._active_tool_budgets["thread"] = budget
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+    secret_query = "private merger plan"
+    try:
+        await provider._handle_dynamic_tool(
+            1,
+            {
+                "namespace": "simajilord",
+                "tool": "test_egress",
+                "arguments": {"subject": secret_query},
+                "threadId": "thread",
+            },
+        )
+
+        assert invoked == [secret_query]
+        assert response.await_args.kwargs["success"] is True
+        assert len(proposals) == 1
+        proposal = proposals[0]
+        assert proposal.confirmation_kind == "external_egress"
+        assert secret_query not in proposal.arguments_json
+        assert json.loads(proposal.arguments_json) == {
+            "field_kinds": ["query"],
+            "provider": "configured_web_search",
+            "sink_audience": "external_public",
+            "source_labels": ["restricted"],
+        }
+        events = await journal.recent(limit=20)
+        finished = next(item for item in events if item.kind == "agent.tool.finished")
+        assert finished.payload["egress_provider"] == "configured_web_search"
+        assert finished.payload["egress_field_kinds"] == ["query"]
+        assert finished.payload["egress_policy_decision"] == "allowed_confirmed"
+        assert str(finished.payload["egress_policy_reference_id"]).startswith(
+            "egressref_"
+        )
+        assert secret_query not in json.dumps(finished.payload)
+    finally:
+        await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_external_sink_without_host_consent_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    registry = CapabilityRegistry()
+
+    async def connector_read(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.subject)
+        return WriteResponse(job_id="unexpected")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                name="test.connector_read",
+                summary="Invoke an unknown-audience connector.",
+                risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PRIVATE,
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="reviewed_connector",
+                    field_kinds=(EgressFieldKind.CONNECTOR_ARGUMENTS,),
+                    request_fields=("subject",),
+                    sink_audience=EgressSinkAudience.UNKNOWN,
+                ),
+            ),
+            WriteRequest,
+            WriteResponse,
+            connector_read,
+        )
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-connector-egress",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(
+            registry,
+            ("test.connector_read",),
+            required_grants={"test.connector_read": "connectors"},
+        ),
+    )
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({"connectors"}),
+        origin_resource_id="general",
+        active_message_id="message",
+    )
+    provider._active_tool_budgets["thread"] = _ToolTurnBudget(
+        context=context,
+        calls_remaining=1,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="message",
+    )
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+
+    await provider._handle_dynamic_tool(
+        1,
+        {
+            "namespace": "simajilord",
+            "tool": "test_connector_read",
+            "arguments": {"subject": "unlabelled arguments"},
+            "threadId": "thread",
+        },
+    )
+
+    assert invoked == []
+    assert response.await_args.kwargs["success"] is False
+    payload = json.loads(response.await_args.kwargs["text"])
+    assert payload["error"]["code"] == "agent.egress_confirmation_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_public_egress_dispatches_without_write_or_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    invoked: list[str] = []
+    registry = CapabilityRegistry()
+
+    async def search(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        invoked.append(request.subject)
+        return WriteResponse(job_id="public-result")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                name="test.public_search",
+                summary="Search public data.",
+                risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="configured_web_search",
+                    field_kinds=(EgressFieldKind.QUERY,),
+                    request_fields=("subject",),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+                ),
+            ),
+            WriteRequest,
+            WriteResponse,
+            search,
+        )
+    )
+    journal = EventJournal(tmp_path / "public-egress-events.sqlite3")
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent-public-egress",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(
+            registry,
+            ("test.public_search",),
+            required_grants={"test.public_search": "web"},
+        ),
+        trace_sink=journal,
+    )
+    context = InvocationContext(
+        actor_id="requester",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        grants=frozenset({"web"}),
+        origin_resource_id="general",
+        active_message_id="message",
+    )
+    provider._active_tool_budgets["thread"] = _ToolTurnBudget(
+        context=context,
+        calls_remaining=1,
+        output_characters_remaining=2_000,
+        on_progress=None,
+        required_message_id="message",
+        discord_disclosure_observations=[
+            DisclosureObservation(
+                source_workspace_id="guild",
+                source_resource_id="general",
+                visibility="guild_public",
+                relation_to_origin="same_or_narrower",
+            )
+        ],
+    )
+    response = AsyncMock()
+    monkeypatch.setattr(provider, "_tool_response", response)
+
+    try:
+        await provider._handle_dynamic_tool(
+            1,
+            {
+                "namespace": "simajilord",
+                "tool": "test_public_search",
+                "arguments": {"subject": "public weather"},
+                "threadId": "thread",
+            },
+        )
+
+        assert invoked == ["public weather"]
+        assert response.await_args.kwargs["success"] is True
+        events = await journal.recent(limit=20)
+        finished = next(item for item in events if item.kind == "agent.tool.finished")
+        assert finished.payload["egress_policy_decision"] == "allowed_public_source"
+        assert str(finished.payload["egress_policy_reference_id"]).startswith(
+            "egressref_"
+        )
+    finally:
+        await journal.close()
+
+
 @pytest.mark.asyncio
 async def test_high_risk_confirmation_binds_exact_revision_and_arguments() -> None:
     proposals: list[AgentHighRiskConfirmation] = []
@@ -8404,18 +8817,34 @@ def test_user_error_reason_explains_stale_undo_and_preserves_unknown_code() -> N
     assert "discord.permission_denied" in _user_error_reason("discord.permission_denied")
 
 
-def test_codex_live_search_requires_the_existing_web_grant() -> None:
+def test_codex_native_search_cannot_bypass_enforced_egress_policy() -> None:
     denied = InvocationContext("actor", "workspace", "agent", "denied")
-    granted = InvocationContext(
+    enforced = InvocationContext(
         "actor",
         "workspace",
         "agent",
-        "granted",
+        "enforced",
         grants=frozenset({AGENT_WEB_GRANT}),
+    )
+    audit = replace(enforced, request_id="audit", information_flow_mode="audit")
+    disabled = replace(
+        enforced,
+        request_id="disabled",
+        information_flow_mode="disabled",
+    )
+    strict_autonomy = replace(
+        audit,
+        request_id="strict-autonomy",
+        agent_trigger="autonomous",
+        principal_kind="service",
+        policy_id="discord-autonomy-strict-v1",
     )
 
     assert _web_search_mode(denied) == "disabled"
-    assert _web_search_mode(granted) == "live"
+    assert _web_search_mode(enforced) == "disabled"
+    assert _web_search_mode(audit) == "live"
+    assert _web_search_mode(disabled) == "live"
+    assert _web_search_mode(strict_autonomy) == "disabled"
 
 
 @pytest.mark.parametrize("budget", (200, 201, 257, 500))

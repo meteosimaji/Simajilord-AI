@@ -130,6 +130,19 @@ with Discord's generic “interaction failed” banner.
   reads create a guild-scoped observation instead of pretending message labels are missing;
   channel/file/memory/compute content still requires audience or provenance metadata, while an
   absent, invalid, or truncated label remains fail-closed as `uncertain`
+- External egress is classified independently from both operational risk and returned-data
+  disclosure. Each outbound query, URL, prompt, media body, or connector argument declares its
+  provider, body-free field kinds, sink audience, and consent rule. Public labelled data can use
+  ordinary web/media lookups without being treated as a write. Restricted or uncertain sources
+  require a requester-only Discord confirmation bound to the exact arguments, source-label set,
+  active message revision, provider, and sink before dispatch. Unlabelled inputs and every
+  unknown connector sink enter the same consent boundary and fail closed when confirmation is
+  unavailable; Hive additionally requires a prior labelled read of the exact source channel. The
+  confirmation UI and audit never retain the query, prompt, connector arguments, URL, or media
+  bytes: they keep
+  only provider, field kinds, policy decision, and an opaque policy reference. Hive attachment
+  bytes are materialized by the host after consent and never enter the model tool arguments.
+  Egress capabilities use metadata-only invocation audit records
 - The Discord adapter currently registers 106 typed capability endpoints covering the bot-visible
   conversation, moderation, audio, and common server-management areas listed below. This is a
   broad capability catalog, not a one-to-one implementation of every route in Discord's official
@@ -216,11 +229,14 @@ with Discord's generic “interaction failed” banner.
   anchored to the active message, the host invalidates that plan and any discovery contract, then
   requires a fresh AI semantic plan before capability browsing. History stays selective while a
   pre-context plan cannot ground a current ability claim
-- `AGENT_WEB_SEARCH_ACCESS` exposes both Codex first-party live search through the host's existing
-  ChatGPT OAuth session and Simajilord's local `web.search`, `web.fetch`, and `web.find` tools.
-  This lets the agent discover sources, continue through long HTML/PDF text, locate a passage,
-  and locally fetch a public URL that first-party search could not open. The same grant policy
-  applies to autonomous turns; explicit `/web` and prefix commands remain available independently
+- `AGENT_WEB_SEARCH_ACCESS` exposes Simajilord's typed `web.search`, `web.fetch`, and `web.find`
+  tools. This lets the agent discover sources, continue through long HTML/PDF text, locate a
+  passage, and fetch a public URL while keeping the query/URL inside the host egress boundary.
+  Codex-native first-party search cannot be intercepted before dispatch, so `enforce` disables
+  it and retains the typed path; the explicit `audit` or `disabled` information-flow modes restore
+  native live search as rollback behavior. Strict autonomous turns
+  do not receive any declared egress capability; the explicit legacy autonomy policy is the only
+  rollback to the former catalog. Explicit `/web` and prefix commands remain available independently
 - The 106 registered Discord endpoints span server/member Presence and activities, live VC state,
   channels/threads/pins/reactions/poll voters, effective permissions and overwrites,
   audit/bans/invites/events/AutoMod, emojis/stickers/soundboard, token-free webhooks,
@@ -354,6 +370,8 @@ with Discord's generic “interaction failed” banner.
   or administrative changes, and cannot
   search BOT-visible staff channels; voice events do not borrow the BOT's VC authority; and
   `act` no longer converts every `WHEN_REQUESTED` capability into ambient approval. The
+  strict catalog also excludes every capability carrying an external-egress descriptor, even
+  when an operator grants that capability to explicit mention turns. The
   `legacy` policy mode restores the former broad catalog explicitly. The autonomous
   principal is the BOT itself, never the user who produced an event; source actors in the batch
   provide context but not borrowed authority.

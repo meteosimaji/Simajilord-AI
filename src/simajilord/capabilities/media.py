@@ -13,6 +13,9 @@ from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
     DisclosureClass,
+    EgressDescriptor,
+    EgressFieldKind,
+    EgressSinkAudience,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -87,6 +90,13 @@ def build_download_endpoint(media: MediaService) -> CapabilityEndpoint:
             side_effects=(
                 "Connects to a public media service.",
                 "Creates a temporary local file.",
+            ),
+            audit_payload="metadata",
+            egress=EgressDescriptor(
+                provider="public_media",
+                field_kinds=(EgressFieldKind.URL,),
+                request_fields=("url",),
+                sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
             ),
         ),
         DownloadRequest,
@@ -174,6 +184,13 @@ def build_media_save_endpoint(
             side_effects=(
                 "Connects to the public media URL.",
                 "Creates up to four bounded files in the isolated workspace.",
+            ),
+            audit_payload="metadata",
+            egress=EgressDescriptor(
+                provider="public_media",
+                field_kinds=(EgressFieldKind.URL,),
+                request_fields=("url",),
+                sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
             ),
             requires_workspace=True,
             idempotency="idempotent_write",

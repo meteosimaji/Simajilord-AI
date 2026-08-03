@@ -8,6 +8,9 @@ from simajilord.core.capabilities import (
     CapabilityDescriptor,
     CapabilityEndpoint,
     DisclosureClass,
+    EgressDescriptor,
+    EgressFieldKind,
+    EgressSinkAudience,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -132,6 +135,13 @@ def build_moderation_endpoints(
                 ),
                 side_effects=(
                     "Uses one provider analysis when no cached result exists.",
+                ),
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="hive",
+                    field_kinds=(EgressFieldKind.MEDIA,),
+                    request_fields=("filename", "content_type", "content"),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PRIVATE,
                 ),
             ),
             SyntheticMediaAnalyzeRequest,

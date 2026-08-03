@@ -54,6 +54,7 @@ from simajilord.integrations.discord.cogs import (
     _agent_delivery_nonce,
     _agent_invocation_context,
     _agent_request_replay_barrier_reason,
+    _autonomy_allowed_capabilities,
     _autonomy_event_write_capabilities,
     _pending_host_invocation_context,
 )
@@ -98,6 +99,36 @@ def test_strict_autonomy_never_borrows_service_voice_authority() -> None:
             frozenset({event_kind}),
         )
         assert allowed.isdisjoint(AGENT_AUDIO_WRITE_CAPABILITIES)
+
+
+def test_strict_autonomy_excludes_every_declared_external_egress() -> None:
+    runtime = SimpleNamespace(
+        registry=SimpleNamespace(
+            all=lambda: (
+                SimpleNamespace(
+                    descriptor=SimpleNamespace(name="web.search", egress=object())
+                ),
+                SimpleNamespace(
+                    descriptor=SimpleNamespace(name="web.status", egress=None)
+                ),
+                SimpleNamespace(
+                    descriptor=SimpleNamespace(
+                        name="discord.analyze_attachment",
+                        egress=object(),
+                    )
+                ),
+            )
+        )
+    )
+
+    allowed = _autonomy_allowed_capabilities(
+        runtime,
+        AgentAutonomyMode.ACT,
+        frozenset({AutonomyEventKind.MESSAGE_CREATE}),
+        policy_mode=AgentAutonomyPolicyMode.STRICT,
+    )
+
+    assert allowed == frozenset({"web.status"})
 
 
 async def _enqueue_messages(
@@ -172,6 +203,64 @@ async def test_high_risk_host_confirmation_rechecks_message_revision(
     assert runtime.journal.append.await_args.kwargs["payload"][
         "revision_valid"
     ] is False
+
+
+@pytest.mark.asyncio
+async def test_external_egress_confirmation_uses_body_free_ui_and_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = Mock(spec=discord.TextChannel)
+    confirmation_message = Mock(spec=discord.Message)
+    confirmation_message.edit = AsyncMock()
+    channel.send = AsyncMock(return_value=confirmation_message)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(
+            author=SimpleNamespace(id=7),
+            edited_at=None,
+        )
+    )
+    source = Mock(spec=discord.Message)
+    source.channel = channel
+    source.guild = SimpleNamespace(id=10)
+    runtime = SimpleNamespace(
+        settings=SimpleNamespace(
+            agent_high_risk_confirmation_timeout_seconds=120,
+        ),
+        journal=SimpleNamespace(append=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs."
+        "AgentHighRiskConfirmationView.wait_for_decision",
+        AsyncMock(return_value=True),
+    )
+    proposal = AgentHighRiskConfirmation(
+        capability="web.search",
+        arguments_json=(
+            '{"field_kinds":["query"],"provider":"configured_web_search",'
+            '"sink_audience":"external_public","source_labels":["restricted"]}'
+        ),
+        binding_sha256="b" * 64,
+        requester_principal_id="7",
+        authorization_message_id="20",
+        authorization_message_edited_at=None,
+        confirmation_kind="external_egress",
+    )
+
+    accepted = await AgentCog(SimpleNamespace(), runtime)._confirm_high_risk_action(
+        source,
+        proposal,
+    )
+
+    assert accepted is True
+    sent_embed = channel.send.await_args.kwargs["embed"]
+    assert sent_embed.title == "Confirm external data transfer"
+    assert "content is intentionally hidden" in sent_embed.description
+    assert runtime.journal.append.await_args.kwargs["kind"] == (
+        "agent.egress.confirmed"
+    )
+    assert runtime.journal.append.await_args.kwargs["payload"][
+        "confirmation_kind"
+    ] == "external_egress"
 
 
 @pytest.mark.asyncio
@@ -1392,9 +1481,10 @@ async def test_autonomy_cog_passes_whole_batch_under_bot_principal(
         registry=SimpleNamespace(
             all=lambda: tuple(
                 SimpleNamespace(
-                    descriptor=SimpleNamespace(
-                        name=name,
-                        approval=(
+                        descriptor=SimpleNamespace(
+                            name=name,
+                            egress=None,
+                            approval=(
                             ApprovalMode.NEVER
                             if name == "discord.send_message"
                             else ApprovalMode.WHEN_REQUESTED
@@ -1588,9 +1678,10 @@ async def test_autonomy_host_reply_receipts_only_posted_ids_for_source_actor(
         registry=SimpleNamespace(
             all=lambda: tuple(
                 SimpleNamespace(
-                    descriptor=SimpleNamespace(
-                        name=name,
-                        approval=ApprovalMode.WHEN_REQUESTED,
+                        descriptor=SimpleNamespace(
+                            name=name,
+                            egress=None,
+                            approval=ApprovalMode.WHEN_REQUESTED,
                     )
                 )
                 for name in AGENT_REQUESTED_WRITE_CAPABILITIES

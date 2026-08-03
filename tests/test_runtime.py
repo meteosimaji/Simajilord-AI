@@ -912,6 +912,25 @@ def test_agent_hive_attachment_analysis_requires_per_message_write_authority(
             "arguments": {},
         },
     ) == "discord.analyze_attachment"
+    egress = provider.tools.egress_descriptor_for_call(
+        tool_name="capability_invoke",
+        arguments={
+            "name": "discord.analyze_attachment",
+            "arguments": {},
+        },
+    )
+    assert egress is not None
+    assert egress.provider == "hive"
+    assert tuple(item.value for item in egress.field_kinds) == ("media",)
+    assert egress.request_fields == ()
+    assert egress.source_resource_fields == ("channel_id",)
+    assert runtime.registry.endpoint(
+        "discord.analyze_attachment"
+    ).schema.request_fields == (
+        "channel_id",
+        "message_id",
+        "attachment_index",
+    )
     hive_context = InvocationContext(
         actor_id="7",
         workspace_id="1",

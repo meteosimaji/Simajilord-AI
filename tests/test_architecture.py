@@ -119,3 +119,52 @@ def test_read_capabilities_declare_disclosure_classes() -> None:
         "files.read": "ACTOR_PRIVATE",
         "compute.run": "ACTOR_PRIVATE",
     }.items() <= declared.items()
+
+
+def test_external_data_transfers_declare_typed_egress_policy() -> None:
+    declared: set[str] = set()
+    body_audit_violations: list[str] = []
+    for path in Path("src/simajilord").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Name)
+                or node.func.id != "CapabilityDescriptor"
+            ):
+                continue
+            keywords = {item.arg: item.value for item in node.keywords if item.arg}
+            name_node = keywords.get("name") or (node.args[0] if node.args else None)
+            if (
+                "egress" in keywords
+                and isinstance(name_node, ast.Constant)
+                and isinstance(name_node.value, str)
+            ):
+                declared.add(name_node.value)
+                audit_node = keywords.get("audit_payload")
+                if not (
+                    isinstance(audit_node, ast.Constant)
+                    and audit_node.value == "metadata"
+                ):
+                    body_audit_violations.append(name_node.value)
+
+    assert {
+        "audio.search",
+        "audio.play",
+        "audio.mix",
+        "connector.read",
+        "connector.write",
+        "connector.destructive",
+        "discord.analyze_attachment",
+        "discord.play_audio",
+        "discord.set_audio_radio",
+        "files.download_url",
+        "image.generate",
+        "media.download",
+        "media.save",
+        "moderation.detect_synthetic_media",
+        "web.search",
+        "web.fetch",
+        "web.find",
+    } <= declared
+    assert body_audit_violations == []

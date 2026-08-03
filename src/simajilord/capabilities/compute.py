@@ -10,6 +10,9 @@ from simajilord.core import (
     CapabilityDescriptor,
     CapabilityEndpoint,
     DisclosureClass,
+    EgressDescriptor,
+    EgressFieldKind,
+    EgressSinkAudience,
     InvocationContext,
     RiskLevel,
     endpoint,
@@ -144,6 +147,13 @@ def build_compute_endpoints(
                 side_effects=(
                     "Fetches one public HTTP or HTTPS resource.",
                     "Creates or replaces a file in the isolated workspace.",
+                ),
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="public_web",
+                    field_kinds=(EgressFieldKind.URL,),
+                    request_fields=("url",),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
                 ),
                 requires_workspace=True,
                 idempotency="idempotent_write",
