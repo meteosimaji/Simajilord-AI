@@ -2178,6 +2178,14 @@ class CodexAppServerProvider:
         watchdog: _TurnWatchdog,
     ) -> tuple[str, dict[str, object]]:
         while True:
+            # A notification that the host already observed must win over an
+            # idle deadline.  The consumer can otherwise be resumed just after
+            # the deadline and report a false timeout even though the queue
+            # already contains the turn's completion event.
+            try:
+                return notifications.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
             watchdog.changed.clear()
             remaining = watchdog.seconds_until_expiry()
             if remaining <= 0:

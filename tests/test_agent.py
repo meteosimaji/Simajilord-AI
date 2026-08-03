@@ -7523,7 +7523,7 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
         executable="codex",
         model="test",
         workspace_dir=tmp_path / "agent-native-compaction",
-        idle_timeout_seconds=0.04,
+        idle_timeout_seconds=1,
         reasoning_effort="medium",
         tools=AgentToolCatalog(CapabilityRegistry(), ()),
         max_tool_calls=4,
@@ -7534,7 +7534,6 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
     turn = asyncio.create_task(provider._await_turn("thread", "turn"))
     await asyncio.sleep(0)
 
-    await asyncio.sleep(0.025)
     with caplog.at_level("INFO", logger="simajilord.agent.providers.codex"):
         await provider._handle_notification(
             "item/started",
@@ -7552,7 +7551,9 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
                 "item": {"type": "contextCompaction"},
             },
         )
-    await asyncio.sleep(0.025)
+    assert not turn.done()
+    watchdog = provider._turn_watchdogs["turn"]
+    assert watchdog.last_activity_kind == "item/completed"
     await provider._handle_notification(
         "item/completed",
         {
@@ -7578,6 +7579,19 @@ async def test_provider_keeps_native_compaction_alive_and_logs_it(
         "agent.context_compaction.completed",
     ]
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_buffered_notification_wins_over_expired_watchdog() -> None:
+    watchdog = _TurnWatchdog(idle_timeout_seconds=0.02)
+    notifications: asyncio.Queue[tuple[str, dict[str, object]]] = asyncio.Queue()
+    await notifications.put(("turn/completed", {"turnId": "turn"}))
+    watchdog.last_activity_at -= 1
+
+    assert await CodexAppServerProvider._next_turn_notification(
+        notifications,
+        watchdog,
+    ) == ("turn/completed", {"turnId": "turn"})
 
 
 @pytest.mark.asyncio
