@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import discord
@@ -1459,6 +1459,11 @@ async def test_reaction_capabilities_act_only_as_the_bot(
     message = Mock(spec=discord.Message)
     message.id = 30
     message.channel = channel
+    message.reactions = (
+        ()
+        if reacted
+        else (SimpleNamespace(me=True, emoji="✅"),)
+    )
     message.add_reaction = AsyncMock()
     message.remove_reaction = AsyncMock()
     channel.fetch_message = AsyncMock(return_value=message)
@@ -1475,13 +1480,45 @@ async def test_reaction_capabilities_act_only_as_the_bot(
     )
 
     assert response.reacted is reacted
-    assert response.changed is reacted
+    assert response.changed is True
     if reacted:
         message.add_reaction.assert_awaited_once_with("✅")
         message.remove_reaction.assert_not_awaited()
     else:
         message.remove_reaction.assert_awaited_once_with("✅", bot_member)
         message.add_reaction.assert_not_awaited()
+
+    message.add_reaction.reset_mock()
+    message.remove_reaction.reset_mock()
+    message.reactions = (
+        (SimpleNamespace(me=True, emoji="✅"),)
+        if reacted
+        else ()
+    )
+    dispatch = AsyncMock()
+    complete_without_dispatch = AsyncMock()
+    effect = SimpleNamespace(
+        dispatch=dispatch,
+        complete_without_dispatch=complete_without_dispatch,
+    )
+    noop = await endpoints[capability_name].invoke(
+        DiscordReactionRequest(
+            channel_id="20",
+            message_id="30",
+            emoji="✅",
+        ),
+        replace(
+            _agent_context(),
+            external_effect_dispatch=cast(Any, effect),
+        ),
+    )
+
+    assert noop.reacted is reacted
+    assert noop.changed is False
+    dispatch.assert_not_awaited()
+    complete_without_dispatch.assert_awaited_once_with()
+    message.add_reaction.assert_not_awaited()
+    message.remove_reaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,7 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import discord
@@ -231,11 +231,40 @@ async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
             runtime,
         )
     }
+    invalid_dispatch = AsyncMock()
+    invalid_effect = SimpleNamespace(
+        dispatch=invalid_dispatch,
+        complete_without_dispatch=AsyncMock(),
+    )
+    with pytest.raises(UserError, match=r"files\.path_invalid"):
+        await endpoints["discord.import_attachment"].invoke(
+            DiscordImportAttachmentRequest(
+                channel_id="1373866905357778984",
+                message_id="1531959431212961902",
+                destination_path="../document.pdf",
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="guild",
+                transport="agent",
+                request_id="invalid-import",
+                external_effect_dispatch=cast(Any, invalid_effect),
+            ),
+        )
+    invalid_dispatch.assert_not_awaited()
+    attachment.read.assert_not_awaited()
+
+    dispatch = AsyncMock()
+    effect = SimpleNamespace(
+        dispatch=dispatch,
+        complete_without_dispatch=AsyncMock(),
+    )
     context = InvocationContext(
         actor_id="7",
         workspace_id="guild",
         transport="agent",
         request_id="discord:message:1531959431212961902",
+        external_effect_dispatch=cast(Any, effect),
     )
 
     response = await endpoints["discord.import_attachment"].invoke(
@@ -255,6 +284,7 @@ async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
     ).read_bytes() == payload
     assert response.provenance is not None
     assert response.provenance.origin_channel_id == "1373866905357778984"
+    dispatch.assert_awaited_once_with()
     attachment.read.assert_awaited_once_with(use_cached=False)
 
 
@@ -268,9 +298,21 @@ async def test_agent_attachment_import_rechecks_downloaded_size(
     attachment.filename = "payload.bin"
     attachment.size = 1
     attachment.read = AsyncMock(return_value=b"12345")
+    source_guild = Mock(spec=discord.Guild)
+    source_guild.id = 10
+    source_channel = Mock(spec=discord.TextChannel)
+    source_channel.id = 20
+    source_message = Mock(spec=discord.Message)
+    source_message.id = 2
+    source_message.guild = source_guild
+    source_message.channel = source_channel
     monkeypatch.setattr(
         "simajilord.integrations.discord.capabilities._attachment",
-        AsyncMock(return_value=(Mock(spec=discord.Message), attachment)),
+        AsyncMock(return_value=(source_message, attachment)),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._channel_visibility",
+        lambda *_: "restricted",
     )
     runtime = Mock(spec=SimajilordRuntime)
     runtime.files = AgentFileSandbox(tmp_path / "agent-files", max_file_bytes=4)

@@ -344,9 +344,22 @@ with Discord's generic “interaction failed” banner.
   The bounded `.data/agent_actions.sqlite3` ledger retains at most 2,000 records, at most 100 per
   actor, for seven days. It stores IDs and a small scalar inverse (maximum 4 KiB), never a file
   body, deleted-message body, or large snapshot. The same database places every provider write
-  behind a body-free `planned → dispatched → confirmed|unknown → reconciled` effect ledger.
-  A process restart converts an unconfirmed dispatch to `unknown`; interrupted mention recovery
-  then refuses to replay that whole model turn, instead of risking a duplicate external action.
+  behind a body-free effect ledger. Typed arguments are fingerprinted while only bounded target
+  IDs, the authorization reference, and a body-free summary are retained. Validation and live
+  permission failures close `planned` as `rejected` (or `cancelled` for a pre-dispatch stop/no-op)
+  without a replay barrier. Each adapter advances `planned → dispatched` immediately before its
+  first HTTP, Gateway, process, provider, or durable local mutation; positive result evidence then
+  advances it to `confirmed`, while a post-dispatch timeout or failure becomes `unknown` and is
+  never automatically retried. A process restart converts an unconfirmed `dispatched` row to
+  `unknown`; interrupted mention recovery then refuses to replay that whole model turn, instead
+  of risking a duplicate external action. After stopping the bot and checking the real provider,
+  operators can inspect and close uncertainty without replaying it:
+
+  ```bash
+  uv run simajilord-agent-effects list --status unknown
+  uv run simajilord-agent-effects show EFFECT_ID --json
+  uv run simajilord-agent-effects reconcile EFFECT_ID --yes
+  ```
 - Durable agent memory is independent of Codex provider threads in
   `.data/agent_memory.sqlite3`. Typed `user`, `channel`, `workspace`, and verified-success/failure
   `procedure` scopes enforce an explicit creator, live source audience, and review policy. `user`

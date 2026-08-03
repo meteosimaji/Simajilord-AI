@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
@@ -100,6 +101,13 @@ class ModerationStore:
         day = datetime.now(UTC).date().isoformat()
         async with self._lock:
             return await asyncio.to_thread(self._reserve, provider, day, limit)
+
+    async def release_reservation(self, *, provider: str) -> None:
+        """Return one reservation when dispatch tracking fails before provider I/O."""
+
+        day = datetime.now(UTC).date().isoformat()
+        async with self._lock:
+            await asyncio.to_thread(self._release_reservation, provider, day)
 
     async def used(self, *, provider: str) -> int:
         day = datetime.now(UTC).date().isoformat()
@@ -240,6 +248,37 @@ class ModerationStore:
         finally:
             connection.close()
 
+    def _release_reservation(self, provider: str, day: str) -> None:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT count FROM moderation_quota WHERE provider = ? AND day_utc = ?",
+                (provider, day),
+            ).fetchone()
+            used = int(row[0]) if row is not None else 0
+            if used <= 0:
+                connection.rollback()
+                raise RuntimeError("moderation quota reservation is missing")
+            if used == 1:
+                connection.execute(
+                    "DELETE FROM moderation_quota WHERE provider = ? AND day_utc = ?",
+                    (provider, day),
+                )
+            else:
+                connection.execute(
+                    "UPDATE moderation_quota SET count = ? "
+                    "WHERE provider = ? AND day_utc = ?",
+                    (used - 1, provider, day),
+                )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def _prune(self, cutoff: str, cutoff_day: str) -> tuple[int, int]:
         connection = self._connect()
         try:
@@ -289,6 +328,8 @@ class ModerationService:
         content: bytes,
         filename: str,
         content_type: str | None,
+        before_provider: Callable[[], Awaitable[None]] | None = None,
+        on_cached: Callable[[], Awaitable[None]] | None = None,
     ) -> SyntheticMediaAnalysis:
         normalized_name, normalized_type = _validate_media(
             content=content,
@@ -306,7 +347,7 @@ class ModerationService:
         )
         if cached is not None:
             used = await self.store.used(provider=self.provider_name)
-            return _analysis(
+            analysis = _analysis(
                 cached,
                 sha256=sha256,
                 filename=normalized_name,
@@ -315,6 +356,9 @@ class ModerationService:
                 quota_used=used,
                 quota_limit=self.daily_limit,
             )
+            if on_cached is not None:
+                await on_cached()
+            return analysis
         provider = self.provider
         if provider is None:
             raise UserError("moderation.not_configured")
@@ -322,6 +366,12 @@ class ModerationService:
             provider=self.provider_name,
             limit=self.daily_limit,
         )
+        try:
+            if before_provider is not None:
+                await before_provider()
+        except BaseException:
+            await self.store.release_reservation(provider=self.provider_name)
+            raise
         result = await provider.analyze(
             content=content,
             filename=normalized_name,

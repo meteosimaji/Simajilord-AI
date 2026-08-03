@@ -112,6 +112,18 @@ StateHook = Callable[["AudioSession"], Awaitable[None]]
 StateListener = Callable[["AudioSession"], Awaitable[None]]
 
 
+def _append_mix_seed_reference(
+    references: deque[str],
+    reference: str,
+) -> None:
+    normalized = reference.strip()
+    if not normalized.startswith("https://"):
+        return
+    with suppress(ValueError):
+        references.remove(normalized)
+    references.append(normalized)
+
+
 class SpeechQueueReservation:
     """One pre-synthesis slot in a workspace speech queue."""
 
@@ -261,7 +273,12 @@ class AudioSession:
         self._ensure_worker()
         await self._state_changed()
 
-    async def enqueue(self, item: AudioItem) -> int:
+    async def enqueue(
+        self,
+        item: AudioItem,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> int:
         """Queue an item, prioritizing speech ahead of waiting music."""
 
         async with self._lock:
@@ -272,21 +289,28 @@ class AudioSession:
                 if self._speech_load_locked() >= self.max_pending_speech:
                     item.cleanup()
                     raise UserError("speech.queue_full")
+            elif item.queue_lane is not AudioQueueLane.AUTOPLAY:
+                try:
+                    self._assert_music_queue_capacity(item)
+                except UserError:
+                    item.cleanup()
+                    raise
+            if before_mutation is not None:
+                try:
+                    await before_mutation()
+                except BaseException:
+                    item.cleanup()
+                    raise
+            if item.kind is AudioKind.SPEECH:
                 position = self._enqueue_speech_locked(item)
+            elif item.queue_lane is AudioQueueLane.AUTOPLAY:
+                self._autoplay.append(item)
+                position = len(self._autoplay)
             else:
-                if item.queue_lane is AudioQueueLane.AUTOPLAY:
-                    self._autoplay.append(item)
-                    position = len(self._autoplay)
-                else:
-                    try:
-                        self._assert_music_queue_capacity(item)
-                    except UserError:
-                        item.cleanup()
-                        raise
-                    self._remember_mix_seed(item)
-                    self._invalidate_autoplay_locked()
-                    self._music.append(item)
-                    position = len(self._music)
+                self._remember_mix_seed(item)
+                self._invalidate_autoplay_locked()
+                self._music.append(item)
+                position = len(self._music)
             self._wake.set()
             self._ensure_worker()
         await self._state_changed()
@@ -455,13 +479,20 @@ class AudioSession:
         await self._state_changed()
         return first_position, last_position
 
-    async def wait_for_listener(self, actor_id: str) -> None:
+    async def wait_for_listener(
+        self,
+        actor_id: str,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Keep playback dormant until one of the requesting actors joins voice."""
 
         if not actor_id:
             raise ValueError("actor_id must not be empty")
-        if self.output.connected:
+        if self.output.connected or actor_id in self._waiting_actor_ids:
             return
+        if before_mutation is not None:
+            await before_mutation()
         self._waiting_actor_ids.add(actor_id)
         self._suspended = True
         await self._state_changed()
@@ -479,6 +510,8 @@ class AudioSession:
         mode: LoopMode,
         *,
         replace_autoplay: bool = False,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         autoplay_task: asyncio.Task[None] | None = None
         async with self._lock:
@@ -488,6 +521,15 @@ class AudioSession:
                 and not replace_autoplay
             ):
                 raise UserError("audio.loop_mix_conflict")
+            disables_autoplay = (
+                mode is not LoopMode.NONE and self._autoplay_enabled
+            )
+            if self._loop_mode is mode and not disables_autoplay:
+                if on_noop is not None:
+                    await on_noop()
+                return
+            if before_mutation is not None:
+                await before_mutation()
             if mode is not LoopMode.NONE and self._autoplay_enabled:
                 self._autoplay_enabled = False
                 self._autoplay_generation += 1
@@ -503,7 +545,19 @@ class AudioSession:
             await asyncio.gather(autoplay_task, return_exceptions=True)
         await self._state_changed()
 
-    async def set_auto_leave(self, enabled: bool) -> None:
+    async def set_auto_leave(
+        self,
+        enabled: bool,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        if self.auto_leave == enabled:
+            if on_noop is not None:
+                await on_noop()
+            return
+        if before_mutation is not None:
+            await before_mutation()
         self.auto_leave = enabled
         await self._state_changed()
 
@@ -512,6 +566,7 @@ class AudioSession:
         seed_references: tuple[str, ...] = (),
         *,
         replace_loop: bool = False,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[str, ...]:
         """Enable a request-priority station seeded by explicit music references."""
 
@@ -521,13 +576,17 @@ class AudioSession:
                     "audio.mix_loop_conflict",
                     loop_mode=self._loop_mode.value,
                 )
+            prospective_seeds = deque(
+                self._mix_seed_references,
+                maxlen=_MAX_MIX_SEEDS,
+            )
             if seed_references:
                 # Explicit seeds describe the listener's current intent. Do not
                 # blend them with unrelated tracks left by an older station.
-                self._mix_seed_references.clear()
+                prospective_seeds.clear()
                 for reference in seed_references:
-                    self._remember_mix_seed_reference(reference)
-            if not self._mix_seed_references:
+                    _append_mix_seed_reference(prospective_seeds, reference)
+            if not prospective_seeds:
                 candidates = (
                     *((self._current,) if self._current is not None else ()),
                     *self._music,
@@ -535,13 +594,20 @@ class AudioSession:
                 )
                 for item in candidates:
                     if item.kind is AudioKind.MUSIC:
-                        self._remember_mix_seed(item)
-                    if len(self._mix_seed_references) >= _MAX_MIX_SEEDS:
+                        _append_mix_seed_reference(
+                            prospective_seeds,
+                            item.resolver_reference or item.page_url,
+                        )
+                    if len(prospective_seeds) >= _MAX_MIX_SEEDS:
                         break
-            if not self._mix_seed_references:
+            if not prospective_seeds:
                 raise UserError("audio.mix_seed_required")
             if self._autoplay_supplier is None:
                 raise UserError("audio.mix_unavailable")
+            if before_mutation is not None:
+                await before_mutation()
+            self._mix_seed_references.clear()
+            self._mix_seed_references.extend(prospective_seeds)
             if replace_loop:
                 self._loop_mode = LoopMode.NONE
             self._autoplay_enabled = True
@@ -553,11 +619,26 @@ class AudioSession:
         await self._state_changed()
         return seeds
 
-    async def disable_autoplay(self) -> None:
+    async def disable_autoplay(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Stop automatic supply without changing explicit user requests."""
 
         task: asyncio.Task[None] | None
         async with self._lock:
+            if (
+                not self._autoplay_enabled
+                and self._autoplay_refill_task is None
+                and not self._autoplay
+            ):
+                if on_noop is not None:
+                    await on_noop()
+                return
+            if before_mutation is not None:
+                await before_mutation()
             self._autoplay_enabled = False
             self._autoplay_generation += 1
             task = self._autoplay_refill_task
@@ -571,31 +652,66 @@ class AudioSession:
             await asyncio.gather(task, return_exceptions=True)
         await self._state_changed()
 
-    async def shuffle(self) -> None:
+    async def shuffle(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         async with self._lock:
+            if len(self._music) < 2:
+                if on_noop is not None:
+                    await on_noop()
+                return
+            if before_mutation is not None:
+                await before_mutation()
             shuffled = list(self._music)
             random.shuffle(shuffled)
             self._music = deque(shuffled)
         await self._state_changed()
 
-    async def seek(self, position_seconds: float) -> float:
+    async def seek(
+        self,
+        position_seconds: float,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> float:
         async with self._transport_lock:
             current = self._current
             if current is None or current.kind is not AudioKind.MUSIC:
                 raise UserError("audio.nothing_playing")
             upper = current.duration_seconds if current.duration_seconds > 0 else position_seconds
             bounded = max(0.0, min(position_seconds, upper))
+            if before_mutation is not None:
+                await before_mutation()
             current.start_seconds = bounded
             self._restart_requested = True
             self.output.stop()
             await self._wait_for_current()
         return bounded
 
-    async def tune(self, speed: float, pitch: float) -> None:
+    async def tune(
+        self,
+        speed: float,
+        pitch: float,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         if not 0.5 <= speed <= 2.0 or not 0.5 <= pitch <= 2.0:
             raise UserError("audio.tune_range_invalid")
         async with self._transport_lock:
             current = self._current
+            if (
+                current is None
+                and math.isclose(self._speed, speed)
+                and math.isclose(self._pitch, pitch)
+            ):
+                if on_noop is not None:
+                    await on_noop()
+                return
+            if before_mutation is not None:
+                await before_mutation()
             if current is not None and current.kind is AudioKind.MUSIC:
                 current.start_seconds = self._position_seconds()
                 self._restart_requested = True
@@ -627,6 +743,8 @@ class AudioSession:
         speech: float | None = None,
         expected_music: float | None = None,
         expected_speech: float | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[float, float, float, float]:
         """Set durable gains and return current then previous music/speech values."""
 
@@ -657,6 +775,8 @@ class AudioSession:
                 )
             )
             if target_matches:
+                if on_noop is not None:
+                    await on_noop()
                 return (
                     previous_music,
                     previous_speech,
@@ -681,6 +801,8 @@ class AudioSession:
                 )
             ):
                 raise UserError("action.undo_conflict")
+            if before_mutation is not None:
+                await before_mutation()
             restart_music = (
                 music is not None
                 and self._current is not None
@@ -706,7 +828,12 @@ class AudioSession:
             previous_speech,
         )
 
-    async def remove(self, position: int) -> AudioItem:
+    async def remove(
+        self,
+        position: int,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> AudioItem:
         if position < 1:
             raise UserError("audio.queue_position_invalid")
         async with self._lock:
@@ -714,12 +841,21 @@ class AudioSession:
                 item = self._music[position - 1]
             except IndexError as exc:
                 raise UserError("audio.queue_position_invalid") from exc
+            if before_mutation is not None:
+                await before_mutation()
             del self._music[position - 1]
         item.cleanup()
         await self._state_changed()
         return item
 
-    async def move(self, from_position: int, to_position: int) -> AudioItem:
+    async def move(
+        self,
+        from_position: int,
+        to_position: int,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> AudioItem:
         """Move one pending music item using the one-based positions shown to users."""
 
         if from_position < 1 or to_position < 1:
@@ -728,35 +864,80 @@ class AudioSession:
             if from_position > len(self._music) or to_position > len(self._music):
                 raise UserError("audio.queue_position_invalid")
             item = self._music[from_position - 1]
+            if from_position == to_position:
+                if on_noop is not None:
+                    await on_noop()
+                return item
+            if before_mutation is not None:
+                await before_mutation()
             del self._music[from_position - 1]
             self._music.insert(to_position - 1, item)
         await self._state_changed()
         return item
 
-    async def clear_for_actor(self, actor_id: str) -> tuple[AudioItem, ...]:
+    async def clear_for_actor(
+        self,
+        actor_id: str,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> tuple[AudioItem, ...]:
         """Remove only pending music requested by one actor."""
 
         if not actor_id:
             raise ValueError("actor_id must not be empty")
         async with self._lock:
             removed = tuple(item for item in self._music if item.requested_by_id == actor_id)
+            if not removed:
+                if on_noop is not None:
+                    await on_noop()
+                return ()
+            if before_mutation is not None:
+                await before_mutation()
             self._music = deque(item for item in self._music if item.requested_by_id != actor_id)
         for item in removed:
             item.cleanup()
-        if removed:
-            await self._state_changed()
+        await self._state_changed()
         return removed
 
-    async def skip(self) -> None:
+    async def skip(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         async with self._transport_lock:
             if self._current is None:
                 raise UserError("audio.nothing_playing")
+            if before_mutation is not None:
+                await before_mutation()
             self._skip_requested = True
             self.output.stop()
 
-    async def clear(self) -> None:
+    async def clear(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         autoplay_task: asyncio.Task[None] | None
         async with self._transport_lock, self._lock:
+            changed = bool(
+                self._current is not None
+                or self._speech
+                or self._speech_reservations
+                or self._music
+                or self._autoplay
+                or self._waiting_actor_ids
+                or self._voice_activation_required
+                or self._autoplay_enabled
+                or self._autoplay_refill_task is not None
+            )
+            if not changed:
+                if on_noop is not None:
+                    await on_noop()
+                return False
+            if before_mutation is not None:
+                await before_mutation()
             self._discard_requested = True
             self._waiting_actor_ids.clear()
             self._voice_activation_required = False
@@ -777,32 +958,56 @@ class AudioSession:
             await asyncio.gather(autoplay_task, return_exceptions=True)
         await self._wait_for_current()
         await self._state_changed()
+        return True
 
-    async def pause(self) -> None:
+    async def pause(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         async with self._transport_lock:
             if self._current is None or self.output.paused:
                 raise UserError("audio.nothing_playing")
+            if before_mutation is not None:
+                await before_mutation()
             self.output.pause()
             self._paused_at = monotonic()
         await self._state_changed()
 
-    async def resume(self) -> None:
+    async def resume(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         async with self._transport_lock:
             if not self.output.paused:
                 raise UserError("audio.not_paused")
+            if before_mutation is not None:
+                await before_mutation()
             if self._paused_at is not None:
                 self._paused_seconds += monotonic() - self._paused_at
             self._paused_at = None
             self.output.resume()
         await self._state_changed()
 
-    async def disconnect(self) -> None:
+    async def disconnect(
+        self,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """Explicitly leave and forget the queue."""
 
-        await self.clear()
-        await self.output.disconnect()
-        self.destination_id = None
-        await self._state_changed()
+        cleared = await self.clear(before_mutation=before_mutation)
+        if self.output.connected or self.destination_id is not None:
+            if before_mutation is not None:
+                await before_mutation()
+            if self.output.connected:
+                await self.output.disconnect()
+            self.destination_id = None
+            await self._state_changed()
+        elif not cleared and on_noop is not None:
+            await on_noop()
 
     async def suspend(self) -> None:
         """Leave voice and hold the audio route until a listener explicitly resumes it."""
@@ -1057,12 +1262,7 @@ class AudioSession:
         self._remember_mix_seed_reference(item.resolver_reference or item.page_url)
 
     def _remember_mix_seed_reference(self, reference: str) -> None:
-        normalized = reference.strip()
-        if not normalized.startswith("https://"):
-            return
-        with suppress(ValueError):
-            self._mix_seed_references.remove(normalized)
-        self._mix_seed_references.append(normalized)
+        _append_mix_seed_reference(self._mix_seed_references, reference)
 
     def _invalidate_autoplay_locked(self) -> None:
         """Discard only generated candidates; explicit requests stay untouched."""

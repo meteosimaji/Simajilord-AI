@@ -11,7 +11,7 @@ from simajilord.capabilities.compute import (
     build_compute_endpoints,
 )
 from simajilord.core import InvocationContext
-from simajilord.core.errors import UserError
+from simajilord.core.errors import UserError, WebError
 from simajilord.domain.web import FetchedWebResource
 from simajilord.services.compute import (
     ComputeLimits,
@@ -526,6 +526,31 @@ async def test_public_download_reuses_bounded_fetcher_and_file_quota(
         "guild",
         "incoming/document.pdf",
     ).read_bytes() == b"%PDF-test"
+
+
+@pytest.mark.asyncio
+async def test_public_download_rejects_invalid_url_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    fetcher = _FakeFetcher()
+    _, service = _service(tmp_path, fetcher=fetcher)
+    dispatches = 0
+
+    async def before_fetch() -> None:
+        nonlocal dispatches
+        dispatches += 1
+
+    with pytest.raises(WebError) as captured:
+        await service.download(
+            "guild",
+            url="file:///etc/passwd",
+            path="incoming/file",
+            before_fetch=before_fetch,
+        )
+
+    assert captured.value.category == "url_invalid"
+    assert dispatches == 0
+    assert fetcher.calls == []
 
 
 @pytest.mark.asyncio

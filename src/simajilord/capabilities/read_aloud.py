@@ -225,6 +225,8 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
                     text_channel_ids=request.text_channel_ids,
                     audio_destination_id=request.audio_destination_id,
                     mode=request.mode,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
                 )
             except ValueError as exc:
                 code = (
@@ -246,7 +248,11 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
                     audio_destination_id=request.audio_destination_id,
                     mode=request.mode,
                 )
-                await service.configure(route)
+                await service.configure(
+                    route,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
+                )
             else:
                 try:
                     route = await service.add_source(
@@ -254,6 +260,8 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
                         text_channel_id=request.text_channel_id,
                         audio_destination_id=request.audio_destination_id,
                         mode=request.mode,
+                        before_mutation=context.dispatch_external_effect,
+                        on_noop=context.complete_external_effect_without_dispatch,
                     )
                 except ValueError as exc:
                     raise UserError("read_aloud.destination_conflict") from exc
@@ -263,11 +271,18 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
             route = await service.remove_source(
                 workspace_id=workspace_id,
                 text_channel_id=request.text_channel_id,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         elif request.action is ReadAloudAction.DISABLE:
-            await service.disable(workspace_id)
+            await service.disable(
+                workspace_id,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
             route = None
         else:
+            await context.complete_external_effect_without_dispatch()
             route = service.get(workspace_id)
 
         if route is None:
@@ -323,6 +338,8 @@ def build_read_aloud_route_endpoints(
                 text_channel_ids=request.text_channel_ids,
                 audio_destination_id=request.audio_destination_id,
                 mode=request.mode,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         except ValueError as exc:
             code = (
@@ -340,6 +357,8 @@ def build_read_aloud_route_endpoints(
         route = await service.remove_source(
             workspace_id=_workspace_id(context),
             text_channel_id=request.text_channel_id,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return _route_response(ReadAloudAction.REMOVE_SOURCE, route)
 
@@ -348,7 +367,11 @@ def build_read_aloud_route_endpoints(
         context: InvocationContext,
     ) -> ReadAloudResponse:
         workspace_id = _workspace_id(context)
-        await service.disable(workspace_id)
+        await service.disable(
+            workspace_id,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
+        )
         return _route_response(ReadAloudAction.DISABLE, None)
 
     return (
@@ -432,6 +455,8 @@ def build_read_aloud_policy_endpoints(
                 workspace_id=_workspace_id(context),
                 surface=request.surface,
                 reading=request.reading,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         except ValueError as exc:
             raise UserError("read_aloud.dictionary_invalid") from exc
@@ -445,6 +470,8 @@ def build_read_aloud_policy_endpoints(
             policy, _ = await service.remove_dictionary_entry(
                 workspace_id=_workspace_id(context),
                 surface=request.surface,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         except ValueError as exc:
             raise UserError("read_aloud.dictionary_invalid") from exc
@@ -460,12 +487,16 @@ def build_read_aloud_policy_endpoints(
                     workspace_id=_workspace_id(context),
                     user_id=request.target_id,
                     ignored=request.ignored,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
                 )
             else:
                 policy = await service.set_role_ignored(
                     workspace_id=_workspace_id(context),
                     role_id=request.target_id,
                     ignored=request.ignored,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
                 )
         except ValueError as exc:
             raise UserError("read_aloud.exclusion_invalid") from exc
@@ -485,6 +516,8 @@ def build_read_aloud_policy_endpoints(
                 expected_join=request.expected_join,
                 expected_leave=request.expected_leave,
                 expected_move=request.expected_move,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         except ValueError as exc:
             raise UserError("read_aloud.announcement_value_invalid") from exc
@@ -509,6 +542,8 @@ def build_read_aloud_policy_endpoints(
                 expected_replies=request.expected_replies,
                 expected_attachments=request.expected_attachments,
                 expected_vc_members_only=request.expected_vc_members_only,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         except ValueError as exc:
             raise UserError("read_aloud.semantic_value_invalid") from exc
@@ -524,6 +559,8 @@ def build_read_aloud_policy_endpoints(
         policy, previous = await service.set_content_mode_with_previous(
             workspace_id=_workspace_id(context),
             mode=request.mode,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return _policy_response(
             policy,
@@ -545,6 +582,8 @@ def build_read_aloud_policy_endpoints(
             expected_announce_join=request.expected_announce_join,
             expected_announce_leave=request.expected_announce_leave,
             expected_announce_move=request.expected_announce_move,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return _policy_response(policy)
 
@@ -555,6 +594,8 @@ def build_read_aloud_policy_endpoints(
         policy = await service.set_default_voice_preset(
             workspace_id=_workspace_id(context),
             preset=request.preset,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return _policy_response(policy)
 
@@ -568,6 +609,8 @@ def build_read_aloud_policy_endpoints(
             workspace_id=_workspace_id(context),
             user_id=context.actor_id,
             preset=request.preset,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return _policy_response(policy)
 

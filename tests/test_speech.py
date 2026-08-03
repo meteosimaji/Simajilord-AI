@@ -110,6 +110,37 @@ async def test_speech_service_rejects_unknown_voice_preset(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_speech_validation_happens_before_effect_dispatch(tmp_path: Path) -> None:
+    service = SpeechService(
+        WaveSpeechProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        voice_presets={"clear": 2},
+    )
+    dispatches = 0
+
+    async def before_synthesis() -> None:
+        nonlocal dispatches
+        dispatches += 1
+
+    with pytest.raises(UserError, match=r"speech\.no_readable_text"):
+        await service.synthesize(
+            "   ",
+            before_synthesis=before_synthesis,
+        )
+    with pytest.raises(UserError, match=r"speech\.voice_preset_invalid"):
+        await service.synthesize(
+            "hello",
+            voice_preset="missing",
+            before_synthesis=before_synthesis,
+        )
+
+    assert dispatches == 0
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> None:
     class HoldingOutput:
         connected = True

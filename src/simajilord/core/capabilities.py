@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import StrEnum
 from time import monotonic
 from typing import Any, Literal, Protocol, TypeVar
@@ -143,6 +143,20 @@ class DisclosureObservation:
     relation_to_origin: Literal["same_or_narrower", "broader", "uncertain"]
 
 
+class ExternalEffectDispatch(Protocol):
+    """Turn-scoped replay barrier advanced by an adapter at its effect boundary."""
+
+    @property
+    def dispatched(self) -> bool: ...
+
+    @property
+    def completed_without_dispatch(self) -> bool: ...
+
+    async def dispatch(self) -> None: ...
+
+    async def complete_without_dispatch(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class InvocationContext:
     """Identity and scope supplied by a transport adapter."""
@@ -177,6 +191,23 @@ class InvocationContext:
     requester_principal_id: str | None = None
     policy_id: str | None = None
     allowed_capabilities: frozenset[str] | None = None
+    external_effect_dispatch: ExternalEffectDispatch | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    async def dispatch_external_effect(self) -> None:
+        """Advance a tracked write immediately before its first real side effect."""
+
+        if self.external_effect_dispatch is not None:
+            await self.external_effect_dispatch.dispatch()
+
+    async def complete_external_effect_without_dispatch(self) -> None:
+        """Close a validated idempotent no-op without creating a replay barrier."""
+
+        if self.external_effect_dispatch is not None:
+            await self.external_effect_dispatch.complete_without_dispatch()
 
 
 @dataclass(frozen=True, slots=True)

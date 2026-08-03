@@ -62,6 +62,7 @@ def build_compute_endpoints(
             input_paths=request.input_paths,
             actor_id=context.actor_id,
             provenance=file_provenance(context),
+            before_process=context.dispatch_external_effect,
         )
 
     async def download_url(
@@ -73,6 +74,7 @@ def build_compute_endpoints(
             url=request.url,
             path=request.path,
             provenance=file_provenance(context),
+            before_fetch=context.dispatch_external_effect,
         )
 
     return (

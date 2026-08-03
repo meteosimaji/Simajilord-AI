@@ -72,6 +72,7 @@ def build_download_endpoint(media: MediaService) -> CapabilityEndpoint:
             max_bytes=request.max_bytes,
             workspace_id=workspace_id,
             priority=MediaPriority.NORMAL,
+            before_download=context.dispatch_external_effect,
         )
         return DownloadResponse(
             path=artifact.path,
@@ -130,6 +131,7 @@ def build_media_save_endpoint(
                 max_items=request.max_items,
                 workspace_id=context.workspace_id,
                 priority=MediaPriority.NORMAL,
+                before_download=context.dispatch_external_effect,
             )
             pending_files: list[tuple[str, bytes]] = []
             for artifact in batch.artifacts:

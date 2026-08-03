@@ -186,6 +186,8 @@ def build_image_endpoints(
             ),
             auto_deliver=False,
             idempotency_key=context.request_id,
+            before_enqueue=context.dispatch_external_effect,
+            on_idempotent_replay=context.complete_external_effect_without_dispatch,
         )
         terminal = await service.wait_for_terminal(job.job_id)
         if terminal.status is not ImageJobStatus.COMPLETED:

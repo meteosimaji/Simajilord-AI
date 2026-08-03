@@ -167,8 +167,9 @@ def _reaction_registry(
 
     async def add(
         request: ReactionRequest,
-        _context: InvocationContext,
+        context: InvocationContext,
     ) -> ReactionResponse:
+        await context.dispatch_external_effect()
         calls.append(("add", request))
         return ReactionResponse(
             request.channel_id,
@@ -179,8 +180,9 @@ def _reaction_registry(
 
     async def remove(
         request: ReactionRequest,
-        _context: InvocationContext,
+        context: InvocationContext,
     ) -> ReactionResponse:
+        await context.dispatch_external_effect()
         calls.append(("remove", request))
         return ReactionResponse(
             request.channel_id,
@@ -303,7 +305,93 @@ async def test_catalog_preserves_result_fields_and_adds_action_receipt(
     assert effect is not None
     assert effect.status is ExternalEffectStatus.CONFIRMED
     assert effect.action_id == payload["action_receipt"]["action_id"]
+    assert effect.arguments_fingerprint.startswith("sha256:")
+    assert effect.target_ids == (
+        ("channel_id", "channel"),
+        ("message_id", "message"),
+    )
+    assert effect.authorization_reference == "event"
+    assert effect.summary == (
+        "discord.add_reaction; target_fields=channel_id,message_id; "
+        "authorization=bound"
+    )
     assert await service.request_has_replay_barrier(context.request_id)
+
+
+async def test_dispatched_undo_effect_is_confirmed_by_its_own_receipt(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, ReactionRequest]] = []
+    registry = _reaction_registry(calls)
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / "actions.sqlite3"),
+        registry=registry,
+    )
+    registry.register(build_action_undo_endpoint(service))
+    catalog = AgentToolCatalog(
+        registry,
+        (
+            "discord.add_reaction",
+            "discord.remove_own_reaction",
+            "action.undo",
+        ),
+        required_grants={
+            "discord.add_reaction": "messages",
+            "discord.remove_own_reaction": "messages",
+            "action.undo": "messages",
+        },
+        write_capabilities=(
+            "discord.add_reaction",
+            "discord.remove_own_reaction",
+            "action.undo",
+        ),
+        action_receipts=service,
+    )
+    created = json.loads(
+        (
+            await catalog.invoke(
+                namespace="simajilord",
+                tool_name="discord_add_reaction",
+                arguments={
+                    "channel_id": "channel",
+                    "message_id": "message",
+                    "emoji": "✅",
+                    "authorization_event_id": "event",
+                },
+                context=_context(),
+                max_output_characters=4_000,
+            )
+        ).text
+    )
+    original_action_id = str(created["action_receipt"]["action_id"])
+    undo_context = replace(
+        _context(request_id="undo-event"),
+        provider_turn_id="undo-turn",
+        tool_call_id="undo-tool-call",
+    )
+    undone = json.loads(
+        (
+            await catalog.invoke(
+                namespace="simajilord",
+                tool_name="action_undo",
+                arguments={
+                    "action_id": original_action_id,
+                    "authorization_event_id": "undo-event",
+                },
+                context=undo_context,
+                max_output_characters=4_000,
+            )
+        ).text
+    )
+
+    assert undone["status"] == "succeeded"
+    assert undone["action_receipt"]["action_id"] == undone["undo_action_id"]
+    effects = await service.store.external_effects(limit=10)
+    undo_effect = next(
+        effect for effect in effects if effect.request_id == "undo-event"
+    )
+    assert undo_effect.status is ExternalEffectStatus.CONFIRMED
+    assert undo_effect.action_id == undone["undo_action_id"]
 
 
 async def test_action_receipt_persists_distinct_audit_principals(
@@ -435,7 +523,9 @@ async def test_dispatched_external_effect_becomes_unknown_after_restart(
     store = ActionReceiptStore(path)
     planned = await store.plan_external_effect(
         capability="discord.add_reaction",
+        request=ReactionRequest("channel", "message", "✅"),
         context=context,
+        authorization_reference="event",
     )
 
     assert planned.status is ExternalEffectStatus.PLANNED
@@ -453,13 +543,171 @@ async def test_dispatched_external_effect_becomes_unknown_after_restart(
     assert await reopened.request_has_replay_barrier(context.request_id)
 
 
+async def test_diagnostic_open_does_not_reclassify_live_dispatched_effect(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "actions.sqlite3"
+    context = _context(request_id="live-write")
+    store = ActionReceiptStore(path)
+    planned = await store.plan_external_effect(
+        capability="discord.add_reaction",
+        request=ReactionRequest("channel", "message", "✅"),
+        context=context,
+        authorization_reference="event",
+    )
+    await store.dispatch_external_effect(planned.effect_id)
+
+    diagnostic = ActionReceiptStore(path, recover_interrupted=False)
+    current = await diagnostic.external_effect(planned.effect_id)
+
+    assert current is not None
+    assert current.status is ExternalEffectStatus.DISPATCHED
+
+
+async def test_legacy_effect_migration_preserves_plan_and_recovers_only_dispatch(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "actions.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE agent_external_effects (
+                effect_id TEXT PRIMARY KEY,
+                capability TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                workspace_id TEXT,
+                transport TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                provider_thread_id TEXT,
+                provider_turn_id TEXT,
+                tool_call_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                action_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            INSERT INTO agent_external_effects VALUES
+                ('eff-planned', 'discord.send_message', 'actor', 'guild',
+                 'agent', 'request-planned', 'thread', 'turn', 'tool-planned',
+                 'planned', NULL, '2026-08-03T00:00:00+00:00',
+                 '2026-08-03T00:00:00+00:00', '2099-08-03T00:00:00+00:00'),
+                ('eff-dispatched', 'discord.send_message', 'actor', 'guild',
+                 'agent', 'request-dispatched', 'thread', 'turn', 'tool-dispatched',
+                 'dispatched', NULL, '2026-08-03T00:00:00+00:00',
+                 '2026-08-03T00:00:00+00:00', '2099-08-03T00:00:00+00:00'),
+                ('eff-unknown', 'discord.send_message', 'actor', 'guild',
+                 'agent', 'request-unknown', 'thread', 'turn', 'tool-unknown',
+                 'unknown', NULL, '2026-08-03T00:00:00+00:00',
+                 '2026-08-03T00:00:00+00:00', '2099-08-03T00:00:00+00:00');
+            """
+        )
+
+    store = ActionReceiptStore(path)
+    effects = {
+        effect.effect_id: effect
+        for effect in await store.external_effects(limit=10)
+    }
+
+    assert effects["eff-planned"].status is ExternalEffectStatus.PLANNED
+    assert effects["eff-dispatched"].status is ExternalEffectStatus.UNKNOWN
+    assert effects["eff-unknown"].status is ExternalEffectStatus.UNKNOWN
+    assert effects["eff-planned"].arguments_fingerprint == "legacy"
+    assert effects["eff-planned"].target_ids == ()
+    assert effects["eff-planned"].summary == "legacy external effect"
+    assert not await store.request_has_replay_barrier("request-planned")
+    assert await store.request_has_replay_barrier("request-dispatched")
+    assert await store.request_has_replay_barrier("request-unknown")
+
+
+async def test_external_effect_identity_rejects_changed_arguments_and_stores_no_body(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "actions.sqlite3"
+    context = _context(request_id="sensitive-write")
+    secret = "private-message-body-never-store-verbatim"
+    first = await ActionReceiptStore(path).plan_external_effect(
+        capability="discord.send_message",
+        request={
+            "channel_id": "channel",
+            "content": secret,
+            "destination": {"guild_id": "guild"},
+        },
+        context=context,
+        authorization_reference="event",
+    )
+
+    with pytest.raises(ValueError, match="different tool call"):
+        await ActionReceiptStore(
+            path,
+            recover_interrupted=False,
+        ).plan_external_effect(
+            capability="discord.send_message",
+            request={
+                "channel_id": "channel",
+                "content": "changed",
+                "destination": {"guild_id": "guild"},
+            },
+            context=context,
+            authorization_reference="event",
+        )
+
+    assert first.arguments_fingerprint.startswith("sha256:")
+    assert first.target_ids == (
+        ("channel_id", "channel"),
+        ("guild_id", "guild"),
+    )
+    assert secret.encode() not in path.read_bytes()
+
+
+async def test_unresolved_effects_are_not_evicted_when_ledger_cap_is_full(
+    tmp_path: Path,
+) -> None:
+    store = ActionReceiptStore(
+        tmp_path / "actions.sqlite3",
+        max_records=2,
+        max_records_per_actor=2,
+    )
+    effect_ids: list[str] = []
+    for index in range(2):
+        context = replace(
+            _context(request_id=f"unresolved-{index}"),
+            tool_call_id=f"tool-{index}",
+        )
+        planned = await store.plan_external_effect(
+            capability="discord.send_message",
+            request={"content": f"message-{index}"},
+            context=context,
+            authorization_reference="event",
+        )
+        await store.dispatch_external_effect(planned.effect_id)
+        await store.mark_external_effect_unknown(planned.effect_id)
+        effect_ids.append(planned.effect_id)
+
+    with pytest.raises(ValueError, match=r"capacity.*unresolved"):
+        await store.plan_external_effect(
+            capability="discord.send_message",
+            request={"content": "third-message"},
+            context=replace(
+                _context(request_id="unresolved-2"),
+                tool_call_id="tool-2",
+            ),
+            authorization_reference="event",
+        )
+
+    remaining = await store.external_effects(limit=10)
+    assert {effect.effect_id for effect in remaining} == set(effect_ids)
+    assert all(effect.status is ExternalEffectStatus.UNKNOWN for effect in remaining)
+
+
 async def test_catalog_marks_failed_write_effect_unknown(tmp_path: Path) -> None:
     registry = CapabilityRegistry()
 
     async def fail_write(
         _request: ReactionRequest,
-        _context: InvocationContext,
+        context: InvocationContext,
     ) -> ReactionResponse:
+        await context.dispatch_external_effect()
         raise RuntimeError("write result is uncertain")
 
     registry.register(
@@ -513,6 +761,287 @@ async def test_catalog_marks_failed_write_effect_unknown(tmp_path: Path) -> None
     assert effect is not None
     assert effect.status is ExternalEffectStatus.UNKNOWN
     assert await service.request_has_replay_barrier("uncertain-write")
+
+
+async def test_catalog_rejects_pre_dispatch_permission_failure_without_barrier(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def reject_write(
+        _request: ReactionRequest,
+        _context: InvocationContext,
+    ) -> ReactionResponse:
+        raise UserError("discord.reaction_forbidden")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.add_reaction",
+                "Add reaction.",
+                RiskLevel.WRITE,
+                idempotency="idempotent_write",
+            ),
+            ReactionRequest,
+            ReactionResponse,
+            reject_write,
+        )
+    )
+    journal = RecordingJournal()
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / "actions.sqlite3"),
+        registry=registry,
+        journal=journal,
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.add_reaction",),
+        required_grants={"discord.add_reaction": "messages"},
+        write_capabilities=("discord.add_reaction",),
+        action_receipts=service,
+    )
+
+    with pytest.raises(UserError, match=r"discord\.reaction_forbidden"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="discord_add_reaction",
+            arguments={
+                "channel_id": "channel",
+                "message_id": "message",
+                "emoji": "✅",
+                "authorization_event_id": "event",
+            },
+            context=_context(request_id="rejected-write"),
+            max_output_characters=4_000,
+        )
+
+    assert [kind for kind, _ in journal.entries] == [
+        "agent.external_effect.planned",
+        "agent.external_effect.rejected",
+    ]
+    effect_id = str(journal.entries[0][1]["effect_id"])
+    effect = await service.store.external_effect(effect_id)
+    assert effect is not None
+    assert effect.status is ExternalEffectStatus.REJECTED
+    assert not await service.request_has_replay_barrier("rejected-write")
+    replanned = await service.store.plan_external_effect(
+        capability="discord.add_reaction",
+        request=ReactionRequest("channel", "message", "✅"),
+        context=_context(request_id="rejected-write"),
+        authorization_reference="event",
+    )
+    assert replanned.effect_id == effect_id
+    assert replanned.status is ExternalEffectStatus.PLANNED
+    assert not await service.request_has_replay_barrier("rejected-write")
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_status"),
+    (
+        ("cancel", ExternalEffectStatus.CANCELLED),
+        ("noop", ExternalEffectStatus.CANCELLED),
+    ),
+)
+async def test_pre_dispatch_cancel_and_validated_noop_have_no_replay_barrier(
+    tmp_path: Path,
+    mode: str,
+    expected_status: ExternalEffectStatus,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def handle(
+        request: ReactionRequest,
+        context: InvocationContext,
+    ) -> ReactionResponse:
+        if mode == "cancel":
+            raise asyncio.CancelledError
+        await context.complete_external_effect_without_dispatch()
+        return ReactionResponse(
+            request.channel_id,
+            request.message_id,
+            request.emoji,
+            reacted=True,
+            changed=False,
+        )
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.add_reaction",
+                "Add reaction.",
+                RiskLevel.WRITE,
+                idempotency="idempotent_write",
+            ),
+            ReactionRequest,
+            ReactionResponse,
+            handle,
+        )
+    )
+    journal = RecordingJournal()
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / f"{mode}.sqlite3"),
+        registry=registry,
+        journal=journal,
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.add_reaction",),
+        required_grants={"discord.add_reaction": "messages"},
+        write_capabilities=("discord.add_reaction",),
+        action_receipts=service,
+    )
+    invocation = catalog.invoke(
+        namespace="simajilord",
+        tool_name="discord_add_reaction",
+        arguments={
+            "channel_id": "channel",
+            "message_id": "message",
+            "emoji": "✅",
+            "authorization_event_id": "event",
+        },
+        context=_context(request_id=f"{mode}-write"),
+        max_output_characters=4_000,
+    )
+    if mode == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await invocation
+    else:
+        await invocation
+
+    effect_id = str(journal.entries[0][1]["effect_id"])
+    effect = await service.store.external_effect(effect_id)
+    assert effect is not None
+    assert effect.status is expected_status
+    assert not await service.request_has_replay_barrier(f"{mode}-write")
+
+
+async def test_success_without_adapter_dispatch_fails_closed_as_unknown(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def missing_hook(
+        request: ReactionRequest,
+        _context: InvocationContext,
+    ) -> ReactionResponse:
+        return ReactionResponse(
+            request.channel_id,
+            request.message_id,
+            request.emoji,
+            reacted=True,
+        )
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.add_reaction",
+                "Add reaction.",
+                RiskLevel.WRITE,
+                idempotency="idempotent_write",
+            ),
+            ReactionRequest,
+            ReactionResponse,
+            missing_hook,
+        )
+    )
+    journal = RecordingJournal()
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / "missing-hook.sqlite3"),
+        registry=registry,
+        journal=journal,
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.add_reaction",),
+        required_grants={"discord.add_reaction": "messages"},
+        write_capabilities=("discord.add_reaction",),
+        action_receipts=service,
+    )
+
+    with pytest.raises(AgentToolError, match="dispatch boundary"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="discord_add_reaction",
+            arguments={
+                "channel_id": "channel",
+                "message_id": "message",
+                "emoji": "✅",
+                "authorization_event_id": "event",
+            },
+            context=_context(request_id="missing-hook-write"),
+            max_output_characters=4_000,
+        )
+
+    effect_id = str(journal.entries[0][1]["effect_id"])
+    effect = await service.store.external_effect(effect_id)
+    assert effect is not None
+    assert effect.status is ExternalEffectStatus.UNKNOWN
+    assert await service.request_has_replay_barrier("missing-hook-write")
+
+
+async def test_failure_after_declared_noop_fails_closed_as_unknown(
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def invalid_noop(
+        _request: ReactionRequest,
+        context: InvocationContext,
+    ) -> ReactionResponse:
+        await context.complete_external_effect_without_dispatch()
+        raise RuntimeError("failed after declaring no effect")
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.add_reaction",
+                "Add reaction.",
+                RiskLevel.WRITE,
+                idempotency="idempotent_write",
+            ),
+            ReactionRequest,
+            ReactionResponse,
+            invalid_noop,
+        )
+    )
+    journal = RecordingJournal()
+    service = ActionReceiptService(
+        store=ActionReceiptStore(tmp_path / "invalid-noop.sqlite3"),
+        registry=registry,
+        journal=journal,
+    )
+    catalog = AgentToolCatalog(
+        registry,
+        ("discord.add_reaction",),
+        required_grants={"discord.add_reaction": "messages"},
+        write_capabilities=("discord.add_reaction",),
+        action_receipts=service,
+    )
+
+    with pytest.raises(RuntimeError, match="failed after declaring no effect"):
+        await catalog.invoke(
+            namespace="simajilord",
+            tool_name="discord_add_reaction",
+            arguments={
+                "channel_id": "channel",
+                "message_id": "message",
+                "emoji": "✅",
+                "authorization_event_id": "event",
+            },
+            context=_context(request_id="invalid-noop-write"),
+            max_output_characters=4_000,
+        )
+
+    assert [kind for kind, _ in journal.entries] == [
+        "agent.external_effect.planned",
+        "agent.external_effect.cancelled",
+        "agent.external_effect.unknown",
+    ]
+    effect_id = str(journal.entries[0][1]["effect_id"])
+    effect = await service.store.external_effect(effect_id)
+    assert effect is not None
+    assert effect.status is ExternalEffectStatus.UNKNOWN
+    assert await service.request_has_replay_barrier("invalid-noop-write")
 
 
 async def test_receipt_persistence_failure_returns_untracked_without_fake_id(

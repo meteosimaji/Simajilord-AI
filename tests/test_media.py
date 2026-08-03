@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -491,11 +492,14 @@ async def test_media_save_creates_content_addressed_workspace_files(
             max_items: int,
             workspace_id: str,
             priority: MediaPriority,
+            before_download: Callable[[], Awaitable[None]] | None = None,
         ) -> DownloadBatch:
             assert max_bytes == 100
             assert max_items == 4
             assert workspace_id == "guild"
             assert priority is MediaPriority.NORMAL
+            if before_download is not None:
+                await before_download()
             first = destination / "first.mp4"
             second = destination / "second.mp4"
             first.write_bytes(b"first media")
@@ -534,6 +538,30 @@ async def test_media_save_creates_content_addressed_workspace_files(
     assert files.path_for_delivery(
         file_workspace_id(context), result.files[0].path
     ).read_bytes() == b"first media"
+
+
+@pytest.mark.asyncio
+async def test_media_download_rejects_invalid_url_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    media = MediaService(object())  # type: ignore[arg-type]
+    dispatches = 0
+
+    async def before_download() -> None:
+        nonlocal dispatches
+        dispatches += 1
+
+    with pytest.raises(UserError, match=r"media\.url_unsupported"):
+        await media.download_many(
+            "file:///etc/passwd",
+            DownloadFormat.VIDEO,
+            tmp_path / "download",
+            max_bytes=1_000,
+            max_items=1,
+            before_download=before_download,
+        )
+
+    assert dispatches == 0
 
 
 @pytest.mark.asyncio

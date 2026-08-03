@@ -19,6 +19,7 @@ from simajilord.domain.media import (
     DownloadFormat,
     MediaCandidate,
 )
+from simajilord.media.security import validate_media_url
 
 from .metrics import ServiceMetricHook, ServiceOperationMetric
 
@@ -352,17 +353,27 @@ class MediaService:
         max_bytes: int,
         workspace_id: str = "system",
         priority: MediaPriority = MediaPriority.NORMAL,
+        before_download: Callable[[], Awaitable[None]] | None = None,
     ) -> DownloadArtifact:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        normalized_url = validate_media_url(url)
+
+        async def download_operation() -> DownloadArtifact:
+            if before_download is not None:
+                await before_download()
+            return await self.provider.download(
+                normalized_url,
+                media_type,
+                destination,
+                max_bytes=max_bytes,
+            )
+
         return await self._run(
             workspace_id=workspace_id,
             priority=priority,
             operation_name="download",
-            operation=lambda: self.provider.download(
-                url,
-                media_type,
-                destination,
-                max_bytes=max_bytes,
-            ),
+            operation=download_operation,
         )
 
     async def download_many(
@@ -375,20 +386,30 @@ class MediaService:
         max_items: int,
         workspace_id: str = "system",
         priority: MediaPriority = MediaPriority.NORMAL,
+        before_download: Callable[[], Awaitable[None]] | None = None,
     ) -> DownloadBatch:
         if not 1 <= max_items <= 10:
             raise ValueError("max_items must be between 1 and 10")
-        return await self._run(
-            workspace_id=workspace_id,
-            priority=priority,
-            operation_name="download",
-            operation=lambda: self.provider.download_many(
-                url,
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        normalized_url = validate_media_url(url)
+
+        async def download_operation() -> DownloadBatch:
+            if before_download is not None:
+                await before_download()
+            return await self.provider.download_many(
+                normalized_url,
                 media_type,
                 destination,
                 max_bytes=max_bytes,
                 max_items=max_items,
-            ),
+            )
+
+        return await self._run(
+            workspace_id=workspace_id,
+            priority=priority,
+            operation_name="download",
+            operation=download_operation,
         )
 
     async def close(self) -> None:

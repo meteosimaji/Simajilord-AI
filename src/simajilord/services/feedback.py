@@ -7,6 +7,7 @@ import hashlib
 import os
 import secrets
 import sqlite3
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -92,6 +93,8 @@ class FeedbackService:
         workspace_id: str | None = None,
         source_channel_id: str | None = None,
         public_reference_id: str | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> FeedbackCreateResult:
         """Persist only caller-supplied feedback and host-supplied provenance."""
 
@@ -124,6 +127,16 @@ class FeedbackService:
             content_hash=content_hash,
         )
         async with self._lock:
+            existing = await asyncio.to_thread(
+                self._get_by_idempotency_key,
+                idempotency_key,
+            )
+            if existing is not None:
+                if on_noop is not None:
+                    await on_noop()
+                return FeedbackCreateResult(report=existing, created=False)
+            if before_mutation is not None:
+                await before_mutation()
             return await asyncio.to_thread(
                 self._insert_or_existing,
                 title=normalized_title,
@@ -138,6 +151,17 @@ class FeedbackService:
                 content_hash=content_hash,
                 idempotency_key=idempotency_key,
             )
+
+    def _get_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> FeedbackReport | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM feedback_reports WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return _report_from_row(row) if row is not None else None
 
     async def get(self, report_id: str) -> FeedbackReport:
         normalized_id = _bounded_id(report_id)

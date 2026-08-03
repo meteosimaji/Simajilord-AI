@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import dataclasses
@@ -552,6 +553,10 @@ class AgentToolCatalog:
             context=context,
             max_output_characters=max_output_characters,
             before_invoke=before_invoke,
+            authorization_reference=self.authorization_event_id_for_call(
+                tool_name=tool_name,
+                arguments=arguments,
+            ),
         )
 
     def _list(
@@ -921,6 +926,10 @@ class AgentToolCatalog:
             context=context,
             max_output_characters=max_output_characters,
             before_invoke=before_invoke,
+            authorization_reference=self.authorization_event_id_for_call(
+                tool_name=_INVOKE_TOOL,
+                arguments=arguments,
+            ),
         )
 
     async def _invoke_capability(
@@ -931,6 +940,7 @@ class AgentToolCatalog:
         context: InvocationContext,
         max_output_characters: int,
         before_invoke: Callable[[], None] | None,
+        authorization_reference: str | None,
     ) -> AgentToolOutput:
         if not self._is_available(capability_name, context):
             raise AgentToolError("The dynamic tool grant is not present for this turn.")
@@ -938,7 +948,7 @@ class AgentToolCatalog:
         request = _build_dataclass(endpoint.request_type, arguments)
         if before_invoke is not None:
             before_invoke()
-        effect_id: str | None = None
+        effect = None
         tracks_external_effect = (
             self._action_receipts is not None
             and capability_name in self._write_capabilities
@@ -946,32 +956,89 @@ class AgentToolCatalog:
         if tracks_external_effect:
             assert self._action_receipts is not None
             try:
-                effect_id = await self._action_receipts.begin_external_effect(
+                effect = await self._action_receipts.plan_external_effect(
                     capability=capability_name,
+                    request=request,
                     context=context,
+                    authorization_reference=authorization_reference,
                 )
             except Exception as exc:
                 raise AgentToolError(
                     "The external effect ledger is unavailable; the write was not dispatched."
                 ) from exc
+        invocation_context = (
+            dataclasses.replace(context, external_effect_dispatch=effect)
+            if effect is not None
+            else context
+        )
         try:
-            result = await self._registry.invoke(capability_name, request, context)
-        except BaseException:
-            if effect_id is not None:
+            result = await self._registry.invoke(
+                capability_name,
+                request,
+                invocation_context,
+            )
+        except BaseException as exc:
+            if effect is not None:
                 assert self._action_receipts is not None
                 try:
-                    await self._action_receipts.mark_external_effect_unknown(
-                        effect_id,
-                        context=context,
-                    )
+                    if effect.dispatched:
+                        await self._action_receipts.mark_external_effect_unknown(
+                            effect.effect_id,
+                            context=context,
+                        )
+                    elif effect.completed_without_dispatch:
+                        log.critical(
+                            "Write failed after declaring no external effect "
+                            "capability=%s request_id=%s",
+                            capability_name,
+                            context.request_id,
+                        )
+                        await self._action_receipts.mark_external_effect_unknown(
+                            effect.effect_id,
+                            context=context,
+                        )
+                    elif isinstance(exc, asyncio.CancelledError):
+                        await self._action_receipts.cancel_external_effect(
+                            effect.effect_id,
+                            context=context,
+                        )
+                    else:
+                        await self._action_receipts.reject_external_effect(
+                            effect.effect_id,
+                            context=context,
+                        )
                 except Exception:
                     log.critical(
                         "External effect state could not be closed effect=%s request_id=%s",
-                        effect_id,
+                        effect.effect_id,
                         context.request_id,
                         exc_info=True,
                     )
             raise
+        if (
+            effect is not None
+            and not effect.dispatched
+            and not effect.completed_without_dispatch
+        ):
+            # A successful write without an adapter dispatch hook may already have
+            # changed external state. Cross a late barrier and fail closed instead
+            # of returning success or allowing an automatic replay.
+            log.critical(
+                "Write returned without external effect dispatch capability=%s "
+                "request_id=%s",
+                capability_name,
+                context.request_id,
+            )
+            await effect.dispatch()
+            assert self._action_receipts is not None
+            await self._action_receipts.mark_external_effect_unknown(
+                effect.effect_id,
+                context=context,
+            )
+            raise AgentToolError(
+                "The write adapter did not confirm its dispatch boundary; "
+                "the result is blocked from automatic replay."
+            )
         receipt: ActionReceipt | None = None
         if tracks_external_effect:
             assert self._action_receipts is not None
@@ -981,7 +1048,11 @@ class AgentToolCatalog:
                     request=request,
                     response=result,
                     context=context,
-                    effect_id=effect_id,
+                    effect_id=(
+                        effect.effect_id
+                        if effect is not None and effect.dispatched
+                        else None
+                    ),
                 )
             except Exception:
                 log.exception(
@@ -989,32 +1060,20 @@ class AgentToolCatalog:
                     capability_name,
                     context.request_id,
                 )
-                if effect_id is not None:
+                if effect is not None and effect.dispatched:
                     try:
                         await self._action_receipts.mark_external_effect_unknown(
-                            effect_id,
+                            effect.effect_id,
                             context=context,
                         )
                     except Exception:
                         log.critical(
                             "External effect state could not be marked unknown "
                             "effect=%s request_id=%s",
-                            effect_id,
+                            effect.effect_id,
                             context.request_id,
                             exc_info=True,
                         )
-            if (
-                receipt is None
-                and effect_id is not None
-                and capability_name == "action.undo"
-            ):
-                # action.undo owns its inverse receipt internally; the positive
-                # endpoint result still confirms this provider effect.
-                await self._action_receipts.confirm_external_effect(
-                    effect_id,
-                    context=context,
-                    action_id=None,
-                )
         if capability_name in self._image_output_capabilities:
             if not dataclasses.is_dataclass(result):
                 raise AgentToolError("Image capability returned an invalid record.")

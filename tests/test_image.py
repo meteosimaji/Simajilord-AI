@@ -710,6 +710,73 @@ async def test_image_rate_limit_check_and_insert_are_atomic(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_image_validation_and_limits_happen_before_effect_dispatch(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+    dispatches = 0
+    no_effects = 0
+
+    async def before_enqueue() -> None:
+        nonlocal dispatches
+        dispatches += 1
+
+    async def on_idempotent_replay() -> None:
+        nonlocal no_effects
+        no_effects += 1
+
+    invalid_prompt = _prompt(" ")
+    with pytest.raises(UserError, match=r"image\.prompt_field_empty"):
+        await service.submit(
+            actor_id="actor",
+            workspace_id="guild",
+            delivery_target_id="channel",
+            reply_to_message_id="message",
+            prompt=invalid_prompt,
+            before_enqueue=before_enqueue,
+        )
+    assert dispatches == 0
+
+    first = await service.submit(
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt("first"),
+        idempotency_key="same-event",
+        before_enqueue=before_enqueue,
+        on_idempotent_replay=on_idempotent_replay,
+    )
+    assert dispatches == 1
+
+    replay = await service.submit(
+        actor_id="actor",
+        workspace_id="guild",
+        delivery_target_id="channel",
+        reply_to_message_id="message",
+        prompt=_prompt("ignored replay body"),
+        idempotency_key="same-event",
+        before_enqueue=before_enqueue,
+        on_idempotent_replay=on_idempotent_replay,
+    )
+    assert replay.job_id == first.job_id
+    assert dispatches == 1
+    assert no_effects == 1
+
+    with pytest.raises(UserError, match=r"image\.user_limit_reached"):
+        await service.submit(
+            actor_id="actor",
+            workspace_id="other-guild",
+            delivery_target_id="channel",
+            reply_to_message_id="message",
+            prompt=_prompt("rate limited"),
+            before_enqueue=before_enqueue,
+        )
+    assert dispatches == 1
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_image_limits_exempt_only_configured_actor(tmp_path: Path) -> None:
     service = _service(tmp_path, exempt=frozenset({"admin"}))
     for subject in ("one", "two"):

@@ -4,7 +4,11 @@ import asyncio
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -86,14 +90,26 @@ async def test_isolated_shell_writes_inside_and_denies_outside_reads(tmp_path: P
 @pytest.mark.asyncio
 async def test_isolated_shell_rejects_directory_escape(tmp_path: Path) -> None:
     registry = CapabilityRegistry()
-    registry.register(build_isolated_shell_endpoint(tmp_path / "workspaces"))
+    workspace_root = tmp_path / "workspaces"
+    registry.register(build_isolated_shell_endpoint(workspace_root))
+    dispatch = AsyncMock()
+    effect = SimpleNamespace(
+        dispatch=dispatch,
+        complete_without_dispatch=AsyncMock(),
+    )
 
     with pytest.raises(UserError, match=r"shell\.working_directory_invalid"):
         await registry.invoke(
             "system.shell",
             IsolatedShellRequest(argv=("/bin/pwd",), working_directory="../"),
-            _context(),
+            replace(
+                _context(),
+                external_effect_dispatch=cast(Any, effect),
+            ),
         )
+
+    dispatch.assert_not_awaited()
+    assert not workspace_root.exists()
 
 
 @pytest.mark.asyncio

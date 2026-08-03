@@ -155,18 +155,35 @@ async def test_service_cache_avoids_second_paid_attempt(tmp_path) -> None:
         threshold=0.9,
     )
 
+    dispatched = 0
+    cached_noops = 0
+
+    async def before_provider() -> None:
+        nonlocal dispatched
+        dispatched += 1
+
+    async def on_cached() -> None:
+        nonlocal cached_noops
+        cached_noops += 1
+
     first = await service.analyze(
         content=b"same-image",
         filename="sample.png",
         content_type="image/png",
+        before_provider=before_provider,
+        on_cached=on_cached,
     )
     second = await service.analyze(
         content=b"same-image",
         filename="renamed.png",
         content_type="image/png",
+        before_provider=before_provider,
+        on_cached=on_cached,
     )
 
     assert provider.calls == 1
+    assert dispatched == 1
+    assert cached_noops == 1
     assert first.cached is False
     assert second.cached is True
     assert first.quota_used == second.quota_used == 1
@@ -225,11 +242,18 @@ async def test_service_validates_supported_media_before_reserving_quota(tmp_path
         threshold=0.9,
     )
 
+    dispatched = 0
+
+    async def before_provider() -> None:
+        nonlocal dispatched
+        dispatched += 1
+
     with pytest.raises(UserError) as unsupported:
         await service.analyze(
             content=b"text",
             filename="sample.txt",
             content_type="text/plain",
+            before_provider=before_provider,
         )
     assert unsupported.value.code == "moderation.media_type_unsupported"
     with pytest.raises(UserError) as too_large:
@@ -237,6 +261,7 @@ async def test_service_validates_supported_media_before_reserving_quota(tmp_path
             content=b"123456",
             filename="sample.wav",
             content_type="audio/wav",
+            before_provider=before_provider,
         )
     assert too_large.value.code == "moderation.media_too_large"
     with pytest.raises(UserError) as audio:
@@ -244,6 +269,42 @@ async def test_service_validates_supported_media_before_reserving_quota(tmp_path
             content=b"1",
             filename="sample.wav",
             content_type="audio/wav",
+            before_provider=before_provider,
         )
     assert audio.value.code == "moderation.media_type_unsupported"
     assert provider.calls == 0
+    assert dispatched == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_returns_moderation_quota_reservation(tmp_path) -> None:
+    provider = _FakeProvider(_provider_result())
+    store = ModerationStore(tmp_path / "moderation.sqlite3")
+    service = ModerationService(
+        provider=provider,
+        store=store,
+        daily_limit=1,
+        max_media_bytes=1_000,
+        threshold=0.9,
+    )
+
+    async def fail_dispatch() -> None:
+        raise RuntimeError("effect ledger unavailable")
+
+    with pytest.raises(RuntimeError, match="effect ledger unavailable"):
+        await service.analyze(
+            content=b"image",
+            filename="sample.png",
+            content_type="image/png",
+            before_provider=fail_dispatch,
+        )
+
+    assert provider.calls == 0
+    assert await store.used(provider="hive") == 0
+    result = await service.analyze(
+        content=b"image",
+        filename="sample.png",
+        content_type="image/png",
+    )
+    assert result.cached is False
+    assert provider.calls == 1

@@ -63,6 +63,22 @@ def discord_workspace_for_context(
 ) -> Path:
     """Return one actor-and-task-owned path used by provider and shell."""
 
+    workspace = _discord_workspace_path_for_context(workspace_root, context)
+    workspace.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with suppress(OSError):
+        workspace.parent.chmod(0o700)
+    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with suppress(OSError):
+        workspace.chmod(0o700)
+    return workspace.resolve()
+
+
+def _discord_workspace_path_for_context(
+    workspace_root: Path,
+    context: InvocationContext,
+) -> Path:
+    """Derive the isolated path without mutating the host filesystem."""
+
     task_scope = context.agent_task_id or context.request_id
     transport_scope = (
         f"guild:{context.workspace_id}"
@@ -72,14 +88,7 @@ def discord_workspace_for_context(
     scope = f"{transport_scope}:actor:{context.actor_id}:task:{task_scope}"
     digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:24]
     root = workspace_root.expanduser().resolve()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with suppress(OSError):
-        root.chmod(0o700)
-    workspace = root / digest
-    workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with suppress(OSError):
-        workspace.chmod(0o700)
-    return workspace.resolve()
+    return root / digest
 
 
 def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
@@ -88,17 +97,24 @@ def build_isolated_shell_endpoint(workspace_root: Path) -> CapabilityEndpoint:
         context: InvocationContext,
     ) -> IsolatedShellResponse:
         _validate_request(request)
-        workspace = discord_workspace_for_context(workspace_root, context)
+        workspace = _discord_workspace_path_for_context(workspace_root, context)
         working_directory = _resolve_working_directory(
             workspace,
             request.working_directory,
+            allow_missing_workspace=True,
         )
         if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
             raise UserError("shell.isolation_unavailable")
-        temporary_directory = workspace / ".tmp"
-        temporary_directory.mkdir(mode=0o700, exist_ok=True)
         profile = _macos_sandbox_profile(workspace)
         try:
+            await context.dispatch_external_effect()
+            workspace = discord_workspace_for_context(workspace_root, context)
+            working_directory = _resolve_working_directory(
+                workspace,
+                request.working_directory,
+            )
+            temporary_directory = workspace / ".tmp"
+            temporary_directory.mkdir(mode=0o700, exist_ok=True)
             process = await asyncio.create_subprocess_exec(
                 "/usr/bin/sandbox-exec",
                 "-p",
@@ -200,7 +216,12 @@ def _validate_request(request: IsolatedShellRequest) -> None:
         raise UserError("shell.login_shell_forbidden")
 
 
-def _resolve_working_directory(workspace: Path, value: str) -> Path:
+def _resolve_working_directory(
+    workspace: Path,
+    value: str,
+    *,
+    allow_missing_workspace: bool = False,
+) -> Path:
     requested = Path(value)
     if requested.is_absolute() or "\x00" in value:
         raise UserError("shell.working_directory_invalid")
@@ -209,6 +230,10 @@ def _resolve_working_directory(workspace: Path, value: str) -> Path:
         resolved.relative_to(workspace)
     except ValueError as exc:
         raise UserError("shell.working_directory_invalid") from exc
+    if allow_missing_workspace and not workspace.exists():
+        if resolved != workspace:
+            raise UserError("shell.working_directory_invalid")
+        return resolved
     if not resolved.is_dir():
         raise UserError("shell.working_directory_invalid")
     return resolved

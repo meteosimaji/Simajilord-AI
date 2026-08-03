@@ -106,6 +106,50 @@ class FakeOutput:
 
 
 @pytest.mark.asyncio
+async def test_audio_effect_hook_follows_state_validation_and_noop_detection() -> None:
+    session = AudioSession("one", FakeOutput(), max_pending_speech=3)
+    dispatches = 0
+    no_effects = 0
+
+    async def before_mutation() -> None:
+        nonlocal dispatches
+        dispatches += 1
+
+    async def on_noop() -> None:
+        nonlocal no_effects
+        no_effects += 1
+
+    with pytest.raises(UserError, match=r"audio\.nothing_playing"):
+        await session.pause(before_mutation=before_mutation)
+    with pytest.raises(UserError, match=r"audio\.queue_position_invalid"):
+        await session.remove(1, before_mutation=before_mutation)
+    with pytest.raises(UserError, match=r"audio\.volume_range_invalid"):
+        await session.set_volume_with_previous(
+            music=3.0,
+            before_mutation=before_mutation,
+            on_noop=on_noop,
+        )
+    assert dispatches == 0
+    assert no_effects == 0
+
+    await session.set_auto_leave(
+        True,
+        before_mutation=before_mutation,
+        on_noop=on_noop,
+    )
+    assert dispatches == 0
+    assert no_effects == 1
+
+    await session.set_auto_leave(
+        False,
+        before_mutation=before_mutation,
+        on_noop=on_noop,
+    )
+    assert dispatches == 1
+    assert no_effects == 1
+
+
+@pytest.mark.asyncio
 async def test_speech_overlays_current_music_before_waiting_music() -> None:
     output = FakeOutput()
     session = AudioSession("one", output, max_pending_speech=3)

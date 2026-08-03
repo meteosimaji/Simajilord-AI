@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import unicodedata
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -117,8 +118,20 @@ class ReadAloudService:
 
         return self._policies.get(workspace_id, ReadAloudPolicy(workspace_id))
 
-    async def configure(self, route: ReadAloudRoute) -> None:
+    async def configure(
+        self,
+        route: ReadAloudRoute,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         async with self._lock:
+            if self.get(route.workspace_id) == route:
+                if on_noop is not None:
+                    await on_noop()
+                return
+            if before_mutation is not None:
+                await before_mutation()
             self._routes[route.workspace_id] = route
             await asyncio.to_thread(self._save)
 
@@ -129,6 +142,8 @@ class ReadAloudService:
         text_channel_ids: tuple[str, ...],
         audio_destination_id: str,
         mode: ReadAloudMode,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudRoute:
         """Atomically add a source set without discarding existing routes."""
 
@@ -154,6 +169,12 @@ class ReadAloudService:
                 mode=route_mode,
                 additional_text_channel_ids=combined_ids[1:],
             )
+            if current == route:
+                if on_noop is not None:
+                    await on_noop()
+                return route
+            if before_mutation is not None:
+                await before_mutation()
             self._routes[workspace_id] = route
             await asyncio.to_thread(self._save)
             return route
@@ -165,6 +186,8 @@ class ReadAloudService:
         text_channel_id: str,
         audio_destination_id: str,
         mode: ReadAloudMode,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudRoute:
         """Add one source without discarding existing sources for the same VC."""
 
@@ -173,6 +196,8 @@ class ReadAloudService:
             text_channel_ids=(text_channel_id,),
             audio_destination_id=audio_destination_id,
             mode=mode,
+            before_mutation=before_mutation,
+            on_noop=on_noop,
         )
 
     async def remove_source(
@@ -180,17 +205,23 @@ class ReadAloudService:
         *,
         workspace_id: str,
         text_channel_id: str,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudRoute | None:
         """Remove one source; deleting the last source disables the route."""
 
         async with self._lock:
             current = self.get(workspace_id)
             if current is None or text_channel_id not in current.text_channel_ids:
+                if on_noop is not None:
+                    await on_noop()
                 return current
             channel_ids = tuple(
                 item for item in current.text_channel_ids if item != text_channel_id
             )
             if not channel_ids:
+                if before_mutation is not None:
+                    await before_mutation()
                 self._routes.pop(workspace_id, None)
                 await asyncio.to_thread(self._save)
                 return None
@@ -201,16 +232,29 @@ class ReadAloudService:
                 mode=current.mode,
                 additional_text_channel_ids=channel_ids[1:],
             )
+            if before_mutation is not None:
+                await before_mutation()
             self._routes[workspace_id] = route
             await asyncio.to_thread(self._save)
             return route
 
-    async def disable(self, workspace_id: str) -> bool:
+    async def disable(
+        self,
+        workspace_id: str,
+        *,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> bool:
         async with self._lock:
-            existed = self._routes.pop(workspace_id, None) is not None
-            if existed:
-                await asyncio.to_thread(self._save)
-            return existed
+            if workspace_id not in self._routes:
+                if on_noop is not None:
+                    await on_noop()
+                return False
+            if before_mutation is not None:
+                await before_mutation()
+            self._routes.pop(workspace_id, None)
+            await asyncio.to_thread(self._save)
+            return True
 
     def matches(self, workspace_id: str, text_channel_id: str) -> bool:
         route = self.get(workspace_id)
@@ -222,6 +266,8 @@ class ReadAloudService:
         workspace_id: str,
         surface: str,
         reading: str,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Add or replace a literal dictionary entry for one guild."""
 
@@ -252,6 +298,12 @@ class ReadAloudService:
                     ),
                 ),
             )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -261,6 +313,8 @@ class ReadAloudService:
         *,
         workspace_id: str,
         surface: str,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ReadAloudPolicy, bool]:
         """Remove an exact dictionary surface and report whether it existed."""
 
@@ -278,8 +332,12 @@ class ReadAloudService:
             )
             removed = len(entries) != len(current.dictionary)
             if not removed:
+                if on_noop is not None:
+                    await on_noop()
                 return current, False
             updated = replace(current, dictionary=entries)
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated, True
@@ -290,6 +348,8 @@ class ReadAloudService:
         workspace_id: str,
         user_id: str,
         ignored: bool,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Set whether messages from one user may enter the speech queue."""
 
@@ -304,6 +364,12 @@ class ReadAloudService:
                     enabled=ignored,
                 ),
             )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -314,6 +380,8 @@ class ReadAloudService:
         workspace_id: str,
         role_id: str,
         ignored: bool,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Set whether members with one role may enter the speech queue."""
 
@@ -328,6 +396,12 @@ class ReadAloudService:
                     enabled=ignored,
                 ),
             )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -360,6 +434,8 @@ class ReadAloudService:
         expected_join: bool | None = None,
         expected_leave: bool | None = None,
         expected_move: bool | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
         """Update announcement switches and atomically return the prior policy."""
 
@@ -374,6 +450,8 @@ class ReadAloudService:
                 announce_move=current.announce_move if move is None else move,
             )
             if updated == current:
+                if on_noop is not None:
+                    await on_noop()
                 return current, current
             if (
                 expected_join is not None
@@ -386,6 +464,8 @@ class ReadAloudService:
                 and current.announce_move != expected_move
             ):
                 raise UserError("action.undo_conflict")
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated, current
@@ -409,6 +489,8 @@ class ReadAloudService:
         *,
         workspace_id: str,
         mode: ReadAloudContentMode,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
         """Apply a content preset and atomically return the prior scalar policy."""
 
@@ -430,6 +512,12 @@ class ReadAloudService:
                 announce_leave=read_events,
                 announce_move=read_events,
             )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current, current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated, current
@@ -480,6 +568,8 @@ class ReadAloudService:
         expected_announce_join: bool | None = None,
         expected_announce_leave: bool | None = None,
         expected_announce_move: bool | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Restore the four exact booleans collapsed by a content-mode preset."""
 
@@ -493,6 +583,8 @@ class ReadAloudService:
                 announce_move=announce_move,
             )
             if updated == current:
+                if on_noop is not None:
+                    await on_noop()
                 return current
             if (
                 expected_read_messages is not None
@@ -508,6 +600,8 @@ class ReadAloudService:
                 and current.announce_move != expected_announce_move
             ):
                 raise UserError("action.undo_conflict")
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -517,12 +611,20 @@ class ReadAloudService:
         *,
         workspace_id: str,
         preset: ReadAloudVoicePreset,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Set the server-wide voice used unless a member overrides it."""
 
         async with self._lock:
             current = self.policy(workspace_id)
             updated = replace(current, default_voice_preset=preset)
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -533,6 +635,8 @@ class ReadAloudService:
         workspace_id: str,
         user_id: str,
         preset: ReadAloudVoicePreset | None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> ReadAloudPolicy:
         """Set or clear one member's self-managed voice override."""
 
@@ -548,6 +652,12 @@ class ReadAloudService:
                 current,
                 user_voice_presets=tuple(sorted(overrides.items())),
             )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated
@@ -598,6 +708,8 @@ class ReadAloudService:
         expected_replies: bool | None = None,
         expected_attachments: bool | None = None,
         expected_vc_members_only: bool | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
         """Update semantic options and atomically return the prior policy."""
 
@@ -630,6 +742,8 @@ class ReadAloudService:
                 ),
             )
             if updated == current:
+                if on_noop is not None:
+                    await on_noop()
                 return current, current
             if (
                 expected_author_names is not None
@@ -645,6 +759,8 @@ class ReadAloudService:
                 and current.vc_members_only != expected_vc_members_only
             ):
                 raise UserError("action.undo_conflict")
+            if before_mutation is not None:
+                await before_mutation()
             self._policies[workspace_id] = updated
             await asyncio.to_thread(self._save)
             return updated, current

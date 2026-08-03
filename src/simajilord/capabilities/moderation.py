@@ -71,12 +71,14 @@ def build_moderation_endpoints(
 ) -> tuple[CapabilityEndpoint, ...]:
     async def analyze(
         request: SyntheticMediaAnalyzeRequest,
-        _: InvocationContext,
+        context: InvocationContext,
     ) -> SyntheticMediaAnalyzeResponse:
         result = await moderation.analyze(
             content=request.content,
             filename=request.filename,
             content_type=request.content_type,
+            before_provider=context.dispatch_external_effect,
+            on_cached=context.complete_external_effect_without_dispatch,
         )
         return SyntheticMediaAnalyzeResponse(
             sha256=result.sha256,

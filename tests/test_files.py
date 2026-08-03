@@ -516,6 +516,7 @@ def test_file_sandbox_rejects_path_escape(tmp_path: Path, path: str) -> None:
     sandbox = AgentFileSandbox(tmp_path / "files")
     with pytest.raises(UserError, match=r"files\.path_invalid"):
         sandbox.write_text("guild", path, "no")
+    assert list((tmp_path / "files").iterdir()) == []
 
 
 def test_file_sandbox_rejects_symlink_parent(tmp_path: Path) -> None:

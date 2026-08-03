@@ -14,7 +14,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
@@ -24,6 +24,7 @@ from typing import Protocol
 
 from simajilord.core.errors import UserError
 from simajilord.providers.web.base import PublicWebFetcher
+from simajilord.providers.web.http import normalize_public_web_url
 
 from .files import (
     AgentFileSandbox,
@@ -570,6 +571,7 @@ class WorkspaceComputeService:
         input_paths: tuple[str, ...] = (),
         actor_id: str | None = None,
         provenance: WorkspaceFileProvenance | None = None,
+        before_process: Callable[[], Awaitable[None]] | None = None,
     ) -> ComputeRunResult:
         if runtime != "python":
             raise UserError("compute.runtime_unsupported")
@@ -610,6 +612,8 @@ class WorkspaceComputeService:
                     raise UserError("compute.script_not_found")
                 started = monotonic()
                 async with self._process_slots:
+                    if before_process is not None:
+                        await before_process()
                     process_result = await self.launcher.run_python(
                         workspace=workspace,
                         temporary_directory=temporary_directory,
@@ -652,9 +656,14 @@ class WorkspaceComputeService:
         url: str,
         path: str,
         provenance: WorkspaceFileProvenance | None = None,
+        before_fetch: Callable[[], Awaitable[None]] | None = None,
     ) -> WorkspaceDownloadResult:
+        self.files.validate_path(workspace_id, path)
+        normalized_url = normalize_public_web_url(url)
+        if before_fetch is not None:
+            await before_fetch()
         resource_result = await self.web_fetcher.fetch(
-            url,
+            normalized_url,
             max_bytes=self.max_download_bytes,
         )
         content_type = resource_result.content_type.lower().strip()

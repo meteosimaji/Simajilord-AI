@@ -135,15 +135,19 @@ def build_discord_automod_endpoints(
         trigger, actions, roles, channels = _rule_parts(
             guild, actor, bot, request.rule
         )
+        name = _bounded_name(request.rule.name, "discord.automod_name_invalid")
+        event_type = _event_type(request.rule.trigger_kind)
+        reason = _audit_reason(request.reason or "Create AutoMod rule", context)
+        await context.dispatch_external_effect()
         rule = await guild.create_automod_rule(
-            name=_bounded_name(request.rule.name, "discord.automod_name_invalid"),
-            event_type=_event_type(request.rule.trigger_kind),
+            name=name,
+            event_type=event_type,
             trigger=trigger,
             actions=actions,
             enabled=request.rule.enabled,
             exempt_roles=roles,
             exempt_channels=channels,
-            reason=_audit_reason(request.reason or "Create AutoMod rule", context),
+            reason=reason,
         )
         return _response(guild, rule)
 
@@ -158,15 +162,19 @@ def build_discord_automod_endpoints(
         trigger, actions, roles, channels = _rule_parts(
             guild, actor, bot, request.rule
         )
+        name = _bounded_name(request.rule.name, "discord.automod_name_invalid")
+        event_type = _event_type(request.rule.trigger_kind)
+        reason = _audit_reason(request.reason or "Update AutoMod rule", context)
+        await context.dispatch_external_effect()
         updated = await existing.edit(
-            name=_bounded_name(request.rule.name, "discord.automod_name_invalid"),
-            event_type=_event_type(request.rule.trigger_kind),
+            name=name,
+            event_type=event_type,
             trigger=trigger,
             actions=actions,
             enabled=request.rule.enabled,
             exempt_roles=roles,
             exempt_channels=channels,
-            reason=_audit_reason(request.reason or "Update AutoMod rule", context),
+            reason=reason,
         )
         return _response(guild, updated)
 
@@ -178,9 +186,9 @@ def build_discord_automod_endpoints(
         await _automod_members(guild, context)
         rule = await _fetch_rule(guild, request.rule_id)
         response = _response(guild, rule)
-        await rule.delete(
-            reason=_audit_reason(request.reason or "Delete AutoMod rule", context)
-        )
+        reason = _audit_reason(request.reason or "Delete AutoMod rule", context)
+        await context.dispatch_external_effect()
+        await rule.delete(reason=reason)
         return response
 
     shared_keywords = (

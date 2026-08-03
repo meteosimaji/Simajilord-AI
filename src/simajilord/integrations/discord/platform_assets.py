@@ -143,6 +143,7 @@ def build_discord_platform_asset_endpoints(
         )
         if request.kind == "guild_emoji":
             roles = _asset_roles(guild, request.role_ids)
+            await context.dispatch_external_effect()
             guild_emoji = await guild.create_custom_emoji(
                 name=name,
                 image=content,
@@ -152,6 +153,7 @@ def build_discord_platform_asset_endpoints(
             return _asset_response(guild, request.kind, guild_emoji)
         if request.kind == "application_emoji":
             await _require_global_application_permission(client, actor)
+            await context.dispatch_external_effect()
             application_emoji = await client.create_application_emoji(
                 name=name,
                 image=content,
@@ -163,6 +165,7 @@ def build_discord_platform_asset_endpoints(
                 raise UserError("discord.sticker_emoji_required")
             file = discord.File(io.BytesIO(content), filename=filename)
             try:
+                await context.dispatch_external_effect()
                 sticker = await guild.create_sticker(
                     name=name,
                     description=request.description,
@@ -175,11 +178,13 @@ def build_discord_platform_asset_endpoints(
             return _asset_response(guild, request.kind, sticker)
         if not 0 <= request.volume <= 1:
             raise UserError("discord.soundboard_volume_invalid")
+        sound_emoji = request.emoji.strip() or None
+        await context.dispatch_external_effect()
         sound = await guild.create_soundboard_sound(
             name=name,
             sound=content,
             volume=request.volume,
-            emoji=request.emoji.strip() or None,
+            emoji=sound_emoji,
             reason=reason,
         )
         return _asset_response(guild, request.kind, sound)
@@ -224,15 +229,19 @@ def build_discord_platform_asset_endpoints(
                 await _require_global_application_permission(client, actor)
                 if request.role_ids is not None:
                     raise UserError("discord.application_emoji_roles_invalid")
+                await context.dispatch_external_effect()
                 updated_emoji = await asset.edit(name=name or asset.name)
             elif roles is None:
+                await context.dispatch_external_effect()
                 updated_emoji = await asset.edit(
                     name=name or asset.name,
                     reason=reason,
                 )
             elif name is None:
+                await context.dispatch_external_effect()
                 updated_emoji = await asset.edit(roles=roles, reason=reason)
             else:
+                await context.dispatch_external_effect()
                 updated_emoji = await asset.edit(
                     name=name,
                     roles=roles,
@@ -257,6 +266,7 @@ def build_discord_platform_asset_endpoints(
                 if not emoji:
                     raise UserError("discord.sticker_emoji_required")
                 options["emoji"] = emoji
+            await context.dispatch_external_effect()
             updated_sticker = await cast(Any, sticker.edit)(**options)
             return _asset_response(guild, request.kind, updated_sticker)
         sound = await _fetch_sound(guild, request.resource_id)
@@ -278,6 +288,7 @@ def build_discord_platform_asset_endpoints(
             sound_options["emoji"] = (
                 None if request.clear_emoji else request.emoji
             )
+        await context.dispatch_external_effect()
         updated_sound = await cast(Any, sound.edit)(**sound_options)
         return _asset_response(guild, request.kind, updated_sound or sound)
 
@@ -302,18 +313,22 @@ def build_discord_platform_asset_endpoints(
             if request.kind == "application_emoji":
                 await _require_global_application_permission(client, actor)
                 response = _asset_response(guild, request.kind, asset)
+                await context.dispatch_external_effect()
                 await asset.delete()
                 return response
             response = _asset_response(guild, request.kind, asset)
+            await context.dispatch_external_effect()
             await asset.delete(reason=reason)
             return response
         if request.kind == "guild_sticker":
             sticker = await _fetch_sticker(guild, request.resource_id)
             response = _asset_response(guild, request.kind, sticker)
+            await context.dispatch_external_effect()
             await sticker.delete(reason=reason)
             return response
         sound = await _fetch_sound(guild, request.resource_id)
         response = _asset_response(guild, request.kind, sound)
+        await context.dispatch_external_effect()
         await sound.delete(reason=reason)
         return response
 

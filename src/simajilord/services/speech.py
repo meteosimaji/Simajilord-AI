@@ -250,12 +250,14 @@ class SpeechService:
         title: str = "Read aloud",
         workspace_id: str = "default",
         voice_preset: str | None = None,
+        before_synthesis: Callable[[], Awaitable[None]] | None = None,
     ) -> AudioItem:
         return await self.synthesize_segments(
             (SpeechSegment(SpeechSegmentKind.BODY, text),),
             title=title,
             workspace_id=workspace_id,
             voice_preset=voice_preset,
+            before_synthesis=before_synthesis,
         )
 
     async def synthesize_segments(
@@ -265,6 +267,7 @@ class SpeechService:
         title: str = "Read aloud",
         workspace_id: str,
         voice_preset: str | None = None,
+        before_synthesis: Callable[[], Awaitable[None]] | None = None,
     ) -> AudioItem:
         normalized_segments: list[SpeechSegment] = []
         for segment in segments:
@@ -281,6 +284,8 @@ class SpeechService:
         if not prepared:
             raise UserError("speech.no_readable_text")
         voice_id = self._resolve_voice_id(voice_preset)
+        if before_synthesis is not None:
+            await before_synthesis()
 
         return await self._scheduler.run(
             workspace_id,

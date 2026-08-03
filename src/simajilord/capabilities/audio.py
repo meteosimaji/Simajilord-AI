@@ -324,8 +324,14 @@ def build_audio_endpoints(
             item.request_id = context.request_id
             item.requested_at_epoch = int(time())
             if not session.output.connected:
-                await session.wait_for_listener(context.actor_id)
-            position = await session.enqueue(item)
+                await session.wait_for_listener(
+                    context.actor_id,
+                    before_mutation=context.dispatch_external_effect,
+                )
+            position = await session.enqueue(
+                item,
+                before_mutation=context.dispatch_external_effect,
+            )
         finally:
             await reservation.release()
         snapshot = await session.snapshot()
@@ -366,9 +372,13 @@ def build_audio_endpoints(
             seeds = await session.enable_autoplay(
                 request.seed_references,
                 replace_loop=request.replace_loop,
+                before_mutation=context.dispatch_external_effect,
             )
         else:
-            await session.disable_autoplay()
+            await session.disable_autoplay(
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
             seeds = ()
         snapshot = await session.snapshot()
         return AudioMixResponse(
@@ -417,34 +427,66 @@ def build_audio_endpoints(
         previous_speech_volume_percent: int | None = None
         removed_count: int | None = None
         if request.action is AudioAction.PAUSE:
-            await session.pause()
+            await session.pause(
+                before_mutation=context.dispatch_external_effect,
+            )
         elif request.action is AudioAction.RESUME:
-            await session.resume()
+            await session.resume(
+                before_mutation=context.dispatch_external_effect,
+            )
         elif request.action is AudioAction.SKIP:
-            await session.skip()
+            await session.skip(
+                before_mutation=context.dispatch_external_effect,
+            )
         elif request.action is AudioAction.STOP:
-            await session.clear()
+            await session.clear(
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
         elif request.action is AudioAction.LEAVE:
-            await session.disconnect()
+            await session.disconnect(
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
         elif request.action is AudioAction.REMOVE:
             if request.position is None:
                 raise UserError("audio.queue_position_invalid")
-            affected_title = (await session.remove(request.position)).title
+            affected_title = (
+                await session.remove(
+                    request.position,
+                    before_mutation=context.dispatch_external_effect,
+                )
+            ).title
         elif request.action is AudioAction.AUTO_LEAVE:
             if request.enabled is None:
                 raise UserError("audio.auto_leave_value_required")
-            await session.set_auto_leave(request.enabled)
+            await session.set_auto_leave(
+                request.enabled,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
             enabled = request.enabled
         elif request.action is AudioAction.SHUFFLE:
-            await session.shuffle()
+            await session.shuffle(
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
         elif request.action is AudioAction.SEEK:
             if request.position_seconds is None:
                 raise UserError("audio.seek_position_required")
-            position_seconds = await session.seek(request.position_seconds)
+            position_seconds = await session.seek(
+                request.position_seconds,
+                before_mutation=context.dispatch_external_effect,
+            )
         elif request.action is AudioAction.TUNE:
             if request.speed is None or request.pitch is None:
                 raise UserError("audio.tune_values_required")
-            await session.tune(request.speed, request.pitch)
+            await session.tune(
+                request.speed,
+                request.pitch,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
             speed = request.speed
             pitch = request.pitch
         elif request.action is AudioAction.VOLUME:
@@ -468,6 +510,8 @@ def build_audio_endpoints(
                     if request.expected_speech_percent is None
                     else request.expected_speech_percent / 100
                 ),
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
             music_volume_percent = round(music_volume * 100)
             speech_volume_percent = round(speech_volume * 100)
@@ -476,15 +520,30 @@ def build_audio_endpoints(
         elif request.action is AudioAction.MOVE:
             if request.position is None or request.to_position is None:
                 raise UserError("audio.queue_position_invalid")
-            affected_title = (await session.move(request.position, request.to_position)).title
+            affected_title = (
+                await session.move(
+                    request.position,
+                    request.to_position,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
+                )
+            ).title
         elif request.action is AudioAction.CLEAR_MINE:
-            removed_count = len(await session.clear_for_actor(context.actor_id))
+            removed_count = len(
+                await session.clear_for_actor(
+                    context.actor_id,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
+                )
+            )
         else:
             if request.loop_mode is None:
                 raise UserError("audio.loop_mode_required")
             await session.set_loop(
                 request.loop_mode,
                 replace_autoplay=request.replace_mix,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
         return AudioControlResponse(
             action=request.action.value,

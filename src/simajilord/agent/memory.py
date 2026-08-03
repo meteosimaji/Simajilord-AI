@@ -10,6 +10,7 @@ import re
 import sqlite3
 import unicodedata
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -697,6 +698,7 @@ class AgentMemoryStore:
         confidence: float,
         expires_at: datetime | None,
         now: datetime,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[AgentMemoryRecord, bool]:
         if not source_message_locators:
             source_message_locators = tuple(
@@ -717,6 +719,21 @@ class AgentMemoryStore:
             or "simajilord:legacy"
         )
         async with self._lock:
+            await asyncio.to_thread(
+                self._preflight_remember,
+                scope,
+                workspace_id,
+                owner_user_id,
+                channel_id,
+                key,
+                creator_id,
+                is_curator,
+                resource_ids,
+                verified_action_id,
+                _utc(now),
+            )
+            if before_mutation is not None:
+                await before_mutation()
             return await asyncio.to_thread(
                 self._remember,
                 scope,
@@ -761,6 +778,8 @@ class AgentMemoryStore:
         confidence: float,
         expires_at: datetime | None,
         now: datetime,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        validate_existing: Callable[[AgentMemoryRecord], None] | None = None,
     ) -> AgentMemoryRecord:
         if not source_message_locators:
             source_message_locators = tuple(
@@ -776,6 +795,20 @@ class AgentMemoryStore:
                 source_message_locators
             )
         async with self._lock:
+            existing = await asyncio.to_thread(
+                self._preflight_update,
+                memory_id,
+                workspace_id,
+                actor_id,
+                is_curator,
+                resource_ids,
+                verified_action_id,
+                _utc(now),
+            )
+            if validate_existing is not None:
+                validate_existing(existing)
+            if before_mutation is not None:
+                await before_mutation()
             return await asyncio.to_thread(
                 self._update,
                 memory_id,
@@ -806,8 +839,20 @@ class AgentMemoryStore:
         is_curator: bool = False,
         resource_ids: tuple[str, ...] = (),
         now: datetime,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         async with self._lock:
+            await asyncio.to_thread(
+                self._preflight_forget,
+                memory_id,
+                workspace_id,
+                actor_id,
+                is_curator,
+                resource_ids,
+                _utc(now),
+            )
+            if before_mutation is not None:
+                await before_mutation()
             await asyncio.to_thread(
                 self._forget,
                 memory_id,
@@ -828,8 +873,19 @@ class AgentMemoryStore:
         resource_ids: tuple[str, ...],
         decision: AgentMemoryReviewDecision,
         now: datetime,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> AgentMemoryRecord:
         async with self._lock:
+            await asyncio.to_thread(
+                self._preflight_review,
+                memory_id,
+                workspace_id,
+                resource_ids,
+                decision,
+                _utc(now),
+            )
+            if before_mutation is not None:
+                await before_mutation()
             return await asyncio.to_thread(
                 self._review,
                 memory_id,
@@ -996,6 +1052,142 @@ class AgentMemoryStore:
             _migrate_memory_basis_constraint(connection)
             _create_memory_indexes(connection)
         os.chmod(self.path, 0o600)
+
+    def _preflight_remember(
+        self,
+        scope: AgentMemoryScope,
+        workspace_id: str,
+        owner_user_id: str | None,
+        channel_id: str | None,
+        key: str,
+        actor_id: str,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
+        verified_action_id: str | None,
+        now: datetime,
+    ) -> None:
+        if scope is AgentMemoryScope.PROCEDURE:
+            if verified_action_id is None:
+                raise UserError("memory.verified_action_required")
+        elif verified_action_id is not None:
+            raise UserError("memory.verified_action_invalid")
+        locator = _memory_locator(
+            scope=scope,
+            workspace_id=workspace_id,
+            owner_user_id=owner_user_id,
+            channel_id=channel_id,
+            key=key,
+        )
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_memories
+                WHERE locator = ? AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (locator, now.isoformat()),
+            ).fetchone()
+        if row is not None and not _row_can_mutate(
+            row,
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            is_curator=is_curator,
+            resource_ids=resource_ids,
+        ):
+            raise UserError("memory.not_found")
+
+    def _preflight_update(
+        self,
+        memory_id: str,
+        workspace_id: str,
+        actor_id: str,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
+        verified_action_id: str | None,
+        now: datetime,
+    ) -> AgentMemoryRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_memories
+                WHERE memory_id = ? AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (memory_id, now.isoformat()),
+            ).fetchone()
+        if row is None or not _row_can_mutate(
+            row,
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            is_curator=is_curator,
+            resource_ids=resource_ids,
+        ):
+            raise UserError("memory.not_found")
+        scope = AgentMemoryScope(str(row["scope"]))
+        if scope is AgentMemoryScope.PROCEDURE:
+            if verified_action_id is None:
+                raise UserError("memory.verified_action_required")
+        elif verified_action_id is not None:
+            raise UserError("memory.verified_action_invalid")
+        return _memory_from_row(row)
+
+    def _preflight_forget(
+        self,
+        memory_id: str,
+        workspace_id: str,
+        actor_id: str,
+        is_curator: bool,
+        resource_ids: tuple[str, ...],
+        now: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_memories
+                WHERE memory_id = ? AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (memory_id, now.isoformat()),
+            ).fetchone()
+        if row is None or not _row_can_mutate(
+            row,
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            is_curator=is_curator,
+            resource_ids=resource_ids,
+        ):
+            raise UserError("memory.not_found")
+
+    def _preflight_review(
+        self,
+        memory_id: str,
+        workspace_id: str,
+        resource_ids: tuple[str, ...],
+        decision: AgentMemoryReviewDecision,
+        now: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM agent_memories
+                WHERE memory_id = ? AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (memory_id, now.isoformat()),
+            ).fetchone()
+        if (
+            row is None
+            or str(row["workspace_id"]) != workspace_id
+            or AgentMemoryScope(str(row["scope"])) is AgentMemoryScope.USER
+            or not _row_source_audience_is_accessible(
+                row,
+                workspace_id=workspace_id,
+                resource_ids=resource_ids,
+            )
+        ):
+            raise UserError("memory.not_found")
+        if (
+            decision is AgentMemoryReviewDecision.APPROVE
+            and AgentMemoryScope(str(row["scope"])) is AgentMemoryScope.PROCEDURE
+            and row["verified_action_id"] is None
+        ):
+            raise UserError("memory.verified_action_required")
 
     def _remember(
         self,
@@ -1773,6 +1965,7 @@ class AgentMemoryService:
             confidence=confidence,
             expires_at=_expiry(request.ttl_days, now=now),
             now=now,
+            before_mutation=context.dispatch_external_effect,
         )
         return AgentMemoryWriteResponse(memory=record, created=created)
 
@@ -1803,6 +1996,10 @@ class AgentMemoryService:
         )
         confidence = _validated_confidence(request.confidence)
         now = datetime.now(UTC)
+
+        def validate_existing(existing: AgentMemoryRecord) -> None:
+            _validate_basis(existing.scope, existing.basis, summary)
+
         record = await self.store.update(
             memory_id=memory_id,
             workspace_id=workspace_id,
@@ -1820,8 +2017,9 @@ class AgentMemoryService:
             confidence=confidence,
             expires_at=_expiry(request.ttl_days, now=now),
             now=now,
+            before_mutation=context.dispatch_external_effect,
+            validate_existing=validate_existing,
         )
-        _validate_basis(record.scope, record.basis, record.summary)
         return AgentMemoryWriteResponse(memory=record, created=False)
 
     async def forget(
@@ -1839,6 +2037,7 @@ class AgentMemoryService:
             is_curator=_is_memory_curator(context),
             resource_ids=context.resource_ids,
             now=datetime.now(UTC),
+            before_mutation=context.dispatch_external_effect,
         )
         return AgentMemoryForgetResponse(memory_id=memory_id, forgotten=True)
 
@@ -1857,6 +2056,7 @@ class AgentMemoryService:
             resource_ids=context.resource_ids,
             decision=request.decision,
             now=datetime.now(UTC),
+            before_mutation=context.dispatch_external_effect,
         )
         return AgentMemoryReviewResponse(
             memory=record,

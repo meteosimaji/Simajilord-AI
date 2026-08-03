@@ -245,6 +245,7 @@ def build_discord_platform_action_endpoints(
                 }
                 if request.topic:
                     text_options["topic"] = request.topic
+                await context.dispatch_external_effect()
                 text_channel = await cast(
                     Any,
                     guild.create_text_channel,
@@ -258,6 +259,7 @@ def build_discord_platform_action_endpoints(
                 }
                 if request.bitrate is not None:
                     voice_options["bitrate"] = request.bitrate
+                await context.dispatch_external_effect()
                 voice_channel = await cast(
                     Any,
                     guild.create_voice_channel,
@@ -271,6 +273,7 @@ def build_discord_platform_action_endpoints(
                 }
                 if request.bitrate is not None:
                     stage_options["bitrate"] = request.bitrate
+                await context.dispatch_external_effect()
                 stage_channel = await cast(
                     Any,
                     guild.create_stage_channel,
@@ -285,11 +288,13 @@ def build_discord_platform_action_endpoints(
                 }
                 if request.topic:
                     forum_options["topic"] = request.topic
+                await context.dispatch_external_effect()
                 forum_channel = await cast(
                     Any,
                     guild.create_forum,
                 )(name, **forum_options)
                 return _mutation_response(guild, request.kind, forum_channel)
+            await context.dispatch_external_effect()
             category_channel = await guild.create_category(name, reason=reason)
             return _mutation_response(guild, request.kind, category_channel)
         if request.kind == "invite":
@@ -306,6 +311,7 @@ def build_discord_platform_action_endpoints(
                 raise UserError("discord.invite_max_age_invalid")
             if not 0 <= request.max_uses <= 100:
                 raise UserError("discord.invite_max_uses_invalid")
+            await context.dispatch_external_effect()
             invite = await invite_channel.create_invite(
                 max_age=request.max_age_seconds,
                 max_uses=request.max_uses,
@@ -363,6 +369,7 @@ def build_discord_platform_action_endpoints(
                     event_options["end_time"] = end
             if request.description:
                 event_options["description"] = request.description
+            await context.dispatch_external_effect()
             event = await cast(
                 Any,
                 guild.create_scheduled_event,
@@ -380,6 +387,7 @@ def build_discord_platform_action_endpoints(
             topic = request.topic.strip()
             if not 1 <= len(topic) <= 120:
                 raise UserError("discord.stage_topic_invalid")
+            await context.dispatch_external_effect()
             instance = await channel.create_instance(
                 topic=topic,
                 send_start_notification=request.send_start_notification,
@@ -401,8 +409,10 @@ def build_discord_platform_action_endpoints(
             ):
                 raise UserError("discord.webhook_channel_invalid")
             _require_both_channel_permission(channel, actor, bot, "manage_webhooks")
+            name = _bounded_name(request.name, "discord.webhook_name_invalid")
+            await context.dispatch_external_effect()
             webhook = await channel.create_webhook(
-                name=_bounded_name(request.name, "discord.webhook_name_invalid"),
+                name=name,
                 reason=reason,
             )
             return _mutation_response(
@@ -413,8 +423,10 @@ def build_discord_platform_action_endpoints(
             )
         if request.kind == "template":
             _require_both_guild_permission(actor, bot, "manage_guild")
+            name = _bounded_name(request.name, "discord.template_name_invalid")
+            await context.dispatch_external_effect()
             template = await guild.create_template(
-                name=_bounded_name(request.name, "discord.template_name_invalid"),
+                name=name,
                 description=request.description,
             )
             return DiscordGuildResourceMutationResponse(
@@ -474,6 +486,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["user_limit"] = request.user_limit
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated = await cast(Any, channel.edit)(reason=reason, **kwargs)
             return _mutation_response(guild, request.kind, updated or channel)
         if request.kind == "member":
@@ -506,6 +519,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["voice_channel"] = destination
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated_member = await cast(Any, target.edit)(reason=reason, **kwargs)
             return _mutation_response(guild, request.kind, updated_member or target)
         if request.kind == "role":
@@ -545,6 +559,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["permissions"] = permissions
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated_role = await cast(Any, role.edit)(reason=reason, **kwargs)
             return _mutation_response(guild, request.kind, updated_role or role)
         if request.kind == "scheduled_event":
@@ -574,6 +589,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["status"] = _event_status(request.status)
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated_event = await cast(Any, event.edit)(reason=reason, **kwargs)
             return _mutation_response(guild, request.kind, updated_event)
         if request.kind == "stage_instance":
@@ -588,6 +604,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["topic"] = topic
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             await cast(Any, instance.edit)(reason=reason, **kwargs)
             return _mutation_response(
                 guild,
@@ -617,6 +634,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["channel"] = webhook_destination
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated_webhook = await cast(Any, webhook.edit)(
                 reason=reason,
                 prefer_auth=True,
@@ -636,6 +654,7 @@ def build_discord_platform_action_endpoints(
             _require_both_guild_permission(actor, bot, "manage_guild")
             template = await _template(guild, request.resource_id)
             if request.name is None and request.description is None:
+                await context.dispatch_external_effect()
                 updated_template = await template.sync()
             else:
                 kwargs = {}
@@ -646,6 +665,7 @@ def build_discord_platform_action_endpoints(
                     )
                 if request.description is not None:
                     kwargs["description"] = request.description or None
+                await context.dispatch_external_effect()
                 updated_template = await cast(Any, template.edit)(**kwargs)
             return DiscordGuildResourceMutationResponse(
                 kind=request.kind,
@@ -666,6 +686,7 @@ def build_discord_platform_action_endpoints(
                 kwargs["description"] = request.description or None
             if not kwargs:
                 raise UserError("discord.resource_update_empty")
+            await context.dispatch_external_effect()
             updated_guild = await cast(Any, guild.edit)(reason=reason, **kwargs)
             return _mutation_response(guild, request.kind, updated_guild)
         raise UserError("discord.resource_kind_invalid")
@@ -681,6 +702,7 @@ def build_discord_platform_action_endpoints(
             channel = _guild_channel(guild, request.resource_id)
             _require_both_channel_permission(channel, actor, bot, "manage_channels")
             response = _mutation_response(guild, request.kind, channel)
+            await context.dispatch_external_effect()
             await channel.delete(reason=reason)
             return response
         if request.kind == "role":
@@ -689,6 +711,7 @@ def build_discord_platform_action_endpoints(
                 _require_guild_permission(member, "manage_roles")
                 _require_role_above(member, role)
             response = _mutation_response(guild, request.kind, role)
+            await context.dispatch_external_effect()
             await role.delete(reason=reason)
             return response
         if request.kind == "invite":
@@ -699,6 +722,7 @@ def build_discord_platform_action_endpoints(
                 raise UserError("discord.invite_not_found") from exc
             if invite.guild is None or invite.guild.id != guild.id:
                 raise UserError("discord.invite_not_found")
+            await context.dispatch_external_effect()
             await client.delete_invite(invite, reason=reason)
             return DiscordGuildResourceMutationResponse(
                 kind=request.kind,
@@ -716,6 +740,7 @@ def build_discord_platform_action_endpoints(
             _require_both_guild_permission(actor, bot, "manage_events")
             event = await _scheduled_event(guild, request.resource_id)
             response = _mutation_response(guild, request.kind, event)
+            await context.dispatch_external_effect()
             await event.delete(reason=reason)
             return response
         if request.kind == "stage_instance":
@@ -729,6 +754,7 @@ def build_discord_platform_action_endpoints(
                 instance,
                 channel_id=str(channel.id),
             )
+            await context.dispatch_external_effect()
             await instance.delete(reason=reason)
             return response
         if request.kind == "webhook":
@@ -744,6 +770,7 @@ def build_discord_platform_action_endpoints(
                     else None
                 ),
             )
+            await context.dispatch_external_effect()
             await webhook.delete(reason=reason, prefer_auth=True)
             return response
         if request.kind == "template":
@@ -756,6 +783,7 @@ def build_discord_platform_action_endpoints(
                 source_guild_id=str(guild.id),
                 url=template.url,
             )
+            await context.dispatch_external_effect()
             await template.delete()
             return response
         raise UserError("discord.resource_kind_invalid")
@@ -776,10 +804,12 @@ def build_discord_platform_action_endpoints(
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "send_messages")
                 _require_channel_permissions(channel, member, "manage_messages")
+            await context.dispatch_external_effect()
             await message.publish()
         elif request.action == "clear_all_reactions":
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "manage_messages")
+            await context.dispatch_external_effect()
             await message.clear_reactions()
         elif request.action == "clear_emoji_reactions":
             for member in (actor, bot):
@@ -796,6 +826,7 @@ def build_discord_platform_action_endpoints(
             )
             if reaction is None:
                 raise UserError("discord.reaction_not_found")
+            await context.dispatch_external_effect()
             await reaction.clear()
         elif request.action == "end_poll":
             for member in (actor, bot):
@@ -804,6 +835,7 @@ def build_discord_platform_action_endpoints(
                 raise UserError("discord.poll_not_found")
             if message.author.id != bot.id:
                 raise UserError("discord.poll_not_owned")
+            await context.dispatch_external_effect()
             await message.end_poll()
         else:
             raise UserError("discord.message_action_invalid")
@@ -864,13 +896,15 @@ def build_discord_platform_action_endpoints(
                 }
             )
         )
+        reason = _audit_reason(
+            request.reason or "Update channel permission overwrite",
+            context,
+        )
+        await context.dispatch_external_effect()
         await channel.set_permissions(
             target,
             overwrite=overwrite,
-            reason=_audit_reason(
-                request.reason or "Update channel permission overwrite",
-                context,
-            ),
+            reason=reason,
         )
         return DiscordSetChannelOverwriteResponse(
             channel_id=str(channel.id),

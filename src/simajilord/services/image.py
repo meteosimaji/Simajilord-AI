@@ -80,45 +80,47 @@ class ImageGenerationStore:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT 1 FROM image_generation_jobs WHERE job_id = ?",
-                (job.job_id,),
-            ).fetchone()
-            if existing is not None:
-                connection.commit()
-                return "image.idempotent_replay"
-            if enforce_rate_limits:
-                actor_count = self._count_recent(
-                    connection,
-                    actor_id=job.actor_id,
-                    workspace_id=None,
-                    since=actor_since,
-                )
-                if actor_count >= actor_limit:
-                    connection.rollback()
-                    return "image.user_limit_reached"
-                workspace_count = self._count_recent(
-                    connection,
-                    actor_id=None,
-                    workspace_id=job.workspace_id,
-                    since=workspace_since,
-                )
-                if workspace_count >= workspace_limit:
-                    connection.rollback()
-                    return "image.workspace_limit_reached"
-            pending = connection.execute(
-                """
-                SELECT COUNT(*) AS count FROM image_generation_jobs
-                WHERE status IN (?, ?)
-                """,
-                (ImageJobStatus.QUEUED.value, ImageJobStatus.RUNNING.value),
-            ).fetchone()
-            if int(pending["count"]) >= pending_limit:
+            rejection_code = self._admission_rejection(
+                connection,
+                job,
+                enforce_rate_limits=enforce_rate_limits,
+                actor_since=actor_since,
+                actor_limit=actor_limit,
+                workspace_since=workspace_since,
+                workspace_limit=workspace_limit,
+                pending_limit=pending_limit,
+            )
+            if rejection_code is not None:
                 connection.rollback()
-                return "image.queue_full"
+                return rejection_code
             self._insert(connection, job)
             connection.commit()
         return None
+
+    def admission_rejection(
+        self,
+        job: ImageGenerationJob,
+        *,
+        enforce_rate_limits: bool,
+        actor_since: datetime,
+        actor_limit: int,
+        workspace_since: datetime,
+        workspace_limit: int,
+        pending_limit: int,
+    ) -> str | None:
+        """Read-only admission preflight used before an external-effect dispatch."""
+
+        with self._connect() as connection:
+            return self._admission_rejection(
+                connection,
+                job,
+                enforce_rate_limits=enforce_rate_limits,
+                actor_since=actor_since,
+                actor_limit=actor_limit,
+                workspace_since=workspace_since,
+                workspace_limit=workspace_limit,
+                pending_limit=pending_limit,
+            )
 
     def requeue_running(self) -> int:
         with self._connect() as connection:
@@ -518,6 +520,52 @@ class ImageGenerationStore:
         ).fetchone()
         return int(row["count"])
 
+    def _admission_rejection(
+        self,
+        connection: sqlite3.Connection,
+        job: ImageGenerationJob,
+        *,
+        enforce_rate_limits: bool,
+        actor_since: datetime,
+        actor_limit: int,
+        workspace_since: datetime,
+        workspace_limit: int,
+        pending_limit: int,
+    ) -> str | None:
+        existing = connection.execute(
+            "SELECT 1 FROM image_generation_jobs WHERE job_id = ?",
+            (job.job_id,),
+        ).fetchone()
+        if existing is not None:
+            return "image.idempotent_replay"
+        if enforce_rate_limits:
+            actor_count = self._count_recent(
+                connection,
+                actor_id=job.actor_id,
+                workspace_id=None,
+                since=actor_since,
+            )
+            if actor_count >= actor_limit:
+                return "image.user_limit_reached"
+            workspace_count = self._count_recent(
+                connection,
+                actor_id=None,
+                workspace_id=job.workspace_id,
+                since=workspace_since,
+            )
+            if workspace_count >= workspace_limit:
+                return "image.workspace_limit_reached"
+        pending = connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM image_generation_jobs
+            WHERE status IN (?, ?)
+            """,
+            (ImageJobStatus.QUEUED.value, ImageJobStatus.RUNNING.value),
+        ).fetchone()
+        if int(pending["count"]) >= pending_limit:
+            return "image.queue_full"
+        return None
+
 
 class ImageGenerationService:
     """One restart-safe local generation worker shared by all transports."""
@@ -554,6 +602,7 @@ class ImageGenerationService:
         self._delivery_retry_requested: set[str] = set()
         self._delivery_locks: dict[str, _DeliveryLockState] = {}
         self._terminal_futures: dict[str, asyncio.Future[None]] = {}
+        self._admission_lock = asyncio.Lock()
         self._closed = False
 
     async def start(self, delivery_handler: ImageDeliveryHandler) -> None:
@@ -579,6 +628,8 @@ class ImageGenerationService:
         prompt: ImageGenerationPrompt,
         auto_deliver: bool = False,
         idempotency_key: str | None = None,
+        before_enqueue: Callable[[], Awaitable[None]] | None = None,
+        on_idempotent_replay: Callable[[], Awaitable[None]] | None = None,
     ) -> ImageGenerationJob:
         job_id = (
             _idempotent_job_id(
@@ -592,6 +643,8 @@ class ImageGenerationService:
         if idempotency_key is not None:
             existing = await asyncio.to_thread(self.store.get, job_id)
             if existing is not None:
+                if on_idempotent_replay is not None:
+                    await on_idempotent_replay()
                 return existing
         if self.provider is None:
             raise UserError("image.not_configured")
@@ -617,20 +670,45 @@ class ImageGenerationService:
             created_at_iso=now.isoformat(),
             auto_deliver=auto_deliver,
         )
-        rejection_code = await asyncio.to_thread(
-            self.store.admit,
-            job,
-            enforce_rate_limits=actor_id not in self.rate_limit_exempt_actor_ids,
-            actor_since=now - timedelta(seconds=self.per_user_window_seconds),
-            actor_limit=self.per_user_requests,
-            workspace_since=now - timedelta(seconds=self.per_workspace_window_seconds),
-            workspace_limit=self.per_workspace_requests,
-            pending_limit=self.max_pending_jobs,
+        enforce_rate_limits = actor_id not in self.rate_limit_exempt_actor_ids
+        actor_since = now - timedelta(seconds=self.per_user_window_seconds)
+        workspace_since = now - timedelta(
+            seconds=self.per_workspace_window_seconds
         )
-        if rejection_code == "image.idempotent_replay":
-            return await asyncio.to_thread(self.store.require, job_id)
-        if rejection_code is not None:
-            raise UserError(rejection_code)
+        async with self._admission_lock:
+            rejection_code = await asyncio.to_thread(
+                self.store.admission_rejection,
+                job,
+                enforce_rate_limits=enforce_rate_limits,
+                actor_since=actor_since,
+                actor_limit=self.per_user_requests,
+                workspace_since=workspace_since,
+                workspace_limit=self.per_workspace_requests,
+                pending_limit=self.max_pending_jobs,
+            )
+            if rejection_code == "image.idempotent_replay":
+                if on_idempotent_replay is not None:
+                    await on_idempotent_replay()
+                return await asyncio.to_thread(self.store.require, job_id)
+            if rejection_code is not None:
+                raise UserError(rejection_code)
+            if before_enqueue is not None:
+                await before_enqueue()
+            rejection_code = await asyncio.to_thread(
+                self.store.admit,
+                job,
+                enforce_rate_limits=enforce_rate_limits,
+                actor_since=actor_since,
+                actor_limit=self.per_user_requests,
+                workspace_since=workspace_since,
+                workspace_limit=self.per_workspace_requests,
+                pending_limit=self.max_pending_jobs,
+            )
+            if rejection_code is not None:
+                # The service lock prevents in-process submit races. If another
+                # process changed the database after dispatch, preserve the
+                # conservative UNKNOWN barrier in the caller.
+                raise UserError(rejection_code)
         self._ensure_worker()
         try:
             await self._append_journal(

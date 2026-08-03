@@ -38,6 +38,21 @@ def attachment_can_play(attachment: discord.Attachment) -> bool:
     )
 
 
+def validate_discord_attachment_import(
+    runtime: SimajilordRuntime,
+    attachment: discord.Attachment,
+) -> None:
+    """Reject metadata-known invalid imports before any download or local write."""
+
+    if attachment.size <= 0:
+        raise UserError("local_media.empty")
+    if attachment.size > runtime.settings.local_media_max_file_bytes:
+        raise UserError(
+            "local_media.too_large",
+            maximum=runtime.settings.local_media_max_file_bytes,
+        )
+
+
 async def import_discord_attachment(
     runtime: SimajilordRuntime,
     attachment: discord.Attachment,
@@ -47,13 +62,7 @@ async def import_discord_attachment(
 ) -> LocalMediaRecord:
     """Download once, then hand the untrusted payload to local validation."""
 
-    if attachment.size <= 0:
-        raise UserError("local_media.empty")
-    if attachment.size > runtime.settings.local_media_max_file_bytes:
-        raise UserError(
-            "local_media.too_large",
-            maximum=runtime.settings.local_media_max_file_bytes,
-        )
+    validate_discord_attachment_import(runtime, attachment)
     import_root = runtime.settings.data_dir / "local_media" / "incoming"
     import_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     temporary = import_root / f"{secrets.token_hex(16)}.part"

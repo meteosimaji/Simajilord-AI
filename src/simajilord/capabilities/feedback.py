@@ -46,6 +46,8 @@ def build_feedback_endpoint(service: FeedbackService) -> CapabilityEndpoint:
             source_event_id=context.request_id,
             source_channel_id=context.origin_resource_id,
             public_reference_id=context.public_reference_id,
+            before_mutation=context.dispatch_external_effect,
+            on_noop=context.complete_external_effect_without_dispatch,
         )
         return FeedbackCreateResponse(
             report_id=result.report.report_id,

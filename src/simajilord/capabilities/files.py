@@ -94,29 +94,54 @@ def build_file_endpoints(
         request: FileWriteTextRequest,
         context: InvocationContext,
     ) -> WorkspaceFileRecord:
-        return await asyncio.to_thread(
-            service.write_text_for_actor,
-            workspace(context),
+        workspace_id = workspace(context)
+        provenance = file_provenance(context)
+        await asyncio.to_thread(
+            service.validate_write_text_for_actor,
+            workspace_id,
             context.actor_id,
             request.path,
             request.content,
             expected_sha256=request.expected_sha256,
-            provenance=file_provenance(context),
+            provenance=provenance,
+        )
+        await context.dispatch_external_effect()
+        return await asyncio.to_thread(
+            service.write_text_for_actor,
+            workspace_id,
+            context.actor_id,
+            request.path,
+            request.content,
+            expected_sha256=request.expected_sha256,
+            provenance=provenance,
         )
 
     async def replace_text(
         request: FileReplaceTextRequest,
         context: InvocationContext,
     ) -> WorkspaceFileRecord:
-        return await asyncio.to_thread(
-            service.replace_text_for_actor,
-            workspace(context),
+        workspace_id = workspace(context)
+        provenance = file_provenance(context)
+        await asyncio.to_thread(
+            service.validate_replace_text_for_actor,
+            workspace_id,
             context.actor_id,
             request.path,
             request.old,
             request.new,
             expected_sha256=request.expected_sha256,
-            provenance=file_provenance(context),
+            provenance=provenance,
+        )
+        await context.dispatch_external_effect()
+        return await asyncio.to_thread(
+            service.replace_text_for_actor,
+            workspace_id,
+            context.actor_id,
+            request.path,
+            request.old,
+            request.new,
+            expected_sha256=request.expected_sha256,
+            provenance=provenance,
         )
 
     return (

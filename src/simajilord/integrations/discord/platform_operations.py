@@ -192,6 +192,7 @@ def build_discord_platform_operation_endpoints(
                 if request.name
                 else channel.name
             )
+            await context.dispatch_external_effect()
             cloned = await cast(Any, channel.clone)(name=clone_name, reason=reason)
             return _channel_operation_response(
                 guild,
@@ -221,6 +222,7 @@ def build_discord_platform_operation_endpoints(
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "read_message_history")
                 _require_channel_permissions(destination, member, "manage_webhooks")
+            await context.dispatch_external_effect()
             webhook = await channel.follow(destination=destination, reason=reason)
             return _channel_operation_response(
                 guild,
@@ -235,13 +237,16 @@ def build_discord_platform_operation_endpoints(
                 raise UserError("discord.forum_channel_required")
             for member in (actor, bot):
                 _require_channel_permissions(channel, member, "manage_channels")
+            name = _bounded_name(request.name, "discord.forum_tag_name_invalid")
+            emoji = (
+                discord.PartialEmoji.from_str(request.emoji)
+                if request.emoji
+                else None
+            )
+            await context.dispatch_external_effect()
             tag = await channel.create_tag(
-                name=_bounded_name(request.name, "discord.forum_tag_name_invalid"),
-                emoji=(
-                    discord.PartialEmoji.from_str(request.emoji)
-                    if request.emoji
-                    else None
-                ),
+                name=name,
+                emoji=emoji,
                 moderated=request.moderated,
                 reason=reason,
             )
@@ -269,6 +274,7 @@ def build_discord_platform_operation_endpoints(
                     sound = await guild.fetch_soundboard_sound(sound_id)
                 except discord.DiscordException as exc:
                     raise UserError("discord.soundboard_sound_not_found") from exc
+            await context.dispatch_external_effect()
             await channel.send_sound(sound)
             return _channel_operation_response(
                 guild,
@@ -301,14 +307,17 @@ def build_discord_platform_operation_endpoints(
                         member,
                         "manage_channels",
                     )
+            route = Route(
+                "PUT",
+                "/channels/{channel_id}/voice-status",
+                channel_id=channel.id,
+            )
+            payload = {"status": status or None}
             try:
+                await context.dispatch_external_effect()
                 await client.http.request(
-                    Route(
-                        "PUT",
-                        "/channels/{channel_id}/voice-status",
-                        channel_id=channel.id,
-                    ),
-                    json={"status": status or None},
+                    route,
+                    json=payload,
                     reason=reason,
                 )
             except discord.Forbidden as exc:
@@ -339,6 +348,7 @@ def build_discord_platform_operation_endpoints(
 
         if request.operation == "join_thread":
             _require_channel_permissions(channel, actor, "send_messages")
+            await context.dispatch_external_effect()
             await channel.join()
             return _channel_operation_response(
                 guild,
@@ -346,6 +356,7 @@ def build_discord_platform_operation_endpoints(
                 channel_id=channel.id,
             )
         if request.operation == "leave_thread":
+            await context.dispatch_external_effect()
             await channel.leave()
             return _channel_operation_response(
                 guild,
@@ -357,6 +368,7 @@ def build_discord_platform_operation_endpoints(
         for member in (actor, bot):
             _require_channel_permissions(channel, member, "manage_threads")
         tags = _forum_tags(channel, request.tag_ids)
+        await context.dispatch_external_effect()
         if request.operation == "add_thread_tags":
             await channel.add_tags(*tags, reason=reason)
         else:
@@ -398,6 +410,7 @@ def build_discord_platform_operation_endpoints(
             destination,
         )
         try:
+            await context.dispatch_external_effect()
             posted = await message.forward(destination)
         except discord.Forbidden as exc:
             raise UserError("discord.message_forward_forbidden") from exc
@@ -422,10 +435,12 @@ def build_discord_platform_operation_endpoints(
         target = await _target_member(guild, request.user_id)
         if target.id != actor.id:
             _require_guild_permission(actor, "administrator")
+        allowed_mentions = discord.AllowedMentions.none()
         try:
+            await context.dispatch_external_effect()
             posted = await target.send(
                 content,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=allowed_mentions,
                 suppress_embeds=True,
             )
         except discord.Forbidden as exc:
@@ -459,8 +474,10 @@ def build_discord_platform_operation_endpoints(
                 activity_name,
                 request.streaming_url,
             )
+        status = _presence_status(request.status)
+        await context.dispatch_external_effect()
         await client.change_presence(
-            status=_presence_status(request.status),
+            status=status,
             activity=activity,
         )
         return DiscordSetBotPresenceResponse(

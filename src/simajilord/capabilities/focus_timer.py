@@ -78,6 +78,10 @@ def build_focus_timer_endpoints(
         delivery_target_id = request.delivery_target_id or context.origin_resource_id
         if delivery_target_id is None:
             raise UserError("timer.delivery_target_required")
+        service.validate_create_request(
+            request.duration_seconds,
+            request.message,
+        )
         restore_content_mode: str | None = None
         if request.focus_session and read_aloud is not None:
             async with service.focus_session_lock(workspace_id):
@@ -98,6 +102,7 @@ def build_focus_timer_endpoints(
                     else current_mode.value
                 )
                 if not active_focus:
+                    await context.dispatch_external_effect()
                     await read_aloud.set_content_mode(
                         workspace_id=workspace_id,
                         mode=ReadAloudContentMode.EVENTS,
@@ -112,6 +117,7 @@ def build_focus_timer_endpoints(
                         voice_notify=request.voice_notify,
                         focus_session=True,
                         restore_content_mode=restore_content_mode,
+                        before_mutation=context.dispatch_external_effect,
                     )
                 except Exception:
                     if not active_focus:
@@ -131,6 +137,7 @@ def build_focus_timer_endpoints(
                 voice_notify=request.voice_notify,
                 focus_session=request.focus_session,
                 restore_content_mode=restore_content_mode,
+                before_mutation=context.dispatch_external_effect,
             )
         return FocusTimerResponse(timer=_item(timer))
 
@@ -154,6 +161,8 @@ def build_focus_timer_endpoints(
                 timer_id=request.timer_id,
                 workspace_id=workspace_id,
                 actor_id=context.actor_id,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
             if (
                 changed
@@ -192,6 +201,8 @@ def build_focus_timer_endpoints(
                 timer_id=request.timer_id,
                 workspace_id=workspace_id,
                 actor_id=context.actor_id,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
             )
             try:
                 if (

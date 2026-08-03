@@ -100,7 +100,11 @@ from simajilord.services.quote import (
 
 from .attachment_io import read_attachment_bytes
 from .audio import DiscordAudioOutput
-from .local_media import attachment_can_play, import_discord_attachment
+from .local_media import (
+    attachment_can_play,
+    import_discord_attachment,
+    validate_discord_attachment_import,
+)
 from .permissions import (
     RequesterPrincipal,
     ServicePrincipal,
@@ -2612,11 +2616,15 @@ def build_discord_endpoints(
             _guild_value,
             destination,
         )
+        embeds = expanded_message_embeds(response)
+        view = expanded_message_view(response.jump_url)
+        allowed_mentions = discord.AllowedMentions.none()
         try:
+            await context.dispatch_external_effect()
             posted = await destination.send(
-                embeds=expanded_message_embeds(response),
-                view=expanded_message_view(response.jump_url),
-                allowed_mentions=discord.AllowedMentions.none(),
+                embeds=embeds,
+                view=view,
+                allowed_mentions=allowed_mentions,
                 silent=True,
             )
         except discord.Forbidden as exc:
@@ -2680,26 +2688,26 @@ def build_discord_endpoints(
             raise UserError("discord.quote_render_failed") from exc
         extension = "gif" if rendered.animated else "png"
         filename = f"quote-{message.id}.{extension}"
+        jump_view = (
+            quote_message_view(message.jump_url) if request.include_jump else None
+        )
+        if request.include_jump:
+            assert jump_view is not None
+        allowed_mentions = discord.AllowedMentions.none()
         try:
             image_file = discord.File(
                 io.BytesIO(rendered.content),
                 filename=filename,
             )
-            if request.include_jump:
-                jump_view = quote_message_view(message.jump_url)
-                assert jump_view is not None
-                posted = await destination.send(
-                    file=image_file,
-                    view=jump_view,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    silent=True,
-                )
-            else:
-                posted = await destination.send(
-                    file=image_file,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    silent=True,
-                )
+            send_arguments: dict[str, Any] = {
+                "file": image_file,
+                "allowed_mentions": allowed_mentions,
+                "silent": True,
+            }
+            if jump_view is not None:
+                send_arguments["view"] = jump_view
+            await context.dispatch_external_effect()
+            posted = await destination.send(**send_arguments)
         except discord.Forbidden as exc:
             raise UserError("discord.quote_destination_unavailable") from exc
         except discord.DiscordException as exc:
@@ -2860,15 +2868,16 @@ def build_discord_endpoints(
             raise UserError("discord.attachment_unavailable") from exc
         if len(content) > runtime.settings.hive_max_media_bytes:
             raise UserError("moderation.media_too_large")
+        analysis_request = SyntheticMediaAnalyzeRequest(
+            filename=attachment.filename,
+            content_type=attachment.content_type,
+            content=content,
+        )
         return cast(
             SyntheticMediaAnalyzeResponse,
             await runtime.registry.invoke(
                 "moderation.detect_synthetic_media",
-                SyntheticMediaAnalyzeRequest(
-                    filename=attachment.filename,
-                    content_type=attachment.content_type,
-                    content=content,
-                ),
+                analysis_request,
                 context,
             ),
         )
@@ -2890,12 +2899,6 @@ def build_discord_endpoints(
         )
         if attachment.size > runtime.files.max_file_bytes:
             raise UserError("files.file_too_large")
-        try:
-            content = await read_attachment_bytes(attachment)
-        except discord.DiscordException as exc:
-            raise UserError("discord.attachment_unavailable") from exc
-        if len(content) > runtime.files.max_file_bytes:
-            raise UserError("files.file_too_large")
         destination = request.destination_path or (
             f"attachments/{request.message_id}/"
             f"{_workspace_attachment_name(attachment)}"
@@ -2913,21 +2916,42 @@ def build_discord_endpoints(
             ),
         ):
             raise UserError("discord.attachment_unavailable")
-        return await asyncio.to_thread(
-            runtime.files.import_bytes,
-            file_workspace_id(context),
+        workspace_id = file_workspace_id(context)
+        provenance = file_provenance(
+            context,
+            origin_guild_id=str(source_guild.id),
+            origin_channel_id=str(source_channel.id),
+            origin_message_id=str(message.id),
+            origin_visibility=_channel_visibility(
+                source_guild,
+                source_channel,
+            ),
+        )
+        await asyncio.to_thread(
+            runtime.files.validate_path,
+            workspace_id,
+            destination,
+        )
+        try:
+            content = await read_attachment_bytes(attachment)
+        except discord.DiscordException as exc:
+            raise UserError("discord.attachment_unavailable") from exc
+        if len(content) > runtime.files.max_file_bytes:
+            raise UserError("files.file_too_large")
+        await asyncio.to_thread(
+            runtime.files.validate_import_bytes,
+            workspace_id,
             destination,
             content,
-            provenance=file_provenance(
-                context,
-                origin_guild_id=str(source_guild.id),
-                origin_channel_id=str(source_channel.id),
-                origin_message_id=str(message.id),
-                origin_visibility=_channel_visibility(
-                    source_guild,
-                    source_channel,
-                ),
-            ),
+            provenance=provenance,
+        )
+        await context.dispatch_external_effect()
+        return await asyncio.to_thread(
+            runtime.files.import_bytes,
+            workspace_id,
+            destination,
+            content,
+            provenance=provenance,
         )
 
     async def view_image_attachment(
@@ -2974,10 +2998,13 @@ def build_discord_endpoints(
             _require_channel_permissions(channel, member, "send_messages")
         if not 1 <= len(request.content) <= 2_000:
             raise UserError("discord.message_length_invalid")
+        nonce = _discord_write_nonce(context, "message")
+        allowed_mentions = discord.AllowedMentions.none()
+        await context.dispatch_external_effect()
         message = await channel.send(
             request.content,
-            nonce=_discord_write_nonce(context, "message"),
-            allowed_mentions=discord.AllowedMentions.none(),
+            nonce=nonce,
+            allowed_mentions=allowed_mentions,
             suppress_embeds=True,
         )
         return DiscordSendMessageResponse(
@@ -3042,6 +3069,7 @@ def build_discord_endpoints(
             send_arguments["mention_author"] = False
         if request.silent:
             send_arguments["silent"] = True
+        await context.dispatch_external_effect()
         message = await channel.send(**send_arguments)
         return DiscordSendMessageResponse(
             message_id=str(message.id),
@@ -3064,11 +3092,14 @@ def build_discord_endpoints(
         if not 1 <= len(request.content) <= 2_000:
             raise UserError("discord.message_length_invalid")
         message = await _fetch_message_for_write(channel, request.message_id)
+        nonce = _discord_write_nonce(context, "reply")
+        allowed_mentions = discord.AllowedMentions.none()
+        await context.dispatch_external_effect()
         reply = await message.reply(
             request.content,
-            nonce=_discord_write_nonce(context, "reply"),
+            nonce=nonce,
             mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=allowed_mentions,
             suppress_embeds=True,
             silent=request.silent,
         )
@@ -3092,12 +3123,15 @@ def build_discord_endpoints(
         if message.author.id != bot.id:
             raise UserError("discord.message_not_owned")
         if message.content == request.content:
+            await context.complete_external_effect_without_dispatch()
             return DiscordMessageWriteResponse(
                 request.channel_id, request.message_id, changed=False
             )
+        allowed_mentions = discord.AllowedMentions.none()
+        await context.dispatch_external_effect()
         await message.edit(
             content=request.content,
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=allowed_mentions,
             suppress=True,
         )
         return DiscordMessageWriteResponse(request.channel_id, request.message_id)
@@ -3115,6 +3149,7 @@ def build_discord_endpoints(
         _require_channel_permissions(channel, bot, "pin_messages")
         message = await _fetch_message_for_write(channel, request.message_id)
         if bool(message.pinned) == pinned:
+            await context.complete_external_effect_without_dispatch()
             return DiscordMessageWriteResponse(
                 request.channel_id, request.message_id, changed=False
             )
@@ -3124,7 +3159,9 @@ def build_discord_endpoints(
         ):
             raise UserError("action.undo_conflict")
         operation = message.pin if pinned else message.unpin
-        await operation(reason=_audit_reason(request.reason, context))
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
+        await operation(reason=reason)
         return DiscordMessageWriteResponse(request.channel_id, request.message_id)
 
     async def pin_message(
@@ -3156,10 +3193,13 @@ def build_discord_endpoints(
             if request.message_id is not None
             else None
         )
+        name = _bounded_name(request.name, "discord.thread_name_invalid")
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
         thread = await channel.create_thread(
-            name=_bounded_name(request.name, "discord.thread_name_invalid"),
+            name=name,
             message=message,
-            reason=_audit_reason(request.reason, context),
+            reason=reason,
         )
         return DiscordThreadResponse(
             channel_id=str(channel.id),
@@ -3191,6 +3231,7 @@ def build_discord_endpoints(
         )
         archived = old_archived if request.archived is None else request.archived
         if name == old_name and archived == old_archived:
+            await context.complete_external_effect_without_dispatch()
             return DiscordThreadResponse(
                 channel_id=str(thread.parent_id),
                 thread_id=str(thread.id),
@@ -3213,10 +3254,12 @@ def build_discord_endpoints(
             != request.expected_undo_fingerprint
         ):
             raise UserError("action.undo_conflict")
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
         updated = await thread.edit(
             name=name,
             archived=archived,
-            reason=_audit_reason(request.reason, context),
+            reason=reason,
         )
         return DiscordThreadResponse(
             channel_id=str(updated.parent_id),
@@ -3246,6 +3289,7 @@ def build_discord_endpoints(
         target = await _guild_member(guild, request.user_id)
         existing = any(item.id == target.id for item in thread.members)
         if existing == present:
+            await context.complete_external_effect_without_dispatch()
             return DiscordThreadMemberResponse(
                 request.thread_id, request.user_id, present, changed=False
             )
@@ -3266,6 +3310,7 @@ def build_discord_endpoints(
             and existing != request.expected_present
         ):
             raise UserError("action.undo_conflict")
+        await context.dispatch_external_effect()
         if present:
             await thread.add_user(target)
         else:
@@ -3298,11 +3343,15 @@ def build_discord_endpoints(
         for member in (actor, bot):
             _require_channel_permissions(forum, member, "send_messages")
             _require_channel_permissions(forum, member, "create_public_threads")
+        name = _bounded_name(request.title, "discord.thread_name_invalid")
+        reason = _audit_reason(request.reason, context)
+        allowed_mentions = discord.AllowedMentions.none()
+        await context.dispatch_external_effect()
         created = await forum.create_thread(
-            name=_bounded_name(request.title, "discord.thread_name_invalid"),
+            name=name,
             content=request.content,
-            reason=_audit_reason(request.reason, context),
-            allowed_mentions=discord.AllowedMentions.none(),
+            reason=reason,
+            allowed_mentions=allowed_mentions,
         )
         return DiscordForumPostResponse(
             channel_id=str(created.thread.id),
@@ -3325,12 +3374,16 @@ def build_discord_endpoints(
         _require_guild_permission(bot, "manage_roles")
         if not 0 <= request.colour <= 0xFFFFFF:
             raise UserError("discord.role_colour_invalid")
+        name = _bounded_name(request.name, "discord.role_name_invalid")
+        colour = discord.Colour(request.colour)
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
         role = await guild.create_role(
-            name=_bounded_name(request.name, "discord.role_name_invalid"),
-            colour=discord.Colour(request.colour),
+            name=name,
+            colour=colour,
             hoist=request.hoist,
             mentionable=request.mentionable,
-            reason=_audit_reason(request.reason, context),
+            reason=reason,
         )
         return DiscordRoleResponse(
             str(role.id),
@@ -3346,6 +3399,7 @@ def build_discord_endpoints(
         actor, bot = await _write_members(guild, context)
         role = guild.get_role(_snowflake(request.role_id, "role"))
         if role is None:
+            await context.complete_external_effect_without_dispatch()
             return DiscordCreatedEntityDeleteResponse(request.role_id, True)
         if (
             request.undo_fingerprint is not None
@@ -3367,7 +3421,9 @@ def build_discord_endpoints(
             _require_role_above(member, role)
         if await _role_has_channel_overwrite_reference(guild, role):
             raise UserError("action.undo_target_in_use")
-        await role.delete(reason=_audit_reason("Undo created role", context))
+        reason = _audit_reason("Undo created role", context)
+        await context.dispatch_external_effect()
+        await role.delete(reason=reason)
         return DiscordCreatedEntityDeleteResponse(request.role_id, True)
 
     async def set_member_role(
@@ -3392,6 +3448,7 @@ def build_discord_endpoints(
         _require_member_below(bot, target, guild)
         existing = role in target.roles
         if existing == assigned:
+            await context.complete_external_effect_without_dispatch()
             return DiscordRoleMemberResponse(
                 request.user_id, request.role_id, assigned, changed=False
             )
@@ -3401,7 +3458,9 @@ def build_discord_endpoints(
         ):
             raise UserError("action.undo_conflict")
         operation = target.add_roles if assigned else target.remove_roles
-        await operation(role, reason=_audit_reason(request.reason, context))
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
+        await operation(role, reason=reason)
         return DiscordRoleMemberResponse(request.user_id, request.role_id, assigned)
 
     async def assign_role(
@@ -3445,6 +3504,7 @@ def build_discord_endpoints(
             raise UserError("discord.channel_setting_invalid")
         changed = topic != old_topic or slowmode != old_slowmode
         if not changed:
+            await context.complete_external_effect_without_dispatch()
             return DiscordChannelSettingResponse(
                 request.channel_id,
                 topic,
@@ -3466,6 +3526,7 @@ def build_discord_endpoints(
             "reason": _audit_reason(request.reason, context),
         }
         edit_arguments["topic"] = topic
+        await context.dispatch_external_effect()
         await channel.edit(**edit_arguments)
         return DiscordChannelSettingResponse(
             request.channel_id,
@@ -3488,6 +3549,7 @@ def build_discord_endpoints(
         _require_guild_permission(bot, "manage_channels")
         channel_name = _bounded_name(request.name, "discord.channel_name_invalid")
         audit_reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
         channel = (
             await guild.create_text_channel(
                 channel_name,
@@ -3514,6 +3576,7 @@ def build_discord_endpoints(
         actor, bot = await _write_members(guild, context)
         channel = guild.get_channel(_snowflake(request.channel_id, "channel"))
         if channel is None:
+            await context.complete_external_effect_without_dispatch()
             return DiscordCreatedEntityDeleteResponse(request.channel_id, True)
         if (
             request.undo_fingerprint is not None
@@ -3528,7 +3591,9 @@ def build_discord_endpoints(
                 raise UserError("action.undo_target_in_use")
         for member in (actor, bot):
             _require_guild_permission(member, "manage_channels")
-        await channel.delete(reason=_audit_reason("Undo created channel", context))
+        reason = _audit_reason("Undo created channel", context)
+        await context.dispatch_external_effect()
+        await channel.delete(reason=reason)
         return DiscordCreatedEntityDeleteResponse(request.channel_id, True)
 
     async def set_timeout(
@@ -3546,6 +3611,7 @@ def build_discord_endpoints(
         until = _timeout_datetime(request.until_iso)
         previous = target.timed_out_until
         if previous == until:
+            await context.complete_external_effect_without_dispatch()
             return DiscordTimeoutResponse(
                 request.user_id,
                 request.until_iso,
@@ -3559,7 +3625,9 @@ def build_discord_endpoints(
             )
             if normalized_previous != expected_until:
                 raise UserError("action.undo_conflict")
-        await target.timeout(until, reason=_audit_reason(request.reason, context))
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
+        await target.timeout(until, reason=reason)
         return DiscordTimeoutResponse(
             request.user_id,
             until.isoformat() if until is not None else None,
@@ -3577,6 +3645,7 @@ def build_discord_endpoints(
         _require_channel_permissions(channel, actor, "manage_messages")
         _require_channel_permissions(channel, bot, "manage_messages")
         message = await _fetch_message_for_write(channel, request.message_id)
+        await context.dispatch_external_effect()
         await message.delete()
         return DiscordMessageWriteResponse(request.channel_id, request.message_id)
 
@@ -3600,9 +3669,11 @@ def build_discord_endpoints(
         oldest_bulk_delete_time = datetime.now(UTC) - timedelta(days=14)
         if any(message.created_at <= oldest_bulk_delete_time for message in messages):
             raise UserError("discord.bulk_delete_message_too_old")
+        reason = _audit_reason(request.reason, context)
+        await context.dispatch_external_effect()
         await channel.delete_messages(
             messages,
-            reason=_audit_reason(request.reason, context),
+            reason=reason,
         )
         return DiscordBulkDeleteResponse(request.channel_id, ids)
 
@@ -3617,13 +3688,16 @@ def build_discord_endpoints(
         _assert_origin_guild(context, guild)
         actor, bot = await _write_members(guild, context)
         user_id = _snowflake(request.user_id, "user")
+        reason = _audit_reason(request.reason, context)
         if action == "unban":
             for member in (actor, bot):
                 _require_guild_permission(member, "ban_members")
+            user = discord.Object(user_id)
             try:
+                await context.dispatch_external_effect()
                 await guild.unban(
-                    discord.Object(user_id),
-                    reason=_audit_reason(request.reason, context),
+                    user,
+                    reason=reason,
                 )
             except discord.NotFound:
                 return DiscordMemberModerationResponse(
@@ -3637,12 +3711,13 @@ def build_discord_endpoints(
             for member in (actor, bot):
                 _require_guild_permission(member, permission)
                 _require_member_below(member, target, guild)
+            await context.dispatch_external_effect()
             if action == "kick":
-                await target.kick(reason=_audit_reason(request.reason, context))
+                await target.kick(reason=reason)
             else:
                 await guild.ban(
                     target,
-                    reason=_audit_reason(request.reason, context),
+                    reason=reason,
                     delete_message_seconds=0,
                 )
         return DiscordMemberModerationResponse(request.user_id, action)
@@ -3690,6 +3765,7 @@ def build_discord_endpoints(
                 _snowflake(request.message_id, "message")
             )
         except discord.NotFound:
+            await context.complete_external_effect_without_dispatch()
             return DiscordDeleteOwnMessageResponse(
                 message_id=request.message_id,
                 channel_id=request.channel_id,
@@ -3703,6 +3779,7 @@ def build_discord_endpoints(
         if message.author.id != bot_member.id:
             raise UserError("discord.message_not_owned")
         try:
+            await context.dispatch_external_effect()
             await message.delete()
         except discord.NotFound:
             pass
@@ -3761,6 +3838,10 @@ def build_discord_endpoints(
                 raise UserError("discord.message_not_owned")
             messages.append(message)
 
+        if not messages:
+            await context.complete_external_effect_without_dispatch()
+        else:
+            await context.dispatch_external_effect()
         for message in messages:
             try:
                 await message.delete()
@@ -3789,7 +3870,17 @@ def build_discord_endpoints(
         )
         emoji = _reaction_emoji(request.emoji)
         already_reacted = _bot_has_reaction(message, emoji)
+        if already_reacted:
+            await context.complete_external_effect_without_dispatch()
+            return DiscordReactionResponse(
+                channel_id=str(message.channel.id),
+                message_id=str(message.id),
+                emoji=emoji,
+                reacted=True,
+                changed=False,
+            )
         try:
+            await context.dispatch_external_effect()
             await message.add_reaction(emoji)
         except TypeError as exc:
             raise UserError("discord.reaction_emoji_invalid") from exc
@@ -3823,7 +3914,17 @@ def build_discord_endpoints(
             raise UserError("discord.reaction_unavailable")
         emoji = _reaction_emoji(request.emoji)
         already_reacted = _bot_has_reaction(message, emoji)
+        if not already_reacted:
+            await context.complete_external_effect_without_dispatch()
+            return DiscordReactionResponse(
+                channel_id=str(message.channel.id),
+                message_id=str(message.id),
+                emoji=emoji,
+                reacted=False,
+                changed=False,
+            )
         try:
+            await context.dispatch_external_effect()
             await message.remove_reaction(emoji, bot_member)
         except TypeError as exc:
             raise UserError("discord.reaction_emoji_invalid") from exc
@@ -3919,6 +4020,7 @@ def build_discord_endpoints(
                 send_arguments["mention_author"] = False
             if request.silent:
                 send_arguments["silent"] = True
+            await context.dispatch_external_effect()
             message = await channel.send(
                 request.caption or None,
                 **send_arguments,
@@ -4023,10 +4125,12 @@ def build_discord_endpoints(
         )
         for option in options:
             poll.add_answer(text=option)
+        allowed_mentions = discord.AllowedMentions.none()
         try:
+            await context.dispatch_external_effect()
             message = await channel.send(
                 poll=poll,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=allowed_mentions,
             )
         except discord.Forbidden as exc:
             raise UserError("discord.poll_forbidden") from exc
@@ -4052,10 +4156,17 @@ def build_discord_endpoints(
             workspace_id,
             lambda: DiscordAudioOutput(client, guild.id),
         )
+        if session.output.connected and session.destination_id == str(channel.id):
+            await context.complete_external_effect_without_dispatch()
+            return DiscordConnectVoiceResponse(
+                channel_id=str(channel.id),
+                connected=True,
+            )
         if session.current is not None:
             output = session.output
             if isinstance(output, DiscordAudioOutput) and output.destination_id != channel.id:
                 raise UserError("audio.other_voice_active")
+        await context.dispatch_external_effect()
         await runtime.audio.connect(workspace_id, str(channel.id))
         return DiscordConnectVoiceResponse(channel_id=str(channel.id), connected=True)
 
@@ -4067,7 +4178,13 @@ def build_discord_endpoints(
 
         guild = _guild(client, context)
         member = await _actor_member(guild, context)
-        await _prepare_actor_audio(client, runtime, guild, member)
+        await _prepare_actor_audio(
+            client,
+            runtime,
+            guild,
+            member,
+            before_connect=context.dispatch_external_effect,
+        )
         response = await runtime.registry.invoke(
             "audio.play",
             AudioPlayRequest(
@@ -4093,6 +4210,8 @@ def build_discord_endpoints(
         )
         if not attachment_can_play(attachment):
             raise UserError("local_media.content_type_unsupported")
+        validate_discord_attachment_import(runtime, attachment)
+        await context.dispatch_external_effect()
         record = await import_discord_attachment(
             runtime,
             attachment,
@@ -4274,7 +4393,13 @@ def build_discord_endpoints(
             destination,
         )
         _enforce_voice_listener_audience(runtime, context, guild, destination)
-        await _prepare_actor_audio(client, runtime, guild, member)
+        await _prepare_actor_audio(
+            client,
+            runtime,
+            guild,
+            member,
+            before_connect=context.dispatch_external_effect,
+        )
         response = await runtime.registry.invoke(
             "speech.speak",
             SpeechSpeakRequest(
@@ -7494,6 +7619,8 @@ async def _prepare_actor_audio(
     runtime: SimajilordRuntime,
     guild: discord.Guild,
     member: discord.Member,
+    *,
+    before_connect: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     workspace_id = str(guild.id)
     session = runtime.audio.get_or_create(
@@ -7505,6 +7632,8 @@ async def _prepare_actor_audio(
         _assert_same_voice(session.destination_id, channel)
         return
     if channel is not None:
+        if before_connect is not None:
+            await before_connect()
         await runtime.audio.connect(workspace_id, str(channel.id))
 
 

@@ -219,7 +219,7 @@ class AgentFileSandbox:
         self,
         workspace_id: str,
     ) -> tuple[WorkspaceFileRecord, ...]:
-        scope = self._scope(workspace_id)
+        scope = self._scope_path(workspace_id)
         records: list[WorkspaceFileRecord] = []
         for path in sorted(scope.rglob("*")):
             if path.is_symlink():
@@ -239,6 +239,24 @@ class AgentFileSandbox:
     ) -> WorkspaceFileRecord:
         with self.locked_workspace(workspace_id):
             return self._import_bytes_unlocked(
+                workspace_id,
+                relative_path,
+                content,
+                provenance=provenance,
+            )
+
+    def validate_import_bytes(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        content: bytes,
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
+    ) -> None:
+        """Validate an import without mutating bytes or provenance."""
+
+        with self.locked_workspace(workspace_id):
+            self._validate_import_bytes_unlocked(
                 workspace_id,
                 relative_path,
                 content,
@@ -347,9 +365,32 @@ class AgentFileSandbox:
         *,
         provenance: WorkspaceFileProvenance | None = None,
     ) -> WorkspaceFileRecord:
+        self._validate_import_bytes_unlocked(
+            workspace_id,
+            relative_path,
+            content,
+            provenance=provenance,
+        )
+        scope = self._scope(workspace_id)
+        return self._replace_bytes_unlocked(
+            scope,
+            workspace_id,
+            relative_path,
+            content,
+            provenance=provenance,
+        )
+
+    def _validate_import_bytes_unlocked(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        content: bytes,
+        *,
+        provenance: WorkspaceFileProvenance | None = None,
+    ) -> None:
         if len(content) > self.max_file_bytes:
             raise UserError("files.file_too_large")
-        scope = self._scope(workspace_id)
+        scope = self._scope_path(workspace_id)
         destination = self._path(scope, relative_path)
         existing_size = destination.stat().st_size if destination.exists() else 0
         files = self._list_unlocked(workspace_id)
@@ -358,13 +399,23 @@ class AgentFileSandbox:
         used = sum(item.size_bytes for item in files)
         if used - existing_size + len(content) > self.max_workspace_bytes:
             raise UserError("files.workspace_quota")
-        return self._replace_bytes_unlocked(
-            scope,
+        previous_provenance = self._load_provenance(
             workspace_id,
             relative_path,
-            content,
-            provenance=provenance,
         )
+        if destination.exists() and previous_provenance is None:
+            previous_provenance = unlabelled_file_provenance()
+        if (
+            destination.exists()
+            and provenance is not None
+            and (
+                previous_provenance is None
+                or previous_provenance.unlabelled_input
+                or previous_provenance.owner_actor_ids
+                != provenance.owner_actor_ids
+            )
+        ):
+            raise UserError("files.path_conflict")
 
     def _replace_bytes_unlocked(
         self,
@@ -454,7 +505,7 @@ class AgentFileSandbox:
         if "\x00" in content:
             raise UserError("files.text_invalid")
         with self.locked_workspace(workspace_id):
-            scope = self._scope(workspace_id)
+            scope = self._scope_path(workspace_id)
             destination = self._path(scope, relative_path)
             self._check_expected_hash(destination, expected_sha256)
             return self._import_bytes_unlocked(
@@ -494,6 +545,39 @@ class AgentFileSandbox:
                 provenance=provenance,
             )
 
+    def validate_write_text_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+        provenance: WorkspaceFileProvenance,
+    ) -> None:
+        """Preflight an actor-owned text write without changing file bytes or labels."""
+
+        if "\x00" in content:
+            raise UserError("files.text_invalid")
+        if not file_provenance_is_owned_by(provenance, actor_id):
+            raise UserError("files.provenance_invalid")
+        encoded = content.encode("utf-8")
+        with self.locked_workspace(workspace_id):
+            scope = self._scope_path(workspace_id)
+            destination = self._path(scope, relative_path)
+            if destination.exists() and not file_provenance_is_owned_by(
+                self._load_provenance(workspace_id, relative_path),
+                actor_id,
+            ):
+                raise UserError("files.path_conflict")
+            self._check_expected_hash(destination, expected_sha256)
+            self._validate_import_bytes_unlocked(
+                workspace_id,
+                relative_path,
+                encoded,
+                provenance=provenance,
+            )
+
     def replace_text(
         self,
         workspace_id: str,
@@ -507,7 +591,7 @@ class AgentFileSandbox:
         if not old:
             raise UserError("files.replace_old_empty")
         with self.locked_workspace(workspace_id):
-            scope = self._scope(workspace_id)
+            scope = self._scope_path(workspace_id)
             path = self._path(scope, relative_path)
             self._assert_regular_file(path)
             data = path.read_bytes()
@@ -559,6 +643,55 @@ class AgentFileSandbox:
                 old,
                 new,
                 expected_sha256=expected_sha256,
+                provenance=provenance,
+            )
+
+    def validate_replace_text_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+        old: str,
+        new: str,
+        *,
+        expected_sha256: str,
+        provenance: WorkspaceFileProvenance,
+    ) -> None:
+        """Preflight an actor-owned replacement before recording dispatch."""
+
+        if not old:
+            raise UserError("files.replace_old_empty")
+        if not file_provenance_is_owned_by(provenance, actor_id):
+            raise UserError("files.provenance_invalid")
+        with self.locked_workspace(workspace_id):
+            existing = self._load_provenance(workspace_id, relative_path)
+            if not file_provenance_is_owned_by(existing, actor_id):
+                raise UserError("files.not_found")
+            scope = self._scope_path(workspace_id)
+            path = self._path(scope, relative_path)
+            self._assert_regular_file(path)
+            data = path.read_bytes()
+            if len(data) > 200_000:
+                raise UserError("files.text_too_large_to_edit")
+            try:
+                content = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise UserError("files.text_encoding_unsupported") from exc
+            if hashlib.sha256(data).hexdigest() != expected_sha256:
+                raise UserError("files.hash_conflict")
+            occurrences = content.count(old)
+            if occurrences != 1:
+                raise UserError(
+                    "files.replace_not_unique",
+                    occurrences=occurrences,
+                )
+            replacement = content.replace(old, new, 1)
+            if "\x00" in replacement:
+                raise UserError("files.text_invalid")
+            self._validate_import_bytes_unlocked(
+                workspace_id,
+                relative_path,
+                replacement.encode("utf-8"),
                 provenance=provenance,
             )
 
@@ -746,16 +879,21 @@ class AgentFileSandbox:
     def validate_path(self, workspace_id: str, relative_path: str) -> None:
         """Validate a future workspace path without creating the target file."""
 
-        scope = self._scope(workspace_id)
+        scope = self._scope_path(workspace_id)
         self._path(scope, relative_path)
 
     def _scope(self, workspace_id: str) -> Path:
+        scope = self._scope_path(workspace_id)
+        scope.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return scope
+
+    def _scope_path(self, workspace_id: str) -> Path:
+        """Derive one workspace path without creating it during preflight."""
+
         if not workspace_id or len(workspace_id) > 200:
             raise UserError("files.workspace_invalid")
         digest = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()[:24]
-        scope = self.root / digest
-        scope.mkdir(mode=0o700, parents=True, exist_ok=True)
-        return scope
+        return self.root / digest
 
     def _path(self, scope: Path, relative_path: str) -> Path:
         pure = PurePosixPath(relative_path)

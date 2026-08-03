@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -67,14 +67,9 @@ class FocusTimerService:
         voice_notify: bool = True,
         focus_session: bool = False,
         restore_content_mode: str | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
     ) -> FocusTimer:
-        if not 5 <= duration_seconds <= 7 * 24 * 60 * 60:
-            raise UserError("timer.duration_invalid")
-        normalized = " ".join(message.split())
-        if not normalized:
-            raise UserError("timer.message_required")
-        if len(normalized) > 500:
-            raise UserError("timer.message_too_long")
+        normalized = self.validate_create_request(duration_seconds, message)
         timer = FocusTimer(
             timer_id=uuid.uuid4().hex,
             workspace_id=workspace_id,
@@ -88,8 +83,23 @@ class FocusTimerService:
             status=FocusTimerStatus.SCHEDULED,
         )
         async with self._lock:
+            if before_mutation is not None:
+                await before_mutation()
             await asyncio.to_thread(self._insert, timer)
         return timer
+
+    @staticmethod
+    def validate_create_request(duration_seconds: int, message: str) -> str:
+        """Validate a timer before any coupled read-aloud policy mutation."""
+
+        if not 5 <= duration_seconds <= 7 * 24 * 60 * 60:
+            raise UserError("timer.duration_invalid")
+        normalized = " ".join(message.split())
+        if not normalized:
+            raise UserError("timer.message_required")
+        if len(normalized) > 500:
+            raise UserError("timer.message_too_long")
+        return normalized
 
     async def active(
         self,
@@ -224,6 +234,8 @@ class FocusTimerService:
         timer_id: str,
         workspace_id: str,
         actor_id: str | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[FocusTimer, bool]:
         async with self._lock:
             timer = await asyncio.to_thread(self._require, timer_id)
@@ -232,12 +244,16 @@ class FocusTimerService:
             if actor_id is not None and timer.actor_id != actor_id:
                 raise UserError("timer.not_owner")
             if timer.status is FocusTimerStatus.CANCELLED:
+                if on_noop is not None:
+                    await on_noop()
                 return timer, False
             if timer.status not in {
                 FocusTimerStatus.SCHEDULED,
                 FocusTimerStatus.DELIVERING,
             }:
                 raise UserError("timer.not_active")
+            if before_mutation is not None:
+                await before_mutation()
             cancelled = await asyncio.to_thread(
                 self._set_status,
                 timer_id,
@@ -265,6 +281,8 @@ class FocusTimerService:
         timer_id: str,
         workspace_id: str,
         actor_id: str | None = None,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[FocusTimer, bool]:
         """Restore a cancelled timer without retaining a duplicate timer snapshot."""
 
@@ -275,9 +293,13 @@ class FocusTimerService:
             if actor_id is not None and timer.actor_id != actor_id:
                 raise UserError("timer.not_owner")
             if timer.status is FocusTimerStatus.SCHEDULED:
+                if on_noop is not None:
+                    await on_noop()
                 return timer, False
             if timer.status is not FocusTimerStatus.CANCELLED:
                 raise UserError("timer.not_cancelled")
+            if before_mutation is not None:
+                await before_mutation()
             restored = await asyncio.to_thread(self._restore, timer)
             return restored, True
 

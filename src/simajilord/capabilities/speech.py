@@ -55,6 +55,7 @@ def build_speech_endpoint(
                     title=title,
                     workspace_id=context.workspace_id,
                     voice_preset=request.voice_preset,
+                    before_synthesis=context.dispatch_external_effect,
                 )
             else:
                 item = await speech.synthesize(
@@ -62,6 +63,7 @@ def build_speech_endpoint(
                     title=title,
                     workspace_id=context.workspace_id,
                     voice_preset=request.voice_preset,
+                    before_synthesis=context.dispatch_external_effect,
                 )
             item.requested_by_id = context.actor_id
             if not session.output.connected:

@@ -1142,6 +1142,36 @@ async def test_automod_create_uses_typed_trigger_actions_and_admin_bypass(
     assert call["trigger"].type is discord.AutoModRuleTriggerType.spam
     assert call["actions"][0].type is discord.AutoModRuleActionType.block_message
 
+    guild.create_automod_rule.reset_mock()
+    dispatch = AsyncMock()
+    effect = Mock()
+    effect.dispatch = dispatch
+    effect.complete_without_dispatch = AsyncMock()
+    with pytest.raises(UserError, match=r"discord\.audit_reason_too_long"):
+        await endpoint_by_name["discord.create_automod_rule"].invoke(
+            DiscordCreateAutoModRuleRequest(
+                rule=DiscordAutoModRuleInput(
+                    name="Anti spam",
+                    trigger_kind="spam",
+                    actions=(DiscordAutoModActionInput(kind="block_message"),),
+                    enabled=True,
+                ),
+                reason="x" * 401,
+            ),
+            InvocationContext(
+                actor_id="7",
+                workspace_id="1",
+                transport="agent",
+                request_id="invalid-automod",
+                origin_resource_id="10",
+                grants=frozenset({"files"}),
+                external_effect_dispatch=effect,
+            ),
+        )
+
+    dispatch.assert_not_awaited()
+    guild.create_automod_rule.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_administrator_can_send_suppressed_dm_to_shared_member(

@@ -647,6 +647,8 @@ async def test_procedure_memory_requires_confirmed_non_memory_action(
     effect = await action_store.plan_external_effect(
         capability="discord.send_message",
         context=action_context,
+        request={"channel_id": "300"},
+        authorization_reference=None,
     )
     await action_store.dispatch_external_effect(effect.effect_id)
     await action_store.confirm_external_effect(
@@ -688,6 +690,8 @@ async def test_procedure_memory_requires_confirmed_non_memory_action(
     memory_effect = await action_store.plan_external_effect(
         capability="memory.remember",
         context=memory_action_context,
+        request={"key": "procedure.self_referential"},
+        authorization_reference=None,
     )
     await action_store.dispatch_external_effect(memory_effect.effect_id)
     await action_store.confirm_external_effect(

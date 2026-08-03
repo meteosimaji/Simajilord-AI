@@ -465,6 +465,7 @@ class ConnectorBroker:
         server = self._require_server()
         thread_id = _thread_id(context)
         try:
+            await context.dispatch_external_effect()
             result = await server.call_connector_tool(
                 thread_id=thread_id,
                 server=_CONNECTOR_SERVER,
