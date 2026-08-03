@@ -117,6 +117,26 @@ jobs:
           fi
       - name: macOS integration tests
         run: uv run pytest -q tests/test_translation.py tests/test_discord_audio.py
+      - name: macOS Seatbelt boundary tests
+        id: seatbelt-tests
+        continue-on-error: true
+        run: |
+          mkdir -p .data/ci
+          uv run pytest -q tests/test_compute.py tests/test_isolated_shell.py \
+            --junitxml=.data/ci/seatbelt-pytest.xml
+      - name: Verify macOS Seatbelt boundary results
+        if: always()
+        env:
+          SEATBELT_PYTEST_OUTCOME: ${{ steps.seatbelt-tests.outcome }}
+        run: |
+          uv run python scripts/report_pytest_junit.py \
+            .data/ci/seatbelt-pytest.xml \
+            --title "macOS Seatbelt boundary tests" \
+            --require-no-skips
+          if [ "$SEATBELT_PYTEST_OUTCOME" != "success" ]; then
+            echo "Seatbelt pytest did not complete successfully."
+            exit 1
+          fi
       - name: Offline Discord preview
         run: uv run simajilord-offline-preview --output-dir .data/ci-preview
 
