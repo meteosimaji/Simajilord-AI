@@ -422,8 +422,9 @@ async def _asset_bytes(
     if context.workspace_id is None:
         raise UserError("files.workspace_required")
     filename, content, provenance = await asyncio.to_thread(
-        runtime.files.snapshot_for_delivery_with_provenance,
+        runtime.files.snapshot_for_actor_delivery_with_provenance,
         file_workspace_id(context),
+        context.actor_id,
         path,
     )
     if len(content) > _ASSET_SIZE_LIMITS[kind]:

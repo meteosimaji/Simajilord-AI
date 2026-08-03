@@ -13,7 +13,11 @@ from simajilord.agent import (
     AgentInformationFlowMode,
     ReadAloudAudienceMode,
 )
-from simajilord.config import AgentFeatureAccess, load_settings
+from simajilord.config import (
+    AgentFeatureAccess,
+    load_settings,
+    security_policy_warnings,
+)
 from simajilord.core.errors import ConfigurationError
 from simajilord.integrations.discord.bot import _gateway_intents
 
@@ -247,6 +251,7 @@ def test_agent_security_policies_are_explicit_and_typed(
     assert settings.discord_emoji_radio_id is None
     assert settings.activity_enabled is False
     assert settings.activity_client_secret is None
+    assert security_policy_warnings(settings) == ()
 
 
 def test_safe_compute_requires_the_isolated_file_workspace(
@@ -310,6 +315,10 @@ def test_security_policy_compatibility_modes_are_typed(
         is AgentHighRiskAuthorizationMode.LEGACY_EVENT
     )
     assert settings.agent_autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
+    warnings = security_policy_warnings(settings)
+    assert len(warnings) == 1
+    assert "AGENT_FILE_WORKSPACE_MODE=guild_shared" in warnings[0]
+    assert "Per-actor ownership checks remain enforced" in warnings[0]
 
 
 def test_autonomy_per_channel_queue_cannot_exceed_global_queue(

@@ -27,6 +27,7 @@ from .file_scope import file_provenance, file_workspace_id
 class ComputeRunRequest:
     runtime: Literal["python"]
     argv: tuple[str, ...]
+    input_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,8 @@ def build_compute_endpoints(
             workspace(context),
             runtime=request.runtime,
             argv=request.argv,
+            input_paths=request.input_paths,
+            actor_id=context.actor_id,
             provenance=file_provenance(context),
         )
 
@@ -73,10 +76,10 @@ def build_compute_endpoints(
             CapabilityDescriptor(
                 name="compute.run",
                 summary=(
-                    "Run a Python script already stored in this server's isolated "
-                    "workspace. First create the script with files.write_text, then "
-                    "pass its path and arguments as argv. Shell commands are not accepted; "
-                    "write large results to a workspace file."
+                    "Run one Python script owned by the current actor in the configured "
+                    "workspace. Pass the script in argv[0] and every additional file the "
+                    "script may read in input_paths; unspecified workspace files are not "
+                    "staged. Shell commands are not accepted."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -99,6 +102,9 @@ def build_compute_endpoints(
                     "compute.sandbox_unavailable",
                     "compute.runtime_unsupported",
                     "compute.script_not_found",
+                    "compute.input_not_found",
+                    "compute.input_limit_invalid",
+                    "compute.output_conflict",
                     "compute.timeout",
                     "compute.output_limit",
                     "compute.memory_limit",

@@ -81,12 +81,17 @@ def file_provenance(
                 )
             )
         )
+    resources = tuple(dict.fromkeys(resources))
+    sources_truncated = len(resources) > 32
+    resources = resources[:32]
     sensitivity = _combined_sensitivity(
         (*tuple(item.visibility for item in observations), effective_visibility),
         fallback=effective_visibility,
     )
+    if sources_truncated:
+        sensitivity = "uncertain"
     return WorkspaceFileProvenance(
-        owner_actor_id=context.actor_id,
+        owner_actor_ids=(context.actor_id,),
         origin_guild_id=effective_guild_id,
         origin_channel_id=effective_channel_id,
         origin_message_id=effective_message_id,
@@ -94,6 +99,7 @@ def file_provenance(
         created_task_id=context.agent_task_id,
         sensitivity=sensitivity,
         source_resources=resources,
+        sources_truncated=sources_truncated,
     )
 
 

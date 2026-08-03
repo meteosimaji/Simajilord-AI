@@ -159,6 +159,20 @@ class Settings:
     agent_autonomy_max_pending_events_per_actor: int
 
 
+def security_policy_warnings(settings: Settings) -> tuple[str, ...]:
+    """Describe reversible compatibility modes that need operator attention."""
+
+    warnings: list[str] = []
+    if settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED:
+        warnings.append(
+            "AGENT_FILE_WORKSPACE_MODE=guild_shared uses one physical guild file "
+            "namespace. Per-actor ownership checks remain enforced, but name "
+            "collisions and trusted-internal maintenance paths have a wider blast "
+            "radius; prefer actor or actor_task when compatibility is unnecessary."
+        )
+    return tuple(warnings)
+
+
 def _required(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:

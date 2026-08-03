@@ -3860,8 +3860,9 @@ def build_discord_endpoints(
         snapshots = await asyncio.gather(
             *(
                 asyncio.to_thread(
-                    runtime.files.snapshot_for_delivery_with_provenance,
+                    runtime.files.snapshot_for_actor_delivery_with_provenance,
                     file_workspace_id(context),
+                    context.actor_id,
                     item.path,
                 )
                 for item in request.attachments
@@ -7078,9 +7079,11 @@ def _enforce_file_provenance_to_destination(
             continue
         if provenance.declassified_at is not None:
             continue
+        if provenance.unlabelled_input or provenance.sources_truncated:
+            violations.append(("file", "provenance", "uncertain"))
         if provenance.sensitivity == "actor_private":
             same_origin = (
-                provenance.owner_actor_id == context.actor_id
+                provenance.owner_actor_ids == (context.actor_id,)
                 and provenance.origin_guild_id == str(destination_guild.id)
                 and provenance.origin_channel_id == str(destination.id)
             )

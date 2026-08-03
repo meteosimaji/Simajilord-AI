@@ -951,7 +951,7 @@ async def test_platform_asset_creation_reads_only_the_workspace_snapshot(
         "emoji.png",
         b"png",
         provenance=WorkspaceFileProvenance(
-            owner_actor_id="7",
+            owner_actor_ids=("7",),
             origin_guild_id="1",
             origin_channel_id="10",
             origin_visibility="guild_public",
@@ -1007,7 +1007,7 @@ async def test_application_emoji_rejects_undeclassified_workspace_file(
         "emoji.png",
         b"png",
         provenance=WorkspaceFileProvenance(
-            owner_actor_id="7",
+            owner_actor_ids=("7",),
             origin_guild_id="1",
             origin_channel_id="10",
             origin_visibility="guild_public",

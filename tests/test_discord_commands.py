@@ -344,6 +344,64 @@ async def test_agent_file_delivery_uses_the_guild_upload_limit(
 
 
 @pytest.mark.asyncio
+async def test_agent_file_delivery_hides_another_actor_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "agent-files")
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="guild",
+        transport="agent",
+        request_id="event",
+        resource_ids=("1",),
+        origin_resource_id="1",
+        file_workspace_mode="guild_shared",
+    )
+    other_context = InvocationContext(
+        actor_id="8",
+        workspace_id="guild",
+        transport="agent",
+        request_id="other-event",
+        resource_ids=("1",),
+        origin_resource_id="1",
+        file_workspace_mode="guild_shared",
+    )
+    runtime.files.import_bytes(
+        file_workspace_id(other_context),
+        "private.bin",
+        b"private",
+        provenance=file_provenance(other_context),
+    )
+    guild = Mock(spec=discord.Guild)
+    guild.id = "guild"
+    guild.filesize_limit = 100
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 1
+    channel.send = AsyncMock()
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._write_message_channel",
+        AsyncMock(return_value=(guild, channel, Mock(), Mock())),
+    )
+    endpoints = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+
+    with pytest.raises(UserError, match=r"files\.not_found"):
+        await endpoints["discord.send_file"].invoke(
+            DiscordSendFileRequest(channel_id="1", path="private.bin"),
+            context,
+        )
+
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_agent_file_delivery_sends_the_authorized_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -387,7 +445,12 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
         assert suppress_embeds is True
         assert nonce.startswith("sla")
         assert len(nonce) == 25
-        runtime.files.import_bytes(file_scope, "result.bin", b"newer")
+        runtime.files.import_bytes(
+            file_scope,
+            "result.bin",
+            b"newer",
+            provenance=file_provenance(context),
+        )
         assert file.fp.read() == b"authorized"
         return sent
 

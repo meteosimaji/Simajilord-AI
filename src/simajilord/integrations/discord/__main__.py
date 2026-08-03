@@ -6,15 +6,19 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from simajilord.config import Settings, load_settings
+from simajilord.config import Settings, load_settings, security_policy_warnings
 from simajilord.runtime import SimajilordRuntime
 
 from .bot import SimajilordDiscordBot
+
+log = logging.getLogger(__name__)
 
 
 def main() -> None:
     settings = load_settings()
     _configure_logging(settings)
+    for warning in security_policy_warnings(settings):
+        log.critical("SECURITY COMPATIBILITY MODE: %s", warning)
     bot = SimajilordDiscordBot(SimajilordRuntime.build(settings))
     bot.run(settings.token, log_handler=None)
 

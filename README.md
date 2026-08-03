@@ -157,14 +157,19 @@ with Discord's generic “interaction failed” banner.
   the agent can import Discord attachments,
   download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text
   content in chunks, edit text, and send a selected result back to Discord. Durable provenance
-  records owner, origin server/channel/message, source visibility, creating task, sensitivity,
-  and any explicit declassification fields before restricted bytes become visible. `actor` and
-  the former `guild_shared` scope are reversible operator modes; provenance still prevents a
-  restricted result from being sent to a broader or unverified audience. PDF reads select
+  records the complete bounded owner set, origin server/channel/message, source visibility,
+  creating task, sensitivity, truncation/unknown-input taint, and any explicit declassification
+  fields before restricted bytes become visible. `actor` and the former `guild_shared` scope are
+  reversible operator modes. Even in `guild_shared`, model-facing list/read/write/import/send and
+  compute paths require the current actor's exact single-owner label; unlabelled legacy files and
+  multi-owner results stay hidden and are never implicitly shared or declassified.
+  PDF reads select
   1–20 pages at a time and return `total_pages` plus `next_page`; character-level `next_offset`
   continues within the selected page range, so documents longer than 20 pages remain readable
 - Optional `AGENT_SAFE_COMPUTE_ACCESS` runs only an argv-based Python script that the agent first
-  stores in its selected private workspace. On macOS, Seatbelt blocks network access, child processes,
+  stores in its selected private workspace. Each invocation stages only that owned script and the
+  explicitly named `input_paths`; other workspace files are not implicit inputs. On macOS,
+  Seatbelt blocks network access, child processes,
   personal/project host files, and writes outside a temporary staged workspace; wall time, CPU,
   resident memory, output, open-file, per-file, file-count, and workspace-byte limits are
   host-enforced.

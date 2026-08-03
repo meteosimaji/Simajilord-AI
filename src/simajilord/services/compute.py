@@ -29,6 +29,7 @@ from .files import (
     AgentFileSandbox,
     WorkspaceFileProvenance,
     WorkspaceFileRecord,
+    file_provenance_is_owned_by,
     merge_file_provenances,
     workspace_file_kind,
 )
@@ -48,6 +49,7 @@ _OTOOL_BATCH_SIZE = 128
 _MAX_ARGUMENTS = 32
 _MAX_ARGUMENT_CHARACTERS = 8_192
 _MAX_SINGLE_ARGUMENT_CHARACTERS = 1_024
+_MAX_INPUT_FILES = 32
 _SUPPORTED_DOWNLOAD_CONTENT_TYPES = frozenset(
     {
         "application/epub+zip",
@@ -565,11 +567,18 @@ class WorkspaceComputeService:
         *,
         runtime: str,
         argv: tuple[str, ...],
+        input_paths: tuple[str, ...] = (),
+        actor_id: str | None = None,
         provenance: WorkspaceFileProvenance | None = None,
     ) -> ComputeRunResult:
         if runtime != "python":
             raise UserError("compute.runtime_unsupported")
         normalized_argv = _validated_argv(argv)
+        normalized_inputs = _validated_input_paths(
+            input_paths,
+            script_path=normalized_argv[0],
+        )
+        staged_paths = (normalized_argv[0], *normalized_inputs)
         lock = self._workspace_locks.setdefault(workspace_id, asyncio.Lock())
         async with lock:
             run_directory = Path(
@@ -587,6 +596,8 @@ class WorkspaceComputeService:
                     self._stage_workspace,
                     workspace_id,
                     workspace,
+                    staged_paths,
+                    actor_id,
                 )
                 effective_provenance = merge_file_provenances(
                     (
@@ -669,12 +680,31 @@ class WorkspaceComputeService:
         self,
         workspace_id: str,
         destination: Path,
+        relative_paths: tuple[str, ...],
+        actor_id: str | None,
     ) -> dict[str, WorkspaceFileRecord]:
         with self.files.locked_workspace(workspace_id):
-            records = {
+            available = {
                 record.path: record
                 for record in self.files.list(workspace_id)
             }
+            records: dict[str, WorkspaceFileRecord] = {}
+            for index, relative_path in enumerate(relative_paths):
+                self.files.validate_path(workspace_id, relative_path)
+                record = available.get(relative_path)
+                if record is None or (
+                    actor_id is not None
+                    and not file_provenance_is_owned_by(
+                        record.provenance,
+                        actor_id,
+                    )
+                ):
+                    raise UserError(
+                        "compute.script_not_found"
+                        if index == 0
+                        else "compute.input_not_found"
+                    )
+                records[relative_path] = record
             for relative_path, record in records.items():
                 source = self.files.path_for_delivery(workspace_id, relative_path)
                 target = destination.joinpath(*PurePosixPath(relative_path).parts)
@@ -702,14 +732,13 @@ class WorkspaceComputeService:
                 record.path: record
                 for record in self.files.list(workspace_id)
             }
-            if {
-                path: record.sha256
-                for path, record in current.items()
-            } != {
-                path: record.sha256
-                for path, record in before.items()
-            }:
-                raise UserError("compute.workspace_changed")
+            for path, staged_record in before.items():
+                current_record = current.get(path)
+                if (
+                    current_record is None
+                    or current_record.sha256 != staged_record.sha256
+                ):
+                    raise UserError("compute.workspace_changed")
             removed = set(before) - set(after)
             if removed:
                 raise UserError("compute.file_deletion_unsupported")
@@ -718,6 +747,11 @@ class WorkspaceComputeService:
                 for path, record in after.items()
                 if path not in before or before[path].sha256 != record.sha256
             ]
+            if any(
+                path not in before and path in current
+                for path in changed_paths
+            ):
+                raise UserError("compute.output_conflict")
             changed_paths.sort(
                 key=lambda path: (
                     after[path].size_bytes
@@ -979,6 +1013,34 @@ def _validated_argv(argv: Sequence[str]) -> tuple[str, ...]:
     ):
         raise UserError("compute.script_invalid")
     return tuple(argv)
+
+
+def _validated_input_paths(
+    input_paths: Sequence[str],
+    *,
+    script_path: str,
+) -> tuple[str, ...]:
+    if len(input_paths) > _MAX_INPUT_FILES:
+        raise UserError("compute.input_limit_invalid")
+    normalized: list[str] = []
+    for value in input_paths:
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\x00" in value
+            or len(value) > _MAX_SINGLE_ARGUMENT_CHARACTERS
+        ):
+            raise UserError("compute.input_limit_invalid")
+        path = PurePosixPath(value)
+        if (
+            value.startswith("./")
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            raise UserError("compute.input_limit_invalid")
+        if value != script_path:
+            normalized.append(value)
+    return tuple(dict.fromkeys(normalized))
 
 
 def _sandbox_string(path: Path) -> str:

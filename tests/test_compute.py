@@ -43,6 +43,7 @@ class _FakeLauncher:
         self.remove_path = remove_path
         self.create_symlink = create_symlink
         self.calls: list[tuple[str, ...]] = []
+        self.staged_paths: list[tuple[str, ...]] = []
 
     async def run_python(
         self,
@@ -63,6 +64,15 @@ class _FakeLauncher:
             max_files,
         )
         self.calls.append(argv)
+        self.staged_paths.append(
+            tuple(
+                sorted(
+                    path.relative_to(workspace).as_posix()
+                    for path in workspace.rglob("*")
+                    if path.is_file()
+                )
+            )
+        )
         assert (workspace / argv[0]).is_file()
         if self.remove_path is not None:
             (workspace / self.remove_path).unlink()
@@ -200,7 +210,7 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
     )
     files, service = _service(tmp_path, launcher=launcher)
     restricted = WorkspaceFileProvenance(
-        owner_actor_id="actor",
+        owner_actor_ids=("actor",),
         origin_guild_id="guild",
         origin_channel_id="staff",
         origin_message_id="message",
@@ -220,6 +230,8 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
         "guild",
         runtime="python",
         argv=("scripts/calculate.py", "--format", "text"),
+        actor_id="actor",
+        provenance=restricted,
     )
 
     assert result.exit_code == 0
@@ -227,6 +239,7 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
     assert launcher.calls == [
         ("scripts/calculate.py", "--format", "text")
     ]
+    assert launcher.staged_paths == [("scripts/calculate.py",)]
     assert tuple(file.path for file in result.changed_files) == (
         "outputs/result.txt",
     )
@@ -240,6 +253,168 @@ async def test_compute_stages_script_and_commits_only_validated_changes(
         offset=0,
         max_characters=100,
     ).content == "42\n"
+
+
+@pytest.mark.asyncio
+async def test_compute_stages_only_explicit_actor_owned_inputs(
+    tmp_path: Path,
+) -> None:
+    launcher = _FakeLauncher()
+    files, service = _service(tmp_path, launcher=launcher)
+    actor = WorkspaceFileProvenance(owner_actor_ids=("actor",))
+    other_actor = WorkspaceFileProvenance(owner_actor_ids=("other",))
+    files.write_text(
+        "guild",
+        "run.py",
+        "print('ok')",
+        provenance=actor,
+    )
+    files.write_text(
+        "guild",
+        "selected.txt",
+        "selected",
+        provenance=actor,
+    )
+    files.write_text(
+        "guild",
+        "unrelated.txt",
+        "unrelated",
+        provenance=actor,
+    )
+    files.write_text(
+        "guild",
+        "other.txt",
+        "private",
+        provenance=other_actor,
+    )
+
+    await service.run(
+        "guild",
+        runtime="python",
+        argv=("run.py",),
+        input_paths=("selected.txt",),
+        actor_id="actor",
+        provenance=actor,
+    )
+
+    assert launcher.staged_paths == [("run.py", "selected.txt")]
+
+
+@pytest.mark.asyncio
+async def test_compute_rejects_cross_actor_and_unlabelled_inputs(
+    tmp_path: Path,
+) -> None:
+    launcher = _FakeLauncher()
+    files, service = _service(tmp_path, launcher=launcher)
+    actor = WorkspaceFileProvenance(owner_actor_ids=("actor",))
+    other_actor = WorkspaceFileProvenance(owner_actor_ids=("other",))
+    files.write_text("guild", "run.py", "pass", provenance=actor)
+    files.write_text(
+        "guild",
+        "other-run.py",
+        "pass",
+        provenance=other_actor,
+    )
+    files.write_text(
+        "guild",
+        "other.txt",
+        "private",
+        provenance=other_actor,
+    )
+    files.write_text("guild", "legacy.txt", "unlabelled")
+
+    with pytest.raises(UserError, match=r"compute\.script_not_found"):
+        await service.run(
+            "guild",
+            runtime="python",
+            argv=("other-run.py",),
+            actor_id="actor",
+            provenance=actor,
+        )
+    for path in ("other.txt", "legacy.txt"):
+        with pytest.raises(UserError, match=r"compute\.input_not_found"):
+            await service.run(
+                "guild",
+                runtime="python",
+                argv=("run.py",),
+                input_paths=(path,),
+                actor_id="actor",
+                provenance=actor,
+            )
+
+    assert launcher.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compute_rejects_output_collision_with_unstaged_workspace_file(
+    tmp_path: Path,
+) -> None:
+    launcher = _FakeLauncher(
+        create_path="existing.txt",
+        create_content=b"replacement",
+    )
+    files, service = _service(tmp_path, launcher=launcher)
+    actor = WorkspaceFileProvenance(owner_actor_ids=("actor",))
+    files.write_text("guild", "run.py", "pass", provenance=actor)
+    files.write_text(
+        "guild",
+        "existing.txt",
+        "original",
+        provenance=actor,
+    )
+
+    with pytest.raises(UserError, match=r"compute\.output_conflict"):
+        await service.run(
+            "guild",
+            runtime="python",
+            argv=("run.py",),
+            actor_id="actor",
+            provenance=actor,
+        )
+
+    assert files.read_for_actor(
+        "guild",
+        "actor",
+        "existing.txt",
+        offset=0,
+        max_characters=100,
+    ).content == "original"
+
+
+@pytest.mark.asyncio
+async def test_compute_taints_unlabelled_trusted_input_and_output(
+    tmp_path: Path,
+) -> None:
+    launcher = _FakeLauncher(
+        create_path="result.txt",
+        create_content=b"result",
+    )
+    files, service = _service(tmp_path, launcher=launcher)
+    files.write_text("guild", "run.py", "pass")
+
+    result = await service.run(
+        "guild",
+        runtime="python",
+        argv=("run.py",),
+    )
+
+    assert result.provenance is not None
+    assert result.provenance.owner_actor_ids == ()
+    assert result.provenance.unlabelled_input
+    assert result.provenance.sensitivity == "uncertain"
+    output = files.read(
+        "guild",
+        "result.txt",
+        offset=0,
+        max_characters=100,
+    )
+    assert output.provenance == result.provenance
+    with pytest.raises(UserError, match=r"files\.not_found"):
+        files.snapshot_for_actor_delivery_with_provenance(
+            "guild",
+            "actor",
+            "result.txt",
+        )
 
 
 @pytest.mark.asyncio
@@ -274,7 +449,12 @@ async def test_compute_rejects_deletion_and_symlink_output(tmp_path: Path) -> No
         UserError,
         match=r"compute\.file_deletion_unsupported",
     ):
-        await service.run("guild", runtime="python", argv=("run.py",))
+        await service.run(
+            "guild",
+            runtime="python",
+            argv=("run.py",),
+            input_paths=("input.txt",),
+        )
     assert files.read(
         "guild",
         "input.txt",

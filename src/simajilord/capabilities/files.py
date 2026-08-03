@@ -67,7 +67,11 @@ def build_file_endpoints(
         context: InvocationContext,
     ) -> FileListResponse:
         return FileListResponse(
-            files=await asyncio.to_thread(service.list, workspace(context))
+            files=await asyncio.to_thread(
+                service.list_for_actor,
+                workspace(context),
+                context.actor_id,
+            )
         )
 
     async def read_file(
@@ -75,8 +79,9 @@ def build_file_endpoints(
         context: InvocationContext,
     ) -> WorkspaceReadResult:
         return await asyncio.to_thread(
-            service.read,
+            service.read_for_actor,
             workspace(context),
+            context.actor_id,
             request.path,
             offset=request.offset,
             max_characters=request.max_characters,
@@ -89,8 +94,9 @@ def build_file_endpoints(
         context: InvocationContext,
     ) -> WorkspaceFileRecord:
         return await asyncio.to_thread(
-            service.write_text,
+            service.write_text_for_actor,
             workspace(context),
+            context.actor_id,
             request.path,
             request.content,
             expected_sha256=request.expected_sha256,
@@ -102,8 +108,9 @@ def build_file_endpoints(
         context: InvocationContext,
     ) -> WorkspaceFileRecord:
         return await asyncio.to_thread(
-            service.replace_text,
+            service.replace_text_for_actor,
             workspace(context),
+            context.actor_id,
             request.path,
             request.old,
             request.new,
@@ -115,7 +122,10 @@ def build_file_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="files.list",
-                summary="List files in this actor/task's isolated workspace.",
+                summary=(
+                    "List files owned by the current actor in the configured "
+                    "workspace. Other actors and unlabelled legacy files are hidden."
+                ),
                 risk=RiskLevel.READ,
                 approval=ApprovalMode.NEVER,
                 keywords=(
@@ -140,7 +150,8 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.read",
                 summary=(
-                    "Read text or inspect PDF and ZIP files in the actor/task workspace. "
+                    "Read text or inspect PDF and ZIP files owned by the current actor "
+                    "in the configured workspace. "
                     "Use offset/next_offset within one chunk. For PDF files, use "
                     "page_start/page_count and continue from next_page until complete."
                 ),
@@ -166,6 +177,7 @@ def build_file_endpoints(
                     "files.read_range_invalid",
                     "files.page_range_invalid",
                     "files.page_range_unsupported",
+                    "files.not_found",
                 ),
                 timeout_seconds=30,
             ),
@@ -177,7 +189,8 @@ def build_file_endpoints(
             CapabilityDescriptor(
                 name="files.write_text",
                 summary=(
-                    "Create or update a UTF-8 text file in the actor/task workspace, "
+                    "Create or update a UTF-8 text file owned by the current actor in "
+                    "the configured workspace, "
                     "optionally checking the previous SHA-256."
                 ),
                 risk=RiskLevel.WRITE,
@@ -202,7 +215,11 @@ def build_file_endpoints(
                 ),
                 requires_workspace=True,
                 idempotency="idempotent_write",
-                expected_errors=("files.workspace_required",),
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.path_conflict",
+                    "files.provenance_invalid",
+                ),
                 timeout_seconds=15,
                 user_visible_effect="Creates or updates a file in the isolated workspace.",
             ),
@@ -231,7 +248,12 @@ def build_file_endpoints(
                 side_effects=("Edits a text file in the isolated workspace.",),
                 requires_workspace=True,
                 idempotency="idempotent_write",
-                expected_errors=("files.workspace_required",),
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.not_found",
+                    "files.path_conflict",
+                    "files.provenance_invalid",
+                ),
                 timeout_seconds=15,
                 user_visible_effect="Edits a file in the isolated workspace.",
             ),

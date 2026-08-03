@@ -5172,6 +5172,15 @@ def _record_discord_disclosure_observations(
         assert isinstance(provenance, dict)
         if provenance.get("declassified_at") is not None:
             continue
+        if (
+            provenance.get("unlabelled_input") is True
+            or provenance.get("sources_truncated") is True
+        ):
+            _record_truncated_disclosure_observation(
+                budget,
+                capability_name=capability_name,
+                arguments=arguments,
+            )
         resources = provenance.get("source_resources")
         if not isinstance(resources, list):
             resources = []
@@ -5180,7 +5189,8 @@ def _record_discord_disclosure_observations(
             origin_channel_id = provenance.get("origin_channel_id")
             origin_visibility = provenance.get("origin_visibility")
             if origin_visibility == "actor_private":
-                if provenance.get("owner_actor_id") != budget.context.actor_id:
+                owner_actor_ids = provenance.get("owner_actor_ids")
+                if owner_actor_ids != [budget.context.actor_id]:
                     resources = []
                 else:
                     origin_visibility = "restricted"

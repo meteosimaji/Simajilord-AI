@@ -70,7 +70,7 @@ WorkspaceSourceVisibility: TypeAlias = Literal[
 class WorkspaceFileProvenance:
     """Bounded source label retained independently from file bytes."""
 
-    owner_actor_id: str
+    owner_actor_ids: tuple[str, ...]
     origin_guild_id: str | None = None
     origin_channel_id: str | None = None
     origin_message_id: str | None = None
@@ -80,12 +80,15 @@ class WorkspaceFileProvenance:
     source_resources: tuple[
         tuple[str, str, WorkspaceSourceVisibility], ...
     ] = ()
+    unlabelled_input: bool = False
+    sources_truncated: bool = False
     declassified_at: str | None = None
     declassified_by: str | None = None
 
     def __post_init__(self) -> None:
+        normalized_owners = tuple(sorted(set(self.owner_actor_ids)))
+        object.__setattr__(self, "owner_actor_ids", normalized_owners)
         scalar_values = (
-            self.owner_actor_id,
             self.origin_guild_id,
             self.origin_channel_id,
             self.origin_message_id,
@@ -93,15 +96,55 @@ class WorkspaceFileProvenance:
             self.declassified_at,
             self.declassified_by,
         )
-        if not self.owner_actor_id or any(
+        if any(
             value is not None and len(value) > 200 for value in scalar_values
         ):
             raise ValueError("file provenance values must be bounded")
+        if len(normalized_owners) > 32 or any(
+            not value or len(value) > 200 for value in normalized_owners
+        ):
+            raise ValueError("file provenance owners must be bounded")
+        if (
+            not normalized_owners
+            and not self.unlabelled_input
+            and self.sensitivity != "uncertain"
+        ):
+            raise ValueError("file provenance must retain an owner or uncertainty")
         if len(self.source_resources) > 32 or any(
             len(item) != 3 or any(not value or len(value) > 200 for value in item)
             for item in self.source_resources
         ):
             raise ValueError("file provenance source resources must be bounded")
+        if (
+            len(normalized_owners) != 1
+            or self.unlabelled_input
+            or self.sources_truncated
+        ):
+            object.__setattr__(self, "sensitivity", "uncertain")
+
+
+def unlabelled_file_provenance() -> WorkspaceFileProvenance:
+    """Return the fail-closed label for bytes without durable provenance."""
+
+    return WorkspaceFileProvenance(
+        owner_actor_ids=(),
+        origin_visibility="uncertain",
+        sensitivity="uncertain",
+        unlabelled_input=True,
+    )
+
+
+def file_provenance_is_owned_by(
+    provenance: WorkspaceFileProvenance | None,
+    actor_id: str,
+) -> bool:
+    """Allow private file authority only when one exact actor owns the bytes."""
+
+    return (
+        provenance is not None
+        and not provenance.unlabelled_input
+        and provenance.owner_actor_ids == (actor_id,)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +200,20 @@ class AgentFileSandbox:
     def list(self, workspace_id: str) -> tuple[WorkspaceFileRecord, ...]:
         with self.locked_workspace(workspace_id):
             return self._list_unlocked(workspace_id)
+
+    def list_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+    ) -> tuple[WorkspaceFileRecord, ...]:
+        """List only files whose private authority belongs to one exact actor."""
+
+        with self.locked_workspace(workspace_id):
+            return tuple(
+                record
+                for record in self._list_unlocked(workspace_id)
+                if file_provenance_is_owned_by(record.provenance, actor_id)
+            )
 
     def _list_unlocked(
         self,
@@ -323,13 +380,31 @@ class AgentFileSandbox:
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._assert_no_symlinks(scope, destination)
         previous_provenance = self._load_provenance(workspace_id, relative_path)
+        if destination.exists() and previous_provenance is None:
+            previous_provenance = unlabelled_file_provenance()
+        if (
+            destination.exists()
+            and provenance is not None
+            and not replace_provenance
+            and (
+                previous_provenance is None
+                or previous_provenance.unlabelled_input
+                or previous_provenance.owner_actor_ids
+                != provenance.owner_actor_ids
+            )
+        ):
+            raise UserError("files.path_conflict")
         next_provenance = previous_provenance
         should_store_provenance = replace_provenance or provenance is not None
         if replace_provenance:
             next_provenance = provenance
         elif provenance is not None:
-            next_provenance = merge_file_provenances(
-                (previous_provenance, provenance)
+            next_provenance = (
+                provenance
+                if previous_provenance is None
+                else merge_file_provenances(
+                    (previous_provenance, provenance)
+                )
             )
         with tempfile.NamedTemporaryFile(
             dir=destination.parent,
@@ -389,6 +464,36 @@ class AgentFileSandbox:
                 provenance=provenance,
             )
 
+    def write_text_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+        provenance: WorkspaceFileProvenance,
+    ) -> WorkspaceFileRecord:
+        """Write without allowing a guessed path to overwrite another actor."""
+
+        if not file_provenance_is_owned_by(provenance, actor_id):
+            raise UserError("files.provenance_invalid")
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            destination = self._path(scope, relative_path)
+            if destination.exists() and not file_provenance_is_owned_by(
+                self._load_provenance(workspace_id, relative_path),
+                actor_id,
+            ):
+                raise UserError("files.path_conflict")
+            return self.write_text(
+                workspace_id,
+                relative_path,
+                content,
+                expected_sha256=expected_sha256,
+                provenance=provenance,
+            )
+
     def replace_text(
         self,
         workspace_id: str,
@@ -425,6 +530,34 @@ class AgentFileSandbox:
                 workspace_id,
                 relative_path,
                 content.replace(old, new, 1),
+                expected_sha256=expected_sha256,
+                provenance=provenance,
+            )
+
+    def replace_text_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+        old: str,
+        new: str,
+        *,
+        expected_sha256: str,
+        provenance: WorkspaceFileProvenance,
+    ) -> WorkspaceFileRecord:
+        """Replace only a file exclusively owned by the current actor."""
+
+        if not file_provenance_is_owned_by(provenance, actor_id):
+            raise UserError("files.provenance_invalid")
+        with self.locked_workspace(workspace_id):
+            existing = self._load_provenance(workspace_id, relative_path)
+            if not file_provenance_is_owned_by(existing, actor_id):
+                raise UserError("files.not_found")
+            return self.replace_text(
+                workspace_id,
+                relative_path,
+                old,
+                new,
                 expected_sha256=expected_sha256,
                 provenance=provenance,
             )
@@ -509,8 +642,42 @@ class AgentFileSandbox:
             page_start=selected_page_start,
             next_page=next_page,
             total_pages=total_pages,
-            provenance=self._load_provenance(workspace_id, relative_path),
+            provenance=(
+                self._load_provenance(workspace_id, relative_path)
+                or unlabelled_file_provenance()
+            ),
         )
+
+    def read_for_actor(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+        *,
+        offset: int,
+        max_characters: int,
+        page_start: int = 1,
+        page_count: int = 5,
+    ) -> WorkspaceReadResult:
+        """Read only after atomically validating the current actor authority."""
+
+        with self.locked_workspace(workspace_id):
+            scope = self._scope(workspace_id)
+            path = self._path(scope, relative_path)
+            self._assert_regular_file(path)
+            if not file_provenance_is_owned_by(
+                self._load_provenance(workspace_id, relative_path),
+                actor_id,
+            ):
+                raise UserError("files.not_found")
+            return self.read(
+                workspace_id,
+                relative_path,
+                offset=offset,
+                max_characters=max_characters,
+                page_start=page_start,
+                page_count=page_count,
+            )
 
     def path_for_delivery(self, workspace_id: str, relative_path: str) -> Path:
         scope = self._scope(workspace_id)
@@ -541,8 +708,25 @@ class AgentFileSandbox:
             return (
                 path.name,
                 path.read_bytes(),
-                self._load_provenance(workspace_id, relative_path),
+                self._load_provenance(workspace_id, relative_path)
+                or unlabelled_file_provenance(),
             )
+
+    def snapshot_for_actor_delivery_with_provenance(
+        self,
+        workspace_id: str,
+        actor_id: str,
+        relative_path: str,
+    ) -> tuple[str, bytes, WorkspaceFileProvenance]:
+        """Snapshot only bytes exclusively owned by the requesting actor."""
+
+        with self.locked_workspace(workspace_id):
+            path = self.path_for_delivery(workspace_id, relative_path)
+            provenance = self._load_provenance(workspace_id, relative_path)
+            if not file_provenance_is_owned_by(provenance, actor_id):
+                raise UserError("files.not_found")
+            assert provenance is not None
+            return path.name, path.read_bytes(), provenance
 
     def set_provenance(
         self,
@@ -632,7 +816,10 @@ class AgentFileSandbox:
             size_bytes=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
             kind=workspace_file_kind(path, data),
-            provenance=self._load_provenance(workspace_id, relative_path),
+            provenance=(
+                self._load_provenance(workspace_id, relative_path)
+                or unlabelled_file_provenance()
+            ),
         )
 
     def _initialize_provenance(self) -> None:
@@ -647,6 +834,7 @@ class AgentFileSandbox:
                     workspace_id TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
                     owner_actor_id TEXT NOT NULL,
+                    owner_actor_ids_json TEXT NOT NULL DEFAULT '[]',
                     origin_guild_id TEXT,
                     origin_channel_id TEXT,
                     origin_message_id TEXT,
@@ -654,6 +842,8 @@ class AgentFileSandbox:
                     created_task_id TEXT,
                     sensitivity TEXT NOT NULL,
                     source_resources_json TEXT NOT NULL,
+                    unlabelled_input INTEGER NOT NULL DEFAULT 0,
+                    sources_truncated INTEGER NOT NULL DEFAULT 0,
                     declassified_at TEXT,
                     declassified_by TEXT,
                     updated_at TEXT NOT NULL,
@@ -661,6 +851,64 @@ class AgentFileSandbox:
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(file_provenance)"
+                ).fetchall()
+            }
+            additions = {
+                "owner_actor_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "unlabelled_input": "INTEGER NOT NULL DEFAULT 0",
+                "sources_truncated": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE file_provenance ADD COLUMN {name} {declaration}"
+                    )
+            legacy_rows = connection.execute(
+                """
+                SELECT workspace_id, relative_path, owner_actor_id,
+                       owner_actor_ids_json
+                FROM file_provenance
+                """
+            ).fetchall()
+            for workspace_id, relative_path, owner_actor_id, owners_json in legacy_rows:
+                try:
+                    owners = json.loads(str(owners_json))
+                except json.JSONDecodeError:
+                    owners = []
+                if isinstance(owners, list) and owners:
+                    continue
+                if str(owner_actor_id) == "unknown":
+                    connection.execute(
+                        """
+                        UPDATE file_provenance
+                        SET owner_actor_ids_json = '[]',
+                            unlabelled_input = 1,
+                            sensitivity = 'uncertain'
+                        WHERE workspace_id = ? AND relative_path = ?
+                        """,
+                        (str(workspace_id), str(relative_path)),
+                    )
+                    continue
+                connection.execute(
+                    """
+                    UPDATE file_provenance
+                    SET owner_actor_ids_json = ?
+                    WHERE workspace_id = ? AND relative_path = ?
+                    """,
+                    (
+                        json.dumps(
+                            [str(owner_actor_id)],
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ),
+                        str(workspace_id),
+                        str(relative_path),
+                    ),
+                )
         self._provenance_path.chmod(0o600)
 
     def _load_provenance(
@@ -674,9 +922,10 @@ class AgentFileSandbox:
         ) as connection:
             row = connection.execute(
                 """
-                SELECT owner_actor_id, origin_guild_id, origin_channel_id,
-                       origin_message_id, origin_visibility, created_task_id,
-                       sensitivity, source_resources_json, declassified_at,
+                SELECT owner_actor_id, owner_actor_ids_json, origin_guild_id,
+                       origin_channel_id, origin_message_id, origin_visibility,
+                       created_task_id, sensitivity, source_resources_json,
+                       unlabelled_input, sources_truncated, declassified_at,
                        declassified_by
                 FROM file_provenance
                 WHERE workspace_id = ? AND relative_path = ?
@@ -686,7 +935,15 @@ class AgentFileSandbox:
         if row is None:
             return None
         try:
-            raw_resources = json.loads(str(row[7]))
+            raw_owners = json.loads(str(row[1]))
+            if not isinstance(raw_owners, list) or any(
+                not isinstance(item, str) for item in raw_owners
+            ):
+                raise ValueError("invalid workspace provenance owners")
+            owner_actor_ids = tuple(str(item) for item in raw_owners)
+            if not owner_actor_ids and str(row[0]) != "unknown":
+                owner_actor_ids = (str(row[0]),)
+            raw_resources = json.loads(str(row[8]))
             source_resources = tuple(
                 (
                     str(item[0]),
@@ -696,20 +953,22 @@ class AgentFileSandbox:
                 for item in raw_resources
             )
             return WorkspaceFileProvenance(
-                owner_actor_id=str(row[0]),
-                origin_guild_id=str(row[1]) if row[1] is not None else None,
+                owner_actor_ids=owner_actor_ids,
+                origin_guild_id=str(row[2]) if row[2] is not None else None,
                 origin_channel_id=(
-                    str(row[2]) if row[2] is not None else None
-                ),
-                origin_message_id=(
                     str(row[3]) if row[3] is not None else None
                 ),
-                origin_visibility=_provenance_visibility(str(row[4])),
-                created_task_id=str(row[5]) if row[5] is not None else None,
-                sensitivity=_provenance_visibility(str(row[6])),
+                origin_message_id=(
+                    str(row[4]) if row[4] is not None else None
+                ),
+                origin_visibility=_provenance_visibility(str(row[5])),
+                created_task_id=str(row[6]) if row[6] is not None else None,
+                sensitivity=_provenance_visibility(str(row[7])),
                 source_resources=source_resources,
-                declassified_at=str(row[8]) if row[8] is not None else None,
-                declassified_by=str(row[9]) if row[9] is not None else None,
+                unlabelled_input=bool(row[9]),
+                sources_truncated=bool(row[10]),
+                declassified_at=str(row[11]) if row[11] is not None else None,
+                declassified_by=str(row[12]) if row[12] is not None else None,
             )
         except (IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise UserError("files.provenance_invalid") from exc
@@ -732,13 +991,16 @@ class AgentFileSandbox:
                 """
                 INSERT INTO file_provenance (
                     workspace_id, relative_path, owner_actor_id,
+                    owner_actor_ids_json,
                     origin_guild_id, origin_channel_id, origin_message_id,
                     origin_visibility, created_task_id, sensitivity,
-                    source_resources_json, declassified_at, declassified_by,
+                    source_resources_json, unlabelled_input,
+                    sources_truncated, declassified_at, declassified_by,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(workspace_id, relative_path) DO UPDATE SET
                     owner_actor_id = excluded.owner_actor_id,
+                    owner_actor_ids_json = excluded.owner_actor_ids_json,
                     origin_guild_id = excluded.origin_guild_id,
                     origin_channel_id = excluded.origin_channel_id,
                     origin_message_id = excluded.origin_message_id,
@@ -746,6 +1008,8 @@ class AgentFileSandbox:
                     created_task_id = excluded.created_task_id,
                     sensitivity = excluded.sensitivity,
                     source_resources_json = excluded.source_resources_json,
+                    unlabelled_input = excluded.unlabelled_input,
+                    sources_truncated = excluded.sources_truncated,
                     declassified_at = excluded.declassified_at,
                     declassified_by = excluded.declassified_by,
                     updated_at = excluded.updated_at
@@ -753,7 +1017,16 @@ class AgentFileSandbox:
                 (
                     workspace_id,
                     relative_path,
-                    payload["owner_actor_id"],
+                    (
+                        payload["owner_actor_ids"][0]
+                        if payload["owner_actor_ids"]
+                        else "unknown"
+                    ),
+                    json.dumps(
+                        payload["owner_actor_ids"],
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
                     payload["origin_guild_id"],
                     payload["origin_channel_id"],
                     payload["origin_message_id"],
@@ -765,6 +1038,8 @@ class AgentFileSandbox:
                         ensure_ascii=True,
                         separators=(",", ":"),
                     ),
+                    int(payload["unlabelled_input"]),
+                    int(payload["sources_truncated"]),
                     payload["declassified_at"],
                     payload["declassified_by"],
                     datetime.now(UTC).isoformat(),
@@ -804,11 +1079,41 @@ def _merge_file_provenance(
 ) -> WorkspaceFileProvenance:
     if existing is None:
         return incoming
-    source_resources = tuple(
+    all_owners = tuple(
+        sorted(set((*existing.owner_actor_ids, *incoming.owner_actor_ids)))
+    )
+    owners_truncated = len(all_owners) > 32
+    owner_actor_ids = all_owners[:32]
+    all_source_resources = tuple(
         dict.fromkeys((*existing.source_resources, *incoming.source_resources))
-    )[:32]
+    )
+    sources_truncated = (
+        existing.sources_truncated
+        or incoming.sources_truncated
+        or owners_truncated
+        or len(all_source_resources) > 32
+    )
+    source_resources = all_source_resources[:32]
+    unlabelled_input = (
+        existing.unlabelled_input or incoming.unlabelled_input
+    )
     sensitivities = {existing.sensitivity, incoming.sensitivity}
-    if "uncertain" in sensitivities:
+    origins_disagree = any(
+        left is not None and right is not None and left != right
+        for left, right in (
+            (existing.origin_guild_id, incoming.origin_guild_id),
+            (existing.origin_channel_id, incoming.origin_channel_id),
+            (existing.origin_message_id, incoming.origin_message_id),
+        )
+    )
+    private_origin_disagree = origins_disagree and not all_source_resources
+    if (
+        "uncertain" in sensitivities
+        or len(owner_actor_ids) != 1
+        or unlabelled_input
+        or sources_truncated
+        or private_origin_disagree
+    ):
         sensitivity: WorkspaceVisibility = "uncertain"
     elif "actor_private" in sensitivities:
         sensitivity = "actor_private"
@@ -817,7 +1122,7 @@ def _merge_file_provenance(
     else:
         sensitivity = "guild_public"
     return WorkspaceFileProvenance(
-        owner_actor_id=existing.owner_actor_id,
+        owner_actor_ids=owner_actor_ids,
         origin_guild_id=existing.origin_guild_id or incoming.origin_guild_id,
         origin_channel_id=(
             existing.origin_channel_id or incoming.origin_channel_id
@@ -829,6 +1134,8 @@ def _merge_file_provenance(
         created_task_id=existing.created_task_id or incoming.created_task_id,
         sensitivity=sensitivity,
         source_resources=source_resources,
+        unlabelled_input=unlabelled_input,
+        sources_truncated=sources_truncated,
     )
 
 
@@ -838,13 +1145,22 @@ def merge_file_provenances(
     """Conservatively combine every file source an arbitrary transform can read."""
 
     merged: WorkspaceFileProvenance | None = None
+    saw_unlabelled = False
     for provenance in provenances:
         if provenance is None:
+            saw_unlabelled = True
             continue
         merged = (
             provenance
             if merged is None
             else _merge_file_provenance(merged, provenance)
+        )
+    if saw_unlabelled:
+        unknown = unlabelled_file_provenance()
+        merged = (
+            unknown
+            if merged is None
+            else _merge_file_provenance(merged, unknown)
         )
     return merged
 

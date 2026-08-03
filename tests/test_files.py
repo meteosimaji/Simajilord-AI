@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+import sqlite3
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -12,9 +14,18 @@ import pytest
 from pypdf import PdfWriter
 
 from simajilord.capabilities.file_scope import file_provenance, file_workspace_id
+from simajilord.capabilities.files import (
+    FileReadRequest,
+    FileWriteTextRequest,
+    build_file_endpoints,
+)
 from simajilord.core import DisclosureObservation, InvocationContext
 from simajilord.core.errors import UserError
-from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
+from simajilord.services.files import (
+    AgentFileSandbox,
+    WorkspaceFileProvenance,
+    merge_file_provenances,
+)
 
 
 def _agent_file_context(
@@ -54,6 +65,244 @@ def test_agent_file_workspace_mode_isolates_actor_and_task() -> None:
     ) == "guild"
 
 
+@pytest.mark.asyncio
+async def test_actor_workspace_reuses_owned_files_across_tasks(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    endpoints = {
+        item.descriptor.name: item for item in build_file_endpoints(sandbox)
+    }
+    first_task = _agent_file_context(task_id="task-a", mode="actor")
+    second_task = _agent_file_context(task_id="task-b", mode="actor")
+
+    await endpoints["files.write_text"].invoke(
+        FileWriteTextRequest(path="notes.txt", content="shared by actor"),
+        first_task,
+    )
+    result = await endpoints["files.read"].invoke(
+        FileReadRequest(path="notes.txt"),
+        second_task,
+    )
+
+    assert result.content == "shared by actor"
+    assert result.provenance is not None
+    assert result.provenance.owner_actor_ids == ("actor-a",)
+
+
+def test_guild_shared_workspace_enforces_exact_actor_file_authority(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    actor_a = WorkspaceFileProvenance(owner_actor_ids=("actor-a",))
+    actor_b = WorkspaceFileProvenance(owner_actor_ids=("actor-b",))
+    sandbox.import_bytes("guild", "a.txt", b"a", provenance=actor_a)
+    sandbox.import_bytes("guild", "b.txt", b"b", provenance=actor_b)
+
+    assert tuple(
+        record.path for record in sandbox.list_for_actor("guild", "actor-a")
+    ) == ("a.txt",)
+    assert sandbox.read_for_actor(
+        "guild",
+        "actor-a",
+        "a.txt",
+        offset=0,
+        max_characters=100,
+    ).content == "a"
+    with pytest.raises(UserError, match=r"files\.not_found"):
+        sandbox.read_for_actor(
+            "guild",
+            "actor-a",
+            "b.txt",
+            offset=0,
+            max_characters=100,
+        )
+    with pytest.raises(UserError, match=r"files\.not_found"):
+        sandbox.snapshot_for_actor_delivery_with_provenance(
+            "guild",
+            "actor-a",
+            "b.txt",
+        )
+    with pytest.raises(UserError, match=r"files\.path_conflict"):
+        sandbox.write_text_for_actor(
+            "guild",
+            "actor-a",
+            "b.txt",
+            "overwrite",
+            provenance=actor_a,
+        )
+    with pytest.raises(UserError, match=r"files\.path_conflict"):
+        sandbox.import_bytes(
+            "guild",
+            "b.txt",
+            b"overwrite",
+            provenance=actor_a,
+        )
+
+    assert sandbox.read_for_actor(
+        "guild",
+        "actor-b",
+        "b.txt",
+        offset=0,
+        max_characters=100,
+    ).content == "b"
+
+
+def test_unlabelled_legacy_file_is_hidden_until_ownership_is_assigned(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    record = sandbox.import_bytes("guild", "legacy.txt", b"legacy")
+
+    assert record.provenance is not None
+    assert record.provenance.unlabelled_input
+    assert record.provenance.sensitivity == "uncertain"
+    assert sandbox.list_for_actor("guild", "actor") == ()
+    with pytest.raises(UserError, match=r"files\.not_found"):
+        sandbox.read_for_actor(
+            "guild",
+            "actor",
+            "legacy.txt",
+            offset=0,
+            max_characters=100,
+        )
+
+
+def test_provenance_merge_retains_all_owners_and_taints_missing_or_overflow() -> None:
+    actor_a = WorkspaceFileProvenance(owner_actor_ids=("actor-a",))
+    actor_b = WorkspaceFileProvenance(owner_actor_ids=("actor-b",))
+    multi_owner = merge_file_provenances((actor_a, actor_b))
+
+    assert multi_owner is not None
+    assert multi_owner.owner_actor_ids == ("actor-a", "actor-b")
+    assert multi_owner.sensitivity == "uncertain"
+
+    unlabelled = merge_file_provenances((actor_a, None))
+    assert unlabelled is not None
+    assert unlabelled.owner_actor_ids == ("actor-a",)
+    assert unlabelled.unlabelled_input
+    assert unlabelled.sensitivity == "uncertain"
+
+    public_sources = tuple(
+        ("guild", f"public-{index}", "guild_public")
+        for index in range(20)
+    )
+    restricted_sources = tuple(
+        ("guild", f"staff-{index}", "restricted")
+        for index in range(20)
+    )
+    overflow = merge_file_provenances(
+        (
+            WorkspaceFileProvenance(
+                owner_actor_ids=("actor-a",),
+                sensitivity="guild_public",
+                source_resources=public_sources,
+            ),
+            WorkspaceFileProvenance(
+                owner_actor_ids=("actor-a",),
+                sensitivity="restricted",
+                source_resources=restricted_sources,
+            ),
+        )
+    )
+    assert overflow is not None
+    assert len(overflow.source_resources) == 32
+    assert overflow.sources_truncated
+    assert overflow.sensitivity == "uncertain"
+
+
+def test_provenance_schema_migrates_legacy_single_owner_rows(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "files"
+    database = root.with_name("files.provenance.sqlite3")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE file_provenance (
+                workspace_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                owner_actor_id TEXT NOT NULL,
+                origin_guild_id TEXT,
+                origin_channel_id TEXT,
+                origin_message_id TEXT,
+                origin_visibility TEXT NOT NULL,
+                created_task_id TEXT,
+                sensitivity TEXT NOT NULL,
+                source_resources_json TEXT NOT NULL,
+                declassified_at TEXT,
+                declassified_by TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, relative_path)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO file_provenance VALUES (
+                ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, NULL, ?
+            )
+            """,
+            (
+                "guild",
+                "legacy.txt",
+                "actor-a",
+                "actor_private",
+                "actor_private",
+                json.dumps([]),
+                "2026-08-03T00:00:00+00:00",
+            ),
+        )
+
+    sandbox = AgentFileSandbox(root)
+    provenance = sandbox._load_provenance("guild", "legacy.txt")
+
+    assert provenance is not None
+    assert provenance.owner_actor_ids == ("actor-a",)
+    assert not provenance.unlabelled_input
+    with sqlite3.connect(database) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(file_provenance)"
+            )
+        }
+    assert {
+        "owner_actor_ids_json",
+        "unlabelled_input",
+        "sources_truncated",
+    } <= columns
+
+
+def test_uncertain_and_multi_owner_provenance_survives_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "files"
+    sandbox = AgentFileSandbox(root)
+    sandbox.import_bytes("guild", "unlabelled.txt", b"unlabelled")
+    sandbox.import_bytes(
+        "guild",
+        "multi.txt",
+        b"multi",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("actor-a", "actor-b"),
+        ),
+    )
+
+    restarted = AgentFileSandbox(root)
+    records = {record.path: record for record in restarted.list("guild")}
+
+    unlabelled = records["unlabelled.txt"].provenance
+    assert unlabelled is not None
+    assert unlabelled.owner_actor_ids == ()
+    assert unlabelled.unlabelled_input
+    assert unlabelled.sensitivity == "uncertain"
+    multi = records["multi.txt"].provenance
+    assert multi is not None
+    assert multi.owner_actor_ids == ("actor-a", "actor-b")
+    assert multi.sensitivity == "uncertain"
+
+
 def test_file_provenance_persists_and_cannot_be_downgraded(
     tmp_path: Path,
 ) -> None:
@@ -78,7 +327,7 @@ def test_file_provenance_persists_and_cannot_be_downgraded(
         provenance=restricted,
     )
     public = WorkspaceFileProvenance(
-        owner_actor_id=context.actor_id,
+        owner_actor_ids=(context.actor_id,),
         origin_guild_id="guild",
         origin_channel_id="public-channel",
         origin_visibility="guild_public",
@@ -110,10 +359,15 @@ def test_provenance_failure_does_not_commit_new_bytes(
     tmp_path: Path,
 ) -> None:
     sandbox = AgentFileSandbox(tmp_path / "files")
-    sandbox.import_bytes("scope", "notes.txt", b"old")
     provenance = WorkspaceFileProvenance(
-        owner_actor_id="actor",
+        owner_actor_ids=("actor",),
         sensitivity="restricted",
+    )
+    sandbox.import_bytes(
+        "scope",
+        "notes.txt",
+        b"old",
+        provenance=provenance,
     )
 
     def fail_store(*_args: object, **_kwargs: object) -> None:
