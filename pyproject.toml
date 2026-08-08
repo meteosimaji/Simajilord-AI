@@ -14,7 +14,7 @@ dependencies = [
   "discord.py==2.7.1",
   "pillow>=11.3,<13",
   "pynacl>=1.6.2,<1.7",
-  "pypdf>=6.6,<7",
+  "pypdf>=6.15.0,<7",
   "python-dotenv>=1.1.1,<2",
   "yt-dlp",
   "yt-dlp-ejs==0.8.0",
