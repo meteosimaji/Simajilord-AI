@@ -357,16 +357,14 @@ def security_policy_warnings(settings: Settings) -> tuple[str, ...]:
         )
     if (
         settings.agent_file_workspace_mode is AgentFileWorkspaceMode.GUILD_SHARED
-        and settings.agent_information_flow_mode
-        is not AgentInformationFlowMode.ENFORCE
+        and settings.agent_information_flow_mode is not AgentInformationFlowMode.ENFORCE
     ):
         warnings.append(
             "Unsafe combination: guild_shared files and non-enforcing information "
             "flow widen both the data namespace and its possible disclosure path."
         )
     if (
-        settings.agent_high_risk_authorization_mode
-        is AgentHighRiskAuthorizationMode.LEGACY_EVENT
+        settings.agent_high_risk_authorization_mode is AgentHighRiskAuthorizationMode.LEGACY_EVENT
         and (
             settings.agent_isolated_shell_access is not AgentFeatureAccess.DISABLED
             or settings.agent_connector_access is not AgentFeatureAccess.DISABLED
@@ -672,9 +670,19 @@ def _security_preset(
             "AGENT_SECURITY_PRESET_EXPIRES_AT is required when "
             "AGENT_SECURITY_PRESET=legacy_compatibility."
         )
+    if configured is not AgentSecurityPreset.LEGACY_COMPATIBILITY and expires_at is not None:
+        raise ConfigurationError(
+            "AGENT_SECURITY_PRESET_EXPIRES_AT is valid only when "
+            "AGENT_SECURITY_PRESET=legacy_compatibility. Remove the stale expiry "
+            "before selecting another preset."
+        )
 
     normalized_now = now.astimezone(UTC)
-    expired = expires_at is not None and expires_at <= normalized_now
+    expired = (
+        configured is AgentSecurityPreset.LEGACY_COMPATIBILITY
+        and expires_at is not None
+        and expires_at <= normalized_now
+    )
     effective = AgentSecurityPreset.GUILD_ASSISTANT if expired else configured
     return configured, effective, expires_at, expired
 

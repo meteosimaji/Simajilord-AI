@@ -13,7 +13,7 @@ import logging
 import math
 import secrets
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import datetime
 from enum import Enum
@@ -32,6 +32,7 @@ from simajilord.core import (
 from simajilord.core.errors import CapabilityError
 
 from .actions import ActionReceipt, ActionReceiptService
+from .contracts import expand_agent_grants
 from .errors import AgentToolError
 
 _TOOL_NAMESPACE = "simajilord"
@@ -130,6 +131,7 @@ class AgentToolCatalog:
         destructive_capabilities: Sequence[str] = (),
         image_output_capabilities: Sequence[str] = (),
         action_receipts: ActionReceiptService | None = None,
+        lease_consumer: (Callable[[str, object, InvocationContext], Awaitable[None]] | None) = None,
     ) -> None:
         self._registry = registry
         self._allowed_capabilities = tuple(allowed_capabilities)
@@ -159,6 +161,7 @@ class AgentToolCatalog:
         self._destructive_capabilities = frozenset(destructive_capabilities)
         self._image_output_capabilities = frozenset(image_output_capabilities)
         self._action_receipts = action_receipts
+        self._lease_consumer = lease_consumer
         # Opaque discovery proofs are scoped to this runtime instance and one
         # stable InvocationContext. The model can copy them but cannot mint a
         # contract without first calling capability_describe.
@@ -246,6 +249,13 @@ class AgentToolCatalog:
             arguments=arguments,
         )
         return capability_name if capability_name in self._write_capabilities else None
+
+    def required_grant(self, capability_name: str) -> str | None:
+        """Return the explicit effective authority for diagnostics and leases."""
+
+        if capability_name not in self._allowed_capabilities:
+            raise AgentToolError("The capability is not allowed.")
+        return self._required_grants.get(capability_name)
 
     def authorization_event_id_for_call(
         self,
@@ -774,11 +784,6 @@ class AgentToolCatalog:
             raise AgentToolError("Capability description catalog_id must be text.")
         if not isinstance(capability_name, str) or not capability_name:
             raise AgentToolError("Capability description name must be text.")
-        if (
-            capability_name not in self._allowed_capabilities
-            or self._unavailable_reason(capability_name, context) is not None
-        ):
-            raise AgentToolError("The capability is not available for this turn.")
         available_catalog = tuple(
             item
             for item in self._registry.all()
@@ -793,6 +798,11 @@ class AgentToolCatalog:
             context=context,
             secret=self._discovery_secret,
         )
+        if (
+            capability_name not in self._allowed_capabilities
+            or self._unavailable_reason(capability_name, context) is not None
+        ):
+            raise AgentToolError("The capability is not available for this turn.")
         endpoint = self._validated_endpoint(capability_name, context)
         if before_invoke is not None:
             before_invoke()
@@ -956,6 +966,18 @@ class AgentToolCatalog:
         request = _build_dataclass(endpoint.request_type, arguments)
         if before_invoke is not None:
             before_invoke()
+        if any(
+            capability == capability_name
+            for capability, _lease_id, _revision in context.capability_lease_bindings
+        ):
+            if self._lease_consumer is None:
+                raise AgentToolError("The capability lease verifier is unavailable.")
+            try:
+                await self._lease_consumer(capability_name, request, context)
+            except Exception as exc:
+                raise AgentToolError(
+                    "The capability lease is expired, exhausted, revoked, or outside its target."
+                ) from exc
         effect = None
         tracks_external_effect = (
             self._action_receipts is not None and capability_name in self._write_capabilities
@@ -1137,8 +1159,14 @@ class AgentToolCatalog:
             return "policy_denied"
 
         required_grant = self._required_grants.get(capability_name)
-        has_grant = required_grant is None or (
-            context is not None and required_grant in context.grants
+        has_lease = context is not None and any(
+            leased_capability == capability_name
+            for leased_capability, _lease_id, _revision in context.capability_lease_bindings
+        )
+        has_grant = (
+            required_grant is None
+            or (context is not None and required_grant in expand_agent_grants(context.grants))
+            or has_lease
         )
         if not has_grant:
             return "missing_grant"
@@ -1496,6 +1524,10 @@ def _capability_discovery_scope(context: InvocationContext) -> str:
             context.request_id,
             context.origin_resource_id or "",
             context.active_message_id or "",
+            *(
+                f"{name}:{lease_id}:{revision}"
+                for name, lease_id, revision in context.capability_lease_bindings
+            ),
             *context.resource_ids,
         )
     )

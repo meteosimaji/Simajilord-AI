@@ -184,7 +184,18 @@ with Discord's generic “interaction failed” banner.
   combinations are emitted as critical startup warnings and warning-tone status fields.
   `legacy_compatibility` requires `AGENT_SECURITY_PRESET_EXPIRES_AT`; after that RFC 3339 instant
   its preset defaults revert to `guild_assistant` while separately configured overrides remain
-  visible for review
+  visible for review. The expiry setting is accepted only with `legacy_compatibility`; startup
+  fails explicitly if a stale expiry remains while another preset is selected
+- Agent authority is split into explicit least-privilege grants: file read/private-write/
+  publish/send/delete, connector read/write/destructive, and Discord message/DM/thread/role/
+  channel/guild-resource operations. The former `files`, `connectors`, and `discord_message`
+  grants remain compatibility aliases; `system.status` reports configured grants separately
+  from their effective narrow expansion. A durable, body-free capability-lease store can expose
+  one configured capability to an actor, role, or service for one workspace and optional task/
+  channel/repository/connector/file-publication target, bounded expiry, and finite use count.
+  Leases cannot exceed the runtime or delegator ceiling, never alter an in-flight catalog,
+  cannot be created by autonomous turns, and do not bypass write approval, high-risk review,
+  information-flow, egress, External Effect, or Action Receipt checks
 - A quota-bound file workspace isolated by Discord server, actor, and durable task by default:
   the agent can import Discord attachments,
   download a bounded public document through the same SSRF-safe fetcher, inspect PDF/ZIP/text
@@ -207,7 +218,13 @@ with Discord's generic “interaction failed” banner.
   then creates a separate immutable copy whose ledger binds publisher, reason, target, audience
   revision, expiry, and revocation state; the original bytes and provenance remain unchanged.
   `discord.send_published_file` rechecks the same target, live readers, expiry, revision, and
-  revocation immediately before delivery. A private-thread member addition uses the same
+  revocation immediately before delivery. Managed sends are also CAS-bound to the SHA-256 or
+  publication revision shown at selection time. Mutating file-manager controls claim one use
+  before their first await, and publication confirmation IDs are durably consumed so a replay
+  cannot create another copy. `files.recent_activity` provides actor-and-guild-scoped,
+  body-free, cursor-paged copy/publish/send/delete/revoke history even after a private file is
+  deleted; it stores only bounded display filenames rather than raw paths. A private-thread
+  member addition uses the same
   short-lived host snapshot and shows the target, reader-count expansion, and retained-history
   exposure in the existing requester-private high-risk review.
   PDF reads select

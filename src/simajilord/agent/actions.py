@@ -745,6 +745,9 @@ _REVERSIBLE_POLICIES = (
 NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
     {
         "action.undo",
+        "authority.request",
+        "authority.lease_create",
+        "authority.lease_revoke",
         "audio.play",
         "audio.control",
         "audio.mix",

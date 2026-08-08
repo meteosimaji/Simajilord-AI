@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from simajilord.agent.contracts import expand_agent_grants
 from simajilord.config import EffectiveSecurityPolicy
 from simajilord.core import (
     CapabilityDescriptor,
@@ -64,6 +65,10 @@ class StatusResponse:
     security_preset_expires_at_epoch: int | None
     security_preset_expired: bool
     security_override_names: tuple[str, ...]
+    security_configured_grants: tuple[str, ...]
+    security_effective_grants: tuple[str, ...]
+    security_active_lease_count: int
+    security_active_lease_metadata: tuple[str, ...]
     security_agent_enabled: bool
     security_file_sandbox_enabled: bool
     security_file_workspace_mode: str
@@ -92,10 +97,12 @@ def build_status_endpoint(
     agent_enabled: bool,
     security_policy: EffectiveSecurityPolicy,
     agent_metrics: Callable[[], Mapping[str, int]] | None = None,
+    active_lease_count: Callable[[InvocationContext], int] | None = None,
+    active_lease_metadata: Callable[[InvocationContext], tuple[str, ...]] | None = None,
     speech_provider: str,
     speech_voice: str,
 ) -> CapabilityEndpoint:
-    async def status(_: StatusRequest, __: InvocationContext) -> StatusResponse:
+    async def status(_: StatusRequest, context: InvocationContext) -> StatusResponse:
         web_ready, web_backend, _web_warning = await web.status()
         maintenance_report = maintenance.last_report
         diagnostics = await journal.operation_diagnostics()
@@ -159,14 +166,20 @@ def build_status_endpoint(
             security_preset_expires_at_epoch=security_policy.preset_expires_at_epoch,
             security_preset_expired=security_policy.preset_expired,
             security_override_names=security_policy.override_names,
+            security_configured_grants=tuple(sorted(context.grants)),
+            security_effective_grants=tuple(sorted(expand_agent_grants(context.grants))),
+            security_active_lease_count=(
+                active_lease_count(context) if active_lease_count is not None else 0
+            ),
+            security_active_lease_metadata=(
+                active_lease_metadata(context) if active_lease_metadata is not None else ()
+            ),
             security_agent_enabled=security_policy.agent_enabled,
             security_file_sandbox_enabled=security_policy.file_sandbox_enabled,
             security_file_workspace_mode=security_policy.file_workspace_mode,
             security_information_flow_mode=security_policy.information_flow_mode,
             security_read_aloud_audience_mode=security_policy.read_aloud_audience_mode,
-            security_high_risk_authorization_mode=(
-                security_policy.high_risk_authorization_mode
-            ),
+            security_high_risk_authorization_mode=(security_policy.high_risk_authorization_mode),
             security_autonomy_enabled=security_policy.autonomy_enabled,
             security_autonomy_mode=security_policy.autonomy_mode,
             security_autonomy_policy_mode=security_policy.autonomy_policy_mode,

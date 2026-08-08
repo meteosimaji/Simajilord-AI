@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 import discord
 
+from simajilord.core.errors import UserError
 from simajilord.services.files import (
     WorkspaceFileAction,
     WorkspaceManagedFile,
@@ -26,6 +28,10 @@ HistoryCallback = Callable[
     [WorkspaceManagedFile, discord.Interaction],
     Awaitable[tuple[WorkspaceFileAction, ...]],
 ]
+RecentActivityCallback = Callable[
+    [discord.Interaction],
+    Awaitable[tuple[WorkspaceFileAction, ...]],
+]
 InteractionHandler = Callable[[discord.Interaction], Awaitable[None]]
 
 
@@ -35,7 +41,8 @@ class FileManagerPublishReview:
 
     target_display_name: str
     new_reader_count: int
-    expires_at_iso: str
+    copy_expires_at_iso: str
+    confirmation_expires_at_iso: str
     payload: object
 
 
@@ -60,6 +67,7 @@ class FileManagerCallbacks:
     send: FileActionCallback
     delete_or_revoke: FileActionCallback
     history: HistoryCallback
+    recent_activity: RecentActivityCallback
 
 
 def file_manager_launcher_embed() -> discord.Embed:
@@ -202,6 +210,7 @@ class FileManagerPrivateView(discord.ui.View):
         self.page = 0
         self.selected_ref: str | None = None
         self.status: str | None = None
+        self._busy = False
         self._rebuild_items()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -379,6 +388,13 @@ class FileManagerPrivateView(discord.ui.View):
             row=4,
         )
         self.add_item(history_button)
+        recent_activity_button = _FileManagerButton(
+            handler=self._recent_activity,
+            label="Recent activity",
+            style=discord.ButtonStyle.secondary,
+            row=4,
+        )
+        self.add_item(recent_activity_button)
 
     def render_embed(self) -> discord.Embed:
         selected = self._selected_file()
@@ -395,9 +411,7 @@ class FileManagerPrivateView(discord.ui.View):
             embed.add_field(
                 name=self.section.title(),
                 value=(
-                    "Select a file above."
-                    if self._section_files()
-                    else "No files in this section."
+                    "Select a file above." if self._section_files() else "No files in this section."
                 ),
                 inline=False,
             )
@@ -465,9 +479,18 @@ class FileManagerPrivateView(discord.ui.View):
         selected = self._selected_file()
         if selected is None:
             return
-        await interaction.response.defer()
-        status = await self.callbacks.copy_to_task(selected, interaction)
-        await self._reload(interaction, status=status)
+        if not self._claim_busy():
+            await _send_ephemeral(
+                interaction,
+                "Another file action is already running. Wait for it to finish.",
+            )
+            return
+        try:
+            await interaction.response.defer()
+            status = await self.callbacks.copy_to_task(selected, interaction)
+            await self._reload(interaction, status=status)
+        finally:
+            self._busy = False
 
     async def _inspect_publish(self, interaction: discord.Interaction) -> None:
         selected = self._selected_file()
@@ -480,7 +503,11 @@ class FileManagerPrivateView(discord.ui.View):
             callbacks=self.callbacks,
             file=selected,
             review=review,
-            timeout=float(self.timeout or 900),
+            timeout=_confirmation_timeout(
+                review.confirmation_expires_at_iso,
+                maximum=float(self.timeout or 900),
+            ),
+            origin_interaction=interaction,
         )
         embed = discord.Embed(
             title="Confirm publication copy",
@@ -493,7 +520,14 @@ class FileManagerPrivateView(discord.ui.View):
         embed.add_field(name="File", value=_bounded(selected.filename, 1_024))
         embed.add_field(name="Target", value=_bounded(review.target_display_name, 1_024))
         embed.add_field(name="New readers", value=str(review.new_reader_count))
-        embed.add_field(name="Expires", value=_display_time(review.expires_at_iso))
+        embed.add_field(
+            name="Copy expires",
+            value=_display_time(review.copy_expires_at_iso),
+        )
+        embed.add_field(
+            name="Confirm by",
+            value=_display_time(review.confirmation_expires_at_iso),
+        )
         await interaction.edit_original_response(
             embed=embed,
             view=view,
@@ -504,10 +538,19 @@ class FileManagerPrivateView(discord.ui.View):
         selected = self._selected_file()
         if selected is None:
             return
-        await interaction.response.defer()
-        self.status = await self.callbacks.send(selected, interaction)
-        self._rebuild_items()
-        await interaction.edit_original_response(embed=self.render_embed(), view=self)
+        if not self._claim_busy():
+            await _send_ephemeral(
+                interaction,
+                "Another file action is already running. Wait for it to finish.",
+            )
+            return
+        try:
+            await interaction.response.defer()
+            self.status = await self.callbacks.send(selected, interaction)
+            self._rebuild_items()
+            await interaction.edit_original_response(embed=self.render_embed(), view=self)
+        finally:
+            self._busy = False
 
     async def _confirm_delete(self, interaction: discord.Interaction) -> None:
         selected = self._selected_file()
@@ -529,6 +572,7 @@ class FileManagerPrivateView(discord.ui.View):
             callback=self.callbacks.delete_or_revoke,
             file=selected,
             timeout=float(self.timeout or 900),
+            origin_interaction=interaction,
         )
         await interaction.response.send_message(
             embed=embed,
@@ -550,14 +594,36 @@ class FileManagerPrivateView(discord.ui.View):
         if not actions:
             embed.description = "No copy, publish, send, delete, or revoke actions yet."
         else:
-            embed.description = "\n".join(
-                f"• {_display_time(item.occurred_at)} — {item.summary}"
-                for item in actions[:20]
-            )
+            embed.description = render_file_action_history(actions[:20])
         await interaction.edit_original_response(
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    async def _recent_activity(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        actions = await self.callbacks.recent_activity(interaction)
+        embed = discord.Embed(
+            title="Recent file activity",
+            colour=discord.Colour.blurple(),
+        )
+        embed.description = (
+            render_file_action_history(actions, include_filenames=True)
+            if actions
+            else "No copy, publish, send, delete, or revoke actions yet."
+        )
+        await interaction.edit_original_response(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    def _claim_busy(self) -> bool:
+        """Synchronously claim a mutating private-view action before its first await."""
+
+        if self._busy:
+            return False
+        self._busy = True
+        return True
 
     async def _reload(self, interaction: discord.Interaction, *, status: str) -> None:
         self.catalog = await self.callbacks.catalog(interaction)
@@ -575,7 +641,83 @@ class FileManagerPrivateView(discord.ui.View):
         await interaction.edit_original_response(embed=self.render_embed(), view=self)
 
 
-class FileManagerPublishConfirmationView(discord.ui.View):
+class _FileManagerConfirmationView(discord.ui.View):
+    """One-way confirmation claim shared by publication and deletion controls."""
+
+    def __init__(
+        self,
+        *,
+        requester_id: int,
+        timeout: float,
+        origin_interaction: discord.Interaction,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.requester_id = requester_id
+        self._origin_interaction = origin_interaction
+        self._claimed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await _send_ephemeral(
+            interaction,
+            "Only the requester can use this confirmation.",
+        )
+        return False
+
+    async def _claim(self, interaction: discord.Interaction) -> bool:
+        if self._claimed:
+            await _send_ephemeral(
+                interaction,
+                "This confirmation has already been used. Refresh the file manager.",
+            )
+            return False
+        self._claimed = True
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+        return True
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        del item
+        reference_id = f"ferr_{uuid.uuid4().hex[:12]}"
+        log.exception(
+            "Discord file confirmation failed reference=%s",
+            reference_id,
+            exc_info=error,
+        )
+        message = _confirmation_error_message(error)
+        if message.startswith("The file action failed."):
+            message = f"{message} Reference: {reference_id}."
+        try:
+            await interaction.edit_original_response(
+                content=message,
+                embed=None,
+                view=None,
+            )
+        except discord.DiscordException:
+            await _send_ephemeral(interaction, message)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        self._claimed = True
+        self.stop()
+        try:
+            await self._origin_interaction.edit_original_response(
+                content="This confirmation expired. Inspect the file and target again.",
+                embed=None,
+                view=None,
+            )
+        except discord.DiscordException:
+            log.info("Expired file confirmation could not remove its stale controls")
+
+
+class FileManagerPublishConfirmationView(_FileManagerConfirmationView):
     def __init__(
         self,
         *,
@@ -584,15 +726,16 @@ class FileManagerPublishConfirmationView(discord.ui.View):
         file: WorkspaceManagedFile,
         review: FileManagerPublishReview,
         timeout: float,
+        origin_interaction: discord.Interaction,
     ) -> None:
-        super().__init__(timeout=timeout)
-        self.requester_id = requester_id
+        super().__init__(
+            requester_id=requester_id,
+            timeout=timeout,
+            origin_interaction=origin_interaction,
+        )
         self.callbacks = callbacks
         self.file = file
         self.review = review
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.requester_id
 
     @discord.ui.button(label="Publish exact copy", style=discord.ButtonStyle.danger)
     async def confirm(
@@ -600,6 +743,8 @@ class FileManagerPublishConfirmationView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button[FileManagerPublishConfirmationView],
     ) -> None:
+        if not await self._claim(interaction):
+            return
         await interaction.response.defer()
         status = await self.callbacks.publish(self.file, self.review, interaction)
         self.stop()
@@ -611,6 +756,8 @@ class FileManagerPublishConfirmationView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button[FileManagerPublishConfirmationView],
     ) -> None:
+        if not await self._claim(interaction):
+            return
         self.stop()
         await interaction.response.edit_message(
             content="Publication cancelled.",
@@ -619,7 +766,7 @@ class FileManagerPublishConfirmationView(discord.ui.View):
         )
 
 
-class FileManagerDeleteConfirmationView(discord.ui.View):
+class FileManagerDeleteConfirmationView(_FileManagerConfirmationView):
     def __init__(
         self,
         *,
@@ -627,14 +774,15 @@ class FileManagerDeleteConfirmationView(discord.ui.View):
         callback: FileActionCallback,
         file: WorkspaceManagedFile,
         timeout: float,
+        origin_interaction: discord.Interaction,
     ) -> None:
-        super().__init__(timeout=timeout)
-        self.requester_id = requester_id
+        super().__init__(
+            requester_id=requester_id,
+            timeout=timeout,
+            origin_interaction=origin_interaction,
+        )
         self.callback = callback
         self.file = file
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        return interaction.user.id == self.requester_id
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(
@@ -642,6 +790,8 @@ class FileManagerDeleteConfirmationView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button[FileManagerDeleteConfirmationView],
     ) -> None:
+        if not await self._claim(interaction):
+            return
         await interaction.response.defer()
         status = await self.callback(self.file, interaction)
         self.stop()
@@ -653,6 +803,8 @@ class FileManagerDeleteConfirmationView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button[FileManagerDeleteConfirmationView],
     ) -> None:
+        if not await self._claim(interaction):
+            return
         self.stop()
         await interaction.response.edit_message(
             content="No file action was taken.",
@@ -683,3 +835,88 @@ def _display_time(value: str) -> str:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return "Unknown"
     return discord.utils.format_dt(parsed, style="R")
+
+
+def _confirmation_timeout(value: str, *, maximum: float) -> float:
+    """Bound a view lifetime to the signed confirmation's remaining lifetime."""
+
+    try:
+        expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        return 1.0
+    remaining = (expiry.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+    return max(1.0, min(maximum, remaining))
+
+
+async def _send_ephemeral(
+    interaction: discord.Interaction,
+    message: str,
+) -> None:
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+def _confirmation_error_message(error: Exception) -> str:
+    if isinstance(error, UserError):
+        messages = {
+            "files.publication_confirmation_expired": (
+                "This confirmation expired. Inspect the file and target again."
+            ),
+            "files.publication_confirmation_replayed": (
+                "This confirmation was already used. Inspect the file again for a fresh copy."
+            ),
+            "files.publication_audience_changed": (
+                "The target audience changed. Inspect the target again before publishing."
+            ),
+            "files.hash_conflict": (
+                "The selected file changed. Refresh the file manager and review it again."
+            ),
+            "files.publication_revision_conflict": (
+                "The publication changed. Refresh the file manager before continuing."
+            ),
+        }
+        if error.code in messages:
+            return messages[error.code]
+    return "The file action failed. Refresh the file manager and try again."
+
+
+def render_file_action_history(
+    actions: tuple[WorkspaceFileAction, ...],
+    *,
+    include_filenames: bool = False,
+    maximum: int = 4_096,
+) -> str:
+    """Render complete action lines without ever exceeding Discord's description bound."""
+
+    if maximum < 1:
+        raise ValueError("history maximum must be positive")
+    lines = [
+        (
+            f"• {_display_time(item.occurred_at)} · {_bounded(item.display_filename, 180)} "
+            f"— {item.summary}"
+            if include_filenames
+            else f"• {_display_time(item.occurred_at)} — {item.summary}"
+        )
+        for item in actions
+    ]
+    selected: list[str] = []
+    for line in lines:
+        candidate = "\n".join((*selected, line))
+        if len(candidate) > maximum:
+            break
+        selected.append(line)
+    omitted = len(lines) - len(selected)
+    while omitted > 0:
+        marker = f"… {omitted} more actions omitted"
+        candidate = "\n".join((*selected, marker))
+        if len(candidate) <= maximum:
+            return candidate
+        if not selected:
+            return ""
+        selected.pop()
+        omitted += 1
+    return "\n".join(selected)

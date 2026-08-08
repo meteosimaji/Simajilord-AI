@@ -29,6 +29,31 @@ class _PresentationSpec:
 
 
 _SPECS: dict[str, _PresentationSpec] = {
+    "authority.lease_create": _PresentationSpec(
+        "Create a temporary capability lease",
+        "One actor, role, or service principal",
+        target_keys=(
+            "grantee_kind",
+            "grantee_id",
+            "agent_task_id",
+            "target_kind",
+            "target_id",
+        ),
+        payload_keys=("capabilities", "grants", "expires_at_iso", "max_uses", "reason"),
+        audience=(
+            "Only the private requester review and the selected grantee receive "
+            "authority metadata."
+        ),
+        external_transfer="No external service is called; the bounded lease is stored locally.",
+    ),
+    "authority.lease_revoke": _PresentationSpec(
+        "Revoke a temporary capability lease",
+        "One opaque local lease",
+        target_keys=("lease_id",),
+        payload_keys=("expected_revision",),
+        audience="The selected grantee loses future use after revocation.",
+        external_transfer="No external service is called; local authority is revoked.",
+    ),
     "connector.destructive": _PresentationSpec(
         "Run a destructive connector action",
         "One configured external connector",

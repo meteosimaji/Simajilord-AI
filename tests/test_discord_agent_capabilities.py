@@ -12,6 +12,7 @@ import discord
 import pytest
 
 from simajilord.agent.tools import AgentToolCatalog
+from simajilord.capabilities.files import FileCatalogResponse
 from simajilord.capabilities.speech import SpeechSpeakRequest
 from simajilord.core import (
     CapabilityRegistry,
@@ -36,6 +37,7 @@ from simajilord.integrations.discord.capabilities import (
     DiscordSearchMessagesRequest,
     DiscordSendEmbedRequest,
     DiscordSendManagedFileRequest,
+    DiscordSendManagedFileResponse,
     DiscordSendMessageRequest,
     DiscordSendPublishedFileRequest,
     DiscordThreadAudienceInspectRequest,
@@ -45,7 +47,10 @@ from simajilord.integrations.discord.capabilities import (
     FilePublishTargetInspectRequest,
     build_discord_endpoints,
 )
-from simajilord.integrations.discord.file_manager import FileManagerLauncherView
+from simajilord.integrations.discord.file_manager import (
+    FileManagerLauncherView,
+    FileManagerPrivateView,
+)
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox, WorkspaceFileProvenance
 
@@ -103,36 +108,20 @@ def test_discord_staged_search_tools_explain_filters_and_continuation() -> None:
     }
     search_properties = cast(
         dict[str, dict[str, object]],
-        cast(dict[str, object], tools["discord_search_messages"]["inputSchema"])[
-            "properties"
-        ],
+        cast(dict[str, object], tools["discord_search_messages"]["inputSchema"])["properties"],
     )
     read_properties = cast(
         dict[str, dict[str, object]],
-        cast(dict[str, object], tools["discord_read_messages"]["inputSchema"])[
-            "properties"
-        ],
+        cast(dict[str, object], tools["discord_read_messages"]["inputSchema"])["properties"],
     )
 
-    assert "not semantic paraphrase search" in str(
-        search_properties["content"]["description"]
-    )
-    assert "next_before_message_id" in str(
-        search_properties["before_message_id"]["description"]
-    )
+    assert "not semantic paraphrase search" in str(search_properties["content"]["description"])
+    assert "next_before_message_id" in str(search_properties["before_message_id"]["description"])
     assert "next_offset" in str(search_properties["offset"]["description"])
-    assert "next_after_message_id" in str(
-        search_properties["after_message_id"]["description"]
-    )
-    assert "both requester and bot" in str(
-        search_properties["channel_ids"]["description"]
-    )
-    assert "next_before_message_id" in str(
-        read_properties["before_message_id"]["description"]
-    )
-    assert "total_results is approximate" in str(
-        tools["discord_search_messages"]["description"]
-    )
+    assert "next_after_message_id" in str(search_properties["after_message_id"]["description"])
+    assert "both requester and bot" in str(search_properties["channel_ids"]["description"])
+    assert "next_before_message_id" in str(read_properties["before_message_id"]["description"])
+    assert "total_results is approximate" in str(tools["discord_search_messages"]["description"])
     assert {
         "discord_list_servers",
         "discord_list_channels",
@@ -157,25 +146,17 @@ def test_discord_research_capabilities_are_found_from_natural_japanese() -> None
         }:
             registry.register(item)
 
-    past = {
-        item.descriptor.name
-        for item in registry.search("過去のメッセージを探す", limit=3)
-    }
+    past = {item.descriptor.name for item in registry.search("過去のメッセージを探す", limit=3)}
     popularity = {
-        item.descriptor.name
-        for item in registry.search("このサーバーで人気の理由を分析", limit=3)
+        item.descriptor.name for item in registry.search("このサーバーで人気の理由を分析", limit=3)
     }
     archived = {
         item.descriptor.name
         for item in registry.search("アーカイブ済みフォーラム投稿を探す", limit=3)
     }
-    roles = {
-        item.descriptor.name
-        for item in registry.search("既存ロールを名前で検索", limit=3)
-    }
+    roles = {item.descriptor.name for item in registry.search("既存ロールを名前で検索", limit=3)}
     poll_results = {
-        item.descriptor.name
-        for item in registry.search("この投票結果と票数を確認", limit=3)
+        item.descriptor.name for item in registry.search("この投票結果と票数を確認", limit=3)
     }
 
     assert "discord.search_messages" in past
@@ -201,9 +182,7 @@ async def test_list_channels_is_bounded_and_paginated() -> None:
     second.name = "b"
     second.type = discord.ChannelType.text
     second.category_id = None
-    second.permissions_for.side_effect = lambda member: _permission(
-        readable=member.id in {7, 99}
-    )
+    second.permissions_for.side_effect = lambda member: _permission(readable=member.id in {7, 99})
     guild.channels = [second, channel]
     guild.text_channels = [second, channel]
     client.guilds = [guild]
@@ -240,9 +219,7 @@ async def test_forum_and_archived_posts_are_discoverable_and_searchable() -> Non
     forum.name = "bugs"
     forum.type = discord.ChannelType.forum
     forum.category_id = None
-    forum.permissions_for.side_effect = lambda member: _permission(
-        readable=member.id in {7, 8, 99}
-    )
+    forum.permissions_for.side_effect = lambda member: _permission(readable=member.id in {7, 8, 99})
     archived = Mock(spec=discord.Thread)
     archived.id = 30
     archived.name = "old-bug"
@@ -282,12 +259,8 @@ async def test_forum_and_archived_posts_are_discoverable_and_searchable() -> Non
     guild.threads = []
     guild.voice_channels = []
     guild.stage_channels = []
-    guild.get_channel.side_effect = lambda channel_id: (
-        forum if channel_id == 20 else None
-    )
-    guild.get_channel_or_thread.side_effect = lambda channel_id: (
-        forum if channel_id == 20 else None
-    )
+    guild.get_channel.side_effect = lambda channel_id: forum if channel_id == 20 else None
+    guild.get_channel_or_thread.side_effect = lambda channel_id: forum if channel_id == 20 else None
     client.get_guild.return_value = guild
     client.fetch_channel = AsyncMock(return_value=archived)
     client.http = Mock()
@@ -341,9 +314,7 @@ async def test_forum_and_archived_posts_are_discoverable_and_searchable() -> Non
         _agent_context(),
     )
 
-    assert [(item.channel_id, item.kind) for item in listed.channels] == [
-        ("20", "forum")
-    ]
+    assert [(item.channel_id, item.kind) for item in listed.channels] == [("20", "forum")]
     assert archived_page.threads[0].channel_id == "30"
     assert archived_page.complete is True
     assert search.messages[0].channel_id == "30"
@@ -630,13 +601,10 @@ async def test_cross_guild_file_publication_send_remains_available(
             expected_target_display_name=inspection.target_display_name,
             expected_target_reader_count=inspection.target_reader_count,
             expected_new_reader_count=inspection.new_reader_count,
-            expected_target_audience_revision=(
-                inspection.target_audience_revision
-            ),
+            expected_target_audience_revision=(inspection.target_audience_revision),
             audience_expansion_token=inspection.audience_expansion_token,
-            audience_expansion_expires_at=(
-                inspection.audience_expansion_expires_at
-            ),
+            audience_expansion_expires_at=(inspection.audience_expansion_expires_at),
+            confirmation_id=inspection.confirmation_id,
         ),
         context,
     )
@@ -752,9 +720,7 @@ async def test_cross_guild_write_infers_unique_channel_guild_when_model_omits_it
     client.get_guild.return_value = origin_guild
     client.get_channel.return_value = target_channel
 
-    response = await _endpoint_map(cast(discord.Client, client))[
-        "discord.send_message"
-    ].invoke(
+    response = await _endpoint_map(cast(discord.Client, client))["discord.send_message"].invoke(
         DiscordSendMessageRequest(
             channel_id="21",
             content="Cross-guild post selected by its unique channel ID.",
@@ -841,9 +807,7 @@ def _visibility_guild(
     other = SimpleNamespace(id=other_id, bot=False) if other_id is not None else None
     members = [actor, bot, *([other] if other is not None else [])]
     readers = source_readers or {member.id for member in members}
-    channel.permissions_for.side_effect = lambda member: _permission(
-        readable=member.id in readers
-    )
+    channel.permissions_for.side_effect = lambda member: _permission(readable=member.id in readers)
     guild.get_member.side_effect = lambda member_id: next(
         (member for member in members if member.id == member_id),
         None,
@@ -937,8 +901,7 @@ async def test_get_message_exposes_poll_result_counts_and_answer_ids() -> None:
     assert response.poll.expires_at_iso == expires_at.isoformat()
     assert response.poll.counts_are_exact is False
     assert [
-        (answer.answer_id, answer.text, answer.vote_count)
-        for answer in response.poll.answers
+        (answer.answer_id, answer.text, answer.vote_count) for answer in response.poll.answers
     ] == [("1", "Yes", 1), ("2", "No", 0)]
 
 
@@ -1055,10 +1018,7 @@ async def test_discord_search_messages_stays_inside_authorized_channels() -> Non
     assert response.messages[0].reaction_count == 4
     assert response.messages[0].reaction_summary[0].emoji == "🔥"
     assert response.messages[0].thread_id == "41"
-    assert (
-        response.messages[0].edited_at_iso
-        == "2026-07-29T09:40:00+00:00"
-    )
+    assert response.messages[0].edited_at_iso == "2026-07-29T09:40:00+00:00"
     assert response.oldest_message_id == "31"
     assert response.newest_message_id == "31"
     assert response.has_more is True
@@ -1151,10 +1111,7 @@ async def test_relevance_search_over_500_channels_uses_lossless_global_cursor() 
     assert first.next_cursor is not None
     assert tuple(item.message_id for item in second.messages) == ("9002",)
     second_call_params = client.http.request.await_args_list[2:4]
-    assert [
-        dict(call.kwargs["params"])["offset"]
-        for call in second_call_params
-    ] == ["1", "0"]
+    assert [dict(call.kwargs["params"])["offset"] for call in second_call_params] == ["1", "0"]
 
 
 @pytest.mark.asyncio
@@ -1212,9 +1169,7 @@ async def test_discord_search_accepts_bounded_iso_period_without_phrase() -> Non
     _readable_guild(guild, channel)
     client.get_guild.return_value = guild
     client.http = Mock()
-    client.http.request = AsyncMock(
-        return_value={"total_results": 0, "messages": []}
-    )
+    client.http.request = AsyncMock(return_value={"total_results": 0, "messages": []})
     endpoints = _endpoint_map(cast(discord.Client, client))
 
     response = await endpoints["discord.search_messages"].invoke(
@@ -1271,9 +1226,7 @@ async def test_discord_search_messages_reports_indexing_without_guessing() -> No
     _readable_guild(guild, channel)
     client.get_guild.return_value = guild
     client.http = Mock()
-    client.http.request = AsyncMock(
-        return_value={"code": 110000, "retry_after": 2.5}
-    )
+    client.http.request = AsyncMock(return_value={"code": 110000, "retry_after": 2.5})
     endpoints = _endpoint_map(cast(discord.Client, client))
 
     response = await endpoints["discord.search_messages"].invoke(
@@ -1428,9 +1381,7 @@ async def test_cross_guild_read_rejects_requester_who_is_not_a_member() -> None:
     origin_guild, _, _, _ = _visibility_guild(10, 20)
     source_guild, source_channel, _, _ = _visibility_guild(11, 21)
     source_guild.get_member.side_effect = lambda _member_id: None
-    source_guild.fetch_member = AsyncMock(
-        return_value=SimpleNamespace(id=123456, bot=False)
-    )
+    source_guild.fetch_member = AsyncMock(return_value=SimpleNamespace(id=123456, bot=False))
     client.get_guild.side_effect = lambda guild_id: {
         10: origin_guild,
         11: source_guild,
@@ -1456,9 +1407,7 @@ async def test_private_source_to_broader_destination_returns_advisory_warning() 
     guild, destination, _, _ = _visibility_guild(10, 20)
     source = Mock(spec=discord.TextChannel)
     source.id = 21
-    source.permissions_for.side_effect = lambda member: _permission(
-        readable=member.id in {7, 99}
-    )
+    source.permissions_for.side_effect = lambda member: _permission(readable=member.id in {7, 99})
     source.fetch_message = AsyncMock(return_value=_fetched_message(source))
     guild.text_channels = [destination, source]
     guild.get_channel_or_thread.side_effect = lambda channel_id: {
@@ -1521,17 +1470,13 @@ async def test_restricted_source_cannot_flow_to_broader_destination() -> None:
     )
 
     with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
-        await _endpoint_map(cast(discord.Client, client))[
-            "discord.send_message"
-        ].invoke(
+        await _endpoint_map(cast(discord.Client, client))["discord.send_message"].invoke(
             DiscordSendMessageRequest(channel_id="20", content="restricted"),
             context,
         )
     destination.send.assert_not_awaited()
 
-    response = await _endpoint_map(cast(discord.Client, client))[
-        "discord.send_message"
-    ].invoke(
+    response = await _endpoint_map(cast(discord.Client, client))["discord.send_message"].invoke(
         DiscordSendMessageRequest(channel_id="20", content="audited"),
         replace(context, information_flow_mode="audit"),
     )
@@ -1574,9 +1519,7 @@ async def test_private_thread_member_requires_exact_host_audience_snapshot() -> 
     endpoints = _endpoint_map(cast(discord.Client, client))
     context = _agent_context()
 
-    inspection = await endpoints[
-        "discord.inspect_thread_audience_expansion"
-    ].invoke(
+    inspection = await endpoints["discord.inspect_thread_audience_expansion"].invoke(
         DiscordThreadAudienceInspectRequest(thread_id="21", user_id="8"),
         context,
     )
@@ -1603,14 +1546,10 @@ async def test_private_thread_member_requires_exact_host_audience_snapshot() -> 
             expected_target_display_name=inspection.target_display_name,
             expected_source_reader_count=inspection.source_reader_count,
             expected_expanded_reader_count=inspection.expanded_reader_count,
-            expected_retained_history_exposed=(
-                inspection.retained_history_exposed
-            ),
+            expected_retained_history_exposed=(inspection.retained_history_exposed),
             expected_audience_revision=inspection.audience_revision,
             audience_expansion_token=inspection.audience_expansion_token,
-            audience_expansion_expires_at=(
-                inspection.audience_expansion_expires_at
-            ),
+            audience_expansion_expires_at=(inspection.audience_expansion_expires_at),
         ),
         context,
     )
@@ -1711,21 +1650,15 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
             expected_target_display_name=inspection.target_display_name,
             expected_target_reader_count=inspection.target_reader_count,
             expected_new_reader_count=inspection.new_reader_count,
-            expected_target_audience_revision=(
-                inspection.target_audience_revision
-            ),
+            expected_target_audience_revision=(inspection.target_audience_revision),
             audience_expansion_token=inspection.audience_expansion_token,
-            audience_expansion_expires_at=(
-                inspection.audience_expansion_expires_at
-            ),
+            audience_expansion_expires_at=(inspection.audience_expansion_expires_at),
+            confirmation_id=inspection.confirmation_id,
         ),
         context,
     )
     assert sandbox.list_for_actor("10", "7")[0].provenance is not None
-    assert (
-        sandbox.list_for_actor("10", "7")[0].provenance.publication_id
-        is None
-    )
+    assert sandbox.list_for_actor("10", "7")[0].provenance.publication_id is None
 
     with pytest.raises(UserError, match=r"files\.publication_target_mismatch"):
         await endpoints["discord.send_published_file"].invoke(
@@ -1742,6 +1675,7 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
         DiscordSendManagedFileRequest(
             file_ref=publication.publication_id,
             channel_id="20",
+            expected_revision=publication.revision,
         ),
         context,
     )
@@ -1777,6 +1711,234 @@ async def test_published_file_copy_is_bound_to_exact_target_and_revocation(
             ),
             context,
         )
+
+
+def _managed_file_send_endpoints(
+    sandbox: AgentFileSandbox,
+) -> tuple[dict[str, Any], Mock]:
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = sandbox
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    actor = SimpleNamespace(id=7, bot=False, display_name="Requester")
+    bot = SimpleNamespace(id=99, bot=True, display_name="Simajilord")
+    guild.members = [actor, bot]
+    guild.member_count = 2
+    guild.chunked = True
+    guild.filesize_limit = 25 * 1024 * 1024
+    guild.me = bot
+    guild.get_member.side_effect = {7: actor, 99: bot}.get
+    channel = Mock(spec=discord.TextChannel)
+    channel.id = 20
+    channel.name = "review"
+    channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        attach_files=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    guild.get_channel_or_thread.return_value = channel
+    client.get_guild.return_value = guild
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(cast(discord.Client, client), runtime)
+    }
+    return endpoints, channel
+
+
+@pytest.mark.asyncio
+async def test_send_managed_file_rejects_stale_private_sha256(tmp_path: Path) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    provenance = WorkspaceFileProvenance(
+        owner_actor_ids=("7",),
+        origin_guild_id="10",
+        sensitivity="actor_private",
+    )
+    selected = sandbox.import_bytes("10", "private.txt", b"version one", provenance=provenance)
+    assert selected.file_ref is not None
+    updated = sandbox.import_bytes("10", "private.txt", b"version two", provenance=provenance)
+    assert updated.file_ref == selected.file_ref
+    endpoints, channel = _managed_file_send_endpoints(sandbox)
+    context = replace(
+        _agent_context(),
+        file_workspace_mode="guild_shared",
+        information_flow_mode="disabled",
+    )
+
+    with pytest.raises(UserError, match=r"files\.hash_conflict"):
+        await endpoints["discord.send_managed_file"].invoke(
+            DiscordSendManagedFileRequest(
+                file_ref=selected.file_ref,
+                channel_id="20",
+                expected_sha256=selected.sha256,
+            ),
+            context,
+        )
+    channel.send.assert_not_awaited()
+
+    response = await endpoints["discord.send_managed_file"].invoke(
+        DiscordSendManagedFileRequest(
+            file_ref=updated.file_ref or "",
+            channel_id="20",
+            expected_sha256=updated.sha256,
+        ),
+        context,
+    )
+    assert response.filename == "private.txt"
+    channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_managed_publication_rejects_stale_revision(tmp_path: Path) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = replace(_agent_context(), file_workspace_mode="guild_shared")
+    source = sandbox.import_bytes(
+        "10",
+        "private.txt",
+        b"private bytes",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("7",),
+            origin_guild_id="10",
+            sensitivity="actor_private",
+        ),
+    )
+    publication = sandbox.publish_copy_for_actor(
+        "10",
+        "7",
+        "private.txt",
+        expected_sha256=source.sha256,
+        target_workspace_id="10",
+        target_resource_id="20",
+        target_display_name="#review",
+        target_audience_revision="a" * 64,
+        confirmation_digest="b" * 64,
+        reason="Create a revision-bound test copy.",
+        expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    )
+    revoked, _ = sandbox.revoke_publication_for_actor(
+        publication.publication_id,
+        "7",
+        expected_revision=publication.revision,
+    )
+    endpoints, channel = _managed_file_send_endpoints(sandbox)
+
+    with pytest.raises(UserError, match=r"files\.publication_revision_conflict"):
+        await endpoints["discord.send_managed_file"].invoke(
+            DiscordSendManagedFileRequest(
+                file_ref=publication.publication_id,
+                channel_id="20",
+                expected_revision=publication.revision,
+            ),
+            context,
+        )
+    assert revoked.revision != publication.revision
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_manager_send_forwards_selected_sha256(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    source = sandbox.import_bytes(
+        "10",
+        "private.txt",
+        b"private bytes",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("7",),
+            origin_guild_id="10",
+            created_task_id="task-a",
+        ),
+    )
+    catalog = sandbox.managed_catalog_for_actor("10", "7", current_task_id="task-a")
+    invoked: list[tuple[str, object, InvocationContext]] = []
+
+    class FakeHumanExecutor:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        async def invoke(
+            self,
+            name: str,
+            request: object,
+            context: InvocationContext,
+        ) -> object:
+            invoked.append((name, request, context))
+            if name == "files.catalog":
+                return FileCatalogResponse(
+                    catalog=catalog,
+                    offset=0,
+                    next_offset=None,
+                    complete=True,
+                )
+            if name == "discord.send_managed_file":
+                return DiscordSendManagedFileResponse(
+                    file_ref=source.file_ref or "",
+                    message_id="31",
+                    channel_id="20",
+                    filename="private.txt",
+                    size_bytes=len(b"private bytes"),
+                    guild_id="10",
+                )
+            raise AssertionError(name)
+
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities.HumanCapabilityExecutor",
+        FakeHumanExecutor,
+    )
+    endpoints, channel = _managed_file_send_endpoints(sandbox)
+    runtime_context = replace(
+        _agent_context(resource_ids=("20",)),
+        agent_task_id="task-a",
+        file_workspace_mode="guild_shared",
+    )
+    opened = await endpoints["discord.open_file_manager"].invoke(
+        DiscordOpenFileManagerRequest(channel_id="20"), runtime_context
+    )
+    assert opened.channel_id == "20"
+    launcher = channel.send.await_args.kwargs["view"]
+    launch_button = next(item for item in launcher.children if isinstance(item, discord.ui.Button))
+    launch_interaction = Mock(spec=discord.Interaction)
+    launch_interaction.id = 101
+    launch_interaction.user = SimpleNamespace(id=7)
+    launch_interaction.guild_id = 10
+    launch_interaction.channel_id = 20
+    launch_interaction.response = Mock()
+    launch_interaction.response.defer = AsyncMock()
+    launch_interaction.edit_original_response = AsyncMock()
+    await launch_button.callback(launch_interaction)
+    private_view = launch_interaction.edit_original_response.await_args.kwargs["view"]
+    assert isinstance(private_view, FileManagerPrivateView)
+    private_view.selected_ref = source.file_ref
+    private_view._rebuild_items()
+    send_button = next(
+        item
+        for item in private_view.children
+        if isinstance(item, discord.ui.Button) and item.label == "Send here"
+    )
+    send_interaction = Mock(spec=discord.Interaction)
+    send_interaction.id = 102
+    send_interaction.user = SimpleNamespace(id=7)
+    send_interaction.guild_id = 10
+    send_interaction.channel_id = 20
+    send_interaction.response = Mock()
+    send_interaction.response.defer = AsyncMock()
+    send_interaction.response.is_done = Mock(return_value=False)
+    send_interaction.followup = Mock()
+    send_interaction.followup.send = AsyncMock()
+    send_interaction.edit_original_response = AsyncMock()
+    await send_button.callback(send_interaction)
+
+    _, request, confirmation_context = invoked[-1]
+    assert isinstance(request, DiscordSendManagedFileRequest)
+    assert request.expected_sha256 == source.sha256
+    assert request.expected_revision is None
+    assert confirmation_context.request_id == "102"
 
 
 @pytest.mark.asyncio
@@ -1815,9 +1977,7 @@ async def test_uncertain_source_audience_fails_closed_before_send() -> None:
     )
 
     with pytest.raises(UserError, match=r"discord\.information_flow_forbidden"):
-        await _endpoint_map(cast(discord.Client, client))[
-            "discord.send_message"
-        ].invoke(
+        await _endpoint_map(cast(discord.Client, client))["discord.send_message"].invoke(
             DiscordSendMessageRequest(channel_id="20", content="uncertain"),
             context,
         )
@@ -1945,11 +2105,7 @@ async def test_reaction_capabilities_act_only_as_the_bot(
     message = Mock(spec=discord.Message)
     message.id = 30
     message.channel = channel
-    message.reactions = (
-        ()
-        if reacted
-        else (SimpleNamespace(me=True, emoji="✅"),)
-    )
+    message.reactions = () if reacted else (SimpleNamespace(me=True, emoji="✅"),)
     message.add_reaction = AsyncMock()
     message.remove_reaction = AsyncMock()
     channel.fetch_message = AsyncMock(return_value=message)
@@ -1976,11 +2132,7 @@ async def test_reaction_capabilities_act_only_as_the_bot(
 
     message.add_reaction.reset_mock()
     message.remove_reaction.reset_mock()
-    message.reactions = (
-        (SimpleNamespace(me=True, emoji="✅"),)
-        if reacted
-        else ()
-    )
+    message.reactions = (SimpleNamespace(me=True, emoji="✅"),) if reacted else ()
     dispatch = AsyncMock()
     complete_without_dispatch = AsyncMock()
     effect = SimpleNamespace(

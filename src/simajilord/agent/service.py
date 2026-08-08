@@ -330,6 +330,8 @@ class AgentService:
                         trigger_actor_ids=request.trigger_actor_ids,
                         requester_principal_id=request.requester_principal_id,
                         policy_id=request.policy_id,
+                        principal_role_ids=request.principal_role_ids,
+                        capability_lease_bindings=request.capability_lease_bindings,
                         allowed_capabilities=request.allowed_capabilities,
                     )
                     if on_progress is not None:
@@ -643,6 +645,8 @@ class AgentService:
                     trigger_actor_ids=request.trigger_actor_ids,
                     requester_principal_id=request.requester_principal_id,
                     policy_id=request.policy_id,
+                    principal_role_ids=request.principal_role_ids,
+                    capability_lease_bindings=request.capability_lease_bindings,
                     allowed_capabilities=request.allowed_capabilities,
                 )
                 try:

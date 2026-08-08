@@ -27,6 +27,8 @@ from discord.ext import commands
 from simajilord.agent import (
     ACTION_UNDO_ANY_GRANT,
     AGENT_AUDIO_GRANT,
+    AGENT_AUTHORITY_MANAGE_GRANT,
+    AGENT_AUTHORITY_REQUEST_GRANT,
     AGENT_COMPUTE_GRANT,
     AGENT_CONNECTOR_GRANT,
     AGENT_FEEDBACK_GRANT,
@@ -62,6 +64,7 @@ from simajilord.agent import (
     AutonomyEnqueueResult,
     AutonomyEventBatch,
     AutonomyEventKind,
+    CapabilityLeaseBinding,
     new_agent_public_reference_id,
     new_agent_task_id,
     task_scoped_conversation_id,
@@ -9164,8 +9167,11 @@ def _agent_grants(
         and autonomy_policy_mode is AgentAutonomyPolicyMode.LEGACY
     )
     grants: set[str] = {AGENT_AUDIO_GRANT, AGENT_MEMORY_GRANT}
+    if not autonomous:
+        grants.add(AGENT_AUTHORITY_REQUEST_GRANT)
     if not autonomous and (memory_curator or actor_id in settings.agent_admin_user_ids):
         grants.add(AGENT_MEMORY_CURATOR_GRANT)
+        grants.add(AGENT_AUTHORITY_MANAGE_GRANT)
     if not autonomous:
         grants.add(AGENT_FEEDBACK_GRANT)
     if not autonomous or legacy_autonomy_act:
@@ -9468,6 +9474,8 @@ def _agent_invocation_context(request: AgentRequest) -> InvocationContext:
         trigger_actor_ids=request.trigger_actor_ids,
         requester_principal_id=request.requester_principal_id,
         policy_id=request.policy_id,
+        principal_role_ids=request.principal_role_ids,
+        capability_lease_bindings=request.capability_lease_bindings,
         allowed_capabilities=request.allowed_capabilities,
     )
 
@@ -9893,6 +9901,35 @@ class AgentCog(commands.Cog):
             if existing_request is not None
             else await self.runtime.agent_store.task_id_for_event(event_id) or new_agent_task_id()
         )
+        principal_role_ids = tuple(
+            sorted(
+                str(role.id)
+                for role in requester_principal.member.roles
+                if role.id != message.guild.default_role.id
+            )
+        )
+        lease_bindings: tuple[CapabilityLeaseBinding, ...] = ()
+        if self.runtime.capability_leases is not None:
+            lease_context = InvocationContext(
+                actor_id=actor_id,
+                workspace_id=str(message.guild.id),
+                transport="agent",
+                request_id=event_id,
+                resource_ids=resource_ids,
+                grants=grants,
+                origin_resource_id=str(message.channel.id),
+                approvals=approvals,
+                public_reference_id=public_reference_id,
+                agent_task_id=task_id,
+                agent_trigger="mention",
+                principal_kind="requester",
+                principal_role_ids=principal_role_ids,
+            )
+            lease_bindings = await asyncio.to_thread(
+                self.runtime.capability_leases.resolve_bindings,
+                lease_context,
+                static_grants=grants,
+            )
         conversation_id = discord_conversation_id(
             guild_id=message.guild.id if message.guild else None,
             channel_id=message.channel.id,
@@ -9930,6 +9967,11 @@ class AgentCog(commands.Cog):
             trigger_actor_ids=(actor_id,),
             requester_principal_id=actor_id,
             policy_id="discord-mention-v2",
+            principal_role_ids=principal_role_ids,
+            capability_lease_bindings=tuple(
+                (binding.capability, binding.lease_id, binding.revision)
+                for binding in lease_bindings
+            ),
             message_edited_at=message_edited_at,
             grants=grants,
             approvals=approvals,

@@ -128,10 +128,7 @@ class WorkspaceFilePublication:
             self.revoked_at,
             self.revoked_by,
         )
-        if any(
-            value is not None and (not value or len(value) > 500)
-            for value in scalar_values
-        ):
+        if any(value is not None and (not value or len(value) > 500) for value in scalar_values):
             raise ValueError("file publication values must be bounded")
         if not self.source_path or len(self.source_path) > 2_400:
             raise ValueError("file publication source path must be bounded")
@@ -156,9 +153,8 @@ class WorkspaceFilePublication:
     def active(self) -> bool:
         """Return whether this authority is usable at the current instant."""
 
-        return (
-            self.revoked_at is None
-            and datetime.now(UTC) < _publication_datetime(self.expires_at)
+        return self.revoked_at is None and datetime.now(UTC) < _publication_datetime(
+            self.expires_at
         )
 
 
@@ -173,9 +169,7 @@ class WorkspaceFileProvenance:
     origin_visibility: WorkspaceVisibility = "actor_private"
     created_task_id: str | None = None
     sensitivity: WorkspaceVisibility = "actor_private"
-    source_resources: tuple[
-        tuple[str, str, WorkspaceSourceVisibility], ...
-    ] = ()
+    source_resources: tuple[tuple[str, str, WorkspaceSourceVisibility], ...] = ()
     unlabelled_input: bool = False
     sources_truncated: bool = False
     declassified_at: str | None = None
@@ -194,19 +188,13 @@ class WorkspaceFileProvenance:
             self.declassified_by,
             self.publication_id,
         )
-        if any(
-            value is not None and len(value) > 200 for value in scalar_values
-        ):
+        if any(value is not None and len(value) > 200 for value in scalar_values):
             raise ValueError("file provenance values must be bounded")
         if len(normalized_owners) > 32 or any(
             not value or len(value) > 200 for value in normalized_owners
         ):
             raise ValueError("file provenance owners must be bounded")
-        if (
-            not normalized_owners
-            and not self.unlabelled_input
-            and self.sensitivity != "uncertain"
-        ):
+        if not normalized_owners and not self.unlabelled_input and self.sensitivity != "uncertain":
             raise ValueError("file provenance must retain an owner or uncertainty")
         if len(self.source_resources) > 32 or any(
             len(item) != 3 or any(not value or len(value) > 200 for value in item)
@@ -218,11 +206,7 @@ class WorkspaceFileProvenance:
             self.publication_id,
         ):
             raise ValueError("invalid file provenance publication ID")
-        if (
-            len(normalized_owners) != 1
-            or self.unlabelled_input
-            or self.sources_truncated
-        ):
+        if len(normalized_owners) != 1 or self.unlabelled_input or self.sources_truncated:
             object.__setattr__(self, "sensitivity", "uncertain")
 
 
@@ -302,6 +286,7 @@ class WorkspaceFileAction:
     action: WorkspaceFileActionKind
     summary: str
     occurred_at: str
+    display_filename: str = "Managed file"
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,9 +334,7 @@ class AgentFileSandbox:
         self._workspace_locks: dict[str, threading.RLock] = {}
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
-        self._provenance_path = self.root.with_name(
-            f"{self.root.name}.provenance.sqlite3"
-        )
+        self._provenance_path = self.root.with_name(f"{self.root.name}.provenance.sqlite3")
         self._initialize_provenance()
 
     def list(self, workspace_id: str) -> tuple[WorkspaceFileRecord, ...]:
@@ -384,10 +367,13 @@ class AgentFileSandbox:
         _validate_managed_identity(guild_id, actor_id)
         private_rows: list[tuple[object, ...]]
         publication_rows: list[sqlite3.Row]
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             private_rows = connection.execute(
                 """
                 SELECT workspace_id, relative_path
@@ -428,16 +414,11 @@ class AgentFileSandbox:
                 if not path.is_file() or path.is_symlink():
                     continue
                 record = self._record(workspace_id, scope, path)
-            if (
-                record.file_ref is None
-                or record.created_at is None
-                or record.updated_at is None
-            ):
+            if record.file_ref is None or record.created_at is None or record.updated_at is None:
                 continue
             section: WorkspaceManagedFileSection = (
                 "task"
-                if current_task_id is not None
-                and provenance.created_task_id == current_task_id
+                if current_task_id is not None and provenance.created_task_id == current_task_id
                 else "my"
             )
             managed.append(
@@ -541,10 +522,13 @@ class AgentFileSandbox:
 
         _validate_private_file_ref(file_ref)
         _validate_managed_identity(guild_id, actor_id)
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             row = connection.execute(
                 """
                 SELECT workspace_id, relative_path
@@ -625,10 +609,7 @@ class AgentFileSandbox:
                 path,
             )
             provenance = record.provenance
-            if (
-                record.file_ref != file_ref
-                or not file_provenance_is_owned_by(provenance, actor_id)
-            ):
+            if record.file_ref != file_ref or not file_provenance_is_owned_by(provenance, actor_id):
                 raise UserError("files.file_ref_not_found")
             assert provenance is not None
             return path.name, path.read_bytes(), provenance, record
@@ -673,6 +654,7 @@ class AgentFileSandbox:
             guild_id,
             action="copied_to_task",
             summary="Copied to the current task.",
+            display_filename=filename,
         )
         if copied.file_ref is not None:
             self.record_managed_action(
@@ -681,6 +663,7 @@ class AgentFileSandbox:
                 guild_id,
                 action="copied_to_task",
                 summary="Created as a task copy.",
+                display_filename=filename,
             )
         return copied
 
@@ -717,10 +700,13 @@ class AgentFileSandbox:
                 raise UserError("files.file_ref_not_found")
             path.unlink()
             try:
-                with self._provenance_lock, sqlite3.connect(
-                    self._provenance_path,
-                    timeout=5.0,
-                ) as connection:
+                with (
+                    self._provenance_lock,
+                    sqlite3.connect(
+                        self._provenance_path,
+                        timeout=5.0,
+                    ) as connection,
+                ):
                     connection.execute("BEGIN IMMEDIATE")
                     cursor = connection.execute(
                         """
@@ -738,6 +724,7 @@ class AgentFileSandbox:
                         guild_id,
                         action="deleted",
                         summary="Deleted the private file.",
+                        display_filename=path.name,
                     )
             except Exception:
                 self._replace_bytes_unlocked(
@@ -771,13 +758,17 @@ class AgentFileSandbox:
                 raise UserError("files.publication_not_found")
         else:
             raise UserError("files.file_ref_not_found")
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             rows = connection.execute(
                 """
-                SELECT action_id, file_ref, action, summary, occurred_at
+                SELECT action_id, file_ref, action, summary, occurred_at,
+                       display_filename
                 FROM file_actions
                 WHERE actor_id = ? AND guild_id = ? AND file_ref = ?
                 ORDER BY occurred_at DESC, action_id DESC
@@ -793,6 +784,7 @@ class AgentFileSandbox:
                     action=_file_action_kind(str(row[2])),
                     summary=str(row[3]),
                     occurred_at=str(row[4]),
+                    display_filename=str(row[5]),
                 )
                 for row in rows
             )
@@ -807,6 +799,7 @@ class AgentFileSandbox:
         *,
         action: WorkspaceFileActionKind,
         summary: str,
+        display_filename: str = "Managed file",
     ) -> WorkspaceFileAction:
         """Record one bounded user-visible action without file content or IDs."""
 
@@ -818,10 +811,13 @@ class AgentFileSandbox:
             publication = self.get_publication_for_actor(file_ref, actor_id)
             if publication.target_workspace_id != guild_id:
                 raise UserError("files.publication_not_found")
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             return self._insert_file_action(
                 connection,
                 file_ref,
@@ -829,7 +825,82 @@ class AgentFileSandbox:
                 guild_id,
                 action=action,
                 summary=summary,
+                display_filename=display_filename,
             )
+
+    def managed_recent_activity_for_actor(
+        self,
+        actor_id: str,
+        guild_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> tuple[tuple[WorkspaceFileAction, ...], str | None]:
+        """Return actor/guild-scoped body-free activity without resolving live files."""
+
+        _validate_managed_identity(guild_id, actor_id)
+        if not 1 <= limit <= 50:
+            raise UserError("files.history_limit_invalid")
+        cursor_pair: tuple[str, str] | None = None
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
+            if cursor is not None:
+                if not re.fullmatch(r"fact_[0-9a-f]{32}", cursor):
+                    raise UserError("files.history_cursor_invalid")
+                cursor_row = connection.execute(
+                    """
+                    SELECT occurred_at, action_id
+                    FROM file_actions
+                    WHERE actor_id = ? AND guild_id = ? AND action_id = ?
+                    """,
+                    (actor_id, guild_id, cursor),
+                ).fetchone()
+                if cursor_row is None:
+                    raise UserError("files.history_cursor_invalid")
+                cursor_pair = (str(cursor_row[0]), str(cursor_row[1]))
+            where_cursor = (
+                "AND (occurred_at < ? OR (occurred_at = ? AND action_id < ?))"
+                if cursor_pair is not None
+                else ""
+            )
+            parameters: tuple[object, ...] = (actor_id, guild_id)
+            if cursor_pair is not None:
+                parameters += (cursor_pair[0], cursor_pair[0], cursor_pair[1])
+            rows = connection.execute(
+                f"""
+                SELECT action_id, file_ref, action, summary, occurred_at,
+                       display_filename
+                FROM file_actions
+                WHERE actor_id = ? AND guild_id = ?
+                {where_cursor}
+                ORDER BY occurred_at DESC, action_id DESC
+                LIMIT ?
+                """,
+                (*parameters, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        visible_rows = rows[:limit]
+        try:
+            actions = tuple(
+                WorkspaceFileAction(
+                    action_id=str(row[0]),
+                    file_ref=str(row[1]),
+                    action=_file_action_kind(str(row[2])),
+                    summary=str(row[3]),
+                    occurred_at=str(row[4]),
+                    display_filename=str(row[5]),
+                )
+                for row in visible_rows
+            )
+        except (TypeError, ValueError) as exc:
+            raise UserError("files.history_invalid") from exc
+        next_cursor = actions[-1].action_id if has_more and actions else None
+        return actions, next_cursor
 
     @staticmethod
     def _insert_file_action(
@@ -840,6 +911,7 @@ class AgentFileSandbox:
         *,
         action: WorkspaceFileActionKind,
         summary: str,
+        display_filename: str = "Managed file",
     ) -> WorkspaceFileAction:
         if action not in {
             "copied_to_task",
@@ -852,14 +924,23 @@ class AgentFileSandbox:
         clean_summary = summary.strip()
         if not clean_summary or len(clean_summary) > 200:
             raise UserError("files.history_summary_invalid")
+        clean_filename = display_filename.strip()
+        if (
+            not clean_filename
+            or len(clean_filename) > 180
+            or "/" in clean_filename
+            or "\\" in clean_filename
+            or "\x00" in clean_filename
+        ):
+            raise UserError("files.history_filename_invalid")
         action_id = f"fact_{uuid.uuid4().hex}"
         occurred_at = datetime.now(UTC).isoformat()
         connection.execute(
             """
             INSERT INTO file_actions (
                 action_id, file_ref, actor_id, guild_id,
-                action, summary, occurred_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                action, summary, occurred_at, display_filename
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_id,
@@ -869,6 +950,7 @@ class AgentFileSandbox:
                 action,
                 clean_summary,
                 occurred_at,
+                clean_filename,
             ),
         )
         return WorkspaceFileAction(
@@ -877,6 +959,7 @@ class AgentFileSandbox:
             action=action,
             summary=clean_summary,
             occurred_at=occurred_at,
+            display_filename=clean_filename,
         )
 
     def _private_share_state(
@@ -885,10 +968,13 @@ class AgentFileSandbox:
         relative_path: str,
         actor_id: str,
     ) -> WorkspaceManagedFileShareState:
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
@@ -967,10 +1053,7 @@ class AgentFileSandbox:
             raise UserError("files.path_conflict")
         with self.locked_workspace(workspace_id):
             scope = self._scope(workspace_id)
-            current = {
-                record.path: record
-                for record in self._list_unlocked(workspace_id)
-            }
+            current = {record.path: record for record in self._list_unlocked(workspace_id)}
             prospective = dict(current)
             for relative_path, content in files:
                 if len(content) > self.max_file_bytes:
@@ -992,10 +1075,7 @@ class AgentFileSandbox:
                 )
             if len(prospective) > self.max_files:
                 raise UserError("files.file_count_limit")
-            if (
-                sum(record.size_bytes for record in prospective.values())
-                > self.max_workspace_bytes
-            ):
+            if sum(record.size_bytes for record in prospective.values()) > self.max_workspace_bytes:
                 raise UserError("files.workspace_quota")
 
             previous = {
@@ -1008,9 +1088,7 @@ class AgentFileSandbox:
             }
             previous_provenance = {
                 relative_path: (
-                    current[relative_path].provenance
-                    if relative_path in current
-                    else None
+                    current[relative_path].provenance if relative_path in current else None
                 )
                 for relative_path in paths
             }
@@ -1099,8 +1177,7 @@ class AgentFileSandbox:
             and (
                 previous_provenance is None
                 or previous_provenance.unlabelled_input
-                or previous_provenance.owner_actor_ids
-                != provenance.owner_actor_ids
+                or previous_provenance.owner_actor_ids != provenance.owner_actor_ids
             )
         ):
             raise UserError("files.path_conflict")
@@ -1128,8 +1205,7 @@ class AgentFileSandbox:
             and (
                 previous_provenance is None
                 or previous_provenance.unlabelled_input
-                or previous_provenance.owner_actor_ids
-                != provenance.owner_actor_ids
+                or previous_provenance.owner_actor_ids != provenance.owner_actor_ids
             )
         ):
             raise UserError("files.path_conflict")
@@ -1141,9 +1217,7 @@ class AgentFileSandbox:
             next_provenance = (
                 provenance
                 if previous_provenance is None
-                else merge_file_provenances(
-                    (previous_provenance, provenance)
-                )
+                else merge_file_provenances((previous_provenance, provenance))
             )
         with tempfile.NamedTemporaryFile(
             dir=destination.parent,
@@ -1464,8 +1538,7 @@ class AgentFileSandbox:
             next_page=next_page,
             total_pages=total_pages,
             provenance=(
-                self._load_provenance(workspace_id, relative_path)
-                or unlabelled_file_provenance()
+                self._load_provenance(workspace_id, relative_path) or unlabelled_file_provenance()
             ),
         )
 
@@ -1529,8 +1602,7 @@ class AgentFileSandbox:
             return (
                 path.name,
                 path.read_bytes(),
-                self._load_provenance(workspace_id, relative_path)
-                or unlabelled_file_provenance(),
+                self._load_provenance(workspace_id, relative_path) or unlabelled_file_provenance(),
             )
 
     def snapshot_for_actor_delivery_with_provenance(
@@ -1560,6 +1632,7 @@ class AgentFileSandbox:
         target_resource_id: str,
         target_display_name: str,
         target_audience_revision: str,
+        confirmation_digest: str,
         reason: str,
         expires_at: str,
     ) -> WorkspaceFilePublication:
@@ -1575,12 +1648,12 @@ class AgentFileSandbox:
             raise UserError("files.hash_invalid")
         if not re.fullmatch(r"[0-9a-f]{64}", target_audience_revision):
             raise UserError("files.publication_audience_invalid")
-        filename, content, source_provenance = (
-            self.snapshot_for_actor_delivery_with_provenance(
-                source_workspace_id,
-                actor_id,
-                source_path,
-            )
+        if not re.fullmatch(r"[0-9a-f]{64}", confirmation_digest):
+            raise UserError("files.publication_confirmation_required")
+        filename, content, source_provenance = self.snapshot_for_actor_delivery_with_provenance(
+            source_workspace_id,
+            actor_id,
+            source_path,
         )
         source_file_ref, _created_at, _updated_at = self._load_file_identity(
             source_workspace_id,
@@ -1635,6 +1708,7 @@ class AgentFileSandbox:
                 self._store_publication(
                     publication,
                     source_file_ref=source_file_ref,
+                    confirmation_digest=confirmation_digest,
                 )
             except Exception:
                 copy_scope = self._scope_path(copy_workspace_id)
@@ -1642,6 +1716,41 @@ class AgentFileSandbox:
                 self._delete_provenance(copy_workspace_id, copy_path)
                 raise
         return publication
+
+    def consume_publication_confirmation(
+        self,
+        confirmation_digest: str,
+        actor_id: str,
+        guild_id: str,
+    ) -> None:
+        """Atomically consume one body-free publish confirmation before dispatch."""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", confirmation_digest):
+            raise UserError("files.publication_confirmation_required")
+        _validate_managed_identity(guild_id, actor_id)
+        try:
+            with (
+                self._provenance_lock,
+                sqlite3.connect(
+                    self._provenance_path,
+                    timeout=5.0,
+                ) as connection,
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO file_publication_confirmations (
+                        confirmation_digest, actor_id, guild_id, consumed_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        confirmation_digest,
+                        actor_id,
+                        guild_id,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise UserError("files.publication_confirmation_replayed") from exc
 
     def get_publication_for_actor(
         self,
@@ -1716,10 +1825,13 @@ class AgentFileSandbox:
             bool,
         ):
             raise UserError("files.publication_revision_conflict")
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.row_factory = sqlite3.Row
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1764,6 +1876,7 @@ class AgentFileSandbox:
                 publication.target_workspace_id,
                 action="revoked",
                 summary=summary,
+                display_filename=PurePosixPath(publication.copy_path).name,
             )
             if source_row is not None:
                 source_file_ref = str(source_row[0])
@@ -1780,6 +1893,7 @@ class AgentFileSandbox:
                         source_guild_id,
                         action="revoked",
                         summary=summary,
+                        display_filename=PurePosixPath(publication.source_path).name,
                     )
             updated = replace(
                 publication,
@@ -1887,8 +2001,7 @@ class AgentFileSandbox:
             sha256=hashlib.sha256(data).hexdigest(),
             kind=workspace_file_kind(path, data),
             provenance=(
-                self._load_provenance(workspace_id, relative_path)
-                or unlabelled_file_provenance()
+                self._load_provenance(workspace_id, relative_path) or unlabelled_file_provenance()
             ),
             file_ref=file_ref,
             created_at=created_at,
@@ -1896,10 +2009,13 @@ class AgentFileSandbox:
         )
 
     def _initialize_provenance(self) -> None:
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute(
                 """
@@ -1929,9 +2045,7 @@ class AgentFileSandbox:
             )
             columns = {
                 str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(file_provenance)"
-                ).fetchall()
+                for row in connection.execute("PRAGMA table_info(file_provenance)").fetchall()
             }
             additions = {
                 "file_ref": "TEXT",
@@ -1998,10 +2112,7 @@ class AgentFileSandbox:
             seen_file_refs: set[str] = set()
             for rowid, raw_file_ref, raw_created_at, raw_updated_at in identity_rows:
                 file_ref = str(raw_file_ref) if raw_file_ref is not None else ""
-                if (
-                    not re.fullmatch(r"fil_[0-9a-f]{32}", file_ref)
-                    or file_ref in seen_file_refs
-                ):
+                if not re.fullmatch(r"fil_[0-9a-f]{32}", file_ref) or file_ref in seen_file_refs:
                     file_ref = f"fil_{uuid.uuid4().hex}"
                 seen_file_refs.add(file_ref)
                 created_at = (
@@ -2043,8 +2154,45 @@ class AgentFileSandbox:
                     expires_at TEXT NOT NULL,
                     revision INTEGER NOT NULL,
                     revoked_at TEXT,
-                    revoked_by TEXT
+                    revoked_by TEXT,
+                    confirmation_digest TEXT
                 )
+                """
+            )
+            publication_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(file_publications)").fetchall()
+            }
+            if "confirmation_digest" not in publication_columns:
+                connection.execute(
+                    "ALTER TABLE file_publications ADD COLUMN confirmation_digest TEXT"
+                )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS file_publications_confirmation_digest
+                ON file_publications (confirmation_digest)
+                WHERE confirmation_digest IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_publication_confirmations (
+                    confirmation_digest TEXT PRIMARY KEY,
+                    actor_id TEXT NOT NULL,
+                    guild_id TEXT NOT NULL,
+                    consumed_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO file_publication_confirmations (
+                    confirmation_digest, actor_id, guild_id, consumed_at
+                )
+                SELECT confirmation_digest, published_by_actor_id,
+                       target_workspace_id, published_at
+                FROM file_publications
+                WHERE confirmation_digest IS NOT NULL
                 """
             )
             connection.execute(
@@ -2067,10 +2215,22 @@ class AgentFileSandbox:
                     guild_id TEXT NOT NULL,
                     action TEXT NOT NULL,
                     summary TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL
+                    occurred_at TEXT NOT NULL,
+                    display_filename TEXT NOT NULL DEFAULT 'Managed file'
                 )
                 """
             )
+            action_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(file_actions)").fetchall()
+            }
+            if "display_filename" not in action_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE file_actions
+                    ADD COLUMN display_filename TEXT NOT NULL DEFAULT 'Managed file'
+                    """
+                )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS file_actions_actor_file
@@ -2084,10 +2244,13 @@ class AgentFileSandbox:
         workspace_id: str,
         relative_path: str,
     ) -> tuple[str | None, str | None, str | None]:
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             row = connection.execute(
                 """
                 SELECT file_ref, created_at, updated_at
@@ -2108,10 +2271,13 @@ class AgentFileSandbox:
         workspace_id: str,
         relative_path: str,
     ) -> WorkspaceFileProvenance | None:
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             row = connection.execute(
                 """
                 SELECT owner_actor_id, owner_actor_ids_json, origin_guild_id,
@@ -2147,12 +2313,8 @@ class AgentFileSandbox:
             return WorkspaceFileProvenance(
                 owner_actor_ids=owner_actor_ids,
                 origin_guild_id=str(row[2]) if row[2] is not None else None,
-                origin_channel_id=(
-                    str(row[3]) if row[3] is not None else None
-                ),
-                origin_message_id=(
-                    str(row[4]) if row[4] is not None else None
-                ),
+                origin_channel_id=(str(row[3]) if row[3] is not None else None),
+                origin_message_id=(str(row[4]) if row[4] is not None else None),
                 origin_visibility=_provenance_visibility(str(row[5])),
                 created_task_id=str(row[6]) if row[6] is not None else None,
                 sensitivity=_provenance_visibility(str(row[7])),
@@ -2178,10 +2340,13 @@ class AgentFileSandbox:
         payload = asdict(provenance)
         now = datetime.now(UTC).isoformat()
         file_ref = f"fil_{uuid.uuid4().hex}"
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.execute(
                 """
                 INSERT INTO file_provenance (
@@ -2215,11 +2380,7 @@ class AgentFileSandbox:
                     workspace_id,
                     relative_path,
                     file_ref,
-                    (
-                        payload["owner_actor_ids"][0]
-                        if payload["owner_actor_ids"]
-                        else "unknown"
-                    ),
+                    (payload["owner_actor_ids"][0] if payload["owner_actor_ids"] else "unknown"),
                     json.dumps(
                         payload["owner_actor_ids"],
                         ensure_ascii=True,
@@ -2251,41 +2412,65 @@ class AgentFileSandbox:
         publication: WorkspaceFilePublication,
         *,
         source_file_ref: str,
+        confirmation_digest: str,
     ) -> None:
         _validate_private_file_ref(source_file_ref)
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO file_publications (
+                        publication_id, source_workspace_id, source_path,
+                        source_sha256, copy_workspace_id, copy_path, target_kind,
+                        target_workspace_id, target_resource_id, target_display_name,
+                        target_audience_revision, published_by_actor_id, reason,
+                        published_at, expires_at, revision, revoked_at, revoked_by,
+                        confirmation_digest
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        publication.publication_id,
+                        publication.source_workspace_id,
+                        publication.source_path,
+                        publication.source_sha256,
+                        publication.copy_workspace_id,
+                        publication.copy_path,
+                        publication.target_kind,
+                        publication.target_workspace_id,
+                        publication.target_resource_id,
+                        publication.target_display_name,
+                        publication.target_audience_revision,
+                        publication.published_by_actor_id,
+                        publication.reason,
+                        publication.published_at,
+                        publication.expires_at,
+                        publication.revision,
+                        publication.revoked_at,
+                        publication.revoked_by,
+                        confirmation_digest,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "confirmation_digest" in str(exc):
+                    raise UserError("files.publication_confirmation_replayed") from exc
+                raise
             connection.execute(
                 """
-                INSERT INTO file_publications (
-                    publication_id, source_workspace_id, source_path,
-                    source_sha256, copy_workspace_id, copy_path, target_kind,
-                    target_workspace_id, target_resource_id, target_display_name,
-                    target_audience_revision, published_by_actor_id, reason,
-                    published_at, expires_at, revision, revoked_at, revoked_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO file_publication_confirmations (
+                    confirmation_digest, actor_id, guild_id, consumed_at
+                ) VALUES (?, ?, ?, ?)
                 """,
                 (
-                    publication.publication_id,
-                    publication.source_workspace_id,
-                    publication.source_path,
-                    publication.source_sha256,
-                    publication.copy_workspace_id,
-                    publication.copy_path,
-                    publication.target_kind,
-                    publication.target_workspace_id,
-                    publication.target_resource_id,
-                    publication.target_display_name,
-                    publication.target_audience_revision,
+                    confirmation_digest,
                     publication.published_by_actor_id,
-                    publication.reason,
+                    publication.target_workspace_id,
                     publication.published_at,
-                    publication.expires_at,
-                    publication.revision,
-                    publication.revoked_at,
-                    publication.revoked_by,
                 ),
             )
             source_row = connection.execute(
@@ -2308,6 +2493,7 @@ class AgentFileSandbox:
                 source_guild_id,
                 action="published",
                 summary=summary,
+                display_filename=PurePosixPath(publication.source_path).name,
             )
             self._insert_file_action(
                 connection,
@@ -2316,6 +2502,7 @@ class AgentFileSandbox:
                 publication.target_workspace_id,
                 action="published",
                 summary=summary,
+                display_filename=PurePosixPath(publication.copy_path).name,
             )
 
     def _load_publication(
@@ -2324,10 +2511,13 @@ class AgentFileSandbox:
     ) -> WorkspaceFilePublication | None:
         if not re.fullmatch(r"pub_[0-9a-f]{32}", publication_id):
             raise UserError("files.publication_not_found")
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.row_factory = sqlite3.Row
             row = connection.execute(
                 "SELECT * FROM file_publications WHERE publication_id = ?",
@@ -2345,10 +2535,13 @@ class AgentFileSandbox:
         workspace_id: str,
         relative_path: str,
     ) -> None:
-        with self._provenance_lock, sqlite3.connect(
-            self._provenance_path,
-            timeout=5.0,
-        ) as connection:
+        with (
+            self._provenance_lock,
+            sqlite3.connect(
+                self._provenance_path,
+                timeout=5.0,
+            ) as connection,
+        ):
             connection.execute(
                 "DELETE FROM file_provenance WHERE workspace_id = ? AND relative_path = ?",
                 (workspace_id, relative_path),
@@ -2356,12 +2549,7 @@ class AgentFileSandbox:
 
 
 def _validate_managed_identity(guild_id: str, actor_id: str) -> None:
-    if (
-        not guild_id
-        or len(guild_id) > 200
-        or not actor_id
-        or len(actor_id) > 200
-    ):
+    if not guild_id or len(guild_id) > 200 or not actor_id or len(actor_id) > 200:
         raise UserError("files.file_ref_not_found")
 
 
@@ -2453,16 +2641,8 @@ def _publication_from_row(row: sqlite3.Row) -> WorkspaceFilePublication:
         published_at=str(row["published_at"]),
         expires_at=str(row["expires_at"]),
         revision=int(row["revision"]),
-        revoked_at=(
-            str(row["revoked_at"])
-            if row["revoked_at"] is not None
-            else None
-        ),
-        revoked_by=(
-            str(row["revoked_by"])
-            if row["revoked_by"] is not None
-            else None
-        ),
+        revoked_at=(str(row["revoked_at"]) if row["revoked_at"] is not None else None),
+        revoked_by=(str(row["revoked_by"]) if row["revoked_by"] is not None else None),
     )
 
 
@@ -2484,9 +2664,7 @@ def _merge_file_provenance(
 ) -> WorkspaceFileProvenance:
     if existing is None:
         return incoming
-    all_owners = tuple(
-        sorted(set((*existing.owner_actor_ids, *incoming.owner_actor_ids)))
-    )
+    all_owners = tuple(sorted(set((*existing.owner_actor_ids, *incoming.owner_actor_ids))))
     owners_truncated = len(all_owners) > 32
     owner_actor_ids = all_owners[:32]
     all_source_resources = tuple(
@@ -2499,9 +2677,7 @@ def _merge_file_provenance(
         or len(all_source_resources) > 32
     )
     source_resources = all_source_resources[:32]
-    unlabelled_input = (
-        existing.unlabelled_input or incoming.unlabelled_input
-    )
+    unlabelled_input = existing.unlabelled_input or incoming.unlabelled_input
     sensitivities = {existing.sensitivity, incoming.sensitivity}
     origins_disagree = any(
         left is not None and right is not None and left != right
@@ -2529,12 +2705,8 @@ def _merge_file_provenance(
     return WorkspaceFileProvenance(
         owner_actor_ids=owner_actor_ids,
         origin_guild_id=existing.origin_guild_id or incoming.origin_guild_id,
-        origin_channel_id=(
-            existing.origin_channel_id or incoming.origin_channel_id
-        ),
-        origin_message_id=(
-            existing.origin_message_id or incoming.origin_message_id
-        ),
+        origin_channel_id=(existing.origin_channel_id or incoming.origin_channel_id),
+        origin_message_id=(existing.origin_message_id or incoming.origin_message_id),
         origin_visibility=existing.origin_visibility,
         created_task_id=existing.created_task_id or incoming.created_task_id,
         sensitivity=sensitivity,
@@ -2555,18 +2727,10 @@ def merge_file_provenances(
         if provenance is None:
             saw_unlabelled = True
             continue
-        merged = (
-            provenance
-            if merged is None
-            else _merge_file_provenance(merged, provenance)
-        )
+        merged = provenance if merged is None else _merge_file_provenance(merged, provenance)
     if saw_unlabelled:
         unknown = unlabelled_file_provenance()
-        merged = (
-            unknown
-            if merged is None
-            else _merge_file_provenance(merged, unknown)
-        )
+        merged = unknown if merged is None else _merge_file_provenance(merged, unknown)
     return merged
 
 
@@ -2626,12 +2790,7 @@ def _pdf_text(
                 total_pages=total_pages,
             )
         page_end = min(total_pages, page_start + page_count - 1)
-        lines = [
-            (
-                f"PDF pages: {total_pages}; selected pages: "
-                f"{page_start}-{page_end}"
-            )
-        ]
+        lines = [(f"PDF pages: {total_pages}; selected pages: {page_start}-{page_end}")]
         for index in range(page_start, page_end + 1):
             page = pages[index - 1]
             text = (page.extract_text() or "").strip()
@@ -2669,10 +2828,7 @@ def _zip_listing(data: bytes) -> str:
             shown = entries[:200]
             lines = [
                 f"ZIP entries: {len(entries)}; uncompressed bytes: {total}",
-                *[
-                    f"{item.filename}\t{item.file_size} bytes"
-                    for item in shown
-                ],
+                *[f"{item.filename}\t{item.file_size} bytes" for item in shown],
             ]
             if len(entries) > len(shown):
                 lines.append(f"[{len(entries) - len(shown)} more entries not shown.]")

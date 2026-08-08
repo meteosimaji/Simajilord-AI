@@ -190,6 +190,8 @@ class InvocationContext:
     trigger_actor_ids: tuple[str, ...] = ()
     requester_principal_id: str | None = None
     policy_id: str | None = None
+    principal_role_ids: tuple[str, ...] = ()
+    capability_lease_bindings: tuple[tuple[str, str, int], ...] = ()
     allowed_capabilities: frozenset[str] | None = None
     external_effect_dispatch: ExternalEffectDispatch | None = field(
         default=None,

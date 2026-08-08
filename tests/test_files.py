@@ -29,6 +29,7 @@ from simajilord.core.errors import UserError
 from simajilord.services.files import (
     AgentFileSandbox,
     WorkspaceFileProvenance,
+    WorkspaceFilePublication,
     merge_file_provenances,
 )
 
@@ -56,18 +57,10 @@ def test_agent_file_workspace_mode_isolates_actor_and_task() -> None:
     actor_scope = file_workspace_id(replace(context, file_workspace_mode="actor"))
     task_scope = file_workspace_id(context)
 
-    assert task_scope != file_workspace_id(
-        _agent_file_context(actor_id="actor-b")
-    )
-    assert task_scope != file_workspace_id(
-        _agent_file_context(task_id="task-b")
-    )
-    assert actor_scope == file_workspace_id(
-        _agent_file_context(task_id="task-b", mode="actor")
-    )
-    assert file_workspace_id(
-        replace(context, file_workspace_mode="guild_shared")
-    ) == "guild"
+    assert task_scope != file_workspace_id(_agent_file_context(actor_id="actor-b"))
+    assert task_scope != file_workspace_id(_agent_file_context(task_id="task-b"))
+    assert actor_scope == file_workspace_id(_agent_file_context(task_id="task-b", mode="actor"))
+    assert file_workspace_id(replace(context, file_workspace_mode="guild_shared")) == "guild"
 
 
 @pytest.mark.parametrize("mode", ("actor_task", "actor", "guild_shared"))
@@ -149,6 +142,7 @@ def test_managed_shared_section_contains_only_explicit_publication_copies(
         target_resource_id="21",
         target_display_name="#review",
         target_audience_revision="a" * 64,
+        confirmation_digest="c" * 64,
         reason="Explicit review copy",
         expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
     )
@@ -202,6 +196,7 @@ def test_cross_guild_publication_history_keeps_source_and_target_scopes(
         target_resource_id="21",
         target_display_name="#review",
         target_audience_revision="b" * 64,
+        confirmation_digest="d" * 64,
         reason="Cross-guild review copy",
         expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
     )
@@ -290,14 +285,106 @@ def test_managed_copy_delete_and_history_use_opaque_refs(
         )
 
 
+def test_delete_recent_activity_is_scoped_body_free_and_paginated(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = _agent_file_context(task_id="current-task")
+    records = [
+        sandbox.import_bytes(
+            file_workspace_id(context),
+            f"private/nested-{index}/secret-{index}.txt",
+            f"private body {index}".encode(),
+            provenance=file_provenance(context),
+        )
+        for index in range(3)
+    ]
+    for record in records:
+        assert record.file_ref is not None
+        sandbox.delete_managed_file_for_actor(
+            record.file_ref,
+            "actor-a",
+            "guild",
+            expected_sha256=record.sha256,
+        )
+
+    first, cursor = sandbox.managed_recent_activity_for_actor("actor-a", "guild", limit=2)
+    assert len(first) == 2
+    assert cursor == first[-1].action_id
+    second, final_cursor = sandbox.managed_recent_activity_for_actor(
+        "actor-a", "guild", limit=2, cursor=cursor
+    )
+    assert len(second) == 1
+    assert final_cursor is None
+    assert all(item.action == "deleted" for item in (*first, *second))
+    rendered = repr((*first, *second))
+    assert "private body" not in rendered
+    assert "private/" not in rendered
+    assert "nested-" not in rendered
+    assert {item.display_filename for item in (*first, *second)} == {
+        "secret-0.txt",
+        "secret-1.txt",
+        "secret-2.txt",
+    }
+    assert sandbox.managed_recent_activity_for_actor("actor-b", "guild")[0] == ()
+    assert sandbox.managed_recent_activity_for_actor("actor-a", "other-guild")[0] == ()
+    with pytest.raises(UserError, match=r"files\.history_limit_invalid"):
+        sandbox.managed_recent_activity_for_actor("actor-a", "guild", limit=51)
+    with pytest.raises(UserError, match=r"files\.history_cursor_invalid"):
+        sandbox.managed_recent_activity_for_actor("actor-b", "guild", cursor=first[-1].action_id)
+
+
+def test_publication_confirmation_is_durable_one_use(tmp_path: Path) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    context = _agent_file_context(actor_id="7")
+    workspace_id = file_workspace_id(context)
+    source = sandbox.import_bytes(
+        workspace_id,
+        "report.txt",
+        b"report",
+        provenance=file_provenance(context),
+    )
+    confirmation_digest = "1" * 64
+
+    def publish(digest: str) -> WorkspaceFilePublication:
+        return sandbox.publish_copy_for_actor(
+            workspace_id,
+            "7",
+            "report.txt",
+            expected_sha256=source.sha256,
+            target_workspace_id="guild",
+            target_resource_id="channel",
+            target_display_name="#review",
+            target_audience_revision="2" * 64,
+            confirmation_digest=digest,
+            reason="One reviewed publication.",
+            expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        )
+
+    first = publish(confirmation_digest)
+    with pytest.raises(UserError, match=r"files\.publication_confirmation_replayed"):
+        publish(confirmation_digest)
+    fresh = publish("3" * 64)
+
+    catalog = sandbox.managed_catalog_for_actor("guild", "7", current_task_id="task-a")
+    shared_ids = {item.file_ref for item in catalog.files if item.section == "shared"}
+    assert shared_ids == {first.publication_id, fresh.publication_id}
+
+
+def test_publication_confirmation_reservation_rejects_replay(tmp_path: Path) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    sandbox.consume_publication_confirmation("4" * 64, "actor-a", "guild")
+    with pytest.raises(UserError, match=r"files\.publication_confirmation_replayed"):
+        sandbox.consume_publication_confirmation("4" * 64, "actor-a", "guild")
+    sandbox.consume_publication_confirmation("5" * 64, "actor-a", "guild")
+
+
 @pytest.mark.asyncio
 async def test_actor_workspace_reuses_owned_files_across_tasks(
     tmp_path: Path,
 ) -> None:
     sandbox = AgentFileSandbox(tmp_path / "files")
-    endpoints = {
-        item.descriptor.name: item for item in build_file_endpoints(sandbox)
-    }
+    endpoints = {item.descriptor.name: item for item in build_file_endpoints(sandbox)}
     first_task = _agent_file_context(task_id="task-a", mode="actor")
     second_task = _agent_file_context(task_id="task-b", mode="actor")
 
@@ -320,9 +407,7 @@ async def test_typed_managed_file_actions_do_not_require_raw_paths(
     tmp_path: Path,
 ) -> None:
     sandbox = AgentFileSandbox(tmp_path / "files")
-    endpoints = {
-        item.descriptor.name: item for item in build_file_endpoints(sandbox)
-    }
+    endpoints = {item.descriptor.name: item for item in build_file_endpoints(sandbox)}
     old_task = _agent_file_context(task_id="old-task")
     current_task = _agent_file_context(task_id="current-task")
     written = await endpoints["files.write_text"].invoke(
@@ -373,16 +458,17 @@ def test_guild_shared_workspace_enforces_exact_actor_file_authority(
     sandbox.import_bytes("guild", "a.txt", b"a", provenance=actor_a)
     sandbox.import_bytes("guild", "b.txt", b"b", provenance=actor_b)
 
-    assert tuple(
-        record.path for record in sandbox.list_for_actor("guild", "actor-a")
-    ) == ("a.txt",)
-    assert sandbox.read_for_actor(
-        "guild",
-        "actor-a",
-        "a.txt",
-        offset=0,
-        max_characters=100,
-    ).content == "a"
+    assert tuple(record.path for record in sandbox.list_for_actor("guild", "actor-a")) == ("a.txt",)
+    assert (
+        sandbox.read_for_actor(
+            "guild",
+            "actor-a",
+            "a.txt",
+            offset=0,
+            max_characters=100,
+        ).content
+        == "a"
+    )
     with pytest.raises(UserError, match=r"files\.not_found"):
         sandbox.read_for_actor(
             "guild",
@@ -413,13 +499,16 @@ def test_guild_shared_workspace_enforces_exact_actor_file_authority(
             provenance=actor_a,
         )
 
-    assert sandbox.read_for_actor(
-        "guild",
-        "actor-b",
-        "b.txt",
-        offset=0,
-        max_characters=100,
-    ).content == "b"
+    assert (
+        sandbox.read_for_actor(
+            "guild",
+            "actor-b",
+            "b.txt",
+            offset=0,
+            max_characters=100,
+        ).content
+        == "b"
+    )
 
 
 def test_unlabelled_legacy_file_is_hidden_until_ownership_is_assigned(
@@ -457,14 +546,8 @@ def test_provenance_merge_retains_all_owners_and_taints_missing_or_overflow() ->
     assert unlabelled.unlabelled_input
     assert unlabelled.sensitivity == "uncertain"
 
-    public_sources = tuple(
-        ("guild", f"public-{index}", "guild_public")
-        for index in range(20)
-    )
-    restricted_sources = tuple(
-        ("guild", f"staff-{index}", "restricted")
-        for index in range(20)
-    )
+    public_sources = tuple(("guild", f"public-{index}", "guild_public") for index in range(20))
+    restricted_sources = tuple(("guild", f"staff-{index}", "restricted") for index in range(20))
     overflow = merge_file_provenances(
         (
             WorkspaceFileProvenance(
@@ -535,12 +618,7 @@ def test_provenance_schema_migrates_legacy_single_owner_rows(
     assert provenance.owner_actor_ids == ("actor-a",)
     assert not provenance.unlabelled_input
     with sqlite3.connect(database) as connection:
-        columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info(file_provenance)"
-            )
-        }
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(file_provenance)")}
     assert {
         "file_ref",
         "created_at",
@@ -608,6 +686,7 @@ def test_target_bound_publication_preserves_source_and_rejects_other_targets(
         target_resource_id="21",
         target_display_name="#review",
         target_audience_revision="a" * 64,
+        confirmation_digest="e" * 64,
         reason="Share the reviewed report",
         expires_at=expires_at,
     )
@@ -617,14 +696,12 @@ def test_target_bound_publication_preserves_source_and_rejects_other_targets(
     assert unchanged.sha256 == original.sha256
     assert publication.source_path == "report.txt"
     assert publication.target_resource_id == "21"
-    filename, content, copied_provenance, loaded = (
-        sandbox.snapshot_publication_for_actor(
-            publication.publication_id,
-            "7",
-            target_workspace_id="10",
-            target_resource_id="21",
-            expected_revision=1,
-        )
+    filename, content, copied_provenance, loaded = sandbox.snapshot_publication_for_actor(
+        publication.publication_id,
+        "7",
+        target_workspace_id="10",
+        target_resource_id="21",
+        expected_revision=1,
     )
     assert filename == "report.txt"
     assert content == b"private report"
@@ -676,6 +753,7 @@ def test_expired_publication_copy_cannot_be_reused(tmp_path: Path) -> None:
         target_resource_id="21",
         target_display_name="#review",
         target_audience_revision="b" * 64,
+        confirmation_digest="f" * 64,
         reason="Temporary review",
         expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     )
@@ -746,12 +824,8 @@ def test_file_provenance_persists_and_cannot_be_downgraded(
     record = restarted.list(workspace_id)[0]
     assert record.provenance is not None
     assert record.provenance.sensitivity == "restricted"
-    assert ("guild", "staff-channel", "restricted") in (
-        record.provenance.source_resources
-    )
-    assert ("guild", "public-channel", "guild_public") in (
-        record.provenance.source_resources
-    )
+    assert ("guild", "staff-channel", "restricted") in (record.provenance.source_resources)
+    assert ("guild", "public-channel", "guild_public") in (record.provenance.source_resources)
 
 
 def test_provenance_failure_does_not_commit_new_bytes(
@@ -885,11 +959,7 @@ def test_file_sandbox_quota_is_atomic_across_importers(tmp_path: Path) -> None:
 
     assert len(sandbox.list("guild")) == 1
     assert (
-        sum(
-            value in {"files.file_count_limit", "files.workspace_quota"}
-            for value in results
-        )
-        == 1
+        sum(value in {"files.file_count_limit", "files.workspace_quota"} for value in results) == 1
     )
 
 

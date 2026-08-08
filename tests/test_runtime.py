@@ -14,8 +14,22 @@ from simajilord.agent import (
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
     AGENT_COMPUTE_GRANT,
+    AGENT_CONNECTOR_DESTRUCTIVE_GRANT,
     AGENT_CONNECTOR_GRANT,
+    AGENT_CONNECTOR_READ_GRANT,
+    AGENT_CONNECTOR_WRITE_GRANT,
+    AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+    AGENT_DISCORD_DM_SEND_GRANT,
+    AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT,
+    AGENT_DISCORD_MESSAGE_SEND_GRANT,
+    AGENT_DISCORD_ROLE_MANAGE_GRANT,
+    AGENT_DISCORD_THREAD_MANAGE_GRANT,
+    AGENT_FILE_DELETE_GRANT,
     AGENT_FILE_GRANT,
+    AGENT_FILE_PRIVATE_WRITE_GRANT,
+    AGENT_FILE_PUBLISH_GRANT,
+    AGENT_FILE_READ_GRANT,
+    AGENT_FILE_SEND_GRANT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
@@ -27,6 +41,7 @@ from simajilord.agent import (
     AGENT_WEB_GRANT,
     NON_UNDOABLE_ACTION_CAPABILITIES,
     action_policy,
+    expand_agent_grants,
 )
 from simajilord.agent.providers import CodexAppServerProvider
 from simajilord.capabilities.status import StatusRequest, StatusResponse
@@ -637,6 +652,193 @@ def test_agent_file_grant_exposes_complete_attachment_read_and_delivery_path(
         "discord_send_file",
     }.isdisjoint(denied_eager_names | granted_eager_names)
     asyncio.run(runtime.close())
+
+
+def test_legacy_and_narrow_grants_preserve_least_privilege_matrices(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "true")
+    monkeypatch.setenv("AGENT_CONNECTOR_ACCESS", "everyone")
+    monkeypatch.setenv("IMAGE_GENERATION_ACCESS", "disabled")
+    monkeypatch.setenv("AGENT_WEB_SEARCH_ACCESS", "disabled")
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+    for item in build_discord_endpoints(cast(discord.Client, object()), runtime):
+        runtime.registry.register(item)
+    assert runtime.agent is not None
+    provider = cast(CodexAppServerProvider, runtime.agent.provider)
+    approvals = frozenset(AGENT_REQUESTED_WRITE_CAPABILITIES)
+
+    async def names(grant: str) -> set[str]:
+        return await _listed_capability_names(
+            provider,
+            InvocationContext(
+                "7",
+                "1",
+                "agent",
+                f"grant:{grant}",
+                grants=frozenset({grant}),
+                approvals=approvals,
+            ),
+        )
+
+    async def run() -> None:
+        file_groups = {
+            AGENT_FILE_READ_GRANT: {
+                "files.catalog",
+                "files.list",
+                "files.read",
+                "files.history",
+                "files.recent_activity",
+            },
+            AGENT_FILE_PRIVATE_WRITE_GRANT: {
+                "files.write_text",
+                "files.replace_text",
+                "files.copy_to_task",
+                "discord.import_attachment",
+            },
+            AGENT_FILE_PUBLISH_GRANT: {
+                "files.inspect_publish_target",
+                "files.publish_copy",
+                "files.revoke_publication",
+            },
+            AGENT_FILE_SEND_GRANT: {
+                "discord.send_file",
+                "discord.send_files",
+                "discord.send_managed_file",
+                "discord.send_published_file",
+                "discord.open_file_manager",
+            },
+            AGENT_FILE_DELETE_GRANT: {"files.delete"},
+        }
+        all_file_capabilities = set().union(*file_groups.values())
+        for grant, expected in file_groups.items():
+            available = await names(grant)
+            assert available & all_file_capabilities == expected
+        legacy_files = await names(AGENT_FILE_GRANT)
+        narrow_files: set[str] = set()
+        for grant in file_groups:
+            narrow_files.update(await names(grant))
+        assert legacy_files & all_file_capabilities == narrow_files & all_file_capabilities
+
+        connector_groups = {
+            AGENT_CONNECTOR_READ_GRANT: {
+                "connector.search",
+                "connector.describe",
+                "connector.read",
+            },
+            AGENT_CONNECTOR_WRITE_GRANT: {"connector.write"},
+            AGENT_CONNECTOR_DESTRUCTIVE_GRANT: {"connector.destructive"},
+        }
+        all_connector_capabilities = set().union(*connector_groups.values())
+        for grant, expected in connector_groups.items():
+            available = await names(grant)
+            assert available & all_connector_capabilities == expected
+        legacy_connectors = await names(AGENT_CONNECTOR_GRANT)
+        assert legacy_connectors & all_connector_capabilities == all_connector_capabilities
+
+        discord_groups = {
+            AGENT_DISCORD_MESSAGE_SEND_GRANT: {
+                "discord.send_message",
+                "discord.send_embed",
+                "discord.create_poll",
+                "discord.reply_message",
+                "discord.edit_own_message",
+                "discord.pin_message",
+                "discord.unpin_message",
+                "discord.message_action",
+                "discord.forward_message",
+            },
+            AGENT_DISCORD_DM_SEND_GRANT: {"discord.send_direct_message"},
+            AGENT_DISCORD_THREAD_MANAGE_GRANT: {
+                "discord.create_thread",
+                "discord.update_thread",
+                "discord.add_thread_member",
+                "discord.remove_thread_member",
+                "discord.create_forum_post",
+            },
+            AGENT_DISCORD_ROLE_MANAGE_GRANT: {
+                "discord.create_role",
+                "discord.assign_role",
+                "discord.remove_role",
+            },
+            AGENT_DISCORD_CHANNEL_MANAGE_GRANT: {
+                "discord.update_channel_settings",
+                "discord.create_channel",
+                "discord.set_channel_overwrite",
+                "discord.channel_operation",
+            },
+            AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT: {
+                "discord.create_guild_resource",
+                "discord.update_guild_resource",
+                "discord.create_platform_asset",
+                "discord.update_platform_asset",
+                "discord.create_automod_rule",
+                "discord.update_automod_rule",
+                "discord.set_bot_presence",
+            },
+        }
+        all_discord_capabilities = set().union(*discord_groups.values())
+        for grant, expected in discord_groups.items():
+            available = await names(grant)
+            assert available & all_discord_capabilities == expected
+
+        await runtime.close()
+
+    asyncio.run(run())
+
+
+def test_legacy_grant_expansion_and_status_keep_configured_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    assert expand_agent_grants(frozenset({AGENT_FILE_GRANT})) == frozenset(
+        {
+            AGENT_FILE_GRANT,
+            AGENT_FILE_READ_GRANT,
+            AGENT_FILE_PRIVATE_WRITE_GRANT,
+            AGENT_FILE_PUBLISH_GRANT,
+            AGENT_FILE_SEND_GRANT,
+            AGENT_FILE_DELETE_GRANT,
+        }
+    )
+    monkeypatch.setenv("DISCORD_TOKEN", "test-token")
+    monkeypatch.setenv("DISCORD_APPLICATION_ID", "123")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("AGENT_ENABLED", "true")
+    monkeypatch.setenv("AGENT_FILE_SANDBOX_ENABLED", "true")
+    settings = load_settings(dotenv_path=tmp_path / "missing.env")
+    runtime = SimajilordRuntime.build(settings)
+
+    async def run() -> None:
+        response = cast(
+            StatusResponse,
+            await runtime.registry.invoke(
+                "system.status",
+                StatusRequest(),
+                InvocationContext(
+                    "7",
+                    "1",
+                    "status",
+                    "grant-status",
+                    grants=frozenset({AGENT_FILE_GRANT}),
+                ),
+            ),
+        )
+        assert response.security_configured_grants == (AGENT_FILE_GRANT,)
+        assert set(response.security_effective_grants) == set(
+            expand_agent_grants(frozenset({AGENT_FILE_GRANT}))
+        )
+        assert response.security_active_lease_count == 0
+        assert response.security_active_lease_metadata == ()
+        await runtime.close()
+
+    asyncio.run(run())
 
 
 def test_agent_safe_compute_access_exposes_only_isolated_workspace_tools(

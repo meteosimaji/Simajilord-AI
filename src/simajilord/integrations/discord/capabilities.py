@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import secrets
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -23,6 +24,7 @@ import discord
 from discord.http import Route
 from PIL import Image, UnidentifiedImageError
 
+from simajilord.agent import HumanCapabilityExecutor
 from simajilord.capabilities.audio import (
     AudioAutoLeaveRequest,
     AudioControlRequest,
@@ -45,12 +47,16 @@ from simajilord.capabilities.file_scope import (
     provenance_observations,
 )
 from simajilord.capabilities.files import (
+    FileCatalogRequest,
+    FileCatalogResponse,
     FileCopyToTaskRequest,
     FileCopyToTaskResponse,
     FileDeleteRequest,
     FileDeleteResponse,
     FileHistoryRequest,
     FileHistoryResponse,
+    FileRecentActivityRequest,
+    FileRecentActivityResponse,
 )
 from simajilord.capabilities.moderation import (
     SyntheticMediaAnalyzeRequest,
@@ -219,7 +225,6 @@ class _ResolvedPrivateFileSource:
 
 @dataclass(frozen=True, slots=True)
 class _FileManagerPublishPayload:
-    context: InvocationContext
     request: FilePublishCopyRequest
 
 
@@ -296,9 +301,7 @@ class DiscordUserRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
 
@@ -359,9 +362,7 @@ class DiscordListVoiceStatesRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
     offset: int = dataclass_field(
@@ -447,9 +448,7 @@ class DiscordListRolesRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
     offset: int = dataclass_field(
@@ -494,9 +493,7 @@ class DiscordListChannelsRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
     offset: int = dataclass_field(
@@ -534,17 +531,13 @@ class DiscordListChannelsResponse:
 class DiscordListArchivedThreadsRequest:
     parent_channel_id: str = dataclass_field(
         metadata={
-            "description": (
-                "Readable text or forum channel ID returned by discord.list_channels."
-            )
+            "description": ("Readable text or forum channel ID returned by discord.list_channels.")
         }
     )
     before_iso: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "For an older page, copy next_before_iso from the prior response."
-            )
+            "description": ("For an older page, copy next_before_iso from the prior response.")
         },
     )
     limit: int = dataclass_field(
@@ -554,9 +547,7 @@ class DiscordListArchivedThreadsRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
 
@@ -585,9 +576,7 @@ class DiscordListArchivedThreadsResponse:
 class DiscordReadMessagesRequest:
     channel_id: str = dataclass_field(
         metadata={
-            "description": (
-                "Readable channel or thread ID returned by discord.list_channels."
-            )
+            "description": ("Readable channel or thread ID returned by discord.list_channels.")
         }
     )
     limit: int = dataclass_field(
@@ -606,9 +595,7 @@ class DiscordReadMessagesRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
 
@@ -705,9 +692,7 @@ class DiscordReadMessagesResponse:
     source_guild_id: str = ""
     source_channel_id: str = ""
     visibility: Literal["guild_public", "restricted", "uncertain"] = "uncertain"
-    disclosure_to_origin: Literal[
-        "same_or_narrower", "broader", "uncertain"
-    ] = "uncertain"
+    disclosure_to_origin: Literal["same_or_narrower", "broader", "uncertain"] = "uncertain"
     disclosure_warning: str | None = None
     has_more: bool = False
     next_before_message_id: str | None = None
@@ -822,9 +807,7 @@ class DiscordSearchMessagesRequest:
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={
-            "description": (
-                "Guild ID returned by discord.list_servers. Omit for the origin guild."
-            )
+            "description": ("Guild ID returned by discord.list_servers. Omit for the origin guild.")
         },
     )
 
@@ -1261,6 +1244,7 @@ class FilePublishTargetInspectResponse:
     publication_expires_at: str
     audience_expansion_token: str
     audience_expansion_expires_at: str
+    confirmation_id: str
     source_file_ref: str | None = None
 
 
@@ -1278,6 +1262,7 @@ class FilePublishCopyRequest:
     expected_target_audience_revision: str
     audience_expansion_token: str
     audience_expansion_expires_at: str
+    confirmation_id: str
     guild_id: str | None = dataclass_field(
         default=None,
         metadata={"description": _OPTIONAL_TARGET_GUILD_DESCRIPTION},
@@ -1342,6 +1327,8 @@ class DiscordSendPublishedFileResponse:
 class DiscordSendManagedFileRequest:
     file_ref: str
     channel_id: str
+    expected_sha256: str | None = None
+    expected_revision: int | None = None
     caption: str = ""
     description: str = ""
     spoiler: bool = False
@@ -1723,11 +1710,7 @@ def build_discord_endpoints(
         cached_members_complete = guild.chunked or (
             guild.member_count is not None and len(guild.members) >= guild.member_count
         )
-        bot_count = (
-            sum(member.bot for member in guild.members)
-            if cached_members_complete
-            else None
-        )
+        bot_count = sum(member.bot for member in guild.members) if cached_members_complete else None
         owner = guild.get_member(guild.owner_id) if guild.owner_id is not None else None
         return DiscordServerResponse(
             server_id=str(guild.id),
@@ -1878,9 +1861,7 @@ def build_discord_endpoints(
         roles = tuple(role.name for role in member_roles)
         intents = getattr(client, "intents", None)
         presence_available = (
-            cached_member is not None
-            and isinstance(intents, discord.Intents)
-            and intents.presences
+            cached_member is not None and isinstance(intents, discord.Intents) and intents.presences
         )
         presence_member = cached_member if presence_available else None
         voice_state = (
@@ -1907,11 +1888,7 @@ def build_discord_endpoints(
             nickname=member.nick if member is not None else None,
             role_names=roles,
             role_count=len(roles),
-            status=(
-                str(presence_member.status)
-                if presence_member is not None
-                else None
-            ),
+            status=(str(presence_member.status) if presence_member is not None else None),
             pending=member.pending is True if member is not None else False,
             timed_out_until_iso=(
                 member.timed_out_until.isoformat()
@@ -1924,20 +1901,12 @@ def build_discord_endpoints(
             member=member is not None,
             presence_available=presence_available,
             desktop_status=(
-                str(presence_member.desktop_status)
-                if presence_member is not None
-                else None
+                str(presence_member.desktop_status) if presence_member is not None else None
             ),
             mobile_status=(
-                str(presence_member.mobile_status)
-                if presence_member is not None
-                else None
+                str(presence_member.mobile_status) if presence_member is not None else None
             ),
-            web_status=(
-                str(presence_member.web_status)
-                if presence_member is not None
-                else None
-            ),
+            web_status=(str(presence_member.web_status) if presence_member is not None else None),
             activities=(
                 tuple(_activity_record(activity) for activity in presence_member.activities)
                 if presence_member is not None
@@ -1960,41 +1929,21 @@ def build_discord_endpoints(
                 else None
             ),
             public_flags=_enabled_flag_names(user.public_flags),
-            member_flags=(
-                _enabled_flag_names(member.flags)
-                if member is not None
-                else ()
-            ),
+            member_flags=(_enabled_flag_names(member.flags) if member is not None else ()),
             role_ids=tuple(str(role.id) for role in member_roles),
             enabled_guild_permissions=(
-                _enabled_flag_names(member.guild_permissions)
-                if member is not None
-                else ()
+                _enabled_flag_names(member.guild_permissions) if member is not None else ()
             ),
-            raw_status=(
-                presence_member.raw_status
-                if presence_member is not None
-                else None
-            ),
-            is_on_mobile=(
-                presence_member.is_on_mobile()
-                if presence_member is not None
-                else False
-            ),
+            raw_status=(presence_member.raw_status if presence_member is not None else None),
+            is_on_mobile=(presence_member.is_on_mobile() if presence_member is not None else False),
             discriminator=user.discriminator,
             system=user.system,
             global_avatar_url=str(global_avatar.url) if global_avatar else None,
             banner_url=str(banner.url) if banner else None,
-            display_banner_url=(
-                str(display_banner.url) if display_banner else None
-            ),
-            accent_colour_value=(
-                accent_colour.value if accent_colour is not None else None
-            ),
+            display_banner_url=(str(display_banner.url) if display_banner else None),
+            accent_colour_value=(accent_colour.value if accent_colour is not None else None),
             avatar_decoration_url=(
-                str(avatar_decoration.url)
-                if avatar_decoration is not None
-                else None
+                str(avatar_decoration.url) if avatar_decoration is not None else None
             ),
             avatar_decoration_sku_id=(
                 str(user.avatar_decoration_sku_id)
@@ -2004,14 +1953,10 @@ def build_discord_endpoints(
             mutual_guild_ids=tuple(
                 sorted(str(mutual_guild.id) for mutual_guild in user.mutual_guilds)
             ),
-            primary_guild_id=(
-                str(primary_guild.id) if primary_guild.id is not None else None
-            ),
+            primary_guild_id=(str(primary_guild.id) if primary_guild.id is not None else None),
             primary_guild_tag=primary_guild.tag,
             primary_guild_badge_url=(
-                str(primary_guild.badge.url)
-                if primary_guild.badge is not None
-                else None
+                str(primary_guild.badge.url) if primary_guild.badge is not None else None
             ),
             primary_guild_identity_enabled=primary_guild.identity_enabled is True,
         )
@@ -2212,9 +2157,7 @@ def build_discord_endpoints(
             )
             for thread in page
         )
-        next_before_iso = (
-            records[-1].archived_at_iso if records and has_more else None
-        )
+        next_before_iso = records[-1].archived_at_iso if records and has_more else None
         return DiscordListArchivedThreadsResponse(
             threads=records,
             source_guild_id=str(guild.id),
@@ -2271,9 +2214,7 @@ def build_discord_endpoints(
             anchor_message_id=request.before_message_id,
             anchor_is_active_message=anchor_is_active_message,
             immediate_predecessor_message_id=(
-                messages[-1].message_id
-                if messages and anchor_is_active_message
-                else None
+                messages[-1].message_id if messages and anchor_is_active_message else None
             ),
             source_guild_id=str(guild.id),
             source_channel_id=str(channel.id),
@@ -2281,9 +2222,7 @@ def build_discord_endpoints(
             disclosure_to_origin=disclosure,
             disclosure_warning=_disclosure_warning(disclosure),
             has_more=has_more,
-            next_before_message_id=(
-                messages[0].message_id if messages and has_more else None
-            ),
+            next_before_message_id=(messages[0].message_id if messages and has_more else None),
         )
 
     async def search_messages(
@@ -2301,13 +2240,10 @@ def build_discord_endpoints(
             or (request.sort_by == "timestamp" and request.offset != 0)
         ):
             raise UserError("discord.message_search_offset_invalid")
-        if (
-            request.cursor is not None
-            and (
-                request.sort_by != "relevance"
-                or request.offset != 0
-                or not 1 <= len(request.cursor) <= 8_192
-            )
+        if request.cursor is not None and (
+            request.sort_by != "relevance"
+            or request.offset != 0
+            or not 1 <= len(request.cursor) <= 8_192
         ):
             raise UserError("discord.message_search_cursor_invalid")
         if not 1 <= request.limit <= 25:
@@ -2344,11 +2280,7 @@ def build_discord_endpoints(
             readable_ids = set(_agent_readable_channel_ids(guild, actor, context))
             if any(channel_id not in readable_ids for channel_id in requested_ids):
                 raise UserError("discord.agent_read_channel_forbidden")
-            scoped_ids = (
-                requested_ids
-                if requested_ids
-                else tuple(sorted(readable_ids, key=int))
-            )
+            scoped_ids = requested_ids if requested_ids else tuple(sorted(readable_ids, key=int))
             if not scoped_ids:
                 return DiscordSearchMessagesResponse(
                     messages=(),
@@ -2369,8 +2301,7 @@ def build_discord_endpoints(
         channel_batches: tuple[tuple[str, ...], ...]
         if scoped_ids:
             channel_batches = tuple(
-                scoped_ids[index : index + 500]
-                for index in range(0, len(scoped_ids), 500)
+                scoped_ids[index : index + 500] for index in range(0, len(scoped_ids), 500)
             )
         else:
             channel_batches = ((),)
@@ -2403,9 +2334,7 @@ def build_discord_endpoints(
             batch_offsets = (0,) * len(channel_batches)
             next_batch_index = 0
 
-        batch_hits: list[list[tuple[int, DiscordMessageRecord]]] = [
-            [] for _ in channel_batches
-        ]
+        batch_hits: list[list[tuple[int, DiscordMessageRecord]]] = [[] for _ in channel_batches]
         batch_fetched_counts = [0 for _ in channel_batches]
         batch_totals = [0 for _ in channel_batches]
         indexing = False
@@ -2508,18 +2437,12 @@ def build_discord_endpoints(
                     group_record = record
                     break
                 if group_record is not None:
-                    batch_hits[batch_index].append(
-                        (group_position, group_record)
-                    )
+                    batch_hits[batch_index].append((group_position, group_record))
 
         total_results = sum(batch_totals)
         next_cursor: str | None = None
         if request.sort_by == "timestamp":
-            records = [
-                record
-                for hits in batch_hits
-                for _, record in hits
-            ]
+            records = [record for hits in batch_hits for _, record in hits]
             records.sort(
                 key=lambda item: (item.created_at_iso, int(item.message_id)),
                 reverse=request.sort_order == "desc",
@@ -2537,18 +2460,14 @@ def build_discord_endpoints(
             while len(merged) < request.limit:
                 progressed = False
                 for step in range(len(channel_batches)):
-                    batch_index = (
-                        next_batch_index + step
-                    ) % len(channel_batches)
+                    batch_index = (next_batch_index + step) % len(channel_batches)
                     position = consumed_positions[batch_index]
                     hits = batch_hits[batch_index]
                     if position >= len(hits):
                         continue
                     raw_position, record = hits[position]
                     consumed_positions[batch_index] += 1
-                    next_offsets[batch_index] = (
-                        batch_offsets[batch_index] + raw_position
-                    )
+                    next_offsets[batch_index] = batch_offsets[batch_index] + raw_position
                     last_batch_index = batch_index
                     progressed = True
                     if record.message_id not in seen_message_ids:
@@ -2562,8 +2481,7 @@ def build_discord_endpoints(
             for batch_index, hits in enumerate(batch_hits):
                 if consumed_positions[batch_index] >= len(hits):
                     next_offsets[batch_index] = (
-                        batch_offsets[batch_index]
-                        + batch_fetched_counts[batch_index]
+                        batch_offsets[batch_index] + batch_fetched_counts[batch_index]
                     )
             page = tuple(merged)
             batch_has_more = tuple(
@@ -2595,12 +2513,8 @@ def build_discord_endpoints(
                     )
             else:
                 next_offset = None
-        oldest_message_id = (
-            min((item.message_id for item in page), key=int) if page else None
-        )
-        newest_message_id = (
-            max((item.message_id for item in page), key=int) if page else None
-        )
+        oldest_message_id = min((item.message_id for item in page), key=int) if page else None
+        newest_message_id = max((item.message_id for item in page), key=int) if page else None
         return DiscordSearchMessagesResponse(
             messages=page,
             total_results=total_results,
@@ -2612,25 +2526,15 @@ def build_discord_endpoints(
             has_more=has_more,
             next_offset=next_offset,
             next_cursor=next_cursor,
-            cursor_pagination=(
-                request.sort_by == "relevance" and len(channel_batches) > 1
-            ),
+            cursor_pagination=(request.sort_by == "relevance" and len(channel_batches) > 1),
             next_before_message_id=(
                 oldest_message_id
-                if (
-                    has_more
-                    and request.sort_by == "timestamp"
-                    and request.sort_order == "desc"
-                )
+                if (has_more and request.sort_by == "timestamp" and request.sort_order == "desc")
                 else None
             ),
             next_after_message_id=(
                 newest_message_id
-                if (
-                    has_more
-                    and request.sort_by == "timestamp"
-                    and request.sort_order == "asc"
-                )
+                if (has_more and request.sort_by == "timestamp" and request.sort_order == "asc")
                 else None
             ),
             search_window_exhausted=search_window_exhausted,
@@ -2707,9 +2611,7 @@ def build_discord_endpoints(
             ),
             reply_context=reply_context,
             edited_at_iso=_message_edited_at_iso(message),
-            reaction_count=sum(
-                reaction.count for reaction in getattr(message, "reactions", ())
-            ),
+            reaction_count=sum(reaction.count for reaction in getattr(message, "reactions", ())),
             reaction_summary=tuple(
                 DiscordReactionSummaryRecord(str(reaction.emoji), reaction.count)
                 for reaction in getattr(message, "reactions", ())[:10]
@@ -2928,9 +2830,7 @@ def build_discord_endpoints(
             raise UserError("discord.quote_render_failed") from exc
         extension = "gif" if rendered.animated else "png"
         filename = f"quote-{message.id}.{extension}"
-        jump_view = (
-            quote_message_view(message.jump_url) if request.include_jump else None
-        )
+        jump_view = quote_message_view(message.jump_url) if request.include_jump else None
         if request.include_jump:
             assert jump_view is not None
         allowed_mentions = discord.AllowedMentions.none()
@@ -3140,8 +3040,7 @@ def build_discord_endpoints(
         if attachment.size > runtime.files.max_file_bytes:
             raise UserError("files.file_too_large")
         destination = request.destination_path or (
-            f"attachments/{request.message_id}/"
-            f"{_workspace_attachment_name(attachment)}"
+            f"attachments/{request.message_id}/{_workspace_attachment_name(attachment)}"
         )
         source_guild = message.guild
         source_channel = message.channel
@@ -3393,10 +3292,7 @@ def build_discord_endpoints(
             return DiscordMessageWriteResponse(
                 request.channel_id, request.message_id, changed=False
             )
-        if (
-            request.expected_pinned is not None
-            and bool(message.pinned) != request.expected_pinned
-        ):
+        if request.expected_pinned is not None and bool(message.pinned) != request.expected_pinned:
             raise UserError("action.undo_conflict")
         operation = message.pin if pinned else message.unpin
         reason = _audit_reason(request.reason, context)
@@ -3483,15 +3379,12 @@ def build_discord_endpoints(
                 changed=False,
             )
         if (
-            request.expected_name is not None
-            and old_name != request.expected_name
-        ) or (
-            request.expected_archived is not None
-            and old_archived != request.expected_archived
-        ) or (
-            request.expected_undo_fingerprint is not None
-            and _thread_undo_fingerprint(thread)
-            != request.expected_undo_fingerprint
+            (request.expected_name is not None and old_name != request.expected_name)
+            or (request.expected_archived is not None and old_archived != request.expected_archived)
+            or (
+                request.expected_undo_fingerprint is not None
+                and _thread_undo_fingerprint(thread) != request.expected_undo_fingerprint
+            )
         ):
             raise UserError("action.undo_conflict")
         reason = _audit_reason(request.reason, context)
@@ -3550,9 +3443,7 @@ def build_discord_endpoints(
             _require_channel_permissions(thread, member, "manage_threads")
         target = await _guild_member(guild, request.user_id)
         expansion = await _thread_audience_expansion(guild, thread, target)
-        expires_at = (
-            datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL
-        ).isoformat()
+        expires_at = (datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL).isoformat()
         payload = thread_audience_payload(
             context,
             guild,
@@ -3569,8 +3460,7 @@ def build_discord_endpoints(
             source_reader_count=len(expansion.source_reader_ids),
             expanded_reader_count=len(expansion.expanded_reader_ids),
             new_reader_count=(
-                len(expansion.expanded_reader_ids)
-                - len(expansion.source_reader_ids)
+                len(expansion.expanded_reader_ids) - len(expansion.source_reader_ids)
             ),
             retained_history_exposed=expansion.retained_history_exposed,
             expansion_required=expansion.retained_history_exposed,
@@ -3615,9 +3505,7 @@ def build_discord_endpoints(
                 request.user_id,
                 present,
                 changed=False,
-                audience_revision=(
-                    expansion.revision if expansion is not None else None
-                ),
+                audience_revision=(expansion.revision if expansion is not None else None),
             )
         if (
             present
@@ -3627,8 +3515,7 @@ def build_discord_endpoints(
         ):
             try:
                 if (
-                    request.expected_target_display_name
-                    != expansion.target_display_name
+                    request.expected_target_display_name != expansion.target_display_name
                     or not _exact_integer(
                         request.expected_source_reader_count,
                         len(expansion.source_reader_ids),
@@ -3671,10 +3558,7 @@ def build_discord_endpoints(
                     target.id,
                     expansion.revision,
                 )
-        if (
-            request.expected_present is not None
-            and existing != request.expected_present
-        ):
+        if request.expected_present is not None and existing != request.expected_present:
             raise UserError("action.undo_conflict")
         await context.dispatch_external_effect()
         if present:
@@ -3779,10 +3663,7 @@ def build_discord_endpoints(
             raise UserError("action.undo_conflict")
         if not (
             guild.chunked
-            or (
-                guild.member_count is not None
-                and len(guild.members) >= guild.member_count
-            )
+            or (guild.member_count is not None and len(guild.members) >= guild.member_count)
         ):
             raise UserError("action.undo_target_state_uncertain")
         if role.members:
@@ -3823,10 +3704,7 @@ def build_discord_endpoints(
             return DiscordRoleMemberResponse(
                 request.user_id, request.role_id, assigned, changed=False
             )
-        if (
-            request.expected_assigned is not None
-            and existing != request.expected_assigned
-        ):
+        if request.expected_assigned is not None and existing != request.expected_assigned:
             raise UserError("action.undo_conflict")
         operation = target.add_roles if assigned else target.remove_roles
         reason = _audit_reason(request.reason, context)
@@ -3861,16 +3739,8 @@ def build_discord_endpoints(
         _require_channel_permissions(channel, bot, "manage_channels")
         old_topic = channel.topic
         old_slowmode = channel.slowmode_delay
-        topic = (
-            old_topic
-            if request.topic == _UNCHANGED_CHANNEL_TOPIC
-            else request.topic
-        )
-        slowmode = (
-            old_slowmode
-            if request.slowmode_seconds is None
-            else request.slowmode_seconds
-        )
+        topic = old_topic if request.topic == _UNCHANGED_CHANNEL_TOPIC else request.topic
+        slowmode = old_slowmode if request.slowmode_seconds is None else request.slowmode_seconds
         if len(topic or "") > 1_024 or not 0 <= slowmode <= 21_600:
             raise UserError("discord.channel_setting_invalid")
         changed = topic != old_topic or slowmode != old_slowmode
@@ -3949,12 +3819,9 @@ def build_discord_endpoints(
         if channel is None:
             await context.complete_external_effect_without_dispatch()
             return DiscordCreatedEntityDeleteResponse(request.channel_id, True)
-        if (
-            request.undo_fingerprint is not None
-            and (
-                not isinstance(channel, discord.TextChannel)
-                or _channel_undo_fingerprint(channel) != request.undo_fingerprint
-            )
+        if request.undo_fingerprint is not None and (
+            not isinstance(channel, discord.TextChannel)
+            or _channel_undo_fingerprint(channel) != request.undo_fingerprint
         ):
             raise UserError("action.undo_conflict")
         if isinstance(channel, discord.TextChannel):
@@ -3991,9 +3858,7 @@ def build_discord_endpoints(
             )
         if request.expected_until_iso != _NO_EXPECTED_STRING_STATE:
             expected_until = _timeout_state_datetime(request.expected_until_iso)
-            normalized_previous = (
-                previous.astimezone(UTC) if previous is not None else None
-            )
+            normalized_previous = previous.astimezone(UTC) if previous is not None else None
             if normalized_previous != expected_until:
                 raise UserError("action.undo_conflict")
         reason = _audit_reason(request.reason, context)
@@ -4033,10 +3898,7 @@ def build_discord_endpoints(
         ids = tuple(dict.fromkeys(request.message_ids))
         if not 2 <= len(ids) <= 100:
             raise UserError("discord.bulk_delete_limit_invalid")
-        messages = [
-            await _fetch_message_for_write(channel, message_id)
-            for message_id in ids
-        ]
+        messages = [await _fetch_message_for_write(channel, message_id) for message_id in ids]
         oldest_bulk_delete_time = datetime.now(UTC) - timedelta(days=14)
         if any(message.created_at <= oldest_bulk_delete_time for message in messages):
             raise UserError("discord.bulk_delete_message_too_old")
@@ -4132,9 +3994,7 @@ def build_discord_endpoints(
         ):
             raise UserError("discord.message_delete_forbidden")
         try:
-            message = await channel.fetch_message(
-                _snowflake(request.message_id, "message")
-            )
+            message = await channel.fetch_message(_snowflake(request.message_id, "message"))
         except discord.NotFound:
             await context.complete_external_effect_without_dispatch()
             return DiscordDeleteOwnMessageResponse(
@@ -4187,14 +4047,9 @@ def build_discord_endpoints(
             raise UserError("discord.message_delete_forbidden")
 
         message_ids = tuple(request.message_ids.split(","))
-        if (
-            not 1 <= len(message_ids) <= 100
-            or len(set(message_ids)) != len(message_ids)
-        ):
+        if not 1 <= len(message_ids) <= 100 or len(set(message_ids)) != len(message_ids):
             raise UserError("action.undo_target_state_uncertain")
-        numeric_ids = tuple(
-            _snowflake(message_id, "message") for message_id in message_ids
-        )
+        numeric_ids = tuple(_snowflake(message_id, "message") for message_id in message_ids)
         messages: list[discord.Message] = []
         for message_id in numeric_ids:
             try:
@@ -4377,6 +4232,7 @@ def build_discord_endpoints(
         reason: str,
         publication_expires_at: str,
         token_expires_at: str,
+        confirmation_id: str,
         audience: _FilePublishAudience,
         provenance: WorkspaceFileProvenance,
     ) -> dict[str, object]:
@@ -4400,6 +4256,7 @@ def build_discord_endpoints(
             "reason": reason,
             "publication_expires_at": publication_expires_at,
             "token_expires_at": token_expires_at,
+            "confirmation_id": confirmation_id,
         }
 
     async def inspect_file_publish_target(
@@ -4437,9 +4294,8 @@ def build_discord_endpoints(
             content=source.content,
             provenance=source.provenance,
         )
-        token_expires_at = (
-            datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL
-        ).isoformat()
+        token_expires_at = (datetime.now(UTC) + _AUDIENCE_EXPANSION_TOKEN_TTL).isoformat()
+        confirmation_id = f"fcon_{uuid.uuid4().hex}"
         payload = file_publish_payload(
             context,
             guild,
@@ -4450,6 +4306,7 @@ def build_discord_endpoints(
             reason=reason,
             publication_expires_at=publication_expires_at,
             token_expires_at=token_expires_at,
+            confirmation_id=confirmation_id,
             audience=audience,
             provenance=source.provenance,
         )
@@ -4470,6 +4327,7 @@ def build_discord_endpoints(
                 payload,
             ),
             audience_expansion_expires_at=token_expires_at,
+            confirmation_id=confirmation_id,
             source_file_ref=source.file_ref,
         )
 
@@ -4492,6 +4350,8 @@ def build_discord_endpoints(
             error_code="files.publication_confirmation_expired",
             maximum=_AUDIENCE_EXPANSION_TOKEN_TTL,
         ).isoformat()
+        if not re.fullmatch(r"fcon_[0-9a-f]{32}", request.confirmation_id):
+            raise UserError("files.publication_confirmation_required")
         guild, channel, _actor, _bot = await _authorized_write_message_channel(
             client,
             context,
@@ -4551,11 +4411,19 @@ def build_discord_endpoints(
                 reason=reason,
                 publication_expires_at=publication_expires_at,
                 token_expires_at=token_expires_at,
+                confirmation_id=request.confirmation_id,
                 audience=audience,
                 provenance=source.provenance,
             ),
             request.audience_expansion_token,
             error_code="files.publication_confirmation_required",
+        )
+        confirmation_digest = hashlib.sha256(request.confirmation_id.encode("utf-8")).hexdigest()
+        await asyncio.to_thread(
+            runtime.files.consume_publication_confirmation,
+            confirmation_digest,
+            context.actor_id,
+            str(guild.id),
         )
         await context.dispatch_external_effect()
         publication = cast(
@@ -4570,6 +4438,7 @@ def build_discord_endpoints(
                 target_resource_id=str(channel.id),
                 target_display_name=audience.target_display_name,
                 target_audience_revision=audience.target_revision,
+                confirmation_digest=confirmation_digest,
                 reason=reason,
                 expires_at=publication_expires_at,
             ),
@@ -4847,16 +4716,16 @@ def build_discord_endpoints(
         if context.workspace_id is None:
             raise UserError("files.workspace_required")
         if request.file_ref.startswith("pub_"):
-            publication = await asyncio.to_thread(
-                runtime.files.get_publication_for_actor,
-                request.file_ref,
-                context.actor_id,
-            )
+            if not isinstance(request.expected_revision, int) or isinstance(
+                request.expected_revision,
+                bool,
+            ):
+                raise UserError("files.managed_snapshot_required")
             response = await send_published_file(
                 DiscordSendPublishedFileRequest(
-                    publication_id=publication.publication_id,
+                    publication_id=request.file_ref,
                     channel_id=request.channel_id,
-                    expected_revision=publication.revision,
+                    expected_revision=request.expected_revision,
                     caption=request.caption,
                     description=request.description,
                     spoiler=request.spoiler,
@@ -4875,6 +4744,7 @@ def build_discord_endpoints(
                     response.guild_id,
                     action="sent",
                     summary="Sent the published copy to its confirmed Discord target.",
+                    display_filename=response.filename,
                 )
             except Exception:
                 log.exception("Could not append published file manager history")
@@ -4905,6 +4775,15 @@ def build_discord_endpoints(
         )
         if record.file_ref != request.file_ref:
             raise UserError("files.file_ref_not_found")
+        if request.expected_sha256 is None or not re.fullmatch(
+            r"[0-9a-f]{64}", request.expected_sha256
+        ):
+            raise UserError("files.managed_snapshot_required")
+        if (
+            record.sha256 != request.expected_sha256
+            or hashlib.sha256(content).hexdigest() != request.expected_sha256
+        ):
+            raise UserError("files.hash_conflict")
         _enforce_file_provenance_to_destination(
             client,
             context,
@@ -4953,6 +4832,7 @@ def build_discord_endpoints(
                 str(guild.id),
                 action="sent",
                 summary="Sent the private file to an authorized Discord channel.",
+                display_filename=filename,
             )
         except Exception:
             log.exception("Could not append private file manager history")
@@ -4971,15 +4851,13 @@ def build_discord_endpoints(
     ) -> InvocationContext:
         if str(interaction.user.id) != base.actor_id:
             raise UserError("discord.agent_actor_mismatch")
-        if (
-            interaction.guild_id is None
-            or base.workspace_id != str(interaction.guild_id)
-        ):
+        if interaction.guild_id is None or base.workspace_id != str(interaction.guild_id):
             raise UserError("files.workspace_required")
         return replace(
             base,
             transport="discord",
             request_id=str(interaction.id),
+            tool_call_id=f"discord-interaction:{interaction.id}",
             origin_resource_id=(
                 str(interaction.channel_id)
                 if interaction.channel_id is not None
@@ -4993,18 +4871,45 @@ def build_discord_endpoints(
         base_context: InvocationContext,
         target_channel_id: str,
     ) -> FileManagerCallbacks:
+        def human_executor() -> HumanCapabilityExecutor:
+            if runtime.action_receipts is None:
+                raise UserError("action.receipts_unavailable")
+            return HumanCapabilityExecutor(
+                registry=runtime.registry,
+                action_receipts=runtime.action_receipts,
+                allowed_capabilities=(
+                    "files.catalog",
+                    "files.copy_to_task",
+                    "files.inspect_publish_target",
+                    "files.publish_copy",
+                    "discord.send_managed_file",
+                    "files.revoke_publication",
+                    "files.delete",
+                    "files.history",
+                    "files.recent_activity",
+                ),
+                write_capabilities=(
+                    "files.copy_to_task",
+                    "files.publish_copy",
+                    "discord.send_managed_file",
+                    "files.revoke_publication",
+                    "files.delete",
+                ),
+            )
+
         async def catalog(
             interaction: discord.Interaction,
         ) -> WorkspaceManagedFileCatalog:
             context = file_manager_interaction_context(base_context, interaction)
-            if runtime.files is None or context.workspace_id is None:
-                raise UserError("files.workspace_required")
-            return await asyncio.to_thread(
-                runtime.files.managed_catalog_for_actor,
-                context.workspace_id,
-                context.actor_id,
-                current_task_id=context.agent_task_id,
+            response = cast(
+                FileCatalogResponse,
+                await human_executor().invoke(
+                    "files.catalog",
+                    FileCatalogRequest(limit=100),
+                    context,
+                ),
             )
+            return response.catalog
 
         async def copy_to_task(
             file: WorkspaceManagedFile,
@@ -5013,7 +4918,8 @@ def build_discord_endpoints(
             context = file_manager_interaction_context(base_context, interaction)
             response = cast(
                 FileCopyToTaskResponse,
-                await runtime.registry.endpoint("files.copy_to_task").invoke(
+                await human_executor().invoke(
+                    "files.copy_to_task",
                     FileCopyToTaskRequest(
                         file_ref=file.file_ref,
                         expected_sha256=file.sha256,
@@ -5029,15 +4935,21 @@ def build_discord_endpoints(
         ) -> FileManagerPublishReview:
             context = file_manager_interaction_context(base_context, interaction)
             expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
-            inspected = await inspect_file_publish_target(
-                FilePublishTargetInspectRequest(
-                    source_path="",
-                    source_file_ref=file.file_ref,
-                    channel_id=target_channel_id,
-                    expires_at_iso=expiry,
-                    reason="Requester confirmed a target-bound copy in the private file manager.",
+            inspected = cast(
+                FilePublishTargetInspectResponse,
+                await human_executor().invoke(
+                    "files.inspect_publish_target",
+                    FilePublishTargetInspectRequest(
+                        source_path="",
+                        source_file_ref=file.file_ref,
+                        channel_id=target_channel_id,
+                        expires_at_iso=expiry,
+                        reason=(
+                            "Requester confirmed a target-bound copy in the private file manager."
+                        ),
+                    ),
+                    context,
                 ),
-                context,
             )
             publish_request = FilePublishCopyRequest(
                 source_path="",
@@ -5054,13 +4966,14 @@ def build_discord_endpoints(
                 expected_target_audience_revision=inspected.target_audience_revision,
                 audience_expansion_token=inspected.audience_expansion_token,
                 audience_expansion_expires_at=inspected.audience_expansion_expires_at,
+                confirmation_id=inspected.confirmation_id,
             )
             return FileManagerPublishReview(
                 target_display_name=inspected.target_display_name,
                 new_reader_count=inspected.new_reader_count,
-                expires_at_iso=inspected.publication_expires_at,
+                copy_expires_at_iso=inspected.publication_expires_at,
+                confirmation_expires_at_iso=(inspected.audience_expansion_expires_at),
                 payload=_FileManagerPublishPayload(
-                    context=context,
                     request=publish_request,
                 ),
             )
@@ -5072,6 +4985,7 @@ def build_discord_endpoints(
         ) -> str:
             if str(interaction.user.id) != base_context.actor_id:
                 raise UserError("discord.agent_actor_mismatch")
+            context = file_manager_interaction_context(base_context, interaction)
             payload = review.payload
             if (
                 not isinstance(payload, _FileManagerPublishPayload)
@@ -5079,7 +4993,14 @@ def build_discord_endpoints(
                 or payload.request.expected_source_sha256 != file.sha256
             ):
                 raise UserError("files.publication_confirmation_required")
-            response = await publish_file_copy(payload.request, payload.context)
+            response = cast(
+                FilePublishCopyResponse,
+                await human_executor().invoke(
+                    "files.publish_copy",
+                    payload.request,
+                    context,
+                ),
+            )
             return (
                 f"Published a revocable copy of {response.source_filename} to "
                 f"{response.target_display_name}. Use Shared to send or revoke it."
@@ -5090,12 +5011,20 @@ def build_discord_endpoints(
             interaction: discord.Interaction,
         ) -> str:
             context = file_manager_interaction_context(base_context, interaction)
-            response = await send_managed_file(
-                DiscordSendManagedFileRequest(
-                    file_ref=file.file_ref,
-                    channel_id=target_channel_id,
+            response = cast(
+                DiscordSendManagedFileResponse,
+                await human_executor().invoke(
+                    "discord.send_managed_file",
+                    DiscordSendManagedFileRequest(
+                        file_ref=file.file_ref,
+                        channel_id=target_channel_id,
+                        expected_sha256=(file.sha256 if file.file_ref.startswith("fil_") else None),
+                        expected_revision=(
+                            file.revision if file.file_ref.startswith("pub_") else None
+                        ),
+                    ),
+                    context,
                 ),
-                context,
             )
             return f"Sent {response.filename} here."
 
@@ -5105,12 +5034,16 @@ def build_discord_endpoints(
         ) -> str:
             context = file_manager_interaction_context(base_context, interaction)
             if file.section == "shared":
-                revoke_response = await revoke_file_publication(
-                    FilePublicationRevokeRequest(
-                        publication_id=file.file_ref,
-                        expected_revision=file.revision,
+                revoke_response = cast(
+                    FilePublicationRevokeResponse,
+                    await human_executor().invoke(
+                        "files.revoke_publication",
+                        FilePublicationRevokeRequest(
+                            publication_id=file.file_ref,
+                            expected_revision=file.revision,
+                        ),
+                        context,
                     ),
-                    context,
                 )
                 return (
                     "Revoked future sends of the publication copy."
@@ -5119,7 +5052,8 @@ def build_discord_endpoints(
                 )
             delete_response = cast(
                 FileDeleteResponse,
-                await runtime.registry.endpoint("files.delete").invoke(
+                await human_executor().invoke(
+                    "files.delete",
                     FileDeleteRequest(
                         file_ref=file.file_ref,
                         expected_sha256=file.sha256,
@@ -5136,8 +5070,23 @@ def build_discord_endpoints(
             context = file_manager_interaction_context(base_context, interaction)
             response = cast(
                 FileHistoryResponse,
-                await runtime.registry.endpoint("files.history").invoke(
+                await human_executor().invoke(
+                    "files.history",
                     FileHistoryRequest(file_ref=file.file_ref),
+                    context,
+                ),
+            )
+            return response.actions
+
+        async def recent_activity(
+            interaction: discord.Interaction,
+        ) -> tuple[WorkspaceFileAction, ...]:
+            context = file_manager_interaction_context(base_context, interaction)
+            response = cast(
+                FileRecentActivityResponse,
+                await human_executor().invoke(
+                    "files.recent_activity",
+                    FileRecentActivityRequest(limit=20),
                     context,
                 ),
             )
@@ -5151,6 +5100,7 @@ def build_discord_endpoints(
             send=send,
             delete_or_revoke=delete_or_revoke,
             history=history,
+            recent_activity=recent_activity,
         )
 
     async def open_file_manager(
@@ -5209,11 +5159,7 @@ def build_discord_endpoints(
         actor = await _actor_member(guild, context)
         bot_member = guild.me
         actor_permissions = channel.permissions_for(actor)
-        bot_permissions = (
-            channel.permissions_for(bot_member)
-            if bot_member is not None
-            else None
-        )
+        bot_permissions = channel.permissions_for(bot_member) if bot_member is not None else None
         if (
             bot_permissions is None
             or (
@@ -5637,9 +5583,8 @@ def build_discord_endpoints(
                 ReadAloudAction.ADD_SOURCE,
             }:
                 current_route = runtime.read_aloud.get(str(guild.id))
-                if (
-                    current_route is not None
-                    and current_route.audio_destination_id == str(audience_destination.id)
+                if current_route is not None and current_route.audio_destination_id == str(
+                    audience_destination.id
                 ):
                     known_source_ids = {source.id for source in audience_sources}
                     for existing_source_id in current_route.text_channel_ids:
@@ -6502,9 +6447,7 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.add_reaction",
-                summary=(
-                    "Add one intentional bot reaction to an authorized Discord message."
-                ),
+                summary=("Add one intentional bot reaction to an authorized Discord message."),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
                 keywords=(
@@ -7325,6 +7268,7 @@ def build_discord_endpoints(
                     "files.source_selector_invalid",
                     "files.publication_confirmation_required",
                     "files.publication_confirmation_expired",
+                    "files.publication_confirmation_replayed",
                     "files.publication_audience_changed",
                     "files.publication_expiry_invalid",
                     "files.publication_reason_required",
@@ -7404,9 +7348,7 @@ def build_discord_endpoints(
                     "discord.file_send_forbidden",
                 ),
                 timeout_seconds=30,
-                user_visible_effect=(
-                    "Posts one confirmed, target-bound file copy in Discord."
-                ),
+                user_visible_effect=("Posts one confirmed, target-bound file copy in Discord."),
             ),
             DiscordSendPublishedFileRequest,
             DiscordSendPublishedFileResponse,
@@ -7419,7 +7361,8 @@ def build_discord_endpoints(
                     "Send one requester-owned private or explicitly Shared file selected "
                     "by opaque file_ref. Private files retain information-flow checks; "
                     "Shared copies retain their exact target, revision, expiry, and "
-                    "audience checks."
+                    "audience checks. Supply expected_sha256 for fil_ references or "
+                    "expected_revision for pub_ references from the selected catalog snapshot."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.NEVER,
@@ -7437,6 +7380,8 @@ def build_discord_endpoints(
                 expected_errors=(
                     "files.workspace_required",
                     "files.file_ref_not_found",
+                    "files.managed_snapshot_required",
+                    "files.hash_conflict",
                     "files.publication_not_found",
                     "files.publication_target_mismatch",
                     "files.publication_revision_conflict",
@@ -7516,9 +7461,7 @@ def build_discord_endpoints(
                     "複数ファイルをまとめて送る",
                     "3つのファイルを添付してまとめて送って",
                 ),
-                side_effects=(
-                    "Creates one Discord message containing 1-10 attachments.",
-                ),
+                side_effects=("Creates one Discord message containing 1-10 attachments.",),
                 requires_workspace=True,
                 idempotency="non_idempotent_write",
                 expected_errors=(
@@ -8259,8 +8202,7 @@ def build_discord_endpoints(
                 ),
                 timeout_seconds=15,
                 user_visible_effect=(
-                    "Changes how authors, replies, attachments, and VC membership "
-                    "are narrated."
+                    "Changes how authors, replies, attachments, and VC membership are narrated."
                 ),
             ),
             ReadAloudSemanticsSetRequest,
@@ -8504,9 +8446,7 @@ def _enforce_source_to_destination(
         destination,
     )
     violations: list[tuple[str, str, str]] = (
-        []
-        if relation == "same_or_narrower"
-        else [(str(source_guild.id), str(source.id), relation)]
+        [] if relation == "same_or_narrower" else [(str(source_guild.id), str(source.id), relation)]
     )
     _handle_information_flow_violations(
         context,
@@ -8581,9 +8521,7 @@ def _enforce_read_aloud_route_audience(
     violations = tuple(
         (source.id, inspection.relation)
         for source in sources
-        if (
-            inspection := inspect_read_aloud_audience(guild, source, destination)
-        ).relation
+        if (inspection := inspect_read_aloud_audience(guild, source, destination)).relation
         != "same_or_narrower"
     )
     if not violations:
@@ -8670,8 +8608,7 @@ def _enforce_file_provenance_to_guild(
         provenance is not None
         and provenance.sensitivity == "guild_public"
         and all(
-            workspace_id == str(destination_guild.id)
-            and visibility == "guild_public"
+            workspace_id == str(destination_guild.id) and visibility == "guild_public"
             for workspace_id, _resource_id, visibility in provenance.source_resources
         )
         and bool(provenance.source_resources)
@@ -8893,11 +8830,7 @@ def _voice_state_record(member: discord.Member) -> DiscordVoiceStateRecord:
         channel_id=str(channel.id),
         channel_name=channel.name,
         channel_kind=str(channel.type),
-        category_id=(
-            str(channel.category_id)
-            if channel.category_id is not None
-            else None
-        ),
+        category_id=(str(channel.category_id) if channel.category_id is not None else None),
         server_muted=state.mute,
         server_deafened=state.deaf,
         self_muted=state.self_mute,
@@ -8947,15 +8880,10 @@ def _activity_record(activity: object) -> DiscordActivityRecord:
         large_image_text=optional_text(getattr(activity, "large_image_text", None)),
         small_image_url=optional_text(getattr(activity, "small_image_url", None)),
         small_image_text=optional_text(getattr(activity, "small_image_text", None)),
-        buttons=tuple(
-            str(button)
-            for button in (getattr(activity, "buttons", None) or ())
-        ),
+        buttons=tuple(str(button) for button in (getattr(activity, "buttons", None) or ())),
         party=optional_text(getattr(activity, "party", None)),
         flags=optional_text(getattr(activity, "flags", None)),
-        status_display_type=optional_text(
-            getattr(activity, "status_display_type", None)
-        ),
+        status_display_type=optional_text(getattr(activity, "status_display_type", None)),
         title=optional_text(getattr(activity, "title", None)),
         artist=optional_text(getattr(activity, "artist", None)),
         album=optional_text(getattr(activity, "album", None)),
@@ -9151,9 +9079,7 @@ def _decode_message_search_cursor(
             or not isinstance(offsets, list)
             or len(offsets) != batch_count
             or any(
-                not isinstance(offset, int)
-                or isinstance(offset, bool)
-                or not 0 <= offset <= 9_975
+                not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= 9_975
                 for offset in offsets
             )
             or not isinstance(next_batch_index, int)
@@ -9183,9 +9109,7 @@ def _search_thread_parents(
             continue
         parents[thread_id] = (
             parent_id,
-            raw_type
-            if isinstance(raw_type, int) and not isinstance(raw_type, bool)
-            else None,
+            raw_type if isinstance(raw_type, int) and not isinstance(raw_type, bool) else None,
         )
     return parents
 
@@ -9290,9 +9214,7 @@ async def _authorized_write_message_channel(
         _enforce_information_flow_to_destination(client, context, guild, channel)
     actor, bot = await _write_members(guild, context)
     for member in (actor, bot):
-        if not _can_read_messages(channel, member) or not _can_read_private_thread(
-            channel, member
-        ):
+        if not _can_read_messages(channel, member) or not _can_read_private_thread(channel, member):
             raise UserError("discord.agent_write_channel_forbidden")
         for permission in required_permissions:
             _require_channel_permissions(channel, member, permission)
@@ -9334,11 +9256,7 @@ async def _guild_member(guild: discord.Guild, user_id: str) -> discord.Member:
 
 
 def _require_channel_permissions(
-    channel: (
-        DiscordMessageChannel
-        | discord.ForumChannel
-        | discord.CategoryChannel
-    ),
+    channel: (DiscordMessageChannel | discord.ForumChannel | discord.CategoryChannel),
     member: discord.Member,
     permission: str,
 ) -> None:
@@ -9368,9 +9286,7 @@ def _discord_write_nonce(context: InvocationContext, purpose: str) -> str:
     """Deduplicate one exact model tool call without merging intentional calls."""
 
     invocation_id = context.tool_call_id or context.request_id
-    digest = hashlib.sha256(
-        f"{purpose}\0{invocation_id}".encode()
-    ).hexdigest()
+    digest = hashlib.sha256(f"{purpose}\0{invocation_id}".encode()).hexdigest()
     return f"sla{digest[:22]}"
 
 
@@ -9445,10 +9361,7 @@ def _undo_state_fingerprint(payload: object) -> str:
 
 
 def _thread_undo_fingerprint(thread: discord.Thread) -> str:
-    applied_tag_ids = sorted(
-        str(tag.id)
-        for tag in getattr(thread, "applied_tags", ())
-    )
+    applied_tag_ids = sorted(str(tag.id) for tag in getattr(thread, "applied_tags", ()))
     return _undo_state_fingerprint(
         {
             "name": thread.name,
@@ -9462,9 +9375,7 @@ def _thread_undo_fingerprint(thread: discord.Thread) -> str:
             ),
             "slowmode_delay": getattr(thread, "slowmode_delay", 0),
             "last_message_id": (
-                str(thread.last_message_id)
-                if thread.last_message_id is not None
-                else None
+                str(thread.last_message_id) if thread.last_message_id is not None else None
             ),
             "applied_tag_ids": applied_tag_ids,
         }
@@ -9543,11 +9454,7 @@ def _channel_undo_fingerprint(channel: discord.TextChannel) -> str:
             "topic": channel.topic,
             "slowmode_delay": channel.slowmode_delay,
             "nsfw": bool(channel.nsfw),
-            "category_id": (
-                str(channel.category_id)
-                if channel.category_id is not None
-                else None
-            ),
+            "category_id": (str(channel.category_id) if channel.category_id is not None else None),
             "default_auto_archive_duration": getattr(
                 channel,
                 "default_auto_archive_duration",
@@ -9649,9 +9556,7 @@ def _audience_revision(
         "guild_id": str(guild_id),
         "resource_id": str(resource_id),
         "reader_ids": [str(item) for item in reader_ids],
-        "target_user_id": (
-            str(target_user_id) if target_user_id is not None else None
-        ),
+        "target_user_id": (str(target_user_id) if target_user_id is not None else None),
         "expanded_reader_ids": [str(item) for item in expanded_reader_ids],
     }
     encoded = json.dumps(
@@ -9857,10 +9762,7 @@ def _bot_has_reaction(message: discord.Message, emoji: str) -> bool:
     reactions = getattr(message, "reactions", ())
     if not isinstance(reactions, (list, tuple)):
         return False
-    return any(
-        reaction.me and str(reaction.emoji) == emoji
-        for reaction in reactions
-    )
+    return any(reaction.me and str(reaction.emoji) == emoji for reaction in reactions)
 
 
 def _assert_agent_update_scope(
@@ -9932,9 +9834,7 @@ def _message_record(
             else None
         ),
         edited_at_iso=_message_edited_at_iso(message),
-        reaction_count=sum(
-            reaction.count for reaction in getattr(message, "reactions", ())
-        ),
+        reaction_count=sum(reaction.count for reaction in getattr(message, "reactions", ())),
         reaction_summary=tuple(
             DiscordReactionSummaryRecord(str(reaction.emoji), reaction.count)
             for reaction in getattr(message, "reactions", ())[:10]
@@ -10024,9 +9924,7 @@ def _search_message_record(value: object) -> DiscordMessageRecord | None:
                 )
             )
     reference = value.get("message_reference")
-    reference_message_id = (
-        reference.get("message_id") if isinstance(reference, dict) else None
-    )
+    reference_message_id = reference.get("message_id") if isinstance(reference, dict) else None
     display_name = author.get("global_name") or author.get("username") or author_id
     raw_reactions = value.get("reactions")
     reaction_summary: list[DiscordReactionSummaryRecord] = []
@@ -10036,22 +9934,14 @@ def _search_message_record(value: object) -> DiscordMessageRecord | None:
                 continue
             count = raw_reaction.get("count")
             emoji = raw_reaction.get("emoji")
-            if not isinstance(count, int) or isinstance(count, bool) or not isinstance(
-                emoji, dict
-            ):
+            if not isinstance(count, int) or isinstance(count, bool) or not isinstance(emoji, dict):
                 continue
             emoji_name = emoji.get("name")
             emoji_id = emoji.get("id")
             if not isinstance(emoji_name, str):
                 continue
-            rendered = (
-                f"<:{emoji_name}:{emoji_id}>"
-                if isinstance(emoji_id, str)
-                else emoji_name
-            )
-            reaction_summary.append(
-                DiscordReactionSummaryRecord(rendered, max(0, count))
-            )
+            rendered = f"<:{emoji_name}:{emoji_id}>" if isinstance(emoji_id, str) else emoji_name
+            reaction_summary.append(DiscordReactionSummaryRecord(rendered, max(0, count)))
     thread = value.get("thread")
     raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
     return DiscordMessageRecord(
@@ -10264,15 +10154,9 @@ def _expanded_poll(poll: discord.Poll | None) -> DiscordExpandedPollRecord | Non
         finalized=finalized_value,
         counts_are_exact=finalized_value,
         victor_answer_id=(
-            str(poll.victor_answer_id)
-            if poll.victor_answer_id is not None
-            else None
+            str(poll.victor_answer_id) if poll.victor_answer_id is not None else None
         ),
-        layout_type=(
-            str(layout_name)
-            if layout_name is not None
-            else str(poll.layout_type)
-        ),
+        layout_type=(str(layout_name) if layout_name is not None else str(poll.layout_type)),
     )
 
 

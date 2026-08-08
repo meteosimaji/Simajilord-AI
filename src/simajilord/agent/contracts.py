@@ -16,20 +16,74 @@ AGENT_AUTONOMY_ACTOR_ID = "simajilord:autonomy"
 AGENT_AUDIO_GRANT = "audio"
 AGENT_COMPUTE_GRANT = "safe_compute"
 AGENT_CONNECTOR_GRANT = "connectors"
+AGENT_CONNECTOR_READ_GRANT = "connector.read"
+AGENT_CONNECTOR_WRITE_GRANT = "connector.write"
+AGENT_CONNECTOR_DESTRUCTIVE_GRANT = "connector.destructive"
 AGENT_FEEDBACK_GRANT = "feedback"
 AGENT_FILE_GRANT = "files"
+AGENT_FILE_READ_GRANT = "files.read"
+AGENT_FILE_PRIVATE_WRITE_GRANT = "files.private_write"
+AGENT_FILE_PUBLISH_GRANT = "files.publish"
+AGENT_FILE_SEND_GRANT = "files.send"
+AGENT_FILE_DELETE_GRANT = "files.delete"
 AGENT_HIVE_GRANT = "hive_analysis"
 AGENT_IMAGE_GRANT = "image"
 AGENT_MEDIA_GRANT = "media_download"
 AGENT_MEMORY_GRANT = "memory"
 AGENT_MEMORY_CURATOR_GRANT = "memory_curator"
 AGENT_MESSAGE_GRANT = "discord_message"
+AGENT_DISCORD_MESSAGE_SEND_GRANT = "discord.message.send"
+AGENT_DISCORD_DM_SEND_GRANT = "discord.dm.send"
+AGENT_DISCORD_THREAD_MANAGE_GRANT = "discord.thread.manage"
+AGENT_DISCORD_ROLE_MANAGE_GRANT = "discord.role.manage"
+AGENT_DISCORD_CHANNEL_MANAGE_GRANT = "discord.channel.manage"
+AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT = "discord.guild_resource.manage"
 AGENT_MODERATION_GRANT = "moderation"
 AGENT_QUOTE_GRANT = "discord_quote"
 AGENT_REACTION_GRANT = "discord_reaction"
 AGENT_REPOST_GRANT = "discord_repost"
 AGENT_SHELL_GRANT = "shell_exec"
 AGENT_WEB_GRANT = "web"
+
+AGENT_LEGACY_GRANT_ALIASES: dict[str, frozenset[str]] = {
+    AGENT_FILE_GRANT: frozenset(
+        {
+            AGENT_FILE_READ_GRANT,
+            AGENT_FILE_PRIVATE_WRITE_GRANT,
+            AGENT_FILE_PUBLISH_GRANT,
+            AGENT_FILE_SEND_GRANT,
+            AGENT_FILE_DELETE_GRANT,
+        }
+    ),
+    AGENT_MESSAGE_GRANT: frozenset(
+        {
+            AGENT_DISCORD_MESSAGE_SEND_GRANT,
+            AGENT_DISCORD_DM_SEND_GRANT,
+            AGENT_DISCORD_THREAD_MANAGE_GRANT,
+            AGENT_DISCORD_ROLE_MANAGE_GRANT,
+            AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+            AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT,
+        }
+    ),
+    AGENT_CONNECTOR_GRANT: frozenset(
+        {
+            AGENT_CONNECTOR_READ_GRANT,
+            AGENT_CONNECTOR_WRITE_GRANT,
+            AGENT_CONNECTOR_DESTRUCTIVE_GRANT,
+        }
+    ),
+}
+
+
+def expand_agent_grants(grants: frozenset[str]) -> frozenset[str]:
+    """Expand legacy broad aliases while preserving configured grant provenance."""
+
+    effective = set(grants)
+    for grant in grants:
+        effective.update(AGENT_LEGACY_GRANT_ALIASES.get(grant, ()))
+    return frozenset(effective)
+
+
 AGENT_TIMER_WRITE_CAPABILITIES = (
     "timer.create",
     "timer.cancel",
@@ -123,6 +177,8 @@ AGENT_REQUESTED_WRITE_CAPABILITIES = (
     *AGENT_TIMER_WRITE_CAPABILITIES,
     *AGENT_MEMORY_WRITE_CAPABILITIES,
     "feedback.create",
+    "authority.lease_create",
+    "authority.lease_revoke",
     "connector.write",
     "connector.destructive",
     "system.shell",
@@ -164,6 +220,8 @@ AGENT_HIGH_RISK_CAPABILITIES = frozenset(
         "discord.read_aloud_semantics_set",
         "discord.read_aloud_content_mode_set",
         "connector.destructive",
+        "authority.lease_create",
+        "authority.lease_revoke",
         "files.publish_copy",
         "files.delete",
         "system.shell",
@@ -541,6 +599,8 @@ class AgentRequest:
     trigger_actor_ids: tuple[str, ...] = ()
     requester_principal_id: str | None = None
     policy_id: str | None = None
+    principal_role_ids: tuple[str, ...] = ()
+    capability_lease_bindings: tuple[tuple[str, str, int], ...] = ()
     allowed_capabilities: frozenset[str] | None = None
     message_edited_at: datetime | None = None
     grants: frozenset[str] = frozenset()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,13 +13,27 @@ from simajilord.agent import (
     AGENT_AUDIO_CONTROL_CAPABILITIES,
     AGENT_AUDIO_GRANT,
     AGENT_AUDIO_WRITE_CAPABILITIES,
+    AGENT_AUTHORITY_MANAGE_GRANT,
+    AGENT_AUTHORITY_REQUEST_GRANT,
     AGENT_COMPUTE_GRANT,
-    AGENT_CONNECTOR_GRANT,
+    AGENT_CONNECTOR_DESTRUCTIVE_GRANT,
+    AGENT_CONNECTOR_READ_GRANT,
+    AGENT_CONNECTOR_WRITE_GRANT,
+    AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
     AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+    AGENT_DISCORD_DM_SEND_GRANT,
+    AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT,
+    AGENT_DISCORD_MESSAGE_SEND_GRANT,
     AGENT_DISCORD_MODERATION_CAPABILITIES,
     AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES,
+    AGENT_DISCORD_ROLE_MANAGE_GRANT,
+    AGENT_DISCORD_THREAD_MANAGE_GRANT,
     AGENT_FEEDBACK_GRANT,
-    AGENT_FILE_GRANT,
+    AGENT_FILE_DELETE_GRANT,
+    AGENT_FILE_PRIVATE_WRITE_GRANT,
+    AGENT_FILE_PUBLISH_GRANT,
+    AGENT_FILE_READ_GRANT,
+    AGENT_FILE_SEND_GRANT,
     AGENT_HIVE_GRANT,
     AGENT_IMAGE_GRANT,
     AGENT_MEDIA_GRANT,
@@ -41,7 +56,10 @@ from simajilord.agent import (
     AutonomyEnqueueResult,
     AutonomyEventKind,
     AutonomyEventQueue,
+    CapabilityLeaseBinding,
+    CapabilityLeaseStore,
     build_action_undo_endpoint,
+    build_authority_endpoints,
     build_curated_workflow_endpoint,
     build_memory_endpoints,
 )
@@ -75,7 +93,7 @@ from simajilord.capabilities import (
 )
 from simajilord.capabilities.status import build_status_endpoint
 from simajilord.config import AgentFeatureAccess, Settings, effective_security_policy
-from simajilord.core.capabilities import CapabilityRegistry
+from simajilord.core.capabilities import CapabilityRegistry, InvocationContext
 from simajilord.domain.audio import AudioItem, AudioQueueLane
 from simajilord.media.providers import RoutingMediaProvider, YtDlpProvider
 from simajilord.observability import EventJournal
@@ -145,6 +163,7 @@ class SimajilordRuntime:
     journal: EventJournal
     autonomy_events: AutonomyEventQueue
     action_receipts: ActionReceiptService | None
+    capability_leases: CapabilityLeaseStore | None
     agent_store: AgentConversationStore
     maintenance: DataMaintenanceService
     agent: AgentService | None
@@ -431,6 +450,7 @@ class SimajilordRuntime:
         )
         registry = CapabilityRegistry(journal=journal)
         action_receipts: ActionReceiptService | None = None
+        capability_leases: CapabilityLeaseStore | None = None
         agent: AgentService | None = None
         curated_workflow_endpoint = None
         if settings.agent_enabled:
@@ -522,8 +542,51 @@ class SimajilordRuntime:
                 "web.fetch",
                 "web.find",
                 "web.status",
+                "authority.request",
+                "authority.lease_create",
+                "authority.lease_revoke",
+                "authority.lease_list",
             ]
+            discord_narrow_grants: dict[str, str] = {
+                "discord.connect_voice": AGENT_AUDIO_GRANT,
+                "discord.create_poll": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.reply_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.edit_own_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.pin_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.unpin_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.create_thread": AGENT_DISCORD_THREAD_MANAGE_GRANT,
+                "discord.update_thread": AGENT_DISCORD_THREAD_MANAGE_GRANT,
+                "discord.add_thread_member": AGENT_DISCORD_THREAD_MANAGE_GRANT,
+                "discord.remove_thread_member": AGENT_DISCORD_THREAD_MANAGE_GRANT,
+                "discord.create_forum_post": AGENT_DISCORD_THREAD_MANAGE_GRANT,
+                "discord.create_role": AGENT_DISCORD_ROLE_MANAGE_GRANT,
+                "discord.assign_role": AGENT_DISCORD_ROLE_MANAGE_GRANT,
+                "discord.remove_role": AGENT_DISCORD_ROLE_MANAGE_GRANT,
+                "discord.update_channel_settings": AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+                "discord.create_channel": AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+                "discord.create_guild_resource": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.update_guild_resource": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.message_action": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.set_channel_overwrite": AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+                "discord.create_platform_asset": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.update_platform_asset": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.create_automod_rule": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.update_automod_rule": (AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT),
+                "discord.channel_operation": AGENT_DISCORD_CHANNEL_MANAGE_GRANT,
+                "discord.forward_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.send_direct_message": AGENT_DISCORD_DM_SEND_GRANT,
+                "discord.set_bot_presence": AGENT_DISCORD_GUILD_RESOURCE_MANAGE_GRANT,
+                **{name: AGENT_MODERATION_GRANT for name in AGENT_DISCORD_MODERATION_CAPABILITIES},
+            }
+            if set(discord_narrow_grants) != set(AGENT_DISCORD_REQUESTED_WRITE_CAPABILITIES):
+                raise RuntimeError(
+                    "Discord narrow grant mapping must cover every requested write exactly"
+                )
             required_grants: dict[str, str] = {
+                "authority.request": AGENT_AUTHORITY_REQUEST_GRANT,
+                "authority.lease_create": AGENT_AUTHORITY_MANAGE_GRANT,
+                "authority.lease_revoke": AGENT_AUTHORITY_MANAGE_GRANT,
+                "authority.lease_list": AGENT_AUTHORITY_REQUEST_GRANT,
                 "action.undo": AGENT_MESSAGE_GRANT,
                 "memory.search": AGENT_MEMORY_GRANT,
                 "feedback.create": AGENT_FEEDBACK_GRANT,
@@ -552,22 +615,14 @@ class SimajilordRuntime:
                 "discord.read_aloud_semantics_set": AGENT_AUDIO_GRANT,
                 "discord.read_aloud_content_mode_set": AGENT_AUDIO_GRANT,
                 "discord.speak": AGENT_AUDIO_GRANT,
-                "discord.send_message": AGENT_MESSAGE_GRANT,
-                "discord.send_embed": AGENT_MESSAGE_GRANT,
+                "discord.send_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
+                "discord.send_embed": AGENT_DISCORD_MESSAGE_SEND_GRANT,
                 **{
-                    name: (
-                        AGENT_AUDIO_GRANT
-                        if name == "discord.connect_voice"
-                        else (
-                            AGENT_MODERATION_GRANT
-                            if name in AGENT_DISCORD_MODERATION_CAPABILITIES
-                            else AGENT_MESSAGE_GRANT
-                        )
-                    )
+                    name: discord_narrow_grants[name]
                     for name in discord_requested_write_capabilities
                 },
                 "discord.add_reaction": AGENT_REACTION_GRANT,
-                "discord.delete_own_message": AGENT_MESSAGE_GRANT,
+                "discord.delete_own_message": AGENT_DISCORD_MESSAGE_SEND_GRANT,
                 "discord.remove_own_reaction": AGENT_REACTION_GRANT,
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
                 "discord.create_quote_image": AGENT_QUOTE_GRANT,
@@ -592,7 +647,13 @@ class SimajilordRuntime:
                 )
                 agent_capabilities.extend(connector_capabilities)
                 required_grants.update(
-                    {name: AGENT_CONNECTOR_GRANT for name in connector_capabilities}
+                    {
+                        "connector.search": AGENT_CONNECTOR_READ_GRANT,
+                        "connector.describe": AGENT_CONNECTOR_READ_GRANT,
+                        "connector.read": AGENT_CONNECTOR_READ_GRANT,
+                        "connector.write": AGENT_CONNECTOR_WRITE_GRANT,
+                        "connector.destructive": AGENT_CONNECTOR_DESTRUCTIVE_GRANT,
+                    }
                 )
             if settings.hive_api_key is not None:
                 capability_name = "discord.analyze_attachment"
@@ -616,6 +677,7 @@ class SimajilordRuntime:
                     "files.copy_to_task",
                     "files.delete",
                     "files.history",
+                    "files.recent_activity",
                     "files.inspect_publish_target",
                     "files.publish_copy",
                     "files.revoke_publication",
@@ -627,8 +689,31 @@ class SimajilordRuntime:
                     "discord.open_file_manager",
                 )
                 agent_capabilities.extend(file_capabilities)
-                required_grants.update({name: AGENT_FILE_GRANT for name in file_capabilities})
-                required_grants["discord.create_platform_asset"] = AGENT_FILE_GRANT
+                file_narrow_grants = {
+                    "files.catalog": AGENT_FILE_READ_GRANT,
+                    "files.list": AGENT_FILE_READ_GRANT,
+                    "files.read": AGENT_FILE_READ_GRANT,
+                    "files.history": AGENT_FILE_READ_GRANT,
+                    "files.recent_activity": AGENT_FILE_READ_GRANT,
+                    "files.write_text": AGENT_FILE_PRIVATE_WRITE_GRANT,
+                    "files.replace_text": AGENT_FILE_PRIVATE_WRITE_GRANT,
+                    "files.copy_to_task": AGENT_FILE_PRIVATE_WRITE_GRANT,
+                    "discord.import_attachment": AGENT_FILE_PRIVATE_WRITE_GRANT,
+                    "files.delete": AGENT_FILE_DELETE_GRANT,
+                    "files.inspect_publish_target": AGENT_FILE_PUBLISH_GRANT,
+                    "files.publish_copy": AGENT_FILE_PUBLISH_GRANT,
+                    "files.revoke_publication": AGENT_FILE_PUBLISH_GRANT,
+                    "discord.send_file": AGENT_FILE_SEND_GRANT,
+                    "discord.send_files": AGENT_FILE_SEND_GRANT,
+                    "discord.send_managed_file": AGENT_FILE_SEND_GRANT,
+                    "discord.send_published_file": AGENT_FILE_SEND_GRANT,
+                    "discord.open_file_manager": AGENT_FILE_SEND_GRANT,
+                }
+                if set(file_narrow_grants) != set(file_capabilities):
+                    raise RuntimeError(
+                        "File narrow grant mapping must cover every file capability exactly"
+                    )
+                required_grants.update(file_narrow_grants)
                 agent_capabilities.append("media.save")
                 required_grants["media.save"] = AGENT_MEDIA_GRANT
             if compute is not None:
@@ -647,6 +732,45 @@ class SimajilordRuntime:
                     ).intersection(agent_capabilities),
                 )
                 agent_capabilities.append(curated_workflow_endpoint.descriptor.name)
+            capability_leases = CapabilityLeaseStore(
+                settings.data_dir / "agent_capability_leases.sqlite3",
+                registry=registry,
+                configured_capabilities=tuple(agent_capabilities),
+                required_grants=required_grants,
+            )
+
+            async def consume_capability_lease(
+                capability_name: str,
+                request: object,
+                context: InvocationContext,
+            ) -> None:
+                assert capability_leases is not None
+                raw_binding = next(
+                    (
+                        item
+                        for item in context.capability_lease_bindings
+                        if item[0] == capability_name
+                    ),
+                    None,
+                )
+                if raw_binding is None:
+                    raise RuntimeError("capability lease binding is missing")
+                required_grant = required_grants.get(capability_name)
+                if required_grant is None:
+                    raise RuntimeError("leased capability has no explicit grant")
+                binding = CapabilityLeaseBinding(
+                    capability=capability_name,
+                    required_grant=required_grant,
+                    lease_id=raw_binding[1],
+                    revision=raw_binding[2],
+                )
+                await asyncio.to_thread(
+                    capability_leases.consume_binding,
+                    binding,
+                    request,
+                    context,
+                )
+
             agent_tools = AgentToolCatalog(
                 registry,
                 tuple(agent_capabilities),
@@ -675,6 +799,9 @@ class SimajilordRuntime:
                         *AGENT_MEMORY_WRITE_CAPABILITIES,
                         *AGENT_AUDIO_WRITE_CAPABILITIES,
                         "feedback.create",
+                        "authority.request",
+                        "authority.lease_create",
+                        "authority.lease_revoke",
                     )
                     + (("system.shell",) if "system.shell" in agent_capabilities else ())
                     + (
@@ -711,6 +838,8 @@ class SimajilordRuntime:
                 ),
                 destructive_capabilities=(
                     *AGENT_DISCORD_DESTRUCTIVE_CAPABILITIES,
+                    "authority.lease_create",
+                    "authority.lease_revoke",
                     *(("files.delete",) if files is not None else ()),
                     *(
                         ("connector.destructive",)
@@ -725,6 +854,7 @@ class SimajilordRuntime:
                     *(("image.generate",) if "image.generate" in agent_capabilities else ()),
                 ),
                 action_receipts=action_receipts,
+                lease_consumer=consume_capability_lease,
             )
             codex_provider = CodexAppServerProvider(
                 executable=settings.codex_executable,
@@ -801,6 +931,7 @@ class SimajilordRuntime:
             journal=journal,
             autonomy_events=autonomy_events,
             action_receipts=action_receipts,
+            capability_leases=capability_leases,
             agent_store=agent_store,
             maintenance=maintenance,
             agent=agent,
@@ -838,6 +969,11 @@ class SimajilordRuntime:
             *build_source_inspection_endpoints(source_inspection),
             build_high_risk_plan_endpoint(),
             build_task_route_endpoint(),
+            *(
+                build_authority_endpoints(capability_leases)
+                if capability_leases is not None
+                else ()
+            ),
             *(connectors.endpoints() if connectors is not None else ()),
             *((curated_workflow_endpoint,) if curated_workflow_endpoint else ()),
             *(
@@ -857,6 +993,12 @@ class SimajilordRuntime:
                 agent_enabled=settings.agent_enabled,
                 security_policy=effective_security_policy(settings),
                 agent_metrics=agent.runtime_metrics if agent is not None else None,
+                active_lease_count=(
+                    capability_leases.active_count if capability_leases is not None else None
+                ),
+                active_lease_metadata=(
+                    capability_leases.active_metadata if capability_leases is not None else None
+                ),
                 speech_provider=settings.tts_provider,
                 speech_voice=(
                     f"style {settings.voicevox_speaker_id}"

@@ -113,6 +113,19 @@ class FileHistoryResponse:
     actions: tuple[WorkspaceFileAction, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class FileRecentActivityRequest:
+    limit: int = 20
+    cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FileRecentActivityResponse:
+    actions: tuple[WorkspaceFileAction, ...]
+    next_cursor: str | None
+    complete: bool
+
+
 def build_file_endpoints(
     service: AgentFileSandbox,
 ) -> tuple[CapabilityEndpoint, ...]:
@@ -151,17 +164,11 @@ def build_file_endpoints(
         filtered = (
             catalog.files
             if request.section == "all"
-            else tuple(
-                item
-                for item in catalog.files
-                if item.section == request.section
-            )
+            else tuple(item for item in catalog.files if item.section == request.section)
         )
         page = filtered[request.offset : request.offset + request.limit]
         next_offset = (
-            request.offset + len(page)
-            if request.offset + len(page) < len(filtered)
-            else None
+            request.offset + len(page) if request.offset + len(page) < len(filtered) else None
         )
         return FileCatalogResponse(
             catalog=WorkspaceManagedFileCatalog(
@@ -328,6 +335,26 @@ def build_file_endpoints(
         )
         return FileHistoryResponse(file_ref=request.file_ref, actions=actions)
 
+    async def recent_activity(
+        request: FileRecentActivityRequest,
+        context: InvocationContext,
+    ) -> FileRecentActivityResponse:
+        guild_id = context.workspace_id
+        if guild_id is None:
+            raise UserError("files.workspace_required")
+        actions, next_cursor = await asyncio.to_thread(
+            service.managed_recent_activity_for_actor,
+            context.actor_id,
+            guild_id,
+            limit=request.limit,
+            cursor=request.cursor,
+        )
+        return FileRecentActivityResponse(
+            actions=actions,
+            next_cursor=next_cursor,
+            complete=next_cursor is None,
+        )
+
     return (
         endpoint(
             CapabilityDescriptor(
@@ -457,9 +484,7 @@ def build_file_endpoints(
                     "直して",
                     "文書",
                 ),
-                side_effects=(
-                    "Creates or updates a text file in the configured workspace.",
-                ),
+                side_effects=("Creates or updates a text file in the configured workspace.",),
                 requires_workspace=True,
                 idempotency="idempotent_write",
                 expected_errors=(
@@ -600,5 +625,34 @@ def build_file_endpoints(
             FileHistoryRequest,
             FileHistoryResponse,
             file_history,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="files.recent_activity",
+                summary=(
+                    "Show bounded body-free copy, publish, send, delete, and revoke "
+                    "activity for the current actor and guild, including deleted files."
+                ),
+                risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.ACTOR_PRIVATE,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "files",
+                    "recent file activity",
+                    "deleted file history",
+                    "最近のファイル操作",
+                    "削除済みファイル履歴",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "files.workspace_required",
+                    "files.history_limit_invalid",
+                    "files.history_cursor_invalid",
+                ),
+                timeout_seconds=10,
+            ),
+            FileRecentActivityRequest,
+            FileRecentActivityResponse,
+            recent_activity,
         ),
     )

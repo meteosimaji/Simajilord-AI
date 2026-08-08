@@ -345,6 +345,68 @@ def test_legacy_compatibility_requires_expiry_and_reverts_to_safe_defaults(
     assert any("expired" in item for item in security_policy_warnings(expired))
 
 
+@pytest.mark.parametrize("preset", tuple(AgentSecurityPreset))
+@pytest.mark.parametrize("expiry_state", ("missing", "future", "past"))
+def test_all_security_presets_obey_legacy_only_expiry_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    preset: AgentSecurityPreset,
+    expiry_state: str,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    monkeypatch.setenv("AGENT_SECURITY_PRESET", preset.value)
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "30")
+    if expiry_state != "missing":
+        delta = timedelta(hours=1 if expiry_state == "future" else -1)
+        monkeypatch.setenv("AGENT_SECURITY_PRESET_EXPIRES_AT", (now + delta).isoformat())
+
+    if preset is not AgentSecurityPreset.LEGACY_COMPATIBILITY:
+        if expiry_state == "missing":
+            settings = load_settings(dotenv_path=dotenv_path, now=now)
+            assert settings.agent_effective_security_preset is preset
+            assert settings.agent_security_preset_expired is False
+        else:
+            with pytest.raises(ConfigurationError, match="valid only"):
+                load_settings(dotenv_path=dotenv_path, now=now)
+        return
+    if expiry_state == "missing":
+        with pytest.raises(ConfigurationError, match="EXPIRES_AT is required"):
+            load_settings(dotenv_path=dotenv_path, now=now)
+        return
+    settings = load_settings(dotenv_path=dotenv_path, now=now)
+    expected = (
+        AgentSecurityPreset.LEGACY_COMPATIBILITY
+        if expiry_state == "future"
+        else AgentSecurityPreset.GUILD_ASSISTANT
+    )
+    assert settings.agent_effective_security_preset is expected
+    assert settings.agent_security_preset_expired is (expiry_state == "past")
+
+
+def test_expired_legacy_preset_keeps_visible_individual_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dotenv_path = _prepare_environment(monkeypatch, tmp_path)
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+    monkeypatch.setenv("AGENT_SECURITY_PRESET", "legacy_compatibility")
+    monkeypatch.setenv(
+        "AGENT_SECURITY_PRESET_EXPIRES_AT",
+        (now - timedelta(minutes=1)).isoformat(),
+    )
+    monkeypatch.setenv("AGENT_ISOLATED_SHELL_ACCESS", "admins")
+    monkeypatch.setenv("AGENT_ADMIN_USER_IDS", "30")
+
+    settings = load_settings(dotenv_path=dotenv_path, now=now)
+    policy = effective_security_policy(settings)
+
+    assert settings.agent_effective_security_preset is AgentSecurityPreset.GUILD_ASSISTANT
+    assert settings.agent_isolated_shell_access is AgentFeatureAccess.ADMINS
+    assert "AGENT_ISOLATED_SHELL_ACCESS" in policy.override_names
+    assert "30" not in repr(policy)
+
+
 def test_security_preset_individual_environment_overrides_are_effective(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
