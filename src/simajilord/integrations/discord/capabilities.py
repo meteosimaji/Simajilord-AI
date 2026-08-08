@@ -5159,6 +5159,8 @@ def build_discord_endpoints(
     ) -> DiscordOpenFileManagerResponse:
         if runtime.files is None:
             raise UserError("files.disabled")
+        if context.workspace_id is None:
+            raise UserError("files.workspace_required")
         guild, channel, _actor, _bot = await _authorized_write_message_channel(
             client,
             context,
@@ -5167,6 +5169,8 @@ def build_discord_endpoints(
             required_permissions=("send_messages",),
             enforce_information_flow=False,
         )
+        if str(guild.id) != context.workspace_id:
+            raise UserError("files.file_manager_cross_guild_forbidden")
         try:
             requester_id = int(context.actor_id)
         except ValueError as exc:
@@ -7476,6 +7480,7 @@ def build_discord_endpoints(
                 expected_errors=(
                     "files.disabled",
                     "files.workspace_required",
+                    "files.file_manager_cross_guild_forbidden",
                     "discord.message_send_forbidden",
                 ),
                 timeout_seconds=15,

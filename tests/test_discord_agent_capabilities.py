@@ -486,6 +486,176 @@ async def test_open_file_manager_posts_only_metadata_free_launcher(
     assert sent_view.requester_id == 7
 
 
+@pytest.mark.asyncio
+async def test_open_file_manager_rejects_cross_guild_launcher_before_send(
+    tmp_path: Path,
+) -> None:
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = AgentFileSandbox(tmp_path / "files")
+    origin_guild = Mock(spec=discord.Guild)
+    origin_guild.id = 10
+    target_guild = Mock(spec=discord.Guild)
+    target_guild.id = 11
+    actor = SimpleNamespace(id=7, bot=False)
+    bot = SimpleNamespace(id=99, bot=True)
+    target_guild.get_member.return_value = actor
+    target_guild.me = bot
+    target_channel = Mock(spec=discord.TextChannel)
+    target_channel.id = 21
+    target_channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    target_channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    target_guild.get_channel_or_thread.return_value = target_channel
+    client.get_guild.side_effect = lambda guild_id: {
+        10: origin_guild,
+        11: target_guild,
+    }.get(guild_id)
+    effect_dispatch = SimpleNamespace(
+        dispatch=AsyncMock(),
+        complete_without_dispatch=AsyncMock(),
+    )
+    context = replace(
+        _agent_context(resource_ids=("20", "21")),
+        external_effect_dispatch=effect_dispatch,
+    )
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(
+            cast(discord.Client, client),
+            runtime,
+        )
+    }
+
+    with pytest.raises(UserError) as caught:
+        await endpoints["discord.open_file_manager"].invoke(
+            DiscordOpenFileManagerRequest(channel_id="21", guild_id="11"),
+            context,
+        )
+
+    assert caught.value.code == "files.file_manager_cross_guild_forbidden"
+    effect_dispatch.dispatch.assert_not_awaited()
+    target_channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cross_guild_file_publication_send_remains_available(
+    tmp_path: Path,
+) -> None:
+    sandbox = AgentFileSandbox(tmp_path / "files")
+    source = sandbox.import_bytes(
+        "10",
+        "review.txt",
+        b"review bytes",
+        provenance=WorkspaceFileProvenance(
+            owner_actor_ids=("7",),
+            origin_guild_id="10",
+            sensitivity="actor_private",
+        ),
+    )
+    assert source.file_ref is not None
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.files = sandbox
+    origin_guild = Mock(spec=discord.Guild)
+    origin_guild.id = 10
+    target_guild = Mock(spec=discord.Guild)
+    target_guild.id = 11
+    actor = SimpleNamespace(id=7, bot=False, display_name="Requester")
+    reader = SimpleNamespace(id=8, bot=False, display_name="Reader")
+    bot = SimpleNamespace(id=99, bot=True, display_name="Simajilord")
+    target_guild.members = [actor, reader, bot]
+    target_guild.member_count = 3
+    target_guild.chunked = True
+    target_guild.filesize_limit = 25 * 1024 * 1024
+    target_guild.me = bot
+    target_guild.get_member.side_effect = {7: actor, 8: reader, 99: bot}.get
+    target_channel = Mock(spec=discord.TextChannel)
+    target_channel.id = 21
+    target_channel.name = "cross-guild-review"
+    target_channel.permissions_for.return_value = SimpleNamespace(
+        view_channel=True,
+        read_message_history=True,
+        send_messages=True,
+        attach_files=True,
+        administrator=False,
+        manage_threads=False,
+    )
+    target_channel.send = AsyncMock(return_value=SimpleNamespace(id=31))
+    target_guild.get_channel_or_thread.return_value = target_channel
+    client.get_guild.side_effect = lambda guild_id: {
+        10: origin_guild,
+        11: target_guild,
+    }.get(guild_id)
+    endpoints = {
+        endpoint.descriptor.name: endpoint
+        for endpoint in build_discord_endpoints(
+            cast(discord.Client, client),
+            runtime,
+        )
+    }
+    context = replace(
+        _agent_context(resource_ids=("20", "21")),
+        file_workspace_mode="guild_shared",
+    )
+    publication_expiry = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    inspection = await endpoints["files.inspect_publish_target"].invoke(
+        FilePublishTargetInspectRequest(
+            source_path="",
+            source_file_ref=source.file_ref,
+            channel_id="21",
+            guild_id="11",
+            expires_at_iso=publication_expiry,
+            reason="Cross-guild review",
+        ),
+        context,
+    )
+    publication = await endpoints["files.publish_copy"].invoke(
+        FilePublishCopyRequest(
+            source_path="",
+            source_file_ref=source.file_ref,
+            channel_id="21",
+            guild_id="11",
+            expires_at_iso=publication_expiry,
+            reason="Cross-guild review",
+            expected_source_sha256=inspection.source_sha256,
+            expected_source_sensitivity=inspection.source_sensitivity,
+            expected_source_reader_count=inspection.source_reader_count,
+            expected_target_display_name=inspection.target_display_name,
+            expected_target_reader_count=inspection.target_reader_count,
+            expected_new_reader_count=inspection.new_reader_count,
+            expected_target_audience_revision=(
+                inspection.target_audience_revision
+            ),
+            audience_expansion_token=inspection.audience_expansion_token,
+            audience_expansion_expires_at=(
+                inspection.audience_expansion_expires_at
+            ),
+        ),
+        context,
+    )
+    sent = await endpoints["discord.send_published_file"].invoke(
+        DiscordSendPublishedFileRequest(
+            publication_id=publication.publication_id,
+            channel_id="21",
+            guild_id="11",
+            expected_revision=publication.revision,
+        ),
+        context,
+    )
+
+    assert sent.guild_id == "11"
+    assert sent.channel_id == "21"
+    assert sent.filename == "review.txt"
+    target_channel.send.assert_awaited_once()
+
+
 def _readable_guild(
     guild: Mock,
     channel: Mock,
