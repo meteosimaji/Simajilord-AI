@@ -293,7 +293,7 @@ async def test_codex_version_guard_accepts_only_configured_line(
         returncode = 0
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            return b"codex-cli 0.146.0-alpha.9.2\n", b""
+            return b"codex-cli 0.147.0-alpha.6.5\n", b""
 
     async def create_process(*args: object, **kwargs: object) -> Process:
         del args, kwargs
@@ -304,13 +304,13 @@ async def test_codex_version_guard_accepts_only_configured_line(
 
     assert await _verify_codex_version(
         "/resolved/codex",
-        expected_prefix="0.146.",
+        expected_prefix="0.147.",
         environment=environment,
-    ) == "0.146.0-alpha.9.2"
+    ) == "0.147.0-alpha.6.5"
     with pytest.raises(AgentUnavailableError, match="supported prefix"):
         await _verify_codex_version(
             "/resolved/codex",
-            expected_prefix="0.145.",
+            expected_prefix="0.146.",
             environment=environment,
         )
 

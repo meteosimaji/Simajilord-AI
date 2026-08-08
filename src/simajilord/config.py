@@ -1179,7 +1179,7 @@ def load_settings(
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         codex_expected_version_prefix=_text(
             "CODEX_EXPECTED_VERSION_PREFIX",
-            "0.146.",
+            "0.147.",
         ),
         agent_idle_timeout_seconds=_positive_float_with_legacy_name(
             "AGENT_IDLE_TIMEOUT_SECONDS",

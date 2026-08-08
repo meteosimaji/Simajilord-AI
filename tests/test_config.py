@@ -162,7 +162,7 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
     assert settings.agent_security_preset_expired is False
     assert settings.agent_isolated_shell_access is AgentFeatureAccess.DISABLED
     assert settings.agent_connector_access is AgentFeatureAccess.DISABLED
-    assert settings.codex_expected_version_prefix == "0.146."
+    assert settings.codex_expected_version_prefix == "0.147."
     assert settings.discord_members_intent_enabled is False
     assert settings.discord_presence_intent_enabled is False
 
