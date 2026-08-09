@@ -1,0 +1,16 @@
+# Generated training corpora are local run artifacts, not source files.
+# In particular, sealed final-test positions must never be published with the code.
+/datasets/*
+!/datasets/README.md
+
+# Checkpoints are published only as separately reviewed release artifacts after
+# their parent/data/rights lineage and held-out gates have passed.
+*.safetensors
+*.npz
+*.onnx
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.psv
+*.hcpe

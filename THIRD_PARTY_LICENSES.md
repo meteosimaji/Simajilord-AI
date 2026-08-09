@@ -13,6 +13,10 @@ The package distributions and linked repositories contain the complete license t
 | yt-dlp-ejs | YouTube JavaScript challenge support | Unlicense (bundled MIT / ISC components) |
 | python-dotenv | Local environment configuration | BSD-3-Clause |
 | PyNaCl | Discord voice encryption support | Apache-2.0 |
+| rsshogi | Shogi rules, board representation, and policy labels in `shogi_ai` | MIT |
+| MLX | Apple Silicon neural inference and training in `shogi_ai` | MIT |
+| NumPy | Numerical arrays and replay sampling in `shogi_ai` | BSD-3-Clause |
+| psutil | Current unified-memory pressure measurements in `shogi_ai` | BSD-3-Clause |
 
 The complete yt-dlp upstream repository is vendored at `vendor/yt-dlp`; its license text and
 third-party notices are preserved in that directory. `yt-dlp-ejs` is pinned because current
