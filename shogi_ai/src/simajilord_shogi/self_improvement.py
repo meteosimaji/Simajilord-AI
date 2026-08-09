@@ -263,7 +263,15 @@ def run_generation(
     else:
         champion = bootstrap_champion.resolve()
         generation = 1
-    load_checkpoint(champion)
+    champion_model, _champion_step = load_checkpoint(champion)
+    if (
+        champion_model.config.history_input_version != 1
+        or champion_model.config.canonical_head_version != 1
+    ):
+        raise ValueError(
+            "the current self-improvement pipeline is legacy-only and cannot consume a "
+            "history-input-v2/canonical-head-v2 champion; no generation was started"
+        )
     generation_dir = workdir / f"generation-{generation:06d}"
     manifest_path = generation_dir / "manifest.json"
     actor_path = generation_dir / "actor.jsonl"

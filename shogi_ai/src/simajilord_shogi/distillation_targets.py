@@ -319,6 +319,17 @@ def _scorer_target(value: object, *, board: Board, index: int) -> CanonicalScore
     )
 
 
+def validate_canonical_scorer_target(
+    value: object,
+    *,
+    board: Board,
+    index: int,
+) -> CanonicalScorerTarget:
+    """Public strict parser shared by canonical target contract versions."""
+
+    return _scorer_target(value, board=board, index=index)
+
+
 def _equivalence_group(
     value: object,
     *,

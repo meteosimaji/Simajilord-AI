@@ -2,14 +2,14 @@
 
 更新: 2026-08-09
 
-この台帳は、無料で再現・公開できる将棋AI「Meteo」のために、外部エンジンを
+この台帳は、公開可能なMeteoと、ユーザーが正規に入手したローカル限定Meteoを混同しないために、外部エンジンを
 「実行すること」と、その実行結果・棋譜・重みを「学習や公開に使うこと」を分離して
 判定したものです。判定の機械可読な正本は
 `src/simajilord_shogi/model_rights.py`です。未登録のモデルは許可済みと推測せず、CLIが
 fail closedします。
 
 ここでいう「全モデル」は、2026-08-09時点で調査できた主要な公開モデル、手元で使用可能な
-モデル、および比較対象として名前が挙がった有料・ホスト専用モデルの全23件です。世界中の
+モデル、および比較対象として名前が挙がった有料・ホスト専用モデルの全24件です。世界中の
 将棋プログラムを無条件に網羅したという意味ではありません。新しい版・別配布物・別規約は
 別の`rights_id`で再審査します。本書は技術上のリスク管理記録であり、法律相談ではありません。
 
@@ -36,11 +36,16 @@ PV、MultiPV確率を、元プログラムの表現を含まない数値的な�
 が追加学習、パラメータ転用、改変、リバースエンジニアリング、再配布を禁止し、大会向けの
 棋譜生成も限定目的だけを許しています。このモデルは一般的なsoft-label蒸留へ入れません。
 
+価格は権利判定ではありません。機械可読台帳は、`public_release_allowed`（出力限定で公開Meteoへ
+利用可）、`local_authorized_only`（正規入手とrunごとの明示承認を条件にローカル学習可、公開不可）、
+`not_authorized`（未入手、未審査、または条件不適合）の三つを返します。正規入手した水匠11Plusを
+「有料だから未使用」とは扱いません。一方、購入・起動した事実だけで公開許諾が生じたとも扱いません。
+
 ## 監査結果
 
-凡例: `可`は現在の無料・出力限定方針で使用可、`GPL条件`は直接利用・再配布時にGPLと
-由来表示を満たす別成果物として扱う必要あり、`不可`は現在のMeteoへ使用しない、`限定`は
-記載された狭い用途だけです。
+凡例: `可`は版固定の確認範囲で使用可、`GPL条件`は直接利用・再配布時にGPLと由来表示を満たす
+別成果物として扱う必要あり、`不可`は現在のMeteoへ使用しない、`限定(local)`は正規入手した
+ローカル環境だけで解析・蒸留・学習でき、公開checkpointへ流せないことを示します。
 
 | rights_id | モデル／版 | USI出力蒸留 | 終局棋譜学習 | 重み直接利用 | 判定の要点 |
 | --- | --- | --- | --- | --- | --- |
@@ -63,10 +68,11 @@ PV、MultiPV確率を、元プログラムの表現を含まない数値的な�
 | `gpsfish-public` | GPSFish公開版 | 可 | 可 | GPL条件 | 公開GPL資源。詰み・探索多様性用 |
 | `sunfish4` | Sunfish 4 | 可 | 可 | 対象外 | MITの古典探索。回帰・多様性用 |
 | `hisui-wcsc36-hosted` | 氷彗 WCSC36優勝版 | 不可 | 公開大会棋譜のみ | 不可 | ダウンロード版を確認できず、棋神アナリティクス上のホスト提供。学習データ非公開 |
-| `suisho10-11-supporter` | 水匠10/11支援者版 | 対象外 | 対象外 | 対象外 | 現在の無料のみ方針で除外 |
-| `tanuki-wcsc36-paid` | 六角堂狸 WCSC36 | 対象外 | 対象外 | 対象外 | 有料配布のため除外 |
-| `soujou-tsec7-paid` | 奏乗 TSEC7 | 対象外 | 対象外 | 対象外 | 有料配布のため除外 |
-| `kanade-wcsc35-paid` | Kanade WCSC35 | 対象外 | 対象外 | 対象外 | 有料モデルのため除外 |
+| `suisho11plus-wcsc36-20260525-local` | 水匠11Plus WCSC36（正規入手済みexact local profile） | 限定(local) | 限定(local) | 不可 | 外部USI出力をローカル蒸留・学習へ使用可。元artifact・raw labels・派生checkpointの公開は権利者receiptまで不可 |
+| `suisho10-11-supporter` | 未審査の水匠10/11支援者版catch-all | 不可 | 不可 | 不可 | exact profile・正規入手証跡・run承認がない別版。上記水匠11Plusを除外する行ではない |
+| `tanuki-wcsc36-paid` | 六角堂狸 WCSC36 | 不可 | 不可 | 不可 | このworkspaceではexact artifactを正規入手・審査していない。価格ではなく証跡不足で不承認 |
+| `soujou-tsec7-paid` | 奏乗 TSEC7 | 不可 | 不可 | 不可 | このworkspaceではexact artifactを正規入手・審査していない。価格ではなく証跡不足で不承認 |
+| `kanade-wcsc35-paid` | Kanade WCSC35 | 不可 | 不可 | 不可 | このworkspaceではexact artifactを正規入手・審査していない。価格ではなく証跡不足で不承認 |
 
 主な一次資料は、[NAGISA V3.1公式BOOTH](https://booth.pm/ja/items/8639574)、
 [AobaNNUE公式](https://github.com/yssaya/AobaNNUE)、
@@ -93,14 +99,15 @@ WCSC36優勝版の氷彗を同サービスへ搭載したとしています。�
 ダウンロードできる公式配布は見つかりませんでした。したがって「氷彗をダウンロード済み」
 とは扱いません。
 
-Meteoが無料方針で利用できるのは、公開WCSC棋譜を通常の対局棋譜として学ぶことと、公開された
+Meteoが公開経路で利用できるのは、公開WCSC棋譜を通常の対局棋譜として学ぶことと、公開された
 設計方向を独立実装して比較することです。これは氷彗の評価値・MultiPV・重みを蒸留したことには
 なりません。将来、公式無料配布と条件が出た時点で新しい`rights_id`を追加して再審査します。
 
 ## 手元で実行確認した教師
 
-外部binary・評価関数はすべて`/tmp`またはユーザーのDownloadsに置き、このリポジトリへは
-コピーしていません。元archiveと評価関数をSHA-256で固定しました。
+外部binary・評価関数はすべてリポジトリ外に置き、このリポジトリへはコピーしていません。
+公開可能な教師は下表の再現性情報を残します。水匠11Plusのprivate path、元ファイル名、配布URL、
+artifact SHA-256は公開文書・release・Thanksへ載せず、ignore済みのlocal provenanceだけに保存します。
 
 | 教師 | 入手・実行状態 | archive SHA-256 | engine SHA-256 | eval/model SHA-256 |
 | --- | --- | --- | --- | --- |
@@ -141,7 +148,9 @@ sidecarを再検証できない場合は推測で許可済みにせず、旧line
 adjacent receiptを用意します。receiptは元の教師artifactやsidecarを公開してよい許可にはなりません。
 
 ```bash
-uv run --project shogi_ai simajilord-shogi model-rights --distillable-only
+uv run --project shogi_ai simajilord-shogi model-rights --public-distillable-only
+uv run --project shogi_ai simajilord-shogi model-rights --local-distillable-only
+uv run --project shogi_ai simajilord-shogi model-rights --not-authorized-only
 
 uv run --project shogi_ai simajilord-shogi reanalyse-usi \
   artifacts/actor.jsonl artifacts/gikou-tactics.jsonl \
@@ -158,12 +167,12 @@ uv run --project shogi_ai simajilord-shogi reanalyse-usi \
 混同せず学習できます。戦術蒸留は定跡なし・`--selection tactical`で、王手、王手応手、捕獲、
 成り、王手をかける着手を優先します。
 
-## 強さを優先した無料教師の順序
+## 強さと多様性を優先した教師の順序
 
-1. NAGISA V3.1、AobaNNUE v1.1を強いNNUEの評価・探索教師にする。
-2. 水匠5を固定された再現可能baseline、深いαβ教師、arena相手にする。
+1. NAGISA V3.1と正規入手済み水匠11Plusを独立canonical scorerにし、教師間の不一致を平均で消さない。
+2. AobaNNUE v1.1、水匠5を公開再現可能なNNUE baseline、深いαβ教師、arena相手にする。
 3. `dlshogi_aoba` WCSC35とAobaZeroの公開重み・棋譜をDL側の初期化・大規模教師候補にする。
-4. 技巧を戦術、人間的評価項目、10戦型の多様性教師にする。
+4. 技巧、振電、tanuki系、弱い対局相手を候補提案と局面多様性に使い、canonical scorerで再採点する。
 5. 同一局面をMeteo自身の浅探索と深探索、異種NNUEとDL探索へ同時に渡し、最善手逆転とregretを
    優先学習する。
 6. 公開WCSC棋譜、詰み、入玉、千日手、長手数終盤、過去championをanchor replayとして残し、

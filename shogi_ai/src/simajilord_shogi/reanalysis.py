@@ -131,7 +131,8 @@ def reanalyse_game(
         if index not in selected:
             revised.append(sample)
             continue
-        teacher = search.search(Board(sample.sfen), add_root_noise=False)
+        history = UsiPositionHistory.from_game(game, sample)
+        teacher = search.search(history.target_board(), add_root_noise=False)
         actor_reference = _actor_reference_move(sample)
         teacher_chosen_q = (
             teacher.q_values.get(sample.chosen_move) if sample.chosen_move is not None else None

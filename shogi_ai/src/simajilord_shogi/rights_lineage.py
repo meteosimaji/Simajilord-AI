@@ -528,6 +528,16 @@ def expected_lineage_rights_summary(
                 )
             current_sidecars.append(summary)
 
+    raw_canonical_summary = lineage.get("canonical_target_rights_restriction_summary")
+    if raw_canonical_summary is not None:
+        if not isinstance(raw_canonical_summary, dict):
+            raise ValueError(
+                "canonical target rights restriction summary must be a JSON object"
+            )
+        current_sidecars.append(
+            validate_rights_restriction_summary(raw_canonical_summary)
+        )
+
     current = merge_rights_restriction_summaries(
         current_sidecars,
         teacher_sources=cast(list[str], raw_teacher_sources),

@@ -10,6 +10,8 @@ from rsshogi.core import Board, Move
 from simajilord_shogi.cli import main
 from simajilord_shogi.config import ReanalysisConfig, SearchConfig
 from simajilord_shogi.domain import GameRecord, PositionSample, Termination
+from simajilord_shogi.encoding import history_input_from_board
+from simajilord_shogi.evaluator import Evaluation
 from simajilord_shogi.external_usi import ExternalTeacherPolicy, ExternalUsiTeacher
 from simajilord_shogi.reanalysis import (
     reanalyse_game,
@@ -19,6 +21,22 @@ from simajilord_shogi.reanalysis import (
 from simajilord_shogi.replay import append_games, load_games
 
 from .test_mcts_game import MATE_IN_ONE_SFEN, MateMoveHasTinyPrior
+
+
+class _HistoryInspectingEvaluator:
+    def __init__(self, expected_prefix: tuple[str, ...]) -> None:
+        self.expected_prefix = expected_prefix
+        self.calls = 0
+
+    def evaluate(self, board: Board) -> Evaluation:
+        history = history_input_from_board(board)
+        assert history.moves[: len(self.expected_prefix)] == self.expected_prefix
+        legal = [move.to_usi() for move in board.legal_moves()]
+        self.calls += 1
+        return Evaluation(
+            policy={move: 1.0 / len(legal) for move in legal},
+            value=0.0,
+        )
 
 
 def test_same_position_deep_reanalysis_records_policy_reversal() -> None:
@@ -63,6 +81,44 @@ def test_same_position_deep_reanalysis_records_policy_reversal() -> None:
     assert revised_sample.teacher_regret is not None
     assert revised_sample.teacher_regret > 0
     assert sample_weight(revised_sample, reanalysis) > 5.0
+
+
+def test_same_model_reanalysis_preserves_the_exact_game_prefix() -> None:
+    moves = ("7g7f", "3c3d", "2g2f", "8c8d")
+    board = Board()
+    for move_usi in moves:
+        board.apply_usi(move_usi)
+    legal_move = board.legal_moves()[0].to_usi()
+    sample = PositionSample(
+        sfen=board.to_sfen(),
+        ply=len(moves),
+        turn=board.turn.value,
+        policy={legal_move: 1.0},
+        root_value=0.0,
+        chosen_move=legal_move,
+        actor_best_move=legal_move,
+    )
+    game = GameRecord(
+        initial_sfen=Board().to_sfen(),
+        moves=moves,
+        samples=(sample,),
+        winner=None,
+        termination=Termination.REPETITION,
+    )
+    evaluator = _HistoryInspectingEvaluator(moves)
+
+    reanalyse_game(
+        game,
+        evaluator,
+        SearchConfig(simulations=1, root_min_visits=1, dirichlet_fraction=0),
+        ReanalysisConfig(
+            teacher_simulation_multiplier=2,
+            minimum_teacher_simulations=2,
+            reanalyse_fraction=1.0,
+        ),
+    )
+
+    assert evaluator.calls > 0
 
 
 def test_external_tactical_reanalysis_records_versioned_teacher_source(

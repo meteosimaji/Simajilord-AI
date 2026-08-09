@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import asdict, dataclass
+from typing import Any, Literal
 
 ModelProfile = Literal["smoke", "development", "competition_v1", "competition_v2"]
 
@@ -32,6 +32,8 @@ class ModelConfig:
     attention_heads: int = 8
     se_interval: int | None = None
     dlshogi_legacy: bool = False
+    history_input_version: int = 1
+    canonical_head_version: int = 1
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -48,12 +50,33 @@ class ModelConfig:
             raise ValueError("value head dimensions must be positive")
         if self.channels % self.attention_heads != 0:
             raise ValueError("channels must be divisible by attention_heads")
+        if self.history_input_version not in {1, 2}:
+            raise ValueError("history_input_version must be 1 or 2")
+        if self.canonical_head_version not in {1, 2}:
+            raise ValueError("canonical_head_version must be 1 or 2")
+        if self.canonical_head_version == 2 and self.history_input_version != 2:
+            raise ValueError("canonical head v2 requires history input v2")
         for label, interval in (
             ("transformer_interval", self.transformer_interval),
             ("se_interval", self.se_interval),
         ):
             if interval is not None and interval < 1:
                 raise ValueError(f"{label} must be positive when enabled")
+
+
+def model_config_payload(config: ModelConfig) -> dict[str, Any]:
+    """Serialize a model config without changing legacy checkpoint identity.
+
+    The two v2 fields are omitted when both are at their historical defaults.
+    Old metadata therefore reloads and fingerprints byte-for-byte as before,
+    while an upgraded model records the new architecture explicitly.
+    """
+
+    payload = asdict(config)
+    if config.history_input_version == 1 and config.canonical_head_version == 1:
+        payload.pop("history_input_version")
+        payload.pop("canonical_head_version")
+    return payload
 
 
 @dataclass(frozen=True, slots=True)

@@ -57,6 +57,29 @@ def test_benchmark_uses_a_reviewed_rights_profile() -> None:
     assert args.rights_profile == "gikou2-v2.0.2"
 
 
+@pytest.mark.parametrize(
+    ("flag", "attribute"),
+    [
+        ("--public-distillable-only", "public_distillable_only"),
+        ("--local-distillable-only", "local_distillable_only"),
+        ("--not-authorized-only", "not_authorized_only"),
+    ],
+)
+def test_model_rights_exposes_three_disjoint_scope_filters(
+    flag: str, attribute: str
+) -> None:
+    args = build_parser().parse_args(["model-rights", flag])
+
+    assert getattr(args, attribute)
+
+
+def test_model_rights_scope_filters_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["model-rights", "--public-distillable-only", "--local-distillable-only"]
+        )
+
+
 def test_external_reanalysis_exposes_teacher_specific_score_calibration() -> None:
     args = build_parser().parse_args(
         [
@@ -98,6 +121,27 @@ def test_external_reanalysis_exposes_suisho11plus_local_only_gate() -> None:
     assert args.local_only_root == Path("/tmp/meteo-local-only-fixture")
 
 
+def test_benchmark_exposes_suisho11plus_local_only_gate() -> None:
+    args = build_parser().parse_args(
+        [
+            "benchmark-usi",
+            "checkpoint",
+            "private-benchmark",
+            "--engine",
+            "engine",
+            "--rights-profile",
+            "suisho11plus-wcsc36-20260525-local",
+            "--local-only-user-authorized",
+            "--local-only-root",
+            "/tmp/meteo-local-only-fixture",
+            "--legacy-single-opening-debug",
+        ]
+    )
+
+    assert args.local_only_user_authorized
+    assert args.local_only_root == Path("/tmp/meteo-local-only-fixture")
+
+
 def test_suisho11plus_options_require_no_book_fv40_and_yaneuraou_hash(
     tmp_path: Path,
 ) -> None:
@@ -114,6 +158,7 @@ def test_suisho11plus_options_require_no_book_fv40_and_yaneuraou_hash(
     }
 
     _require_suisho11plus_teacher_options(options, multipv=8)
+    _require_suisho11plus_teacher_options(options, multipv=1, minimum_multipv=1)
     with pytest.raises(ValueError, match=r"FV_SCALE|fv_scale"):
         _require_suisho11plus_teacher_options({**options, "FV_SCALE": "16"}, multipv=8)
     with pytest.raises(ValueError, match=r"USI_Hash|usi_hash"):
@@ -121,6 +166,19 @@ def test_suisho11plus_options_require_no_book_fv40_and_yaneuraou_hash(
         _require_suisho11plus_teacher_options({**without_usi_hash, "Hash": "64"}, multipv=8)
     with pytest.raises(ValueError, match="MultiPV"):
         _require_suisho11plus_teacher_options(options, multipv=4)
+
+    for empty_eval_dir in ("", "   "):
+        with pytest.raises(ValueError, match=r"non-empty.*EvalDir"):
+            _require_suisho11plus_teacher_options(
+                {**options, "EvalDir": empty_eval_dir}, multipv=8
+            )
+
+    eval_link = tmp_path / "eval-link"
+    eval_link.symlink_to(eval_directory, target_is_directory=True)
+    with pytest.raises(ValueError, match="non-symlink"):
+        _require_suisho11plus_teacher_options(
+            {**options, "EvalDir": str(eval_link)}, multipv=8
+        )
 
 
 def test_limited_local_outputs_must_stay_below_explicit_root(tmp_path: Path) -> None:
@@ -135,6 +193,14 @@ def test_limited_local_outputs_must_stay_below_explicit_root(tmp_path: Path) -> 
     )
     with pytest.raises(ValueError, match="child of local-only root"):
         _require_limited_local_destinations(local_root, (tmp_path / "escaped.jsonl",))
+
+    local_root_link = tmp_path / "private-link"
+    local_root_link.symlink_to(local_root, target_is_directory=True)
+    with pytest.raises(ValueError, match="non-symlink"):
+        _require_limited_local_destinations(
+            local_root_link,
+            (local_root_link / "teacher.jsonl",),
+        )
 
 
 def test_ponanza_coefficient_resolution_preserves_explicit_legacy_denominators() -> None:

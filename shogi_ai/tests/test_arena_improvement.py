@@ -24,7 +24,7 @@ from simajilord_shogi.checkpoint import save_checkpoint
 from simajilord_shogi.config import SearchConfig, model_profile
 from simajilord_shogi.domain import GameRecord, Termination
 from simajilord_shogi.external_usi import ExternalTeacherPolicy, ExternalUsiTeacher
-from simajilord_shogi.model import PolicyValueResNet
+from simajilord_shogi.model import PolicyValueResNet, upgrade_model_to_canonical_v2
 from simajilord_shogi.opening_suite import OpeningPosition, load_opening_suite
 from simajilord_shogi.self_improvement import SelfImprovementConfig, run_generation
 from simajilord_shogi.trainer import TrainingInterlockConfig
@@ -55,6 +55,54 @@ for raw in sys.stdin:
         print('usiok', flush=True)
     elif command == 'isready':
         print('readyok', flush=True)
+    elif command.startswith('go '):
+        print('info depth 1 nodes 1 score cp 9999 pv G*5b', flush=True)
+        print('bestmove G*5b', flush=True)
+    elif command == 'quit':
+        break
+""",
+        encoding="utf-8",
+    )
+
+
+def _fake_yaneuraou_benchmark_usi(path: Path) -> None:
+    path.write_text(
+        """import sys
+options = {
+    'MultiPV': '1',
+    'EvalDir': '',
+    'FV_SCALE': '16',
+    'Threads': '1',
+    'USI_Hash': '16',
+    'USI_OwnBook': 'true',
+    'BookFile': 'standard_book.db',
+    'PvInterval': '300',
+}
+for raw in sys.stdin:
+    command = raw.strip()
+    if command == 'usi':
+        print('id name fake-yaneuraou-benchmark', flush=True)
+        print('option name MultiPV type spin default 1 min 1 max 32', flush=True)
+        print('option name EvalDir type string default .', flush=True)
+        print('option name FV_SCALE type spin default 16 min 1 max 128', flush=True)
+        print('option name Threads type spin default 1 min 1 max 512', flush=True)
+        print('option name USI_Hash type spin default 16 min 1 max 1048576', flush=True)
+        print('option name USI_OwnBook type check default true', flush=True)
+        print('option name BookFile type string default standard_book.db', flush=True)
+        print('option name PvInterval type spin default 300 min 0 max 10000', flush=True)
+        print('usiok', flush=True)
+    elif command.startswith('setoption name '):
+        setting = command.removeprefix('setoption name ')
+        name, value = setting.split(' value ', 1)
+        options[name] = value
+    elif command == 'isready':
+        print('readyok', flush=True)
+    elif command.startswith('getoption '):
+        name = command.removeprefix('getoption ')
+        if name in options:
+            print(f'Options[{name}] = {options[name]}', flush=True)
+        else:
+            print(f'No such option: {name}', flush=True)
     elif command.startswith('go '):
         print('info depth 1 nodes 1 score cp 9999 pv G*5b', flush=True)
         print('bestmove G*5b', flush=True)
@@ -338,6 +386,123 @@ def test_benchmark_output_is_create_only_before_engine_start(
         )
 
     assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_suisho11plus_benchmark_requires_explicit_local_authorization(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    save_checkpoint(PolicyValueResNet(model_profile("smoke")), checkpoint, step=0)
+
+    with pytest.raises(PermissionError, match="LOCAL_AUTHORIZED_ONLY benchmark use"):
+        shogi_cli.main(
+            [
+                "benchmark-usi",
+                str(checkpoint),
+                str(tmp_path / "private" / "benchmark"),
+                "--engine",
+                str(tmp_path / "missing-engine"),
+                "--rights-profile",
+                "suisho11plus-wcsc36-20260525-local",
+                "--legacy-single-opening-debug",
+            ]
+        )
+
+
+def test_suisho11plus_benchmark_is_verified_private_and_unpublishable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = tmp_path / "fake_yaneuraou.py"
+    _fake_yaneuraou_benchmark_usi(script)
+    checkpoint = tmp_path / "checkpoint"
+    save_checkpoint(PolicyValueResNet(model_profile("smoke")), checkpoint, step=0)
+    eval_directory = tmp_path / "eval"
+    eval_directory.mkdir()
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    output = private_root / "benchmark"
+    placeholder = GameRecord(
+        initial_sfen=MATE_IN_ONE_SFEN,
+        moves=(),
+        samples=(),
+        winner=None,
+        termination=Termination.MAX_PLIES,
+    )
+
+    def fake_benchmark(*_args: object, **_kwargs: object) -> tuple[object, list[GameRecord]]:
+        return (
+            summarize_paired_arena(
+                [(0.5, 0.5)],
+                incomplete_pairs=1,
+                incomplete_games=2,
+                opening_sfens=[MATE_IN_ONE_SFEN],
+                opening_keys=[OpeningPosition.from_sfen(MATE_IN_ONE_SFEN).normalized_key],
+                legacy_single_opening=True,
+                promotion_eligible=False,
+                bootstrap_iterations=100,
+            ),
+            [placeholder, placeholder],
+        )
+
+    monkeypatch.setattr(shogi_cli, "benchmark_checkpoint_vs_external", fake_benchmark)
+    assert (
+        shogi_cli.main(
+            [
+                "benchmark-usi",
+                str(checkpoint),
+                str(output),
+                "--engine",
+                sys.executable,
+                "--engine-arg",
+                str(script),
+                "--rights-profile",
+                "suisho11plus-wcsc36-20260525-local",
+                "--local-only-user-authorized",
+                "--local-only-root",
+                str(private_root),
+                "--nodes",
+                "1",
+                "--multipv",
+                "1",
+                "--option",
+                f"EvalDir={eval_directory}",
+                "--option",
+                "FV_SCALE=40",
+                "--option",
+                "Threads=1",
+                "--option",
+                "USI_Hash=64",
+                "--option",
+                "USI_OwnBook=false",
+                "--option",
+                "BookFile=no_book",
+                "--option",
+                "PvInterval=0",
+                "--legacy-single-opening-debug",
+                "--initial-sfen",
+                MATE_IN_ONE_SFEN,
+                "--games",
+                "2",
+                "--simulations",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert json.loads(capsys.readouterr().out) == report
+    assert report["rights_mode"] == "limited_local"
+    assert report["local_only_user_authorized"] is True
+    assert report["publication_allowed"] is False
+    assert report["public_release_gate"] == "blocked_pending_rights_holder_permission"
+    assert report["rights"]["distillation_scope"] == "local_authorized_only"
+    assert report["engine"]["option_value_verification"] == "yaneuraou_getoption"
+    applied = report["engine"]["startup_provenance"]["applied_options"]
+    assert applied
+    assert all(option["verified"] for option in applied)
 
 
 def test_failed_benchmark_cleans_sibling_temporary_bundle(
@@ -987,6 +1152,38 @@ def test_one_self_improvement_generation_is_manifested_and_gated(tmp_path: Path)
     }
     assert Path(result.candidate, "weights.safetensors").is_file()
     assert state["champion"] == str(champion.resolve())
+
+
+def test_legacy_self_improvement_rejects_v2_champion_before_writing(tmp_path: Path) -> None:
+    champion = tmp_path / "champion-v2"
+    save_checkpoint(
+        upgrade_model_to_canonical_v2(PolicyValueResNet(model_profile("smoke"))),
+        champion,
+        step=0,
+    )
+    workdir = tmp_path / "loop"
+
+    with pytest.raises(ValueError, match=r"legacy-only.*no generation was started"):
+        run_generation(
+            champion,
+            workdir,
+            SelfImprovementConfig(
+                actor_games=1,
+                actor_simulations=1,
+                actor_temperature_moves=0,
+                teacher_simulations=2,
+                reanalyse_fraction=1.0,
+                training_steps=1,
+                batch_size=1,
+                learning_rate=1e-6,
+                arena_games=2,
+                arena_simulations=1,
+                promotion_min_games=2,
+                max_plies=4,
+                initial_sfen=MATE_IN_ONE_SFEN,
+            ),
+        )
+    assert not workdir.exists()
 
 
 def test_split_opening_generation_records_production_pair_manifest(tmp_path: Path) -> None:

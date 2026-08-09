@@ -260,7 +260,7 @@ def test_unknown_teacher_rights_fail_closed() -> None:
         ExternalUsiTeacher(["/does/not/matter"], policy, nodes=1)
 
 
-def test_paid_teacher_is_disabled_even_when_output_training_is_allowed() -> None:
+def test_local_only_teacher_requires_explicit_authorization() -> None:
     policy = ExternalTeacherPolicy(
         policy_id="test-commercial",
         name="commercial-model",
@@ -268,10 +268,10 @@ def test_paid_teacher_is_disabled_even_when_output_training_is_allowed() -> None
         analysis_allowed=True,
         training_outputs_allowed=True,
         redistribution_allowed=True,
-        requires_payment=True,
+        requires_explicit_local_authorization=True,
     )
 
-    with pytest.raises(PermissionError, match="free-only policy"):
+    with pytest.raises(PermissionError, match="public-release-safe teacher set"):
         ExternalUsiTeacher(["/does/not/matter"], policy, nodes=1)
 
 

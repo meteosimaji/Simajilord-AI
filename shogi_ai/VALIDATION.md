@@ -46,7 +46,7 @@ uv run --project shogi_ai simajilord-shogi verify \
 
 棄却まで含めて自己改善ループです。弱くなったcandidateを自動昇格させないことも受入条件です。
 
-## 本物の無料教師との終局対局
+## 実外部教師との終局対局
 
 すべて初期局面、色替わり2局、Meteoは未学習`smoke` checkpoint・32 simulations/手、
 教師は1 thread・原則10,000 nodes/手、定跡なしです。いずれも上限到達0、全着手を合法に再生し、
@@ -55,7 +55,7 @@ uv run --project shogi_ai simajilord-shogi verify \
 | 教師 | Meteo結果 | 終局手数 | 用途 |
 | --- | ---: | --- | --- |
 | NAGISA V3.1 | 0勝2敗 | 28、21 | 強いNNUE評価・探索教師 |
-| AobaNNUE v1.1 | 0勝2敗 | 26、21 | 無料NNUE異種教師 |
+| AobaNNUE v1.1 | 0勝2敗 | 26、21 | 公開NNUE異種教師 |
 | 技巧2 v2.0.2 | 0勝2敗 | 28、33 | 戦術・10戦型・人間的評価の多様性教師 |
 | 水匠5 | 0勝2敗 | 30、35 | 固定された再現可能baseline |
 

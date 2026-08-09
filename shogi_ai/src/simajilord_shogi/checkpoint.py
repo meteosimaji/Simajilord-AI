@@ -15,7 +15,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .branding import ENGINE_AUTHOR, ENGINE_DISPLAY_NAME, ENGINE_ROMANIZED_NAME
-from .config import ModelConfig
+from .config import ModelConfig, model_config_payload
 from .model import PolicyValueResNet
 from .rights_lineage import (
     expected_lineage_rights_summary,
@@ -148,7 +148,7 @@ def save_checkpoint(
     metadata: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "step": step,
-        "model": asdict(model.config),
+        "model": model_config_payload(model.config),
         "backend": "mlx",
         "engine": {
             "display_name": ENGINE_DISPLAY_NAME,

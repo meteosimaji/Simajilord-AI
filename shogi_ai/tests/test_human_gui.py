@@ -14,6 +14,7 @@ from rsshogi.core import Board
 from simajilord_shogi.arena import MoveDecision
 from simajilord_shogi.compute_interlock import InterlockedEvaluator, training_step
 from simajilord_shogi.config import SearchConfig
+from simajilord_shogi.encoding import history_input_from_board
 from simajilord_shogi.evaluator import Evaluation, UniformEvaluator
 from simajilord_shogi.human_gui import (
     ActiveCheckpointUsiEngine,
@@ -23,12 +24,14 @@ from simajilord_shogi.human_gui import (
     HumanGameLog,
     HumanGuiService,
     HumanPlayLeaseHandle,
+    HumanSession,
     MeteoGuiHttpServer,
     SessionStore,
     TrainingStatus,
     TrainingStatusStore,
     VersionConflictError,
     _parse_usi_position_command,
+    _session_board,
 )
 from simajilord_shogi.trainer import TrainingInterlockConfig
 
@@ -141,6 +144,21 @@ def test_human_white_receives_ai_opening_move(tmp_path: Path) -> None:
     assert payload["turn"] == 1
 
 
+def test_gui_session_board_preserves_the_recorded_history_prefix(tmp_path: Path) -> None:
+    service, _registry, _root = _service(tmp_path)
+    game = service.new_session(0)
+    move = _legal_moves(service, game.session_id)[0]
+    advanced = service.move(game.session_id, move, expected_version=game.version)
+
+    board = _session_board(advanced)
+    history = history_input_from_board(board)
+
+    assert board.to_sfen() == advanced.current_sfen
+    assert history.initial_sfen == advanced.initial_sfen
+    assert history.moves == advanced.moves
+    assert history.complete is True
+
+
 def test_terminal_game_is_candidate_only_hash_chained_and_idempotent(tmp_path: Path) -> None:
     service, _registry, _root = _service(tmp_path)
     game = service.new_session(0)
@@ -173,8 +191,6 @@ def test_partial_human_game_row_fails_closed(tmp_path: Path) -> None:
         step=1,
         published_unix_seconds=time.time(),
     )
-    from simajilord_shogi.human_gui import HumanSession
-
     board = Board()
     session = HumanSession(
         session_id="0" * 32,

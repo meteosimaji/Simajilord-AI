@@ -1538,6 +1538,17 @@ def _adjudicate(board: Board) -> tuple[int | None, str] | None:
     return None
 
 
+def _session_board(session: HumanSession) -> Board:
+    """Rebuild the exact recorded prefix, retaining history for v2 inference."""
+
+    board = Board(session.initial_sfen)
+    for move_usi in session.moves:
+        board.apply_move(Move.from_usi(move_usi))
+    if board.to_sfen() != session.current_sfen:
+        raise ValueError("session history no longer matches its current SFEN")
+    return board
+
+
 class HumanGuiService:
     """Thread-safe game service with optimistic session versions."""
 
@@ -1577,7 +1588,7 @@ class HumanGuiService:
             return player
 
     def _advance_ai(self, session: HumanSession) -> HumanSession:
-        board = Board(session.current_sfen)
+        board = _session_board(session)
         adjudication = _adjudicate(board)
         if adjudication is not None:
             winner, termination = adjudication
@@ -1684,7 +1695,7 @@ class HumanGuiService:
                 )
             if session.status != "playing":
                 raise ValueError("game is already complete")
-            board = Board(session.current_sfen)
+            board = _session_board(session)
             if board.turn.value != session.human_color:
                 raise ValueError("it is not the human player's turn")
             try:
@@ -1742,7 +1753,7 @@ class HumanGuiService:
 
     @staticmethod
     def session_payload(session: HumanSession) -> dict[str, object]:
-        board = Board(session.current_sfen)
+        board = _session_board(session)
         legal_moves = (
             sorted(move.to_usi() for move in board.legal_moves())
             if session.status == "playing" and board.turn.value == session.human_color

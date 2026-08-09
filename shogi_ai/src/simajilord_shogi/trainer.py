@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 from time import perf_counter
@@ -17,20 +17,22 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from numpy.typing import NDArray
 from rsshogi.core import Board, Move
 from rsshogi.policy import MOVE_LABEL_COUNT, move_label
 
 from .compute_interlock import TrainingStepLease
 from .compute_interlock import training_step as acquire_training_step
+from .config import model_config_payload
 from .distillation_targets import (
     CANONICAL_SCORER_IDS,
     CanonicalDistillationTarget,
     ProvenMateStatus,
 )
+from .distillation_targets_v2 import CanonicalDistillationTargetV2
 from .domain import PositionSample
-from .encoding import combined_features
+from .encoding import combined_features, combined_features_with_history
 from .ensemble import normalized_sfen
 from .model import PolicyValueResNet
 
@@ -126,6 +128,12 @@ class TrainingMetrics:
     compute_interlock_enabled: bool
     compute_interlock_acquisitions: int
     compute_interlock_wait_seconds: float
+    canonical_teacher_policy_losses: tuple[float, float] | None
+    canonical_teacher_value_losses: tuple[float, float] | None
+    canonical_play_policy_loss: float | None
+    canonical_play_interval_value_loss: float | None
+    canonical_wdl_loss: float | None
+    canonical_uncertainty_loss: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +325,348 @@ def _make_canonical_batch(
         mx.array(proof_active),
         mx.array(union_masks),
         mx.array(union_sizes),
+    )
+
+
+def _make_canonical_v2_batch(
+    samples: Sequence[PositionSample],
+    targets: Sequence[CanonicalDistillationTargetV2],
+) -> tuple[mx.array, ...]:
+    """Build independent teacher-head and guarded play-head supervision.
+
+    Every row trains the detached teacher heads and uncertainty head.  The play
+    mask disables policy/value/WDL supervision for unresolved rows, which remain
+    in the additional-search queue.
+    """
+
+    if len(samples) != len(targets) or not samples:
+        raise ValueError("canonical v2 samples and targets must be non-empty and aligned")
+    features = np.stack(
+        [combined_features_with_history(target.history) for target in targets]
+    )
+    teacher_policies = np.zeros(
+        (len(samples), len(CANONICAL_SCORER_IDS), MOVE_LABEL_COUNT),
+        dtype=np.float32,
+    )
+    teacher_values = np.empty(
+        (len(samples), len(CANONICAL_SCORER_IDS)), dtype=np.float32
+    )
+    legal_masks = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.bool_)
+    play_active = np.zeros((len(samples),), dtype=np.bool_)
+    play_policies = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.float32)
+    value_lower = np.zeros((len(samples), 1), dtype=np.float32)
+    value_upper = np.zeros((len(samples), 1), dtype=np.float32)
+    wdl_targets = np.zeros((len(samples), 3), dtype=np.float32)
+    wdl_active = np.zeros((len(samples),), dtype=np.bool_)
+    uncertainty_targets = np.empty((len(samples), 1), dtype=np.float32)
+    for row, (sample, target) in enumerate(zip(samples, targets, strict=True)):
+        if target.play.train_play == target.play.additional_search_required:
+            raise ValueError(f"canonical v2 play/search flags are inconsistent at row {row}")
+        if target.normalized_sfen != normalized_sfen(sample.sfen):
+            raise ValueError(f"canonical v2 target does not match sample SFEN at row {row}")
+        board = Board(sample.sfen)
+        history_board = Board(target.history.target_sfen)
+        if board.to_sfen() != history_board.to_sfen():
+            raise ValueError(f"canonical v2 exact history does not match sample at row {row}")
+        legal_moves = tuple(board.legal_moves())
+        if not legal_moves:
+            raise ValueError(f"canonical v2 target row {row} is terminal")
+        legal_labels = tuple(move_label(move, board.turn) for move in legal_moves)
+        if len(set(legal_labels)) != len(legal_labels):
+            raise ValueError(f"legal moves collide in policy-label space at row {row}")
+        legal_masks[row, list(legal_labels)] = True
+        if tuple(scorer.scorer_id for scorer in target.scorers) != CANONICAL_SCORER_IDS:
+            raise ValueError(f"canonical v2 target row {row} lacks the required scorer pair")
+        for scorer_index, scorer in enumerate(target.scorers):
+            teacher_values[row, scorer_index] = scorer.value
+            for move_usi, probability in scorer.policy.items():
+                move = Move.from_usi(move_usi)
+                if not board.is_legal_move(move):
+                    raise ValueError(
+                        f"illegal canonical v2 teacher move {move_usi} at row {row}"
+                    )
+                teacher_policies[
+                    row, scorer_index, move_label(move, board.turn)
+                ] = probability
+        play_active[row] = target.play.train_play
+        uncertainty_targets[row, 0] = target.uncertainty_target
+        if not play_active[row]:
+            if (
+                target.play.policy
+                or target.play.robust_best_moves
+                or target.play.value_interval is not None
+                or target.play.wdl is not None
+            ):
+                raise ValueError(f"unresolved canonical v2 row {row} contains play targets")
+            continue
+        for move_usi, probability in target.play.policy.items():
+            move = Move.from_usi(move_usi)
+            if not board.is_legal_move(move):
+                raise ValueError(f"illegal guarded play move {move_usi} at row {row}")
+            play_policies[row, move_label(move, board.turn)] = probability
+        if not np.isclose(play_policies[row].sum(), 1.0, atol=1e-7, rtol=0.0):
+            raise ValueError(f"guarded play policy is not normalized at row {row}")
+        robust_labels = [
+            move_label(Move.from_usi(move_usi), board.turn)
+            for move_usi in target.play.robust_best_moves
+        ]
+        if not robust_labels:
+            raise ValueError(f"guarded play target lacks robust best moves at row {row}")
+        maximum_probability = float(play_policies[row].max())
+        if any(
+            not math.isclose(
+                float(play_policies[row, label]),
+                maximum_probability,
+                rel_tol=0.0,
+                abs_tol=1e-7,
+            )
+            for label in robust_labels
+        ):
+            raise ValueError(f"guarded robust best is not policy top-1 at row {row}")
+        if target.play.value_interval is None:
+            raise ValueError(f"guarded play target lacks a value interval at row {row}")
+        value_lower[row, 0], value_upper[row, 0] = target.play.value_interval
+        if target.play.wdl is not None:
+            wdl_targets[row] = target.play.wdl
+            wdl_active[row] = True
+    resolved_rows = np.flatnonzero(play_active)
+    if resolved_rows.size == 0:
+        raise ValueError("canonical v2 optimizer batch requires at least one resolved row")
+    return (
+        mx.array(features),
+        mx.array(teacher_policies),
+        mx.array(teacher_values),
+        mx.array(legal_masks),
+        mx.array(features[resolved_rows]),
+        mx.array(legal_masks[resolved_rows]),
+        mx.array(play_policies[resolved_rows]),
+        mx.array(value_lower[resolved_rows]),
+        mx.array(value_upper[resolved_rows]),
+        mx.array(wdl_targets[resolved_rows]),
+        mx.array(wdl_active[resolved_rows]),
+        mx.array(uncertainty_targets),
+    )
+
+
+def _masked_mean(values: mx.array, active: mx.array) -> mx.array:
+    if values.ndim != 1 or active.ndim != 1 or values.shape != active.shape:
+        raise ValueError("masked mean inputs must be aligned rank-one tensors")
+    weights = active.astype(values.dtype)
+    denominator = mx.maximum(mx.sum(weights), mx.array(1.0, dtype=values.dtype))
+    return mx.sum(values * weights) / denominator
+
+
+def _canonical_v2_sample_indices(
+    rng: np.random.Generator,
+    targets: Sequence[CanonicalDistillationTargetV2],
+    *,
+    batch_size: int,
+    auxiliary_seed: int,
+) -> NDArray[np.int64]:
+    """Choose independent deterministic play and auxiliary batches.
+
+    ``batch_size`` is the resolved play-batch capacity.  Unresolved rows are an
+    additional detached auxiliary batch and never displace a resolved row or
+    advance the persisted resolved-sampling RNG.  This keeps the play/trunk
+    update byte-identical when an unresolved queue is attached, including when
+    ``batch_size == 1``.
+    """
+
+    if batch_size < 1 or not targets:
+        raise ValueError("canonical v2 sampling requires targets and a positive batch size")
+    resolved = np.asarray(
+        [index for index, target in enumerate(targets) if target.play.train_play],
+        dtype=np.int64,
+    )
+    unresolved = np.asarray(
+        [index for index, target in enumerate(targets) if not target.play.train_play],
+        dtype=np.int64,
+    )
+    if resolved.size == 0:
+        raise ValueError("canonical v2 has no play-eligible rows")
+    resolved_selected = np.asarray(
+        rng.choice(
+            resolved,
+            size=min(batch_size, int(resolved.size)),
+            replace=False,
+        ),
+        dtype=np.int64,
+    )
+    if unresolved.size == 0:
+        return resolved_selected
+    auxiliary_rng = np.random.default_rng(auxiliary_seed)
+    unresolved_selected = np.asarray(
+        auxiliary_rng.choice(
+            unresolved,
+            size=min(batch_size, int(unresolved.size)),
+            replace=False,
+        ),
+        dtype=np.int64,
+    )
+    return np.concatenate((resolved_selected, unresolved_selected))
+
+
+_CANONICAL_AUXILIARY_PARAMETER_PREFIXES = (
+    "teacher_policies.",
+    "teacher_policy_biases.",
+    "teacher_value_outputs.",
+    "uncertainty_output.",
+)
+
+
+def _canonical_v2_clip_gradients(
+    gradients: dict[str, Any],
+    *,
+    max_norm: float,
+) -> tuple[dict[str, Any], mx.array]:
+    """Clip play/shared and detached auxiliary gradients independently.
+
+    A single global norm would let a high-loss unresolved teacher row scale
+    down the resolved play/trunk gradient even though its play loss is masked.
+    Separate normalizers remove that indirect coupling.
+    """
+
+    flattened = cast(list[tuple[str, mx.array]], tree_flatten(gradients))
+    play = [
+        (name, gradient)
+        for name, gradient in flattened
+        if not name.startswith(_CANONICAL_AUXILIARY_PARAMETER_PREFIXES)
+    ]
+    auxiliary = [
+        (name, gradient)
+        for name, gradient in flattened
+        if name.startswith(_CANONICAL_AUXILIARY_PARAMETER_PREFIXES)
+    ]
+    if not play or not auxiliary:
+        raise AssertionError("canonical v2 gradient parameter groups are incomplete")
+
+    def group_norm(group: list[tuple[str, mx.array]]) -> mx.array:
+        return mx.sqrt(sum((gradient.square().sum() for _name, gradient in group), 0.0))
+
+    play_norm = group_norm(play)
+    auxiliary_norm = group_norm(auxiliary)
+    play_scale = mx.minimum(max_norm / (play_norm + 1e-6), 1.0)
+    auxiliary_scale = mx.minimum(max_norm / (auxiliary_norm + 1e-6), 1.0)
+    clipped = [
+        (
+            name,
+            gradient
+            * (
+                auxiliary_scale
+                if name.startswith(_CANONICAL_AUXILIARY_PARAMETER_PREFIXES)
+                else play_scale
+            ),
+        )
+        for name, gradient in flattened
+    ]
+    return cast(dict[str, Any], tree_unflatten(clipped)), mx.maximum(
+        play_norm, auxiliary_norm
+    )
+
+
+def _canonical_v2_loss(
+    model: PolicyValueResNet,
+    *batch: mx.array,
+    value_loss_weight: float,
+    uncertainty_loss_weight: float = 0.1,
+) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+    """Independent teacher losses plus evidence-gated play losses.
+
+    The two teacher value predictions have shape ``[B, 2]`` and are compared
+    elementwise with ``[B, 2]`` targets.  No scalar-to-two-teacher broadcast is
+    possible.  The model detaches auxiliary heads from the shared trunk.
+    """
+
+    if len(batch) != 12:
+        raise ValueError("canonical v2 training batch has an invalid tensor contract")
+    (
+        teacher_policy_losses,
+        play_policy_loss,
+        teacher_value_losses,
+        interval_value_loss,
+        wdl_loss,
+        uncertainty_loss,
+    ) = _canonical_v2_monitor_losses(model, *batch)
+    teacher_policy_loss = mx.mean(teacher_policy_losses)
+    teacher_value_loss = mx.mean(teacher_value_losses)
+    policy_component = (
+        teacher_policy_loss
+        + play_policy_loss
+        + wdl_loss
+        + uncertainty_loss_weight * uncertainty_loss
+    )
+    value_component = teacher_value_loss + interval_value_loss
+    total = policy_component + value_loss_weight * value_component
+    return total, (policy_component, value_component)
+
+
+def _canonical_v2_monitor_losses(
+    model: PolicyValueResNet,
+    *batch: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
+    """Return per-teacher and play-head losses without averaging their identities."""
+
+    if len(batch) != 12:
+        raise ValueError("canonical v2 training batch has an invalid tensor contract")
+    if model.training:
+        raise ValueError(
+            "canonical v2 loss requires eval mode so unresolved rows cannot alter "
+            "BatchNorm statistics"
+        )
+    (
+        inputs,
+        teacher_policies,
+        teacher_values,
+        legal_mask,
+        play_inputs,
+        play_legal_mask,
+        play_policies,
+        value_lower,
+        value_upper,
+        wdl_targets,
+        wdl_active,
+        uncertainty_targets,
+    ) = batch
+    output = model.forward_canonical(inputs)
+    play_output = model.forward_canonical(play_inputs)
+    floor = mx.array(-1e30, dtype=output.policy_play.dtype)
+    play_logits = mx.where(play_legal_mask, play_output.policy_play, floor)
+    teacher_logits = mx.where(
+        legal_mask[:, None, :],
+        output.policy_teachers,
+        floor,
+    )
+    teacher_policy_rows = nn.losses.cross_entropy(
+        mx.reshape(teacher_logits, (-1, MOVE_LABEL_COUNT)),
+        mx.reshape(teacher_policies, (-1, MOVE_LABEL_COUNT)),
+        reduction="none",
+    )
+    teacher_policy_losses = mx.mean(mx.reshape(teacher_policy_rows, (-1, 2)), axis=0)
+    play_policy_loss = nn.losses.cross_entropy(
+        play_logits,
+        play_policies,
+        reduction="mean",
+    )
+    teacher_value_losses = mx.mean(
+        mx.square(output.value_teachers - teacher_values), axis=0
+    )
+    below = mx.maximum(value_lower - play_output.value_play, 0.0)
+    above = mx.maximum(play_output.value_play - value_upper, 0.0)
+    interval_value_loss = mx.mean(mx.square(below) + mx.square(above))
+    wdl_losses = nn.losses.cross_entropy(
+        play_output.wdl_play_logits,
+        wdl_targets,
+        reduction="none",
+    )
+    wdl_loss = _masked_mean(wdl_losses, wdl_active)
+    uncertainty_loss = mx.mean(mx.square(output.uncertainty - uncertainty_targets))
+    return (
+        teacher_policy_losses,
+        play_policy_loss,
+        teacher_value_losses,
+        interval_value_loss,
+        wdl_loss,
+        uncertainty_loss,
     )
 
 
@@ -561,6 +911,7 @@ def _training_configuration_fingerprint(
     maximum_gradient_norm: float,
     maximum_probe_loss_ratio: float,
     canonical_teacher_only: bool,
+    canonical_target_version: int | None,
     value_loss_weight: float,
     best_union_top5_weight: float,
 ) -> str:
@@ -573,7 +924,7 @@ def _training_configuration_fingerprint(
             if legacy_compatible
             else "meteo-training-configuration-v2"
         ),
-        "model": asdict(model.config),
+        "model": model_config_payload(model.config),
         "sample_count": sample_count,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
@@ -605,12 +956,26 @@ def _training_configuration_fingerprint(
         payload.update(
             {
                 "canonical_teacher_only": canonical_teacher_only,
+                "canonical_target_version": canonical_target_version,
                 "value_loss_weight": value_loss_weight,
                 "best_union_top5_weight": best_union_top5_weight,
                 "canonical_policy_loss": (
-                    "legal-equivalence-group-mass-with-proven-mate-set-precedence-v1"
+                    "independent-teacher-policy-ce-plus-minimax-regret-play-policy-v2"
+                    if canonical_target_version == 2
+                    else "canonical-v1-training-disabled"
                 ),
-                "canonical_value_loss": "mean-per-canonical-scorer-mse-v1",
+                "canonical_value_loss": (
+                    "independent-teacher-head-mse-plus-play-interval-loss-v2"
+                    if canonical_target_version == 2
+                    else "canonical-v1-training-disabled"
+                ),
+                "unresolved_play_policy_value_wdl_masked": True,
+                "auxiliary_teacher_gradient_to_play_trunk": "stopped",
+                "canonical_batchnorm_mode": "frozen_eval",
+                "canonical_batch_sampling": (
+                    "resolved-capacity-plus-independent-unresolved-auxiliary-v3"
+                ),
+                "canonical_gradient_clipping": "separate-play-and-auxiliary-global-norm-v2",
                 "actor_policy_target_mass_in_canonical_mode": 0.0,
                 "game_outcome_value_contribution_in_canonical_mode": 0.0,
             }
@@ -639,6 +1004,7 @@ def _train_impl(
     maximum_probe_loss_ratio: float,
     canonical_teacher_only: bool,
     canonical_targets: Sequence[CanonicalDistillationTarget] | None,
+    canonical_targets_v2: Sequence[CanonicalDistillationTargetV2] | None,
     value_loss_weight: float,
     best_union_top5_weight: float,
     dataset_fingerprint: str,
@@ -648,21 +1014,55 @@ def _train_impl(
     telemetry_interval: int,
     training_interlock: TrainingInterlockConfig | None,
 ) -> TrainingRun:
-    training_samples: Sequence[PositionSample]
-    training_targets: Sequence[CanonicalDistillationTarget] | None = None
+    if canonical_targets is not None:
+        raise ValueError(
+            "canonical target v1 training is disabled because one value head broadcast over "
+            "two teacher values converges to their arithmetic midpoint; rebuild a complete "
+            "canonical-target-contract-v2 sidecar"
+        )
     if canonical_teacher_only:
-        if canonical_targets is None:
-            raise ValueError("canonical teacher-only training requires canonical targets")
+        raise RuntimeError(
+            "canonical-target-contract-v2 optimizer runs are disabled until the real "
+            "score-matrix builder, calibration replay verification, and independent "
+            "held-out receipt are implemented"
+        )
+    training_samples: Sequence[PositionSample]
+    training_targets_v2: Sequence[CanonicalDistillationTargetV2] | None = None
+    if not canonical_teacher_only and (
+        model.config.history_input_version != 1
+        or model.config.canonical_head_version != 1
+    ):
+        raise ValueError(
+            "history/canonical-v2 checkpoints cannot enter the legacy actor/outcome training "
+            "path; use a complete canonical-target-contract-v2 sidecar or a future explicitly "
+            "history-aware Reanalyse contract"
+        )
+    if canonical_teacher_only:
+        if canonical_targets_v2 is None:
+            raise ValueError("canonical teacher-only training requires canonical v2 targets")
         if not require_teacher:
             raise ValueError("canonical teacher-only training cannot allow actor targets")
         if prevalidated_teacher_samples:
             raise ValueError("packed PSV data cannot use canonical teacher-only targets")
-        if len(canonical_targets) != len(samples):
+        if len(canonical_targets_v2) != len(samples):
             raise ValueError("canonical target count must exactly match the training samples")
+        if model.config.canonical_head_version != 2 or model.config.history_input_version != 2:
+            raise ValueError(
+                "canonical-target-contract-v2 requires an explicitly upgraded model with "
+                "independent heads and history-input-v2"
+            )
+        if not any(
+            target.play.train_play and not target.play.additional_search_required
+            for target in canonical_targets_v2
+        ):
+            raise ValueError(
+                "canonical v2 contains no play-eligible positions; unresolved positions remain "
+                "an additional-search queue and cannot create optimizer steps by themselves"
+            )
         training_samples = samples
-        training_targets = canonical_targets
-    elif canonical_targets is not None:
-        raise ValueError("canonical targets require canonical_teacher_only=True")
+        training_targets_v2 = canonical_targets_v2
+    elif canonical_targets_v2 is not None:
+        raise ValueError("canonical v2 targets require canonical_teacher_only=True")
     elif require_teacher and not prevalidated_teacher_samples:
         training_samples = [sample for sample in samples if sample.teacher_policy is not None]
     else:
@@ -690,8 +1090,11 @@ def _train_impl(
         raise ValueError("value_loss_weight must be finite and non-negative")
     if not math.isfinite(best_union_top5_weight) or best_union_top5_weight < 0:
         raise ValueError("best_union_top5_weight must be finite and non-negative")
-    if not canonical_teacher_only and best_union_top5_weight != 0.0:
-        raise ValueError("best-union top-5 loss requires canonical teacher-only training")
+    if best_union_top5_weight != 0.0:
+        raise ValueError(
+            "best-union top-5 is a disabled canonical-v1 auxiliary; canonical v2 derives a "
+            "top-1-preserving minimax-regret play policy"
+        )
     if exact_resume_eligible and (
         len(dataset_fingerprint) != 64
         or any(character not in "0123456789abcdef" for character in dataset_fingerprint)
@@ -715,6 +1118,7 @@ def _train_impl(
         maximum_gradient_norm=maximum_gradient_norm,
         maximum_probe_loss_ratio=maximum_probe_loss_ratio,
         canonical_teacher_only=canonical_teacher_only,
+        canonical_target_version=(2 if canonical_teacher_only else None),
         value_loss_weight=value_loss_weight,
         best_union_top5_weight=best_union_top5_weight,
     )
@@ -781,38 +1185,18 @@ def _train_impl(
         sample_probabilities /= sample_probabilities.sum()
 
     def loss_fn(*batch: mx.array) -> tuple[mx.array, tuple[mx.array, mx.array]]:
-        inputs = batch[0]
-        logits, predictions = model(inputs)
         if canonical_teacher_only:
-            if len(batch) != 9:
-                raise ValueError("canonical training batch has an invalid tensor contract")
-            scorer_values = batch[1]
-            legal_mask = batch[2]
-            group_masks = batch[3]
-            group_masses = batch[4]
-            proof_mask = batch[5]
-            proof_active = batch[6]
-            union_mask = batch[7]
-            union_sizes = batch[8]
-            policy_loss = _canonical_policy_loss(
-                logits,
-                legal_mask,
-                group_masks,
-                group_masses,
-                proof_mask,
-                proof_active,
-                union_mask,
-                union_sizes,
-                best_union_top5_weight=best_union_top5_weight,
+            return _canonical_v2_loss(
+                model,
+                *batch,
+                value_loss_weight=value_loss_weight,
             )
-            value_loss = mx.mean(mx.square(predictions - scorer_values))
-        else:
-            if len(batch) != 3:
-                raise ValueError("legacy training batch has an invalid tensor contract")
-            policies = batch[1]
-            values = batch[2]
-            policy_loss = nn.losses.cross_entropy(logits, policies, reduction="mean")
-            value_loss = mx.mean(mx.square(predictions - values))
+        if len(batch) != 3:
+            raise ValueError("legacy training batch has an invalid tensor contract")
+        inputs, policies, values = batch
+        logits, predictions = model(inputs)
+        policy_loss = nn.losses.cross_entropy(logits, policies, reduction="mean")
+        value_loss = mx.mean(mx.square(predictions - values))
         return _combine_policy_value_loss(
             policy_loss,
             value_loss,
@@ -829,6 +1213,18 @@ def _train_impl(
     }
     probe_count = min(256, len(training_samples))
     probe_indices = np.linspace(0, len(training_samples) - 1, probe_count, dtype=np.int64)
+    if canonical_teacher_only:
+        assert training_targets_v2 is not None
+        probe_eligible = {
+            index for index, target in enumerate(training_targets_v2) if target.play.train_play
+        }
+        probe_unresolved = set(range(len(training_targets_v2))) - probe_eligible
+        if not any(int(index) in probe_eligible for index in probe_indices):
+            probe_indices[0] = min(probe_eligible)
+        if probe_count > 1 and probe_unresolved and not any(
+            int(index) in probe_unresolved for index in probe_indices
+        ):
+            probe_indices[-1] = min(probe_unresolved)
     probe_samples = [training_samples[int(index)] for index in probe_indices]
     probe_effective_mixes = [
         (
@@ -844,9 +1240,9 @@ def _train_impl(
         for sample in probe_samples
     ]
     if canonical_teacher_only:
-        assert training_targets is not None
-        probe_targets = [training_targets[int(index)] for index in probe_indices]
-        probe_batch = _make_canonical_batch(probe_samples, probe_targets)
+        assert training_targets_v2 is not None
+        probe_targets_v2 = [training_targets_v2[int(index)] for index in probe_indices]
+        probe_batch = _make_canonical_v2_batch(probe_samples, probe_targets_v2)
         probe_effective_mixes = [1.0 for _sample in probe_samples]
     else:
         probe_batch = _make_batch(
@@ -866,7 +1262,12 @@ def _train_impl(
     initial_loss = float(initial.item())
     if not np.isfinite(initial_loss):
         raise RuntimeError("training rejected because the initial fixed-probe loss is non-finite")
-    model.train()
+    # Canonical auxiliary rows must not change BatchNorm running statistics.
+    # Gradients still flow through the resolved play rows in eval mode.
+    if canonical_teacher_only:
+        model.eval()
+    else:
+        model.train()
     observed_max_gradient_norm = 0.0
     observed_sum_gradient_norm = 0.0
     clipped_steps = 0
@@ -882,26 +1283,49 @@ def _train_impl(
             # human-play pause therefore cannot advance either exact-resume
             # stream without completing and persisting an optimizer step.
             mx.random.seed(_mlx_step_seed(seed, optimizer_step_before))
-            indices = rng.choice(
-                len(training_samples),
-                size=min(batch_size, len(training_samples)),
-                replace=prevalidated_teacher_samples,
-                p=sample_probabilities,
-            )
+            if canonical_teacher_only:
+                assert training_targets_v2 is not None
+                indices = _canonical_v2_sample_indices(
+                    rng,
+                    training_targets_v2,
+                    batch_size=batch_size,
+                    auxiliary_seed=_mlx_step_seed(
+                        seed ^ 0xA5A5A5A5,
+                        optimizer_step_before,
+                    ),
+                )
+            else:
+                indices = rng.choice(
+                    len(training_samples),
+                    size=min(batch_size, len(training_samples)),
+                    replace=prevalidated_teacher_samples,
+                    p=sample_probabilities,
+                )
             selected_samples = [training_samples[int(index)] for index in indices]
             if canonical_teacher_only:
-                assert training_targets is not None
-                selected_targets = [training_targets[int(index)] for index in indices]
-                batch = _make_canonical_batch(selected_samples, selected_targets)
+                assert training_targets_v2 is not None
+                selected_targets_v2 = [
+                    training_targets_v2[int(index)] for index in indices
+                ]
+                batch = _make_canonical_v2_batch(
+                    selected_samples,
+                    selected_targets_v2,
+                )
             else:
                 batch = _make_batch(
                     selected_samples,
                     **batch_options,
                 )
             (loss, (policy_loss, value_loss)), gradients = value_and_grad(*batch)
-            clipped_gradients, gradient_norm = optim.clip_grad_norm(  # type: ignore[no-untyped-call]
-                gradients, max_norm=maximum_gradient_norm
-            )
+            if canonical_teacher_only:
+                clipped_gradients, gradient_norm = _canonical_v2_clip_gradients(
+                    gradients,
+                    max_norm=maximum_gradient_norm,
+                )
+            else:
+                clipped_gradients, gradient_norm = optim.clip_grad_norm(  # type: ignore[no-untyped-call]
+                    gradients, max_norm=maximum_gradient_norm
+                )
             optimizer.update(model, clipped_gradients)
             # MLX is lazy: the lease must cover mx.eval of model and optimizer
             # state, not merely optimizer.update.
@@ -959,12 +1383,24 @@ def _train_impl(
             )
     model.eval()
     final_wait_started = perf_counter()
+    canonical_monitor_values: tuple[mx.array, ...] | None = None
     with _training_compute_lease(training_interlock) as final_lease:
         if training_interlock is not None:
             interlock_acquisitions += 1
             interlock_wait_seconds += perf_counter() - final_wait_started
         final, (final_policy, final_value) = loss_fn(*probe_batch)
-        mx.eval(final, final_policy, final_value)
+        if canonical_teacher_only:
+            canonical_monitor_values = _canonical_v2_monitor_losses(
+                model, *probe_batch
+            )
+            mx.eval(
+                final,
+                final_policy,
+                final_value,
+                *canonical_monitor_values,
+            )
+        else:
+            mx.eval(final, final_policy, final_value)
         if final_lease is not None:
             final_lease.assert_healthy()
     final_loss = float(final.item())
@@ -981,6 +1417,35 @@ def _train_impl(
             f"{optimizer_step_end} != {expected_optimizer_step_end}"
         )
     model_step_end = model_step_start + steps
+    canonical_teacher_policy_losses: tuple[float, float] | None = None
+    canonical_teacher_value_losses: tuple[float, float] | None = None
+    canonical_play_policy_loss: float | None = None
+    canonical_play_interval_value_loss: float | None = None
+    canonical_wdl_loss: float | None = None
+    canonical_uncertainty_loss: float | None = None
+    if canonical_monitor_values is not None:
+        (
+            teacher_policy_losses,
+            play_policy_loss,
+            teacher_value_losses,
+            play_interval_value_loss,
+            wdl_loss,
+            uncertainty_loss,
+        ) = canonical_monitor_values
+        teacher_policy_array = np.asarray(teacher_policy_losses, dtype=np.float64)
+        teacher_value_array = np.asarray(teacher_value_losses, dtype=np.float64)
+        canonical_teacher_policy_losses = (
+            float(teacher_policy_array[0]),
+            float(teacher_policy_array[1]),
+        )
+        canonical_teacher_value_losses = (
+            float(teacher_value_array[0]),
+            float(teacher_value_array[1]),
+        )
+        canonical_play_policy_loss = float(play_policy_loss.item())
+        canonical_play_interval_value_loss = float(play_interval_value_loss.item())
+        canonical_wdl_loss = float(wdl_loss.item())
+        canonical_uncertainty_loss = float(uncertainty_loss.item())
     metrics = TrainingMetrics(
         steps=steps,
         model_step_start=model_step_start,
@@ -1010,6 +1475,12 @@ def _train_impl(
         compute_interlock_enabled=training_interlock is not None,
         compute_interlock_acquisitions=interlock_acquisitions,
         compute_interlock_wait_seconds=interlock_wait_seconds,
+        canonical_teacher_policy_losses=canonical_teacher_policy_losses,
+        canonical_teacher_value_losses=canonical_teacher_value_losses,
+        canonical_play_policy_loss=canonical_play_policy_loss,
+        canonical_play_interval_value_loss=canonical_play_interval_value_loss,
+        canonical_wdl_loss=canonical_wdl_loss,
+        canonical_uncertainty_loss=canonical_uncertainty_loss,
     )
     state = TrainingState(
         model_step=model_step_end,
@@ -1049,6 +1520,7 @@ def train_resumable(
     maximum_probe_loss_ratio: float = 1.25,
     canonical_teacher_only: bool = False,
     canonical_targets: Sequence[CanonicalDistillationTarget] | None = None,
+    canonical_targets_v2: Sequence[CanonicalDistillationTargetV2] | None = None,
     value_loss_weight: float = 1.0,
     best_union_top5_weight: float = 0.0,
     initial_model_step: int | None = None,
@@ -1078,6 +1550,7 @@ def train_resumable(
         maximum_probe_loss_ratio=maximum_probe_loss_ratio,
         canonical_teacher_only=canonical_teacher_only,
         canonical_targets=canonical_targets,
+        canonical_targets_v2=canonical_targets_v2,
         value_loss_weight=value_loss_weight,
         best_union_top5_weight=best_union_top5_weight,
         dataset_fingerprint=dataset_fingerprint,
@@ -1110,6 +1583,7 @@ def train(
     maximum_probe_loss_ratio: float = 1.25,
     canonical_teacher_only: bool = False,
     canonical_targets: Sequence[CanonicalDistillationTarget] | None = None,
+    canonical_targets_v2: Sequence[CanonicalDistillationTargetV2] | None = None,
     value_loss_weight: float = 1.0,
     best_union_top5_weight: float = 0.0,
     training_interlock: TrainingInterlockConfig | None = None,
@@ -1136,6 +1610,7 @@ def train(
         maximum_probe_loss_ratio=maximum_probe_loss_ratio,
         canonical_teacher_only=canonical_teacher_only,
         canonical_targets=canonical_targets,
+        canonical_targets_v2=canonical_targets_v2,
         value_loss_weight=value_loss_weight,
         best_union_top5_weight=best_union_top5_weight,
         dataset_fingerprint="legacy-warm-start-without-stable-dataset-identity",

@@ -4,11 +4,15 @@ import pytest
 
 from simajilord_shogi.model_rights import (
     MODEL_RIGHTS,
+    DistillationScope,
     RightsDecision,
     analysable_rights_ids,
     distillable_rights_ids,
+    local_only_distillable_rights_ids,
     locally_distillable_rights_ids,
     model_rights,
+    not_authorized_rights_ids,
+    public_distillable_rights_ids,
 )
 
 
@@ -81,7 +85,7 @@ def test_gikou_is_approved_but_hosted_hisui_is_not_locally_distillable() -> None
     assert "hisui-wcsc36-hosted" not in approved
     assert "hisui-wcsc36-hosted" not in analysable
     assert approved <= analysable
-    with pytest.raises(PermissionError, match="free-only policy"):
+    with pytest.raises(PermissionError, match="not approved for analysis"):
         model_rights("hisui-wcsc36-hosted").teacher_policy().require_analysis_permission()
 
 
@@ -93,16 +97,33 @@ def test_suisho11plus_is_explicit_local_only_and_never_public_by_default() -> No
     assert rights.output_distillation == RightsDecision.LIMITED
     assert rights.direct_weight_use == RightsDecision.NOT_APPROVED
     assert rights.output_only_meteo_publication == RightsDecision.NOT_APPROVED
+    assert rights.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
     assert rights_id not in distillable_rights_ids()
+    assert rights_id not in public_distillable_rights_ids()
     assert rights_id in locally_distillable_rights_ids()
-    with pytest.raises(PermissionError, match="free-only policy"):
+    assert local_only_distillable_rights_ids() == (rights_id,)
+    with pytest.raises(PermissionError, match="public-release-safe teacher set"):
         rights.teacher_policy().require_training_permission()
 
     local_policy = rights.teacher_policy(allow_limited_local=True)
     local_policy.require_training_permission()
     assert local_policy.training_outputs_local_only
     assert not local_policy.redistribution_allowed
-    assert not local_policy.requires_payment
+    assert not local_policy.requires_explicit_local_authorization
+
+
+def test_rights_scopes_partition_the_registry_without_using_price_as_a_gate() -> None:
+    public = set(public_distillable_rights_ids())
+    local_only = set(local_only_distillable_rights_ids())
+    not_authorized = set(not_authorized_rights_ids())
+
+    assert public.isdisjoint(local_only)
+    assert public.isdisjoint(not_authorized)
+    assert local_only.isdisjoint(not_authorized)
+    assert public | local_only | not_authorized == {
+        record.rights_id for record in MODEL_RIGHTS
+    }
+    assert public | local_only == set(locally_distillable_rights_ids())
 
 
 def test_unknown_rights_profile_fails_closed() -> None:

@@ -57,10 +57,16 @@ class TsumeSolver:
     pawn-drop mate, is delegated to rsshogi.
     """
 
-    def __init__(self, *, node_limit: int = 1_000_000) -> None:
+    def __init__(
+        self,
+        *,
+        node_limit: int = 1_000_000,
+        history_exact: bool = False,
+    ) -> None:
         if node_limit < 1:
             raise ValueError("node_limit must be positive")
         self.node_limit = node_limit
+        self.history_exact = history_exact
         self.nodes = 0
         self._cache: dict[tuple[int, int], TsumeVariation | None] = {}
 
@@ -123,14 +129,16 @@ class TsumeSolver:
 
     def _solve_attacker(self, board: Board, remaining: int) -> TsumeVariation | None:
         key = (board.zobrist_hash(), remaining)
-        if key in self._cache:
+        if not self.history_exact and key in self._cache:
             return self._cache[key]
         for move in board.legal_moves():
             result = self._try_attack_move(board, move, remaining)
             if result is not None:
-                self._cache[key] = result
+                if not self.history_exact:
+                    self._cache[key] = result
                 return result
-        self._cache[key] = None
+        if not self.history_exact:
+            self._cache[key] = None
         return None
 
     def _count_node(self) -> None:

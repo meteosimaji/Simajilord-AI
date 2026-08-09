@@ -46,10 +46,16 @@ from .distillation_metrics import evaluate_teacher_alignment, normalized_positio
 from .distillation_targets import (
     CANONICAL_SCORER_IDS,
     CANONICAL_TARGET_SIDECAR_SCHEMA,
-    load_canonical_target_sidecar,
     resolve_canonical_target_sidecar,
 )
-from .domain import GameRecord
+from .distillation_targets_v2 import (
+    CANONICAL_TARGET_V2_MODE,
+    CANONICAL_TARGET_V2_SCHEMA,
+    load_canonical_target_sidecar_v2,
+    resolve_canonical_target_sidecar_v2,
+)
+from .domain import GameRecord, PositionSample
+from .encoding import HistoryInput, history_input_sha256
 from .ensemble import (
     TeacherReplayInput,
     build_teacher_ensemble,
@@ -59,6 +65,7 @@ from .external_usi import (
     ExternalUsiTeacher,
     UsiHistoryMode,
     UsiOptionValueVerification,
+    UsiPositionHistory,
 )
 from .floodgate import (
     FloodgateCorpusConfig,
@@ -70,14 +77,22 @@ from .floodgate import (
 from .game import play_game, replay_and_validate
 from .mcts import MCTS
 from .memory import MemoryBudget, configure_mlx_memory
-from .model import MLXEvaluator, PolicyValueResNet, assert_model_shapes, parameter_count
+from .model import (
+    MLXEvaluator,
+    PolicyValueResNet,
+    assert_model_shapes,
+    parameter_count,
+    upgrade_model_to_canonical_v2,
+)
 from .model_rights import (
     MODEL_RIGHTS,
+    DistillationScope,
     RightsDecision,
-    analysable_rights_ids,
-    distillable_rights_ids,
+    local_only_distillable_rights_ids,
     locally_distillable_rights_ids,
     model_rights,
+    not_authorized_rights_ids,
+    public_distillable_rights_ids,
 )
 from .opening_suite import OpeningPosition, load_opening_suite
 from .opponent import OpponentProfile
@@ -94,6 +109,7 @@ from .replay import (
 from .rights_lineage import (
     expected_lineage_rights_summary,
     summarize_teacher_sidecar,
+    validate_rights_restriction_summary,
 )
 from .self_improvement import SelfImprovementConfig, run_self_improvement
 from .selfplay import batched_self_play, parallel_self_play
@@ -109,6 +125,10 @@ from .value_scale_ablation import (
 )
 from .value_scale_fit import fit_teacher_value_scales
 from .ybb_book import build_ybb_reanalysis_plan, write_ybb_reanalysis_plan
+
+_INTERNAL_HARD_GAME_ACTOR_SOURCES: frozenset[str] = frozenset(
+    {"meteo", "floodgate-original-candidate"}
+)
 
 
 def _profile(value: str) -> ModelProfile:
@@ -154,7 +174,7 @@ def _engine_options(values: Sequence[str]) -> dict[str, str | int]:
 
 
 def _require_suisho11plus_teacher_options(
-    options: dict[str, str | int], *, multipv: int
+    options: dict[str, str | int], *, multipv: int, minimum_multipv: int = 8
 ) -> None:
     """Reject a runnable-looking but misconfigured Suisho11Plus teacher."""
 
@@ -174,10 +194,13 @@ def _require_suisho11plus_teacher_options(
                 f"Suisho11Plus engine option {name} must be {expected!r}, got {observed!r}"
             )
     eval_directory = normalized.get("evaldir")
-    if eval_directory is None:
-        raise ValueError("Suisho11Plus requires explicit engine option EvalDir")
-    resolved_eval = Path(eval_directory).expanduser().resolve()
-    if not resolved_eval.is_dir() or resolved_eval.is_symlink():
+    if not eval_directory:
+        raise ValueError("Suisho11Plus requires a non-empty engine option EvalDir")
+    expanded_eval = Path(eval_directory).expanduser()
+    if expanded_eval.is_symlink():
+        raise ValueError("Suisho11Plus EvalDir must be an existing non-symlink directory")
+    resolved_eval = expanded_eval.resolve()
+    if not resolved_eval.is_dir():
         raise ValueError("Suisho11Plus EvalDir must be an existing non-symlink directory")
     for name in ("threads", "usi_hash"):
         raw_value = normalized.get(name)
@@ -191,8 +214,12 @@ def _require_suisho11plus_teacher_options(
             raise ValueError(f"Suisho11Plus engine option {name} must be positive")
     if "hash" in normalized:
         raise ValueError("Suisho11Plus uses USI_Hash, not Hash")
-    if multipv < 8:
-        raise ValueError("Suisho11Plus distillation requires MultiPV of at least 8")
+    if minimum_multipv < 1:
+        raise ValueError("minimum MultiPV must be positive")
+    if multipv < minimum_multipv:
+        raise ValueError(
+            f"Suisho11Plus requires MultiPV of at least {minimum_multipv} for this operation"
+        )
 
 
 def _resolve_ponanza_value_scale(
@@ -525,6 +552,88 @@ def _benchmark_opening_configuration(
     )
 
 
+def _training_lineage_sidecar_record(
+    sidecar: Path,
+    *,
+    benchmark_replay: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Read one sidecar once and bind an external-benchmark report to its replay."""
+
+    expanded_sidecar = sidecar.expanduser()
+    if expanded_sidecar.is_symlink():
+        raise ValueError(f"training lineage sidecar must not be a symlink: {sidecar}")
+    resolved_sidecar = expanded_sidecar.resolve(strict=True)
+    if not resolved_sidecar.is_file():
+        raise FileNotFoundError(resolved_sidecar)
+    sidecar_bytes = resolved_sidecar.read_bytes()
+    sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
+    try:
+        sidecar_payload: object = json.loads(sidecar_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"training lineage sidecar is not valid UTF-8 JSON: {sidecar}"
+        ) from error
+    if not isinstance(sidecar_payload, dict) or not all(
+        isinstance(key, str) for key in sidecar_payload
+    ):
+        raise ValueError(f"training lineage sidecar must be a JSON object: {sidecar}")
+    benchmark_rights_id: str | None = None
+    if benchmark_replay is not None:
+        if sidecar_payload.get("schema") != "meteo-external-usi-benchmark-v2":
+            raise ValueError(
+                "games.jsonl report.json must be a meteo-external-usi-benchmark-v2 report"
+            )
+        recorded_replay = sidecar_payload.get("replay")
+        if not isinstance(recorded_replay, dict):
+            raise ValueError("external benchmark report lacks replay identity")
+        expected_identity = {
+            "sha256": benchmark_replay["sha256"],
+            "bytes": benchmark_replay["bytes"],
+        }
+        observed_identity = {
+            "sha256": recorded_replay.get("sha256"),
+            "bytes": recorded_replay.get("bytes"),
+        }
+        if observed_identity != expected_identity:
+            raise ValueError("external benchmark report is not bound to this exact replay")
+        raw_rights = sidecar_payload.get("rights")
+        if not isinstance(raw_rights, dict) or not isinstance(
+            raw_rights.get("rights_id"), str
+        ):
+            raise ValueError("external benchmark report lacks an exact rights profile")
+        rights = model_rights(str(raw_rights["rights_id"]))
+        benchmark_rights_id = rights.rights_id
+        if rights.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY and (
+            sidecar_payload.get("local_only_user_authorized") is not True
+            or sidecar_payload.get("publication_allowed") is not False
+        ):
+            raise PermissionError(
+                "LOCAL_AUTHORIZED_ONLY benchmark replay lacks its private authorization receipt"
+            )
+    record: dict[str, object] = {
+        "kind": (
+            "external_benchmark_report"
+            if benchmark_replay is not None
+            else "teacher_lineage_sidecar"
+        ),
+        "path": str(resolved_sidecar),
+        "sha256": sidecar_sha256,
+        "bytes": len(sidecar_bytes),
+        "rights_restriction_summary": summarize_teacher_sidecar(
+            sidecar_payload,
+            sidecar_sha256=sidecar_sha256,
+        ),
+    }
+    if benchmark_replay is not None:
+        assert benchmark_rights_id is not None
+        record["benchmark_replay"] = {
+            "sha256": benchmark_replay["sha256"],
+            "bytes": benchmark_replay["bytes"],
+        }
+        record["hard_game_rights_id"] = benchmark_rights_id
+    return record
+
+
 def _training_input_provenance(paths: Sequence[Path]) -> list[dict[str, object]]:
     """Hash replays and link, without embedding, their adjacent lineage sidecars."""
 
@@ -535,34 +644,113 @@ def _training_input_provenance(paths: Sequence[Path]) -> list[dict[str, object]]
         for suffix in (".ensemble.json", ".provenance.json"):
             sidecar = replay.with_suffix(replay.suffix + suffix)
             if sidecar.is_file():
-                resolved_sidecar = sidecar.expanduser().resolve()
-                sidecar_bytes = resolved_sidecar.read_bytes()
-                sidecar_sha256 = hashlib.sha256(sidecar_bytes).hexdigest()
-                try:
-                    sidecar_payload: object = json.loads(sidecar_bytes)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise ValueError(
-                        f"training lineage sidecar is not valid UTF-8 JSON: {sidecar}"
-                    ) from error
-                if not isinstance(sidecar_payload, dict) or not all(
-                    isinstance(key, str) for key in sidecar_payload
-                ):
-                    raise ValueError(
-                        f"training lineage sidecar must be a JSON object: {sidecar}"
-                    )
-                sidecars.append(
-                    {
-                        "path": str(resolved_sidecar),
-                        "sha256": sidecar_sha256,
-                        "bytes": len(sidecar_bytes),
-                        "rights_restriction_summary": summarize_teacher_sidecar(
-                            sidecar_payload,
-                            sidecar_sha256=sidecar_sha256,
-                        ),
-                    }
+                sidecars.append(_training_lineage_sidecar_record(sidecar))
+        benchmark_report = replay.with_name("report.json")
+        if replay.name == "games.jsonl" and benchmark_report.is_file():
+            sidecars.append(
+                _training_lineage_sidecar_record(
+                    benchmark_report,
+                    benchmark_replay=input_record,
                 )
+            )
         records.append({**input_record, "lineage_sidecars": sidecars})
     return records
+
+
+def _reviewed_hard_game_sources(
+    sample_groups: Sequence[Sequence[PositionSample]],
+    input_provenance: Sequence[dict[str, object]],
+) -> tuple[str, ...]:
+    """Review external actors per replay and reject unbound local games.
+
+    A benchmark report authorizes only the exact replay whose hash and byte
+    length it records.  Keeping samples aligned with provenance prevents a
+    reviewed replay from laundering another input from the same LIMITED actor.
+    """
+
+    if len(sample_groups) != len(input_provenance):
+        raise ValueError("training sample groups must align with input provenance")
+    reviewed: set[str] = set()
+    for samples, input_record in zip(sample_groups, input_provenance, strict=True):
+        if any(sample.actor_source is None for sample in samples):
+            raise PermissionError(
+                "actor-target sample lacks actor_source and cannot receive a hard-game "
+                "training decision"
+            )
+        benchmark_bound_sources: set[str] = set()
+        raw_sidecars = input_record.get("lineage_sidecars")
+        if not isinstance(raw_sidecars, list):
+            raise ValueError("training lineage sidecars must be a list")
+        for raw_sidecar in raw_sidecars:
+            if not isinstance(raw_sidecar, dict):
+                raise ValueError("training lineage sidecar record must be an object")
+            sidecar_kind = raw_sidecar.get("kind")
+            if sidecar_kind not in {
+                "teacher_lineage_sidecar",
+                "external_benchmark_report",
+            }:
+                raise ValueError("training lineage sidecar kind is invalid")
+            raw_summary = raw_sidecar.get("rights_restriction_summary")
+            if not isinstance(raw_summary, dict):
+                raise ValueError("training lineage sidecar lacks its rights summary")
+            summary = validate_rights_restriction_summary(raw_summary)
+            raw_sources = summary["sources"]
+            if not isinstance(raw_sources, list):
+                raise ValueError("training lineage rights sources must be a list")
+            summary_source_ids: set[str] = set()
+            for raw_source in raw_sources:
+                if not isinstance(raw_source, dict) or not isinstance(
+                    raw_source.get("rights_id"), str
+                ):
+                    raise ValueError("training lineage rights source is invalid")
+                summary_source_ids.add(str(raw_source["rights_id"]))
+            if sidecar_kind == "external_benchmark_report":
+                hard_game_rights_id = raw_sidecar.get("hard_game_rights_id")
+                bound_replay = raw_sidecar.get("benchmark_replay")
+                if (
+                    not isinstance(hard_game_rights_id, str)
+                    or hard_game_rights_id not in summary_source_ids
+                    or not isinstance(bound_replay, dict)
+                    or bound_replay.get("sha256") != input_record.get("sha256")
+                    or bound_replay.get("bytes") != input_record.get("bytes")
+                ):
+                    raise ValueError(
+                        "external benchmark sidecar is not bound to its replay and rights"
+                    )
+                benchmark_bound_sources.add(hard_game_rights_id)
+
+        for source in sorted(
+            {sample.actor_source for sample in samples if sample.actor_source is not None}
+        ):
+            try:
+                rights = model_rights(source)
+            except ValueError:
+                if source not in _INTERNAL_HARD_GAME_ACTOR_SOURCES:
+                    raise PermissionError(
+                        f"unknown actor source {source!r} lacks a reviewed hard-game "
+                        "training decision"
+                    ) from None
+                continue
+            if rights.hard_game_training is RightsDecision.NOT_APPROVED:
+                raise PermissionError(
+                    f"actor source {source!r} is not approved for hard-game training"
+                )
+            if rights.hard_game_training not in {
+                RightsDecision.ALLOWED,
+                RightsDecision.LIMITED,
+            }:
+                raise PermissionError(
+                    f"actor source {source!r} lacks an approved hard-game training decision"
+                )
+            if (
+                rights.hard_game_training is RightsDecision.LIMITED
+                and source not in benchmark_bound_sources
+            ):
+                raise PermissionError(
+                    f"LIMITED actor source {source!r} requires an exact adjacent rights report"
+                )
+            reviewed.add(source)
+    return tuple(sorted(reviewed))
 
 
 def _training_dataset_fingerprint(
@@ -640,6 +828,7 @@ def _training_lineage(
     dataset_fingerprint: str,
     optimizer_state_restored: bool,
     input_provenance: Sequence[dict[str, object]] | None = None,
+    canonical_target_rights_restriction_summary: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Describe either the first exact-state segment or an exact continuation."""
 
@@ -685,6 +874,12 @@ def _training_lineage(
             "rsshogi": getattr(rsshogi, "__version__", None),
         },
     }
+    if canonical_target_rights_restriction_summary is not None:
+        lineage["canonical_target_rights_restriction_summary"] = (
+            validate_rights_restriction_summary(
+                canonical_target_rights_restriction_summary
+            )
+        )
     lineage["rights_restriction_summary"] = expected_lineage_rights_summary(lineage)
     return lineage
 
@@ -878,8 +1073,11 @@ def _require_limited_local_destinations(
 ) -> Path:
     """Keep restricted teacher artifacts outside Git, or under an ignored local root."""
 
-    root = local_root.expanduser().resolve()
-    if not root.is_dir() or root.is_symlink():
+    expanded_root = local_root.expanduser()
+    if expanded_root.is_symlink():
+        raise ValueError("local-only root must be an existing, non-symlink directory")
+    root = expanded_root.resolve()
+    if not root.is_dir():
         raise ValueError("local-only root must be an existing, non-symlink directory")
     resolved_destinations = tuple(
         destination.expanduser().resolve() for destination in destinations
@@ -1058,8 +1256,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     training.add_argument("--anchor-replay", type=Path, action="append", default=[])
     training.add_argument("--allow-actor-targets", action="store_true")
-    training.add_argument("--canonical-teacher-only", action="store_true")
-    training.add_argument("--canonical-target-sidecar", type=Path)
+    training.add_argument(
+        "--canonical-teacher-only",
+        action="store_true",
+        help=(
+            "validate canonical-target-contract-v2; real optimizer runs remain blocked until "
+            "the score-matrix builder receipt is implemented"
+        ),
+    )
+    training.add_argument(
+        "--canonical-target-sidecar",
+        type=Path,
+        help="explicit canonical v2 sidecar to validate (production training is not yet enabled)",
+    )
     training.add_argument("--value-loss-weight", type=float, default=1.0)
     training.add_argument("--best-union-top5-weight", type=float, default=0.0)
     training.add_argument(
@@ -1519,7 +1728,27 @@ def build_parser() -> argparse.ArgumentParser:
         "model-rights", help="print the reviewed external model and distillation-rights registry"
     )
     rights.add_argument("--rights-id", choices=tuple(item.rights_id for item in MODEL_RIGHTS))
-    rights.add_argument("--distillable-only", action="store_true")
+    rights_scope = rights.add_mutually_exclusive_group()
+    rights_scope.add_argument(
+        "--public-distillable-only",
+        "--distillable-only",
+        dest="public_distillable_only",
+        action="store_true",
+        help=(
+            "show teachers whose labels may flow into a public checkpoint; "
+            "--distillable-only is retained as a backward-compatible alias"
+        ),
+    )
+    rights_scope.add_argument(
+        "--local-distillable-only",
+        action="store_true",
+        help="show only explicitly authorized local-only teachers such as Suisho11Plus",
+    )
+    rights_scope.add_argument(
+        "--not-authorized-only",
+        action="store_true",
+        help="show only exact profiles that remain unavailable for label generation",
+    )
 
     tsume = subparsers.add_parser(
         "tsume-mine", help="mine unique forced mates from replay positions"
@@ -1613,7 +1842,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_training_interlock_arguments(improve)
 
     benchmark = subparsers.add_parser(
-        "benchmark-usi", help="play paired-color games against a reviewed free USI engine"
+        "benchmark-usi",
+        help="play paired-color games against a rights-reviewed USI engine",
     )
     benchmark.add_argument("checkpoint", type=Path)
     benchmark.add_argument("output", type=Path)
@@ -1630,7 +1860,25 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--rights-profile",
         required=True,
-        choices=analysable_rights_ids(),
+        choices=locally_distillable_rights_ids(),
+    )
+    benchmark.add_argument(
+        "--local-only-user-authorized",
+        action="store_true",
+        help=(
+            "explicitly enable a lawfully acquired LOCAL_AUTHORIZED_ONLY opponent; "
+            "the benchmark bundle remains private and unpublished"
+        ),
+    )
+    benchmark.add_argument(
+        "--local-only-root",
+        type=Path,
+        help="existing private root that must contain a LOCAL_AUTHORIZED_ONLY benchmark bundle",
+    )
+    benchmark.add_argument(
+        "--verify-yaneuraou-options",
+        action="store_true",
+        help="query YaneuraOu getoption after isready and reject any option value mismatch",
     )
     benchmark.add_argument("--nodes", type=int, default=100_000)
     benchmark.add_argument("--multipv", type=int, default=1)
@@ -1708,21 +1956,66 @@ def _distillation_evaluation_report(
     replay_path = replay.expanduser().resolve()
     model, step = load_checkpoint(checkpoint_path)
     games = load_games(replay_path)
-    samples = position_samples(games)
-    teacher_samples = [sample for sample in samples if sample.teacher_policy is not None]
+    exact_histories = model.config.history_input_version == 2
+    histories: list[HistoryInput] | None = None
+    if exact_histories:
+        samples: list[PositionSample] = []
+        histories = []
+        for game in games:
+            if game.termination.value == "max_plies":
+                continue
+            complete = Board(game.initial_sfen).to_sfen() == Board().to_sfen()
+            for sample in game.samples:
+                usi_history = UsiPositionHistory.from_game(game, sample)
+                samples.append(sample)
+                histories.append(
+                    HistoryInput(
+                        initial_sfen=usi_history.initial_sfen,
+                        moves=usi_history.moves,
+                        target_sfen=usi_history.target_sfen,
+                        complete=complete,
+                    )
+                )
+    else:
+        samples = position_samples(games)
+    aligned_histories: Sequence[HistoryInput | None] = (
+        [None] * len(samples) if histories is None else histories
+    )
+    teacher_rows = [
+        (sample, history)
+        for sample, history in zip(samples, aligned_histories, strict=True)
+        if sample.teacher_policy is not None
+    ]
+    teacher_samples = [sample for sample, _history in teacher_rows]
     alignment = evaluate_teacher_alignment(
         MLXEvaluator(model),
         samples,
+        histories=histories if exact_histories else None,
         batch_size=batch_size,
     )
     metadata_path = checkpoint_path / "metadata.json"
     weights_path = checkpoint_path / "weights.safetensors"
+
+    def evaluation_position_key(
+        sample: PositionSample,
+        history: HistoryInput | None,
+    ) -> str:
+        if not exact_histories:
+            return normalized_position_key(sample.sfen)
+        if history is None:
+            raise AssertionError("history-input-v2 evaluation lost an exact prefix")
+        return history_input_sha256(history)
+
     teacher_unique_positions = {
-        normalized_position_key(sample.sfen) for sample in teacher_samples
+        evaluation_position_key(sample, history)
+        for sample, history in teacher_rows
     }
     teacher_source_positions = {
-        (sample.teacher_source or "unknown", normalized_position_key(sample.sfen))
-        for sample in teacher_samples
+        (
+            sample.teacher_source or "unknown",
+            evaluation_position_key(sample, history),
+        )
+        for sample, history in teacher_rows
     }
     return {
         "schema": "meteo-distillation-evaluation-v1",
@@ -1755,6 +2048,11 @@ def _distillation_evaluation_report(
             "teacher_unique_positions": len(teacher_unique_positions),
             "evaluated_samples": alignment.overall.samples,
             "evaluated_unique_positions": alignment.overall.unique_positions,
+            "history_identity": (
+                "exact-history-sha256-v2"
+                if exact_histories
+                else "normalized-sfen-v1"
+            ),
         },
         "batch_size": batch_size,
         "metrics": alignment.to_dict(),
@@ -2208,22 +2506,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         model, current_step, resume_state, _parent_trace = (
             load_checkpoint_with_training_state(args.checkpoint)
         )
-        canonical_sidecar_path = resolve_canonical_target_sidecar(
+        legacy_canonical_sidecar_path = resolve_canonical_target_sidecar(args.replay)
+        canonical_sidecar_path = resolve_canonical_target_sidecar_v2(
             args.replay,
-            explicit=args.canonical_target_sidecar,
+            explicit=(args.canonical_target_sidecar if args.canonical_teacher_only else None),
         )
         if args.canonical_teacher_only:
             if args.anchor_replay:
                 raise ValueError(
-                    "canonical teacher-only v1 accepts exactly one replay and no anchors"
+                    "canonical teacher-only v2 accepts exactly one replay and no anchors"
                 )
             if args.allow_actor_targets:
                 raise ValueError("canonical teacher-only training cannot allow actor targets")
             if canonical_sidecar_path is None:
+                if legacy_canonical_sidecar_path is not None:
+                    raise ValueError(
+                        "canonical target v1 training is disabled because its single value head "
+                        "converges to the arithmetic midpoint of two teachers; build a complete "
+                        "canonical-target-contract-v2 sidecar"
+                    )
                 raise ValueError(
-                    "canonical teacher-only training requires one explicit or adjacent sidecar"
+                    "canonical teacher-only training requires one explicit or adjacent v2 sidecar"
                 )
-        elif canonical_sidecar_path is not None:
+            if (
+                legacy_canonical_sidecar_path is not None
+                and not canonical_sidecar_path.samefile(legacy_canonical_sidecar_path)
+            ):
+                raise ValueError("adjacent canonical v1 and v2 sidecars are ambiguous")
+        elif (
+            args.canonical_target_sidecar is not None
+            or canonical_sidecar_path is not None
+            or legacy_canonical_sidecar_path is not None
+        ):
             raise ValueError(
                 "canonical target sidecar is present but --canonical-teacher-only is absent"
             )
@@ -2232,36 +2546,92 @@ def main(argv: Sequence[str] | None = None) -> int:
         replay_files = [args.replay, *args.anchor_replay]
         training_input_provenance = _training_input_provenance(replay_files)
         canonical_sidecar_identity: dict[str, object] | None = None
-        canonical_targets = None
+        canonical_targets_v2 = None
+        canonical_rights_summary: dict[str, object] | None = None
+        canonical_production_training_eligible = False
+        canonical_production_training_blockers: tuple[str, ...] = ()
         replay_games = load_games(args.replay)
         if canonical_sidecar_path is not None:
             canonical_sidecar_identity = {
                 "sha256": _sha256_file(canonical_sidecar_path),
                 "bytes": canonical_sidecar_path.stat().st_size,
             }
-            canonical_targets = load_canonical_target_sidecar(
+            canonical_sidecar = load_canonical_target_sidecar_v2(
                 args.replay,
                 canonical_sidecar_path,
                 games=replay_games,
-            ).positions
+            )
+            canonical_targets_v2 = canonical_sidecar.positions
+            canonical_rights_summary = canonical_sidecar.rights_restriction_summary
+            canonical_production_training_eligible = (
+                canonical_sidecar.production_training_eligible
+            )
+            canonical_production_training_blockers = (
+                canonical_sidecar.production_training_blockers
+            )
+        if args.canonical_teacher_only and not canonical_production_training_eligible:
+            raise RuntimeError(
+                "canonical-target-contract-v2 is inspection/test-only until the real "
+                "score-matrix builder and independently verifiable training receipts are "
+                "implemented; refusing an optimizer run: "
+                f"{list(canonical_production_training_blockers)}"
+            )
+        if args.canonical_teacher_only:
+            if model.config.canonical_head_version == 1:
+                if not args.reset_optimizer_state:
+                    raise ValueError(
+                        "upgrading a v1 checkpoint to canonical-target-contract-v2 changes the "
+                        "parameter tree; pass --reset-optimizer-state for an explicit warm start"
+                    )
+                model = upgrade_model_to_canonical_v2(model)
+            elif (
+                model.config.canonical_head_version != 2
+                or model.config.history_input_version != 2
+            ):
+                raise ValueError("canonical v2 checkpoint has an incompatible model contract")
+        elif (
+            model.config.canonical_head_version != 1
+            or model.config.history_input_version != 1
+        ):
+            raise ValueError(
+                "history-input-v2/canonical-head-v2 checkpoints require canonical v2 targets"
+            )
         dataset_fingerprint = _training_dataset_fingerprint(
             replay_files,
             selection=(
                 None
                 if canonical_sidecar_identity is None
                 else {
-                    "target_mode": "canonical_dual_teacher",
+                    "target_mode": CANONICAL_TARGET_V2_MODE,
+                    "schema": CANONICAL_TARGET_V2_SCHEMA,
                     "canonical_target_sidecar": canonical_sidecar_identity,
+                    "play_eligible_positions": (
+                        None
+                        if canonical_targets_v2 is None
+                        else sum(target.play.train_play for target in canonical_targets_v2)
+                    ),
+                    "unresolved_positions": (
+                        None
+                        if canonical_targets_v2 is None
+                        else sum(
+                            target.play.additional_search_required
+                            for target in canonical_targets_v2
+                        )
+                    ),
                 }
             ),
             input_provenance=training_input_provenance,
         )
-        samples = position_samples(
-            game
-            for replay_file in replay_files
-            for game in (
-                replay_games if replay_file == args.replay else load_games(replay_file)
-            )
+        replay_game_groups = [
+            replay_games,
+            *(load_games(replay_file) for replay_file in args.anchor_replay),
+        ]
+        sample_groups = [position_samples(games) for games in replay_game_groups]
+        samples = [sample for group in sample_groups for sample in group]
+        reviewed_hard_game_sources = (
+            _reviewed_hard_game_sources(sample_groups, training_input_provenance)
+            if args.allow_actor_targets and not args.canonical_teacher_only
+            else ()
         )
         training_hyperparameters: dict[str, object] = {
             "steps": args.steps,
@@ -2277,6 +2647,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "maximum_gradient_norm": args.max_gradient_norm,
             "maximum_probe_loss_ratio": args.max_probe_loss_ratio,
             "telemetry_interval": args.telemetry_interval,
+            "reviewed_hard_game_sources": list(reviewed_hard_game_sources),
             "human_play_compute_interlock": (
                 {"enabled": False}
                 if training_interlock is None
@@ -2303,9 +2674,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "optimizer_state_reset_requested": args.reset_optimizer_state,
                     "canonical_target_contract": (
                         {
-                            "schema": CANONICAL_TARGET_SIDECAR_SCHEMA,
+                            "schema": CANONICAL_TARGET_V2_SCHEMA,
+                            "legacy_schema": CANONICAL_TARGET_SIDECAR_SCHEMA,
+                            "legacy_schema_training_disabled": True,
                             "scorer_ids": list(CANONICAL_SCORER_IDS),
-                            "positions": len(canonical_targets or ()),
+                            "positions": len(canonical_targets_v2 or ()),
+                            "play_eligible_positions": sum(
+                                target.play.train_play
+                                for target in canonical_targets_v2 or ()
+                            ),
+                            "unresolved_positions_auxiliary_heads_only": sum(
+                                target.play.additional_search_required
+                                for target in canonical_targets_v2 or ()
+                            ),
+                            "teacher_policy_heads": "independent",
+                            "teacher_value_heads": "independent",
+                            "teacher_auxiliary_gradient_to_play_trunk": "stopped",
+                            "play_policy_target": "argmin-worst-teacher-regret-only",
+                            "history_input_version": 2,
                             "sidecar_bytes_bound_only_in_dataset_fingerprint": True,
                             "sidecar_path_or_raw_hash_recorded": False,
                         }
@@ -2332,7 +2718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             maximum_gradient_norm=args.max_gradient_norm,
             maximum_probe_loss_ratio=args.max_probe_loss_ratio,
             canonical_teacher_only=args.canonical_teacher_only,
-            canonical_targets=canonical_targets,
+            canonical_targets_v2=canonical_targets_v2,
             value_loss_weight=args.value_loss_weight,
             best_union_top5_weight=args.best_union_top5_weight,
             initial_model_step=current_step,
@@ -2367,7 +2753,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             for sample in samples
                             if sample.teacher_source is not None
                         )
-                    )
+                    ),
+                    *reviewed_hard_game_sources,
                 ],
                 hyperparameters={
                     **training_hyperparameters,
@@ -2376,6 +2763,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dataset_fingerprint=dataset_fingerprint,
                 optimizer_state_restored=effective_resume_state is not None,
                 input_provenance=training_input_provenance,
+                canonical_target_rights_restriction_summary=canonical_rights_summary,
             ),
             training_state=training_run.state,
             training_trace=training_run.trace,
@@ -2395,6 +2783,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "value_loss_weight": args.value_loss_weight,
                             "best_union_top5_weight": args.best_union_top5_weight,
                             "optimizer_state_reset_requested": args.reset_optimizer_state,
+                            "canonical_target_schema": CANONICAL_TARGET_V2_SCHEMA,
+                            "unresolved_positions_auxiliary_heads_only": (
+                                0
+                                if canonical_targets_v2 is None
+                                else sum(
+                                    target.play.additional_search_required
+                                    for target in canonical_targets_v2
+                                )
+                            ),
                         }
                         if args.canonical_teacher_only
                         else {}
@@ -2987,8 +3384,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         records = list(MODEL_RIGHTS)
         if args.rights_id is not None:
             records = [model_rights(args.rights_id)]
-        if args.distillable_only:
-            approved = set(distillable_rights_ids())
+        if args.public_distillable_only:
+            approved = set(public_distillable_rights_ids())
+            records = [record for record in records if record.rights_id in approved]
+        if args.local_distillable_only:
+            approved = set(local_only_distillable_rights_ids())
+            records = [record for record in records if record.rights_id in approved]
+        if args.not_authorized_only:
+            approved = set(not_authorized_rights_ids())
             records = [record for record in records if record.rights_id in approved]
         print(json.dumps([record.to_dict() for record in records], indent=2))
         return 0
@@ -3139,6 +3542,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("benchmark output must not be the checkpoint or a checkpoint child")
         options = _engine_options(args.option)
         rights = model_rights(args.rights_profile)
+        limited_local = (
+            rights.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
+        )
+        if limited_local:
+            if not args.local_only_user_authorized or args.local_only_root is None:
+                raise PermissionError(
+                    "LOCAL_AUTHORIZED_ONLY benchmark use requires "
+                    "--local-only-user-authorized and --local-only-root"
+                )
+            _require_limited_local_destinations(args.local_only_root, (output_path,))
+        elif args.local_only_user_authorized or args.local_only_root is not None:
+            raise ValueError(
+                "local-only acknowledgement options are only valid for a "
+                "LOCAL_AUTHORIZED_ONLY profile"
+            )
+        if rights.rights_id == "suisho11plus-wcsc36-20260525-local":
+            _require_suisho11plus_teacher_options(
+                options,
+                multipv=args.multipv,
+                minimum_multipv=1,
+            )
+        option_value_verification = (
+            UsiOptionValueVerification.YANEURAOU_GETOPTION
+            if args.verify_yaneuraou_options
+            or rights.rights_id == "suisho11plus-wcsc36-20260525-local"
+            else UsiOptionValueVerification.NONE
+        )
         benchmark_interlock = _training_interlock_from_args(args)
         openings, opening_manifest, legacy_single_opening = (
             _benchmark_opening_configuration(args)
@@ -3186,17 +3616,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         report: dict[str, object]
+        benchmark_startup_provenance: dict[str, object]
         try:
             command = [str(engine_path), *args.engine_arg]
             with ExternalUsiTeacher(
                 command,
-                rights.teacher_policy(),
+                rights.teacher_policy(allow_limited_local=limited_local),
                 nodes=args.nodes,
                 multipv=args.multipv,
                 options=options,
                 training_use=False,
                 working_directory=engine_working_directory,
+                option_value_verification=option_value_verification,
             ) as external:
+                benchmark_startup_provenance = external.startup_provenance.to_dict()
                 summary, benchmark_games = benchmark_checkpoint_vs_external(
                     checkpoint_path,
                     external,
@@ -3283,6 +3716,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "arguments": list(args.engine_arg),
                     "working_directory": str(engine_working_directory),
                     "options": options,
+                    "option_value_verification": option_value_verification.value,
+                    "startup_provenance": benchmark_startup_provenance,
                     "nodes_per_move": args.nodes,
                     "multipv": args.multipv,
                     "value_conversion": {
@@ -3297,6 +3732,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "artifacts": artifact_identities,
                 },
                 "rights": rights.to_dict(),
+                "rights_mode": "limited_local" if limited_local else "public_output_only",
+                "local_only_user_authorized": args.local_only_user_authorized,
+                "publication_allowed": (
+                    rights.output_only_meteo_publication == RightsDecision.ALLOWED
+                ),
+                "public_release_gate": (
+                    "blocked_pending_rights_holder_permission"
+                    if limited_local
+                    else "rights_profile_allows_output_only_meteo_publication"
+                ),
                 "meteo_search": asdict(search),
                 "human_play_compute_interlock": (
                     {"enabled": False}

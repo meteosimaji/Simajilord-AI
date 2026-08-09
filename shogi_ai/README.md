@@ -39,12 +39,39 @@
 リポジトリに同梱する初期checkpointはランダム重みです。水匠やWCSC上位へ勝つという主張は、
 強い教師データで学習し、同一条件の多数局arenaで確認するまでは行いません。
 
-canonical dual-teacher学習は現在、型付きsidecar・集合方策loss・教師別value loss・
-exact-resume境界までを実装した第一段階です。training-eligible sidecarを生成するbuilder、
-全候補familyの再採点、内部詰み証明、depth/reply安定性、validation重複除去は未実装です。
-そのためraw NAGISA／水匠出力の単純平均をcanonical targetとして扱ってはならず、
-sidecarが自称するだけの`proven`詰みはloaderが拒否します。これらが揃うまで、同経路の
-checkpointを昇格・公開・教師越えの根拠にしません。
+`canonical-target-contract-v2`では、NAGISAと水匠11Plusのpolicy/valueを別々のheadと
+別々のlossで保持します。単一valueを2教師へbroadcastして平均値へ収束させる旧v1経路は
+学習入口で拒否します。play headは、全候補を両canonical scorerが同一履歴・同一探索条件・
+複数budget・全合法応手込みで採点し、深さと応手に安定した**大域的な最悪教師regret最小手**が
+確定した局面だけ更新します。softmaxで劣る手へ正の確率を残さず、同率最善または内部証明済みの
+複数詰みだけを集合正解にします。教師対立、候補欠落、未証明詰み、不安定な大域最善手が一つでも
+あれば、その局面は`unresolved`としてplay policy/value/WDL lossをゼロにします。教師別headと
+uncertaintyだけは共有trunkからstop-gradientした特徴で更新し、局面を追加解析キューへ戻します。
+教師固有のCP温度soft policyは各教師の補助headを再現するためだけに使い、productionのplay target、
+着手選択、最悪regret判定へは混ぜません。
+canonical学習中はBatchNorm統計を固定し、unresolvedだけのcorpusではoptimizerを開始しません。
+unresolvedはresolvedのbatch枠や永続RNGを消費しない独立補助batchとして追加するため、未解決queueを
+付けても同じseed・同じresolved集合のplay/trunk更新は変わりません。
+候補familyは名前の配列だけで完了扱いせず、familyごとの生成者、provenance SHA-256、
+実際の候補手集合を保存し、その和集合がcanonical候補全体と完全一致することを要求します。
+各score matrixのQ値もsidecarの自己申告は信用しません。教師別・局面phase別の検証済み係数
+`C`と`D=2C`を固定し、CPは`root_q = sign * tanh(raw_cp / D)`、mateはroot視点の符号へ
+ローダが再変換します。候補手と全合法応手の両方にraw CP/mate、bound、nodes、depth、
+time、合法PVを必須とし、保存Qと一致しない場合は学習前に拒否します。
+
+入力も盤面119面だけでなく、直近8手、反復回数、連続王手、入玉宣言可否、絶対手数、履歴完全性の
+46面を追加する`history-input-v2`です。同一SFENでも履歴が違えばtensorが異なります。既存stemは
+そのまま移植し、新しい履歴stemをゼロ初期化するため、upgrade直後のplay出力は旧checkpointと
+数値一致します。training-eligible v2 sidecarを実データから生成するscore-matrix builder、
+全候補familyの強制再採点、proof certificate、独立held-out重複除去はまだ未実装です。したがって
+現在のraw NAGISA／水匠出力やv1 sidecarから実学習を再開せず、builder完成までは検証用fixtureの
+一step学習だけに限定します。`train --canonical-teacher-only`もbuilder・校正artifact再検証・
+独立held-out receiptが実装されるまで常にfail closedし、手書きsidecarでゲートを越えられません。
+
+応手gateは「相手に悪い応手もある」ことを不安定とは数えません。各候補で全合法応手を採点し、
+相手が選ぶ最小Qをbudgetごとにbackupした系列の変動だけをreply instabilityとします。これにより、
+相手の疑問手で高くなる枝を理由に健全な最悪応手評価を捨てず、同時に最善応手への脆弱性を平均で
+隠しません。
 
 ## モデル
 
@@ -67,12 +94,12 @@ BatchNormの統計量、全層shape、同一SFENのpolicy/value数値一致を�
 
 既存モデルの改造は次の三経路を使い分けます。
 
-- 同一構造: 無料公開dlshogi ResNet重みをv1へ変換し、深教師データで継続学習
+- 同一構造: 利用・再配布条件を確認した公開dlshogi ResNet重みをv1へ変換し、深教師データで継続学習
 - 構造拡張: v1の対応するconvolution層をv2へ移植し、追加Transformer層は段階的に解凍
 - 非互換: AobaNNUE・公開水匠・探索エンジンは重みをコピーせず、USI深解析から蒸留
 
-どの経路も、元重みと教師出力の学習利用・改変版再配布条件が確認できた無料資源だけを
-対象にします。
+価格を許諾の代用にはしません。公開checkpointへ入れられる資源と、正規入手・個別確認した
+ローカル限定教師を分け、学習利用と公開可否を別々に判定します。
 
 64 GiB Apple Siliconでの2026-08-09実測では、ランダム重みの20x256 neural MCTSは単局
 100 simulationsで約105 NPS、32局面を各100 simulations読むbatchで合計約781 NPSでした。
@@ -140,11 +167,14 @@ smoke/debug専用として残していますが、同じ局面を反復しても
 実装する場合は、variant専用rules backend、局面schema、replay、model ID、テストを分離し、
 標準将棋の教師・rating・checkpointへ混ぜません。
 
-## 権利確認済みの無料外部教師
+## 外部教師の権利スコープ
 
-主経路は無料で再現・公開可能な資源だけを使います。候補には無料公開版のやねうら王・水匠、
-AobaZero/AobaNNUE、公開WCSC・電竜戦棋譜、公開水匠教師データ、自己対局と深再解析を含みます。
-無料であっても学習データとモデルのライセンスは個別に確認します。
+外部教師は`public_release_allowed`、`local_authorized_only`、`not_authorized`の三つに分けます。
+価格だけで使用可否を決めません。公開版のやねうら王・水匠、AobaZero/AobaNNUE、公開WCSC・
+電竜戦棋譜、自己対局と深再解析はpublic経路の候補です。正規入手して実物と条件を確認した
+水匠11Plusは、元binary・評価関数・raw labelsを公開しない`local_authorized_only`教師として
+ローカル解析・蒸留・学習に使えます。ただし、それを消費したMeteo checkpointは権利者の明示許可
+receiptがない限り公開できません。無料か有料かにかかわらず、版ごとに権利と出力条件を確認します。
 
 `ExternalUsiTeacher` はNAGISA V3.1、AobaNNUE v1.1、技巧2、水匠5などを別processとして
 接続します。4種はこのMacで実際に終局対局とMultiPV蒸留まで確認済みです。
@@ -167,13 +197,14 @@ sidecarの`history_mode=game_prefix`がこの境界を示します。`benchmark-
 GPLv3 §2とGNU FAQに従い、別の出力制限が見つからないGPLエンジンの通常USI出力
 （指し手、数値評価、nodes、PV/MultiPV）はoutput-only蒸留可と判定します。これは元の評価関数や
 重みのコピー・変換・再配布を許す判定ではありません。モデル固有規約を必ず優先し、たとえば
-`dlshogi-dr2-exhi`は一般蒸留不可です。全23件の版固定判定は
+`dlshogi-dr2-exhi`は一般蒸留不可です。全24件の版固定判定は
 [`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)を参照してください。
 
-有料モデル・棋神アナリティクス等は使用しません。`ExternalTeacherPolicy` は
-`requires_payment=True` の教師を、学習出力の許諾があっても起動前に拒否します。有料版は
-強さの外部benchmarkとして記録するだけで、自動取得や蒸留の対象にしません。
-目標は公開資源と自前学習でそれらを超えることです。
+水匠11Plusの正確なlocal profileは、`--local-only-user-authorized`とcreate-onlyな
+`--local-only-root`を明示したrunだけで起動できます。一般的な「水匠10/11」catch-allや、
+未入手・未審査モデルは`not_authorized`のままfail closedします。台帳・文書・releaseへ、有料配布
+ページ、元評価関数、private path、private artifact hashをコピーしません。ローカル学習の進行と
+公開可能なpublic championはlineageで完全に分離します。
 
 ## 詰将棋
 
@@ -212,6 +243,13 @@ uv run --project shogi_ai simajilord-shogi train \
   --anchor-replay artifacts/champion.jsonl --steps 1000 --batch-size 32 \
   --human-play-state-root artifacts/runtime/shogihome
 
+# canonical v2の数学・履歴・独立headはsynthetic fixtureで検証する。
+# 実データのtrain CLIはscore-matrix builder receipt実装まで意図的に拒否する。
+uv run --project shogi_ai pytest -q \
+  shogi_ai/tests/test_distillation_targets_v2.py \
+  shogi_ai/tests/test_trainer_canonical_v2.py \
+  shogi_ai/tests/test_model_contract_v2.py
+
 # value labelだけをC=600 / C=756.086496 / held-out通過teacher-fitで比較
 # p=sigmoid(cp/C)なので、Meteoの符号付きtargetはtanh(cp/(2C))
 uv run --project shogi_ai simajilord-shogi prepare-value-scale-ablation \
@@ -220,8 +258,10 @@ uv run --project shogi_ai simajilord-shogi prepare-value-scale-ablation \
   --parent-checkpoint artifacts/initial --training-seed 0 \
   --minimum-fit-games 30 --minimum-validation-games 10
 
-# 調査済みモデル権利台帳
-uv run --project shogi_ai simajilord-shogi model-rights --distillable-only
+# 公開checkpointへ使える教師 / 正規承認済みlocal-only教師 / 未承認を分けて表示
+uv run --project shogi_ai simajilord-shogi model-rights --public-distillable-only
+uv run --project shogi_ai simajilord-shogi model-rights --local-distillable-only
+uv run --project shogi_ai simajilord-shogi model-rights --not-authorized-only
 
 # 権利確認済み技巧のMultiPVを同一局面へ付与（binary/parameterはrepo外）
 uv run --project shogi_ai simajilord-shogi reanalyse-usi \
@@ -279,7 +319,7 @@ smoke/debug用で、production昇格には使えません。旧schema 1の未完
 新しいpaired判定へresumeせず拒否します。その場合は既存checkpointをbootstrap championにして
 新しいworkdirでschema 2 generationを開始してください。
 
-# ライセンス確認済みの無料USIエンジンと直接対局
+# 権利スコープ確認済みのUSIエンジンと直接対局
 uv run --project shogi_ai simajilord-shogi benchmark-usi \
   artifacts/champion artifacts/arena/suisho5 \
   --engine /path/to/YaneuraOu --engine-cwd /path/to/runtime \
@@ -300,6 +340,14 @@ SFEN重複も拒否し、productionでは最低32組を要求します。report�
 削除し、既存出力を上書きしません。reportにはcheckpoint内全fileのSHA-256とlineage、実際の
 source-tree/Git identity、engine・別配布artifact・rights row・全option、replay SHA-256、
 opening suite/split/hash/key、CI seed/iterations/method、全終局理由と未完数を保存します。
+
+正規入手した`local_authorized_only`教師との対局も、公開可能教師と同じCLIで実行できます。
+その場合は`--local-only-user-authorized`と`--local-only-root`を必須とし、出力bundleを
+明示したprivate rootの子に閉じ込めます。水匠11Plusの正確なlocal profileでは、
+`FV_SCALE=40`、`USI_OwnBook=false`、`BookFile=no_book`、`PvInterval=0`、`EvalDir`、
+`Threads`、`USI_Hash`を明示し、起動後にYaneuraOuの`getoption`で全実値を再確認します。
+ローカル対局・蒸留・学習の承認と、原評価関数または派生checkpointの公開許可は別のgateです。
+private bundle、第三者artifact、入手先URLはrepositoryやreleaseへ含めません。
 
 単一局面の疎通確認だけが必要な場合は`--legacy-single-opening-debug`を明示します。この経路は
 必ず先後1組だけで、summaryにdebug blockerを残し、昇格判定にもEloにも使用できません。

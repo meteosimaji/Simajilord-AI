@@ -25,7 +25,20 @@ class RightsDecision(StrEnum):
     LIMITED = "limited"
     NOT_APPROVED = "not_approved"
     NOT_APPLICABLE = "not_applicable"
-    EXCLUDED_PAID = "excluded_paid"
+
+
+class DistillationScope(StrEnum):
+    """Where labels from one reviewed profile may be consumed.
+
+    This is deliberately independent of the artifact's price.  A lawfully
+    acquired local teacher can be approved for private training while still
+    being forbidden from a public checkpoint.  Conversely, appearing in the
+    public-safe list never means Meteo may redistribute the original model.
+    """
+
+    PUBLIC_RELEASE_ALLOWED = "public_release_allowed"
+    LOCAL_AUTHORIZED_ONLY = "local_authorized_only"
+    NOT_AUTHORIZED = "not_authorized"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +62,41 @@ class ModelRights:
     notes: tuple[str, ...]
     reviewed_at: str = RIGHTS_REVIEW_DATE
 
+    @property
+    def distillation_scope(self) -> DistillationScope:
+        if (
+            self.analysis == RightsDecision.ALLOWED
+            and self.output_distillation == RightsDecision.ALLOWED
+            and self.output_only_meteo_publication == RightsDecision.ALLOWED
+        ):
+            return DistillationScope.PUBLIC_RELEASE_ALLOWED
+        if (
+            self.analysis in {RightsDecision.ALLOWED, RightsDecision.LIMITED}
+            and self.output_distillation in {RightsDecision.ALLOWED, RightsDecision.LIMITED}
+            and (
+                self.analysis == RightsDecision.LIMITED
+                or self.output_distillation == RightsDecision.LIMITED
+            )
+        ):
+            return DistillationScope.LOCAL_AUTHORIZED_ONLY
+        return DistillationScope.NOT_AUTHORIZED
+
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        result = asdict(self)
+        result.update(
+            {
+                "distillation_scope": self.distillation_scope.value,
+                "local_label_generation_allowed": self.distillation_scope
+                in {
+                    DistillationScope.PUBLIC_RELEASE_ALLOWED,
+                    DistillationScope.LOCAL_AUTHORIZED_ONLY,
+                },
+                "public_checkpoint_allowed": (
+                    self.distillation_scope is DistillationScope.PUBLIC_RELEASE_ALLOWED
+                ),
+            }
+        )
+        return result
 
     def teacher_policy(
         self, *, allow_limited_local: bool = False
@@ -77,7 +123,10 @@ class ModelRights:
             analysis_allowed=analysis_allowed,
             training_outputs_allowed=training_outputs_allowed,
             redistribution_allowed=(self.output_only_meteo_publication == RightsDecision.ALLOWED),
-            requires_payment=self.availability == "paid" and not allow_limited_local,
+            requires_explicit_local_authorization=(
+                self.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
+                and not allow_limited_local
+            ),
             training_outputs_local_only=local_only and allow_limited_local,
         )
 
@@ -533,8 +582,8 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
             "https://www.apply.computer-shogi.org/wcsc36/appeal/hisui/hisui_detail.pdf",
             "https://note.com/kishin_analytics/n/n0effe0c2e5d9",
         ),
-        analysis=RightsDecision.EXCLUDED_PAID,
-        output_distillation=RightsDecision.EXCLUDED_PAID,
+        analysis=RightsDecision.NOT_APPROVED,
+        output_distillation=RightsDecision.NOT_APPROVED,
         hard_game_training=RightsDecision.LIMITED,
         direct_weight_use=RightsDecision.NOT_APPROVED,
         original_artifact_redistribution=RightsDecision.NOT_APPROVED,
@@ -579,22 +628,29 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
     ),
     ModelRights(
         rights_id="suisho10-11-supporter",
-        name="Suisho 10/11 supporter builds",
-        version="current supporter distributions",
+        name="Unreviewed Suisho 10/11 supporter builds",
+        version="generic catch-all excluding the exact Suisho11Plus local profile",
         family="NNUE/SFNN",
         availability="paid",
         engine_license="GPL-3.0 YaneuraOu engine",
-        model_terms="supporter-only evaluation terms were not accepted or downloaded",
+        model_terms=(
+            "no run-specific lawful-acquisition acknowledgement or exact artifact review is "
+            "attached to this generic catch-all profile"
+        ),
         sources=("https://github.com/yaneurao/YaneuraOu",),
-        analysis=RightsDecision.EXCLUDED_PAID,
-        output_distillation=RightsDecision.EXCLUDED_PAID,
-        hard_game_training=RightsDecision.EXCLUDED_PAID,
-        direct_weight_use=RightsDecision.EXCLUDED_PAID,
-        original_artifact_redistribution=RightsDecision.EXCLUDED_PAID,
-        output_only_meteo_publication=RightsDecision.EXCLUDED_PAID,
+        analysis=RightsDecision.NOT_APPROVED,
+        output_distillation=RightsDecision.NOT_APPROVED,
+        hard_game_training=RightsDecision.NOT_APPROVED,
+        direct_weight_use=RightsDecision.NOT_APPROVED,
+        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
+        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
         notes=(
-            "Excluded by Meteo's current free-only policy, irrespective of possible "
-            "GPL output use.",
+            "This generic row is not an exclusion of the user's lawfully acquired "
+            "Suisho11Plus copy.  That exact engine/evaluation pair has the separate "
+            "suisho11plus-wcsc36-20260525-local profile and is authorized for private local "
+            "label generation and training.",
+            "Other supporter builds remain unreviewed until they receive their own exact "
+            "profile and run-specific acknowledgement.  Public release is a separate gate.",
         ),
     ),
     ModelRights(
@@ -605,14 +661,18 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         availability="paid",
         engine_license="GPL-3.0 source",
         model_terms="paid evaluation distribution; no purchase terms were accepted",
-        sources=("https://booth.pm/ja/items/8303452",),
-        analysis=RightsDecision.EXCLUDED_PAID,
-        output_distillation=RightsDecision.EXCLUDED_PAID,
-        hard_game_training=RightsDecision.EXCLUDED_PAID,
-        direct_weight_use=RightsDecision.EXCLUDED_PAID,
-        original_artifact_redistribution=RightsDecision.EXCLUDED_PAID,
-        output_only_meteo_publication=RightsDecision.EXCLUDED_PAID,
-        notes=("Excluded by Meteo's current free-only policy.",),
+        sources=("https://github.com/nodchip/tanuki-",),
+        analysis=RightsDecision.NOT_APPROVED,
+        output_distillation=RightsDecision.NOT_APPROVED,
+        hard_game_training=RightsDecision.NOT_APPROVED,
+        direct_weight_use=RightsDecision.NOT_APPROVED,
+        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
+        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
+        notes=(
+            "This exact paid artifact has not been lawfully acquired and reviewed in this "
+            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
+            "and explicit authorization evidence before use.",
+        ),
     ),
     ModelRights(
         rights_id="soujou-tsec7-paid",
@@ -622,14 +682,18 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         availability="paid",
         engine_license="GPL-3.0-derived engine source",
         model_terms="paid evaluation distribution; no purchase terms were accepted",
-        sources=("https://booth.pm/ja/items/8606196",),
-        analysis=RightsDecision.EXCLUDED_PAID,
-        output_distillation=RightsDecision.EXCLUDED_PAID,
-        hard_game_training=RightsDecision.EXCLUDED_PAID,
-        direct_weight_use=RightsDecision.EXCLUDED_PAID,
-        original_artifact_redistribution=RightsDecision.EXCLUDED_PAID,
-        output_only_meteo_publication=RightsDecision.EXCLUDED_PAID,
-        notes=("Excluded by Meteo's current free-only policy.",),
+        sources=("https://www.apply.computer-shogi.org/",),
+        analysis=RightsDecision.NOT_APPROVED,
+        output_distillation=RightsDecision.NOT_APPROVED,
+        hard_game_training=RightsDecision.NOT_APPROVED,
+        direct_weight_use=RightsDecision.NOT_APPROVED,
+        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
+        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
+        notes=(
+            "This exact paid artifact has not been lawfully acquired and reviewed in this "
+            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
+            "and explicit authorization evidence before use.",
+        ),
     ),
     ModelRights(
         rights_id="kanade-wcsc35-paid",
@@ -639,14 +703,18 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         availability="paid",
         engine_license="external dlshogi-compatible engine",
         model_terms="paid model-only distribution; no purchase terms were accepted",
-        sources=("https://booth.pm/ja/items/7108913",),
-        analysis=RightsDecision.EXCLUDED_PAID,
-        output_distillation=RightsDecision.EXCLUDED_PAID,
-        hard_game_training=RightsDecision.EXCLUDED_PAID,
-        direct_weight_use=RightsDecision.EXCLUDED_PAID,
-        original_artifact_redistribution=RightsDecision.EXCLUDED_PAID,
-        output_only_meteo_publication=RightsDecision.EXCLUDED_PAID,
-        notes=("Excluded by Meteo's current free-only policy.",),
+        sources=("https://www.apply.computer-shogi.org/wcsc35/",),
+        analysis=RightsDecision.NOT_APPROVED,
+        output_distillation=RightsDecision.NOT_APPROVED,
+        hard_game_training=RightsDecision.NOT_APPROVED,
+        direct_weight_use=RightsDecision.NOT_APPROVED,
+        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
+        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
+        notes=(
+            "This exact paid artifact has not been lawfully acquired and reviewed in this "
+            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
+            "and explicit authorization evidence before use.",
+        ),
     ),
 )
 
@@ -670,17 +738,25 @@ def model_rights(rights_id: str) -> ModelRights:
         ) from error
 
 
-def distillable_rights_ids() -> tuple[str, ...]:
-    """IDs approved for free, output-only USI distillation."""
+def public_distillable_rights_ids() -> tuple[str, ...]:
+    """IDs whose output-only labels may flow into a public Meteo checkpoint."""
 
     return tuple(
         record.rights_id
         for record in MODEL_RIGHTS
-        if record.availability == "free"
-        and record.analysis == RightsDecision.ALLOWED
-        and record.output_distillation == RightsDecision.ALLOWED
-        and record.output_only_meteo_publication == RightsDecision.ALLOWED
+        if record.distillation_scope is DistillationScope.PUBLIC_RELEASE_ALLOWED
     )
+
+
+def distillable_rights_ids() -> tuple[str, ...]:
+    """Backward-compatible alias for the public-release-safe teacher set.
+
+    The historical name was ambiguous: it omitted authorized local-only
+    teachers such as Suisho11Plus and could therefore be misread as "unused".
+    New code and user-facing output should say ``public_distillable`` explicitly.
+    """
+
+    return public_distillable_rights_ids()
 
 
 def locally_distillable_rights_ids() -> tuple[str, ...]:
@@ -694,11 +770,31 @@ def locally_distillable_rights_ids() -> tuple[str, ...]:
     )
 
 
-def analysable_rights_ids() -> tuple[str, ...]:
-    """IDs approved for local analysis and fair benchmarks under the free-only policy."""
+def local_only_distillable_rights_ids() -> tuple[str, ...]:
+    """IDs whose labels are authorized only for an acknowledged local run."""
 
     return tuple(
         record.rights_id
         for record in MODEL_RIGHTS
-        if record.availability == "free" and record.analysis == RightsDecision.ALLOWED
+        if record.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
+    )
+
+
+def not_authorized_rights_ids() -> tuple[str, ...]:
+    """IDs that remain unavailable for label generation in this workspace."""
+
+    return tuple(
+        record.rights_id
+        for record in MODEL_RIGHTS
+        if record.distillation_scope is DistillationScope.NOT_AUTHORIZED
+    )
+
+
+def analysable_rights_ids() -> tuple[str, ...]:
+    """IDs approved for analysis without a local authorization receipt."""
+
+    return tuple(
+        record.rights_id
+        for record in MODEL_RIGHTS
+        if record.analysis == RightsDecision.ALLOWED
     )

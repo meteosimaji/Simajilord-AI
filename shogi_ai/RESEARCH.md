@@ -2,7 +2,8 @@
 
 更新: 2026-08-09
 
-このメモは、「めてお / Meteo」を無料で再現可能な大会級将棋AIへ育てるために、
+このメモは、「めてお / Meteo」を公開可能な系統と正規承認済みlocal-only系統に分けて
+大会級将棋AIへ育てるために、
 たややん氏／水匠の公開情報、やねうら王の公式資料、WCSCアピール文書から
 実務上の要点をまとめたものです。他エンジンの主張とMeteoの実測は分けて扱います。
 
@@ -11,7 +12,7 @@
 1. たややん氏の[2026年最新の将棋AI事情](https://book.mynavi.jp/shogi/detail/id%3D149624)は、
    NNUEはCPUで高速に広く読み、DL+MCTSは推論が重い代わりに局面評価が高精度と
    整理しています。2026年1月時点の無償最強候補として `AobaNNUE` を明記しているため、
-   無料方針のMeteoでは教師・arena対手の第一候補にします。これは著者の時点付き見解であり、
+   公開可能なMeteo系統では教師・arena対手の第一候補にします。これは著者の時点付き見解であり、
    Meteoの実測勝敗ではありません。
 2. [CEDEC 2024公式講演ページ](https://cedil.cesa.or.jp/cedil_sessions/view/2958)と
    [本人チャンネルの講演映像](https://www.youtube.com/watch?v=TWXP88bTyoQ)は、公開データで
@@ -41,8 +42,9 @@
    標準NNUE型`NNUE_halfKP256`、推奨`FV_SCALE=24`の評価関数を無料公開しています。
    [V9.00 GitHub版](https://github.com/yaneurao/YaneuraOu/releases/tag/V9.00)にはApple Silicon用
    実行ファイルがあります。一方、公式Wikiの2026年8月時点の一覧では水匠10/11系は
-   支援者向け頒布です。無料方針では水匠5を再現可能な固定baselineとし、水匠11は結果だけを
-   外部benchmarkとして扱います。
+   支援者向け頒布です。水匠5は公開再現可能な固定baselineです。一方、ユーザーが正規入手した
+   水匠11Plusのexact profileは、元artifactとraw labelsを非公開に保つlocal-only USI教師として
+   解析・蒸留・学習へ使用します。派生Meteo checkpointの公開は別の権利gateで拒否します。
 8. [NAGISA V3.1の公式BOOTHページ](https://booth.pm/ja/items/8639574)では本体価格は0円、
    1,000円は同一棋力のDiscordサポートと説明されています。ユーザーが取得した公式ZIPの
    Apple M1版を実行し、終局対局、10,000 node MultiPV蒸留、SHA-256固定まで完了しました。
@@ -82,10 +84,26 @@
     同じ変換は`2p-1=tanh(cp/(2C))`です。従来の`tanh(cp/600)`は`C=300`相当であり、
     AobaNNUEの`C=600`とは異なります。ただし`+40 Elo`はAobaNNUE固有の事前証拠で、
     Meteoでの改善保証ではありません。
+15. [AlphaZero論文](https://arxiv.org/abs/1712.01815)は将棋を対象に含み、現在盤だけでなく
+    過去局面を含む時系列表現を入力に使います。これは千日手や到達経路を現在SFENだけへ潰さない
+    `history-input-v2`の一次根拠です。[MuZero Reanalyse](https://arxiv.org/abs/2104.06294)は、
+    保存済み経験へ新しい探索targetを付け直してsample efficiencyを高める方法を提案しています。
+    ただし、どちらもMeteoでの棋力向上を保証するものではないため、同一wall-clock arenaで検証します。
+16. [Confidence-Aware Multi-Teacher Knowledge Distillation](https://arxiv.org/abs/2201.00007)は、
+    複数教師の固定平均が低品質な教師予測によりstudentを誤誘導し得ることを示し、同論文の実験でも
+    単純平均が精度を落としたと報告しています。ただし同手法はground-truth labelで教師信頼度を
+    測るため、正解不明の将棋局面へそのまま移植できません。Meteoではこの結果を「平均を避ける」
+    根拠に限定し、独立head、全候補の相互再採点、内部証明、arenaを代替の検証境界にします。
+17. [Gumbel AlphaZeroのICLR 2022論文](https://openreview.net/forum?id=bERaNdoegnO)は、rootの
+    全手を訪問できない少数simulationで従来AlphaZeroのpolicy improvementが保証されない問題を
+    扱い、少数simulationでの改善を報告しています。これはMeteoの探索高速化ablation候補ですが、
+    canonical教師targetの正しさを保証するものではなく、現PUCTとの同一wall-clock対局を通すまで
+    productionへ置換しません。
 
 ## Meteoへの反映
 
-- まず `competition_v1` (20x256, 24,384,760 parameters) を、無料の公開教師と深再解析で
+- まず `competition_v1` (20x256, 24,384,760 parameters) を、公開教師、正規承認済みlocal教師、
+  深再解析で
   強い基準器へ育てます。上記10倍経験則の目安は約2.44億局面です。
 - `competition_v2` (40x512, 182,930,748 parameters) の同目安は約18.3億局面です。
   構造は強い候補ですが、少量データでの過学習とM4 Proでの教師生成速度を考え、
@@ -94,10 +112,17 @@
   warmup + cosine、教師源ごとのvalue calibration、負けた定跡枝の自動再採掘を追加します。
 - 定跡は単純な勝数集計にしません。深教師で逆転勝ちと誤評価を除外し、対局数と不確実性を
   持つゲーム木として管理します。
-- 無料のAobaNNUE、公開版水匠、やねうら王系を外部USI教師・arenaに使う候補とします。
-  NAGISA V3.1、AobaNNUE v1.1、技巧2 v2.0.2、水匠5は実際に起動し、終局対局と
-  MultiPV蒸留を確認しました。版別の利用・再配布判定は[`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)へ
-  固定し、未登録モデルはfail closedします。
+- AobaNNUE、公開版水匠、やねうら王系に加え、正規入手済み水匠11Plusのexact local profileを
+  外部USI教師・arenaに使います。NAGISA V3.1、AobaNNUE v1.1、技巧2 v2.0.2、水匠5、
+  水匠11Plusは実際に起動し、終局対局またはMultiPV解析を確認しました。版別の利用・再配布判定は
+  [`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)へ固定し、未登録モデルはfail closedします。
+- canonical v1の単一valueへの2教師broadcastは算術中点へ収束するため学習禁止にしました。
+  v2はNAGISA／水匠のpolicy/valueを独立headで監視し、全候補・複数budget・全合法応手を両教師が
+  再採点したときだけ、最悪教師regretの大域的argminをplay targetにします。教師が解消不能に
+  対立する局面はplayを学習せず追加解析へ戻します。最善手をsoftmax温度で意図せず薄めません。
+  ただし実データ用score-matrix builder、校正artifactの再計算receipt、独立held-out splitは
+  未実装です。内部整合する手書きsidecarは実学習の根拠にならないため、canonical v2のtrain CLIは
+  これらのreceiptを実装するまでfail closedとし、synthetic fixtureの勾配検証だけを許します。
 - PSVは`numpy.memmap`で40-byteレコードを遅延復号し、教師源、offset、strideを指定して
   学習できるようにしました。`game_result`は手番側視点、dropを含むYaneuraOu Move16として
   検証し、不正サイズ・不正結果・非合法手を拒否します。
@@ -122,6 +147,7 @@
 
 ## 引き続き必要な競技項目
 
+- canonical score-matrix builder、全候補`searchmoves`再採点、教師/局面phase別CP校正、proof certificate、独立held-out split
 - PSV教師の重複除去、held-out split、HCPE互換入力
 - held-out validation、データ源別メトリクス、warmup + cosine scheduler
 - 各教師の評価値と実際の勝率から学ぶvalue calibration

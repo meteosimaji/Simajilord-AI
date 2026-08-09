@@ -646,7 +646,7 @@ def test_v1_optimizer_state_cannot_silently_resume_canonical_v2_loss() -> None:
         maximum_probe_loss_ratio=100.0,
     )
 
-    with pytest.raises(ValueError, match="explicit warm start with optimizer reset"):
+    with pytest.raises(ValueError, match="arithmetic midpoint"):
         train_resumable(
             model,
             [sample],

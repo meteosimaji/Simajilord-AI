@@ -1,4 +1,4 @@
-"""Out-of-process USI teacher adapter for explicitly approved free engines."""
+"""Out-of-process USI teacher adapter for explicitly reviewed engines."""
 
 from __future__ import annotations
 
@@ -365,7 +365,12 @@ class UsiPositionHistory:
         return UsiHistoryMode.GAME_PREFIX
 
     def target_board(self) -> Board:
-        return Board(self.target_sfen)
+        board = Board(self.initial_sfen)
+        for move_usi in self.moves:
+            board.apply_move(Move.from_usi(move_usi))
+        if board.to_sfen() != self.target_sfen:
+            raise AssertionError("validated USI history changed before target-board replay")
+        return board
 
     def position_command(self) -> str:
         root = (
@@ -388,7 +393,7 @@ class ExternalTeacherPolicy:
     analysis_allowed: bool
     training_outputs_allowed: bool
     redistribution_allowed: bool
-    requires_payment: bool = False
+    requires_explicit_local_authorization: bool = False
     training_outputs_local_only: bool = False
 
     def __post_init__(self) -> None:
@@ -398,9 +403,11 @@ class ExternalTeacherPolicy:
             raise ValueError("local-only training outputs cannot be marked redistributable")
 
     def require_analysis_permission(self) -> None:
-        if self.requires_payment:
+        if self.requires_explicit_local_authorization:
             raise PermissionError(
-                f"engine {self.name!r} requires payment and is disabled by the free-only policy"
+                f"engine {self.name!r} is outside the public-release-safe teacher set; "
+                "use its exact reviewed local profile with an explicit lawful-acquisition "
+                "acknowledgement when local use is authorized"
             )
         if not self.analysis_allowed:
             raise PermissionError(f"engine {self.name!r} is not approved for analysis")

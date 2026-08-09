@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from rsshogi.core import Board, Move
 
 from .domain import PositionSample
+from .encoding import HistoryInput, board_from_history_input, history_input_sha256
 from .evaluator import BatchEvaluator, Evaluation
 
 
@@ -145,6 +146,7 @@ def _score_sample(
     sample: PositionSample,
     evaluation: Evaluation,
     *,
+    position_key: str,
     epsilon: float,
 ) -> _ScoredSample:
     board = Board(sample.sfen)
@@ -169,7 +171,7 @@ def _score_sample(
         squared_error = (evaluation.value - teacher_value) ** 2
         brier = (((evaluation.value + 1.0) / 2.0) - ((teacher_value + 1.0) / 2.0)) ** 2
     return _ScoredSample(
-        position_key=normalized_position_key(sample.sfen),
+        position_key=position_key,
         teacher=sample.teacher_source or "unknown",
         phase=_phase(sample),
         policy_cross_entropy=cross_entropy,
@@ -225,30 +227,50 @@ def evaluate_teacher_alignment(
     evaluator: BatchEvaluator,
     samples: Sequence[PositionSample],
     *,
+    histories: Sequence[HistoryInput] | None = None,
     batch_size: int = 32,
     epsilon: float = 1e-12,
 ) -> AlignmentReport:
     """Evaluate a model against complete MultiPV targets without train-set leakage.
 
-    Repeated records from the same teacher and normalized position are accepted only
-    when their policy and value targets are identical; identical copies are scored once.
-    Different teachers may intentionally score the same position independently.
+    With history-input-v2, deduplication and inference use the exact replay
+    prefix rather than SFEN alone.  Different teachers may intentionally score
+    the same exact position history independently.
     """
 
     if batch_size < 1 or not 0 < epsilon < 1:
         raise ValueError("batch_size and epsilon must be valid")
-    deduplicated: dict[tuple[str, str], PositionSample] = {}
+    if histories is not None and len(histories) != len(samples):
+        raise ValueError("exact histories must align one-to-one with evaluation samples")
+    paired_histories: Sequence[HistoryInput | None] = (
+        [None] * len(samples) if histories is None else histories
+    )
+    deduplicated: dict[
+        tuple[str, str], tuple[PositionSample, HistoryInput | None, str]
+    ] = {}
     signatures: dict[tuple[str, str], tuple[tuple[tuple[str, float], ...], float | None]] = {}
-    for sample in samples:
+    for sample, history in zip(samples, paired_histories, strict=True):
+        if history is not None:
+            sample_sfen = Board(sample.sfen).to_sfen()
+            history_sfen = board_from_history_input(history).to_sfen()
+            if history_sfen != sample_sfen:
+                raise ValueError(
+                    "exact history target SFEN does not match its evaluation sample"
+                )
         if sample.teacher_policy is None:
             continue
-        key = (sample.teacher_source or "unknown", normalized_position_key(sample.sfen))
+        position_key = (
+            normalized_position_key(sample.sfen)
+            if history is None
+            else history_input_sha256(history)
+        )
+        key = (sample.teacher_source or "unknown", position_key)
         signature = (tuple(sorted(sample.teacher_policy.items())), sample.teacher_value)
         previous = signatures.get(key)
         if previous is not None and previous != signature:
             raise ValueError(f"conflicting duplicate teacher target for {key[0]} at {key[1]}")
         signatures[key] = signature
-        deduplicated.setdefault(key, sample)
+        deduplicated.setdefault(key, (sample, history, position_key))
     selected = list(deduplicated.values())
     if not selected:
         raise ValueError("at least one teacher-labelled sample is required")
@@ -256,13 +278,39 @@ def evaluate_teacher_alignment(
     scored: list[_ScoredSample] = []
     for offset in range(0, len(selected), batch_size):
         batch = selected[offset : offset + batch_size]
-        boards = [Board(sample.sfen) for sample in batch]
-        evaluations = evaluator.evaluate_batch(boards)
+        batch_samples = [sample for sample, _history, _key in batch]
+        batch_histories = [history for _sample, history, _key in batch]
+        if histories is None:
+            evaluations = evaluator.evaluate_batch(
+                [Board(sample.sfen) for sample in batch_samples]
+            )
+        else:
+            if any(history is None for history in batch_histories):
+                raise AssertionError("history-aware evaluation lost an exact prefix")
+            exact_batch_histories = [
+                history for history in batch_histories if history is not None
+            ]
+            evaluate_histories = getattr(evaluator, "evaluate_history_batch", None)
+            if not callable(evaluate_histories):
+                raise TypeError(
+                    "history-input-v2 alignment requires an evaluator with "
+                    "evaluate_history_batch"
+                )
+            evaluations = list(evaluate_histories(exact_batch_histories))
         if len(evaluations) != len(batch):
             raise ValueError("evaluator returned the wrong batch length")
         scored.extend(
-            _score_sample(sample, evaluation, epsilon=epsilon)
-            for sample, evaluation in zip(batch, evaluations, strict=True)
+            _score_sample(
+                sample,
+                evaluation,
+                position_key=position_key,
+                epsilon=epsilon,
+            )
+            for (sample, _history, position_key), evaluation in zip(
+                batch,
+                evaluations,
+                strict=True,
+            )
         )
 
     by_teacher_rows: defaultdict[str, list[_ScoredSample]] = defaultdict(list)
