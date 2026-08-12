@@ -71,7 +71,15 @@ async def _run(args: argparse.Namespace) -> dict[str, object]:
         raise FileExistsError(f"Backup destination is not available: {backup_path}")
     backup_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     await asyncio.to_thread(_backup_sqlite, database, backup_path)
-    store = AgentConversationStore(database)
+    stored_epoch = await asyncio.to_thread(
+        _stored_conversation_compatibility_epoch,
+        database,
+    )
+    store = (
+        AgentConversationStore(database)
+        if stored_epoch is None
+        else AgentConversationStore(database, compatibility_epoch=stored_epoch)
+    )
     selected = None if args.all else tuple(args.conversation or ())
     reset_count = await store.reset_provider_continuity(selected)
     return {
@@ -99,6 +107,38 @@ def _backup_sqlite(source_path: Path, destination_path: Path) -> None:
         destination.close()
         source.close()
     os.chmod(destination_path, 0o600)
+
+
+def _stored_conversation_compatibility_epoch(database: Path) -> int | None:
+    """Read an existing epoch without triggering the store's migration path."""
+
+    source = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        table = source.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'agent_runtime_metadata'
+            """
+        ).fetchone()
+        if table is None:
+            return None
+        row = source.execute(
+            """
+            SELECT value FROM agent_runtime_metadata
+            WHERE key = 'conversation_compatibility_epoch'
+            """
+        ).fetchone()
+    finally:
+        source.close()
+    if row is None:
+        return None
+    try:
+        epoch = int(str(row[0]))
+    except ValueError as exc:
+        raise ValueError("stored conversation compatibility epoch is invalid") from exc
+    if epoch < 1 or epoch > 10_000:
+        raise ValueError("stored conversation compatibility epoch is out of range")
+    return epoch
 
 
 def main(argv: Sequence[str] | None = None) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -107,3 +108,48 @@ async def test_agent_reset_cli_creates_sqlite_backup_before_reset(
     reset_conversation = await store.conversation(request.conversation_id)
     assert reset_conversation is not None
     assert reset_conversation.provider_thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_agent_reset_cli_preserves_the_database_compatibility_epoch(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agent.sqlite3"
+    backup = tmp_path / "agent.backup.sqlite3"
+    store = AgentConversationStore(database, compatibility_epoch=6)
+    selected = _request("event-1", "conversation-1")
+    preserved = _request("event-2", "conversation-2")
+    await _complete(store, selected, "thread-1")
+    await _complete(store, preserved, "thread-2")
+
+    result = await _run(
+        argparse.Namespace(
+            database=database,
+            all=False,
+            conversation=[selected.conversation_id],
+            backup_path=backup,
+            yes=True,
+        )
+    )
+
+    assert result["reset_conversations"] == 1
+    with sqlite3.connect(database) as connection:
+        epoch = connection.execute(
+            """
+            SELECT value FROM agent_runtime_metadata
+            WHERE key = 'conversation_compatibility_epoch'
+            """
+        ).fetchone()
+        bindings = dict(
+            connection.execute(
+                """
+                SELECT conversation_id, provider_thread_id
+                FROM agent_conversations
+                """
+            ).fetchall()
+        )
+    assert epoch == ("6",)
+    assert bindings == {
+        selected.conversation_id: None,
+        preserved.conversation_id: "thread-2",
+    }
