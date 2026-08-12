@@ -2627,8 +2627,19 @@ def _download_mlx_source_with_progress(
         root,
         "source_download_start",
         source=shard.filename,
-        bytes=part.stat().st_size if part.is_file() else 0,
+        bytes=(
+            destination.stat().st_size
+            if destination.is_file() and not destination.is_symlink()
+            else part.stat().st_size
+            if part.is_file() and not part.is_symlink()
+            else 0
+        ),
         total_bytes=shard.byte_size,
+        complete_cache_hit=(
+            destination.is_file()
+            and not destination.is_symlink()
+            and destination.stat().st_size == shard.byte_size
+        ),
     )
     monitor.start()
     try:
