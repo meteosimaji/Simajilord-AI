@@ -186,10 +186,14 @@ def test_discord_policy_rejects_an_uninspectable_plugin_mcp_manifest(
 
 def test_discord_extensions_enable_only_reviewed_feature_families() -> None:
     arguments = codex_feature_arguments(allow_discord_extensions=True)
-    pairs = set(zip(arguments[::2], arguments[1::2], strict=True))
+    ordered_pairs = tuple(zip(arguments[::2], arguments[1::2], strict=True))
+    pairs = set(ordered_pairs)
+
+    assert len(ordered_pairs) == len(pairs)
 
     for feature in (
         "apps",
+        "code_mode_host",
         "plugins",
         "skill_search",
     ):
@@ -197,7 +201,6 @@ def test_discord_extensions_enable_only_reviewed_feature_families() -> None:
         assert ("--disable", feature) not in pairs
     for feature in (
         "browser_use",
-        "code_mode_host",
         "computer_use",
         "goals",
         "multi_agent",

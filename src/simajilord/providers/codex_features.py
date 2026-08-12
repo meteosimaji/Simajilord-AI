@@ -45,8 +45,13 @@ def codex_feature_arguments(
 ) -> tuple[str, ...]:
     """Disable unrelated hosted features and opt into images explicitly."""
 
+    # Codex 0.147 presents namespace dynamic tools through the local code-mode
+    # host.  Discord still owns every actual capability invocation and keeps
+    # shell_tool/unified_exec disabled; enabling this host only gives the model
+    # the isolated JavaScript dispatcher required to reach those typed tools.
     enabled_features = {
         "apps",
+        "code_mode_host",
         "plugins",
         "skill_search",
     } if allow_discord_extensions else set()
