@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402 -- MLX-dependent imports must follow the platform skip.
+import json
 import platform
 from pathlib import Path
 
@@ -12,8 +13,18 @@ if platform.system() != "Darwin" or platform.machine() != "arm64":
 
 mx = pytest.importorskip("mlx.core")
 
-from simajilord_shogi.mlx_nnue import WrmLossParameters, _append_jsonl, wrm_probabilities
-from simajilord_shogi.nnue_training import nagisa_wrm_contract
+import simajilord_shogi.mlx_nnue as mlx_nnue
+from simajilord_shogi.mlx_nnue import (
+    WrmLossParameters,
+    _append_jsonl,
+    _download_mlx_source_with_progress,
+    wrm_probabilities,
+)
+from simajilord_shogi.nnue_training import (
+    IncompleteShardDownloadError,
+    PublicPsvShard,
+    nagisa_wrm_contract,
+)
 
 
 def _parameters() -> WrmLossParameters:
@@ -71,3 +82,48 @@ def test_metric_writer_emits_one_json_object_per_line(tmp_path: Path) -> None:
     assert len(lines) == 2
     assert lines[0] == '{"event":"first","value":1}'
     assert lines[1] == '{"event":"second","value":2}'
+
+
+def test_mlx_download_retries_a_resumable_short_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "run"
+    destination = root / "cache" / "split_003.bin"
+    destination.parent.mkdir(parents=True)
+    (root / "logs").mkdir()
+    shard = PublicPsvShard(
+        filename=destination.name,
+        byte_size=40,
+        records=1,
+        sha256="a" * 64,
+        resolve_url="https://example.invalid/split_003.bin",
+    )
+    attempts = 0
+    delays: list[float] = []
+
+    def flaky_download(*_args: object, **_kwargs: object) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise IncompleteShardDownloadError(
+                "downloaded shard is incomplete: expected=40 observed=20"
+            )
+        destination.write_bytes(b"abcdefgh" * 5)
+        return destination
+
+    monkeypatch.setattr(mlx_nnue, "download_nagisa_shard", flaky_download)
+    monkeypatch.setattr(mlx_nnue.time, "sleep", delays.append)
+
+    result = _download_mlx_source_with_progress(root, shard, timeout_seconds=12.5)
+
+    assert result == destination
+    assert attempts == 2
+    assert delays == [5.0]
+    events = [
+        json.loads(line)
+        for line in (root / "logs" / "mlx-training.jsonl").read_text().splitlines()
+    ]
+    retries = [event for event in events if event["event"] == "source_download_retry"]
+    assert len(retries) == 1
+    assert retries[0]["error_type"] == "IncompleteShardDownloadError"

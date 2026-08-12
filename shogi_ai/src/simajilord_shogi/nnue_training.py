@@ -79,6 +79,15 @@ _TATARA_EVAL_ONLY_LINE = re.compile(
 )
 
 
+class IncompleteShardDownloadError(OSError):
+    """A resumable public shard transfer ended before its declared size.
+
+    The verified partial file is intentionally retained.  This is distinct
+    from immutable-source integrity failures such as a bad SHA-256 or an
+    invalid Content-Range, which remain non-retriable ``ValueError`` cases.
+    """
+
+
 def nagisa_wrm_contract(score_scale: float = DEFAULT_SCORE_SCALE) -> dict[str, object]:
     """Return the scale-aligned WRM contract used by NAGISA-style Meteo.
 
@@ -1190,7 +1199,7 @@ def download_nagisa_shard(
             stream.flush()
             os.fsync(stream.fileno())
     if part.stat().st_size != shard.byte_size:
-        raise ValueError(
+        raise IncompleteShardDownloadError(
             f"downloaded shard is incomplete: expected={shard.byte_size} "
             f"observed={part.stat().st_size}"
         )

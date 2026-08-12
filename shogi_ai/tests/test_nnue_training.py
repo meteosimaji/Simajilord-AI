@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import stat
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.request import Request
 
 import numpy as np
 import pytest
@@ -19,8 +22,10 @@ from simajilord_shogi.nnue_training import (
     NAGISA_NNUE_PLAN_SCHEMA,
     NAGISA_NNUE_STATE_SCHEMA,
     PROGRESS_KPABS_BYTES,
+    IncompleteShardDownloadError,
     NagisaNnueArchitecture,
     PublicPsvShard,
+    download_nagisa_shard,
     extract_nagisa_progress,
     index_public_value_corpus,
     nagisa_run_status,
@@ -141,6 +146,69 @@ def test_public_value_index_requires_explicit_local_only_acknowledgement(
     with pytest.raises(PermissionError, match="acknowledgement"):
         index_public_value_corpus()
     assert not called
+
+
+def test_incomplete_shard_download_is_retriable_and_resumes_exact_range(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "run"
+    cache = root / "cache"
+    cache.mkdir(parents=True)
+    payload = b"abcdefgh" * 5
+    shard = PublicPsvShard(
+        filename="split_000.bin",
+        byte_size=len(payload),
+        records=1,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        resolve_url="https://example.invalid/split_000.bin",
+    )
+    requests: list[tuple[str | None, float]] = []
+
+    class Response(io.BytesIO):
+        def __init__(self, body: bytes, *, status: int, content_range: str | None = None) -> None:
+            super().__init__(body)
+            self.status = status
+            self.headers = {} if content_range is None else {"Content-Range": content_range}
+
+        def getcode(self) -> int:
+            return self.status
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.close()
+
+    responses = iter(
+        (
+            Response(payload[:20], status=200),
+            Response(payload[20:], status=206, content_range="bytes 20-39/40"),
+        )
+    )
+
+    def fake_urlopen(request: Request, timeout: float) -> Response:
+        range_header = request.get_header("Range")
+        requests.append((range_header, timeout))
+        return next(responses)
+
+    monkeypatch.setattr(nnue_training.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        nnue_training.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=16 * 1024**3),
+    )
+
+    with pytest.raises(IncompleteShardDownloadError, match="expected=40 observed=20"):
+        download_nagisa_shard(root, shard, timeout_seconds=12.5)
+
+    part = cache / "split_000.bin.part"
+    assert part.read_bytes() == payload[:20]
+    completed = download_nagisa_shard(root, shard, timeout_seconds=12.5)
+
+    assert completed.read_bytes() == payload
+    assert not part.exists()
+    assert requests == [(None, 12.5), ("bytes=20-39", 12.5)]
 
 
 def test_progress_extraction_copies_router_but_not_teacher_weights(tmp_path: Path) -> None:
