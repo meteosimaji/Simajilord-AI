@@ -1,6 +1,6 @@
 # MLX数値学習・高速化の汎用ガイド
 
-更新: 2026-08-12
+更新: 2026-08-13
 
 この文書はMeteoのNNUE学習で得た知見を、将来のCNN、Transformer、LLMにも再利用できる形で
 残すものです。測定値は64 GiB Apple M4 Pro、MLX 0.32.0でのローカル実測であり、別のモデルや
@@ -119,7 +119,49 @@ directory rename、再load、複数forward modeの一致確認、最後に旧世
 「ファイルが存在する」は成功条件ではありません。最新と直前の2世代を残し、完全manifestと再load検証を
 通った世代だけをdurable coordinateにします。
 
-## 6. CNN・LLMへ移すときのチェックリスト
+## 6. 観測座標と永続座標を分離する
+
+学習中の最新stepは、最後に完全保存できたstepとは限りません。本番runnerは進行を二つの座標で記録します。
+
+- `observed_optimizer_step` / `observed_presentations`: 現在のプロセスが計算済みと観測した位置
+- `durable_optimizer_step` / `durable_presentations`: model、optimizer、manifestの再load検証まで終えた位置
+
+クラッシュ後に再開できるのは後者だけです。ETAや速度表示にはobservedを使えますが、完了判定、source shardの削除、
+次世代への昇格にはdurableだけを使います。ログにも両方を同時に出すことで、「5億件処理したように見えたが、
+checkpointは4.8億件まで」という状態を隠しません。
+
+この区別はLLMのtoken数やCNNのimage数にもそのまま適用できます。勾配累積中、非同期checkpoint中、分散worker間の
+barrier前は特にobservedとdurableがずれます。再開テストでは、同じcheckpointから同じ次batchを与えた更新が一致するかを
+確認し、モデルだけでなくoptimizer、scheduler、RNG、data cursorも永続化対象にします。
+
+## 7. lossの低下と最終能力を分離する
+
+訓練loss単独では、学習が健全かも、将棋が強くなったかも判定できません。最低限、次を別々に記録します。
+
+- 初期ランダムモデルの固定held-out loss
+- batchごとの訓練lossと、長めのEMA
+- gradientに一度も使わない固定held-out全体のloss、相関、平均bias
+- float master、QAT forward、native exportの同一sample出力差
+- 局面群・ラベル強度・極端値帯ごとのworst-group指標
+- 最終用途のarena、fixed-node、fixed-time、task eval
+
+訓練batchは難易度も評価値分布も変動するため、隣接ログのloss上昇だけで悪化と判断しません。一方で固定held-outの
+連続悪化、NaN、出力飽和、予測分散の崩壊、targetとの相関低下は停止・調査条件にします。Meteoの公開PSVは
+`PackedSfenValue.score_i16`を学ぶvalue-only契約であり、`move16`をpolicy正解として流用しません。同様にLLMでも、
+pretraining loss、preference loss、生成品質、tool成功率は別の評価系列として扱います。
+
+## 8. データ系譜とstreamingを学習契約に含める
+
+大規模datasetは「URLから読めた」だけでは再現できません。source revision、file hash、byte数、record数、split規則、
+label生成器、前処理コード、重複除去、held-outの由来をreceiptへ保存します。download中は`.part`、検証後だけ正式名へ
+renameし、学習済みshardの削除は対応するdurable checkpointとsource receiptが存在してから行います。
+
+splitは学習前に固定し、同じ対局・開始局面・転置・派生sampleがtrainとheld-outへ漏れない単位で束ねます。これは画像の
+同一被写体・動画フレーム、LLMの同一文書や派生回答にも対応します。巨大corpusでは全データを保持せず、
+`current shard + next prefetched shard + latest/previous checkpoint`の有界windowを保ち、空き容量reserveを下回れば
+prefetchへbackpressureを掛けます。
+
+## 9. CNN・LLMへ移すときのチェックリスト
 
 1. 実配布graph（int8/int4、group scale、zero point、KV形式、kernel fusion順）を一つの仕様にする
 2. merge/fold（BatchNorm、LoRA、factorizer、expert weight）を量子化の前後どちらで行うか固定する
