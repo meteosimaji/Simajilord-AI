@@ -340,6 +340,46 @@ class YaneuraOuBinaryBook:
                 packed_sfen_sha256=hashlib.sha256(entry.packed_sfen).hexdigest(),
             )
 
+    def find_position_index(self, board: Board, *, exact_ply: bool = True) -> int | None:
+        """Find a board in the sorted YBB index without loading the whole book.
+
+        Packed SFEN does not contain the game-ply field, so the optional exact
+        check is required when ``IgnoreBookPly=false``.  The Petashock audit
+        uses that strict mode to distinguish a true book hit from a
+        transposition that appears at a different move number.
+        """
+
+        if not board.is_valid():
+            raise ValueError("cannot query a YBB book with an invalid board")
+        target = bytes(board.to_packed_sfen())
+        low = 0
+        high = len(self)
+        while low < high:
+            middle = (low + high) // 2
+            entry = self.index_entry(middle)
+            if entry.packed_sfen < target:
+                low = middle + 1
+            else:
+                high = middle
+        if low >= len(self):
+            return None
+        entry = self.index_entry(low)
+        if entry.packed_sfen != target:
+            return None
+        if exact_ply:
+            current_ply = int(board.to_sfen().rsplit(" ", 1)[1])
+            if entry.ply != current_ply:
+                return None
+        return low
+
+    def book_moves_for_position_audit(
+        self, board: Board, *, exact_ply: bool = True
+    ) -> tuple[YbbBookMove, ...] | None:
+        """Return registered audit candidates, or ``None`` for a book miss."""
+
+        index = self.find_position_index(board, exact_ply=exact_ply)
+        return None if index is None else self.book_moves_for_audit(index)
+
     def book_moves_for_audit(self, index: int) -> tuple[YbbBookMove, ...]:
         """Decode local book data only to validate or challenge it.
 

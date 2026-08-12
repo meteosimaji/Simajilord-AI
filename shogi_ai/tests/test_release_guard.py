@@ -277,11 +277,21 @@ def test_source_and_repository_reject_supporter_platform_links(tmp_path: Path) -
         scan_repository_index(source)
 
 
-def test_archive_rejects_raw_suisho_startup_provenance(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "rights_id",
+    [
+        "suisho11plus-wcsc36-20260525-local",
+        "soujou-tsec7-paid",
+    ],
+)
+def test_archive_rejects_raw_local_only_teacher_startup_provenance(
+    tmp_path: Path,
+    rights_id: str,
+) -> None:
     archive = tmp_path / "candidate.tar.gz"
     payload = json.dumps(
         {
-            "rights_id": "suisho11plus-wcsc36-20260525-local",
+            "rights_id": rights_id,
             "startup_provenance": {"stdout_lines": ["raw USI output"]},
         }
     ).encode()

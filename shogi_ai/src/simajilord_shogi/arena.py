@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from itertools import count
 from pathlib import Path
@@ -12,8 +12,9 @@ from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 from rsshogi.core import Board, Move
-from rsshogi.types import Color, RepetitionState
+from rsshogi.types import Color
 
+from .adjudication import adjudicate_board, can_declare_win_csa27
 from .checkpoint import load_checkpoint
 from .compute_interlock import ComputeLeaseSettings, InterlockedEvaluator
 from .config import SearchConfig
@@ -21,8 +22,9 @@ from .domain import GameRecord, PositionSample, Termination
 from .evaluator import Evaluator
 from .external_usi import ExternalUsiTeacher, UsiAnalysis, UsiPositionHistory
 from .game import play_match
-from .mcts import MCTS
-from .model import MLXEvaluator
+from .mcts import MCTS, SearchResult, choose_move
+from .model import MLXEvaluator, PolicyValueResNet
+from .multi_objective_distillation import all_legal_value_policy
 from .opening_suite import OpeningPosition
 
 
@@ -37,6 +39,7 @@ class MoveDecision:
     source: str | None = None
     peak_tree_nodes: int | None = None
     tree_recycles: int = 0
+    resignation_overridden: bool = False
 
 
 class DirectPlayer(Protocol):
@@ -76,8 +79,14 @@ class MctsPlayer:
 class ExternalUsiPlayer:
     """An external engine that selects one USI bestmove per actual game ply."""
 
-    def __init__(self, engine: ExternalUsiTeacher) -> None:
+    def __init__(
+        self,
+        engine: ExternalUsiTeacher,
+        *,
+        continue_after_resign: bool = False,
+    ) -> None:
         self.engine = engine
+        self.continue_after_resign = continue_after_resign
 
     def choose_move(self, board: Board) -> MoveDecision:
         return self._decision_from_analysis(board, self.engine.analyse(board))
@@ -95,6 +104,26 @@ class ExternalUsiPlayer:
 
     def _decision_from_analysis(self, board: Board, analysis: UsiAnalysis) -> MoveDecision:
         legal = {move.to_usi() for move in board.legal_moves()}
+        if analysis.bestmove == "resign" and self.continue_after_resign:
+            legal_variations = tuple(
+                variation for variation in analysis.candidates if variation.move in legal
+            )
+            if not legal_variations:
+                raise ValueError(
+                    "external teacher resigned without a legal PV; cannot continue the "
+                    "full-game benchmark to a board-terminal result"
+                )
+            calibrated = self.engine.target_from_analysis(board, analysis)
+            return MoveDecision(
+                calibrated.bestmove,
+                calibrated.policy,
+                calibrated.value,
+                nodes=analysis.nodes,
+                elapsed_seconds=analysis.elapsed_seconds,
+                nps=analysis.nps,
+                source=self.engine.policy.policy_id,
+                resignation_overridden=True,
+            )
         if analysis.bestmove in {"resign", "win"}:
             return MoveDecision(
                 analysis.bestmove,
@@ -109,12 +138,10 @@ class ExternalUsiPlayer:
             raise ValueError(
                 f"external engine selected illegal move {analysis.bestmove} at {board.to_sfen()}"
             )
-        policy = {move: 0.0 for move in legal}
-        policy[analysis.bestmove] = 1.0
         calibrated = self.engine.target_from_analysis(board, analysis)
         return MoveDecision(
             analysis.bestmove,
-            policy,
+            calibrated.policy,
             calibrated.value,
             nodes=analysis.nodes,
             elapsed_seconds=analysis.elapsed_seconds,
@@ -207,21 +234,6 @@ class PairedArenaSummary:
         return cls(**fields)
 
 
-def _adjudicate(board: Board) -> tuple[int | None, Termination] | None:
-    repetition = board.repetition_state()
-    if repetition != RepetitionState.NONE:
-        if repetition in (RepetitionState.WIN, RepetitionState.SUPERIOR):
-            return board.turn.value, Termination.REPETITION
-        if repetition in (RepetitionState.LOSE, RepetitionState.INFERIOR):
-            return board.turn.opponent().value, Termination.REPETITION
-        return None, Termination.REPETITION
-    if board.can_declare_win():
-        return board.turn.value, Termination.DECLARATION
-    if board.is_mated() or not board.legal_moves():
-        return board.turn.opponent().value, Termination.CHECKMATE
-    return None
-
-
 def play_direct_game(
     black: DirectPlayer,
     white: DirectPlayer,
@@ -242,9 +254,10 @@ def play_direct_game(
     termination = Termination.MAX_PLIES
     plies = count() if max_plies is None else range(max_plies)
     for ply in plies:
-        adjudication = _adjudicate(board)
+        adjudication = adjudicate_board(board)
         if adjudication is not None:
-            winner, termination = adjudication
+            winner = adjudication.winner
+            termination = adjudication.termination
             break
         turn = board.turn.value
         player = players[turn]
@@ -262,8 +275,11 @@ def play_direct_game(
             termination = Termination.RESIGNATION
             break
         if decision.move == "win":
-            if not board.can_declare_win():
-                raise ValueError("external engine claimed an illegal entering-king win")
+            if not can_declare_win_csa27(board):
+                raise ValueError(
+                    "external engine claimed an illegal CSARule27 entering-king win: "
+                    f"source={decision.source!r}, sfen={board.to_sfen()}"
+                )
             winner = turn
             termination = Termination.DECLARATION
             break
@@ -285,6 +301,7 @@ def play_direct_game(
                 actor_source=decision.source,
                 actor_peak_tree_nodes=decision.peak_tree_nodes,
                 actor_tree_recycles=decision.tree_recycles,
+                actor_resignation_overridden=decision.resignation_overridden,
             )
         )
         board.apply_move(move)
@@ -554,6 +571,173 @@ def _candidate_point(record: GameRecord, candidate_color: int) -> float:
     return 1.0 if record.winner == candidate_color else 0.0
 
 
+def _batched_checkpoint_games(
+    candidate: Evaluator,
+    champion: Evaluator,
+    search_config: SearchConfig,
+    *,
+    positions: Sequence[OpeningPosition],
+    seed: int,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
+) -> list[GameRecord]:
+    """Advance every color-swapped arena game in shared neural batches.
+
+    Candidate and champion use independent MCTS objects and never share visits or
+    values.  Only independent roots owned by the same checkpoint share a forward
+    pass, preserving the per-game search budget while avoiding scalar GPU calls.
+    """
+
+    initial_sfens = [position.sfen for position in positions for _color in range(2)]
+    candidate_colors = [
+        color
+        for _position in positions
+        for color in (Color.BLACK.value, Color.WHITE.value)
+    ]
+    boards = [Board(sfen) for sfen in initial_sfens]
+    move_lists: list[list[str]] = [[] for _sfen in initial_sfens]
+    sample_lists: list[list[PositionSample]] = [[] for _sfen in initial_sfens]
+    winners: list[int | None] = [None] * len(boards)
+    terminations: list[Termination | None] = [None] * len(boards)
+    rngs = [np.random.default_rng(seed + index) for index in range(len(boards))]
+    candidate_search = MCTS(candidate, search_config, seed=seed)
+    champion_search = MCTS(champion, search_config, seed=seed + 1)
+    plies = count() if search_config.max_plies is None else range(search_config.max_plies)
+
+    for ply in plies:
+        candidate_active: list[int] = []
+        champion_active: list[int] = []
+        for index, board in enumerate(boards):
+            if terminations[index] is not None:
+                continue
+            adjudication = adjudicate_board(board)
+            if adjudication is not None:
+                winners[index] = adjudication.winner
+                terminations[index] = adjudication.termination
+                continue
+            if board.turn.value == candidate_colors[index]:
+                candidate_active.append(index)
+            else:
+                champion_active.append(index)
+        if not candidate_active and not champion_active:
+            break
+
+        results_by_game: dict[int, SearchResult] = {}
+        if candidate_active:
+            candidate_results = candidate_search.search_many(
+                [boards[index] for index in candidate_active],
+                add_root_noise=False,
+            )
+            results_by_game.update(zip(candidate_active, candidate_results, strict=True))
+        if champion_active:
+            champion_results = champion_search.search_many(
+                [boards[index] for index in champion_active],
+                add_root_noise=False,
+            )
+            results_by_game.update(zip(champion_active, champion_results, strict=True))
+
+        for index in sorted(results_by_game):
+            board = boards[index]
+            result = results_by_game[index]
+            if (
+                search_config.resign_threshold is not None
+                and ply >= search_config.resign_min_ply
+                and result.root_value <= search_config.resign_threshold
+            ):
+                winners[index] = board.turn.opponent().value
+                terminations[index] = Termination.RESIGNATION
+                continue
+            temperature = (
+                search_config.temperature
+                if ply < search_config.temperature_moves
+                else 0.0
+            )
+            move_usi = choose_move(result, temperature=temperature, rng=rngs[index])
+            implicit_target = all_legal_value_policy(
+                board,
+                result.q_values,
+                result.root_visits,
+                temperature=search_config.implicit_policy_temperature,
+            )
+            sample_lists[index].append(
+                PositionSample(
+                    sfen=board.to_sfen(),
+                    ply=ply,
+                    turn=board.turn.value,
+                    policy=result.policy,
+                    root_value=result.root_value,
+                    discovery_simulation=result.discovery_simulation,
+                    chosen_move=move_usi,
+                    actor_best_move=result.best_move,
+                    actor_regret=max(
+                        0.0,
+                        result.q_values[result.best_move] - result.q_values[move_usi],
+                    ),
+                    actor_simulations=result.simulations,
+                    actor_search_seconds=result.elapsed_seconds,
+                    actor_nps=result.nodes_per_second,
+                    actor_source="meteo",
+                    actor_peak_tree_nodes=result.peak_tree_nodes,
+                    actor_tree_recycles=result.tree_recycles,
+                    actor_move_values=implicit_target.move_values,
+                    actor_move_visits=implicit_target.move_visits,
+                    actor_implicit_policy=(implicit_target.policy or None),
+                    actor_proven_mate_moves=implicit_target.proven_mate_moves,
+                )
+            )
+            move = Move.from_usi(move_usi)
+            if not board.is_legal_move(move):
+                raise AssertionError(
+                    f"batched arena selected illegal move {move_usi} at {board.to_sfen()}"
+                )
+            board.apply_move(move)
+            move_lists[index].append(move_usi)
+        if progress_callback is not None:
+            samples_generated = sum(len(samples) for samples in sample_lists)
+            progress_callback(
+                {
+                    "plies_completed": ply + 1,
+                    "active_games": len(results_by_game),
+                    "completed_games": sum(
+                        termination is not None for termination in terminations
+                    ),
+                    "samples_generated": samples_generated,
+                    "search_simulations_completed": (
+                        samples_generated * search_config.simulations
+                    ),
+                }
+            )
+    else:
+        for index, termination in enumerate(terminations):
+            if termination is None:
+                terminations[index] = Termination.MAX_PLIES
+
+    records: list[GameRecord] = []
+    for index, initial_sfen in enumerate(initial_sfens):
+        termination = terminations[index]
+        if termination is None:
+            raise AssertionError("batched arena game was not adjudicated")
+        winner = winners[index]
+        samples = tuple(
+            replace(
+                sample,
+                value_target=(
+                    0.0 if winner is None else (1.0 if sample.turn == winner else -1.0)
+                ),
+            )
+            for sample in sample_lists[index]
+        )
+        records.append(
+            GameRecord(
+                initial_sfen=initial_sfen,
+                moves=tuple(move_lists[index]),
+                samples=samples,
+                winner=winner,
+                termination=termination,
+            )
+        )
+    return records
+
+
 def evaluate_checkpoint_pair(
     candidate_checkpoint: Path,
     champion_checkpoint: Path,
@@ -570,6 +754,7 @@ def evaluate_checkpoint_pair(
     training_arena_overlap_keys: Sequence[str] = (),
     promotion_min_games: int | None = None,
     compute_interlock: ComputeLeaseSettings | None = None,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
 ) -> tuple[PairedArenaSummary, list[GameRecord]]:
     """Run every opening twice with colors swapped and no self-play noise."""
 
@@ -599,30 +784,55 @@ def evaluate_checkpoint_pair(
         if compute_interlock is None
         else InterlockedEvaluator(champion_evaluator, compute_interlock)
     )
-    records: list[GameRecord] = []
+    if isinstance(candidate_model, PolicyValueResNet) and isinstance(
+        champion_model, PolicyValueResNet
+    ):
+        records = _batched_checkpoint_games(
+            candidate,
+            champion,
+            search_config,
+            positions=positions,
+            seed=seed,
+            progress_callback=progress_callback,
+        )
+    else:
+        # Retain the protocol-based fallback for test doubles and non-MLX
+        # evaluators. Production checkpoint pairs always use the batched path.
+        records = []
+        for index, position in enumerate(positions):
+            candidate_black = play_match(
+                candidate,
+                champion,
+                search_config,
+                search_config,
+                initial_sfen=position.sfen,
+                seed=seed + 2 * index,
+                self_play_noise=False,
+            )
+            candidate_white = play_match(
+                champion,
+                candidate,
+                search_config,
+                search_config,
+                initial_sfen=position.sfen,
+                seed=seed + 2 * index + 1,
+                self_play_noise=False,
+            )
+            records.extend((candidate_black, candidate_white))
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "opening_pairs_completed": index + 1,
+                        "games_completed": len(records),
+                        "opening_pairs_total": len(positions),
+                    }
+                )
+
     paired_points: list[tuple[float, float]] = []
     paired_terminations: list[tuple[str, str]] = []
     incomplete_flags: list[bool] = []
-    for index, position in enumerate(positions):
-        candidate_black = play_match(
-            candidate,
-            champion,
-            search_config,
-            search_config,
-            initial_sfen=position.sfen,
-            seed=seed + 2 * index,
-            self_play_noise=False,
-        )
-        candidate_white = play_match(
-            champion,
-            candidate,
-            search_config,
-            search_config,
-            initial_sfen=position.sfen,
-            seed=seed + 2 * index + 1,
-            self_play_noise=False,
-        )
-        records.extend((candidate_black, candidate_white))
+    for index, _position in enumerate(positions):
+        candidate_black, candidate_white = records[2 * index : 2 * index + 2]
         paired_points.append(
             (
                 _candidate_point(candidate_black, Color.BLACK.value),
@@ -695,7 +905,7 @@ def benchmark_checkpoint_vs_external(
         if compute_interlock is None
         else InterlockedEvaluator(base_evaluator, compute_interlock)
     )
-    opponent = ExternalUsiPlayer(external)
+    opponent = ExternalUsiPlayer(external, continue_after_resign=True)
     records: list[GameRecord] = []
     paired_points: list[tuple[float, float]] = []
     paired_terminations: list[tuple[str, str]] = []
@@ -744,6 +954,97 @@ def benchmark_checkpoint_vs_external(
             incomplete_by_opening=incomplete_flags,
             legacy_single_opening=legacy_single_opening,
             promotion_eligible=promotion_eligible,
+            promotion_min_pairs=promotion_min_pairs,
+            promotion_lower_bound=promotion_lower_bound,
+            bootstrap_iterations=bootstrap_iterations,
+            seed=seed,
+        ),
+        records,
+    )
+
+
+def benchmark_external_pair(
+    candidate: ExternalUsiTeacher,
+    opponent: ExternalUsiTeacher,
+    *,
+    openings: Sequence[str],
+    seed: int = 0,
+    max_plies: int | None = None,
+    promotion_min_pairs: int = 32,
+    promotion_lower_bound: float = 0.5,
+    bootstrap_iterations: int = 20_000,
+) -> tuple[PairedArenaSummary, list[GameRecord]]:
+    """Play two external USI engines on color-swapped opening clusters.
+
+    This path is intentionally descriptive: it never treats either engine's
+    actual game move as a Meteo policy label.  Its replays are position sources
+    that must later be re-adjudicated by the no-book canonical teachers.
+    Resignation is overridden when the engine supplied a legal PV so games can
+    continue to a board-terminal result as required by the training corpus.
+    """
+
+    if not openings:
+        raise ValueError("at least one opening SFEN is required")
+    if candidate is opponent:
+        raise ValueError("external paired benchmark requires two independent engine instances")
+    if max_plies is not None and max_plies < 1:
+        raise ValueError("max_plies must be positive when configured")
+    positions = tuple(OpeningPosition.from_sfen(opening) for opening in openings)
+    keys = tuple(position.normalized_key for position in positions)
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate normalized opening SFEN is not allowed in paired arena")
+    candidate_player = ExternalUsiPlayer(candidate, continue_after_resign=True)
+    opponent_player = ExternalUsiPlayer(opponent, continue_after_resign=True)
+    records: list[GameRecord] = []
+    paired_points: list[tuple[float, float]] = []
+    paired_terminations: list[tuple[str, str]] = []
+    incomplete_flags: list[bool] = []
+    for position in positions:
+        candidate.new_game()
+        opponent.new_game()
+        candidate_black = play_direct_game(
+            candidate_player,
+            opponent_player,
+            initial_sfen=position.sfen,
+            max_plies=max_plies,
+        )
+        candidate.new_game()
+        opponent.new_game()
+        candidate_white = play_direct_game(
+            opponent_player,
+            candidate_player,
+            initial_sfen=position.sfen,
+            max_plies=max_plies,
+        )
+        records.extend((candidate_black, candidate_white))
+        paired_points.append(
+            (
+                _candidate_point(candidate_black, Color.BLACK.value),
+                _candidate_point(candidate_white, Color.WHITE.value),
+            )
+        )
+        paired_terminations.append(
+            (candidate_black.termination.value, candidate_white.termination.value)
+        )
+        incomplete_flags.append(
+            candidate_black.termination is Termination.MAX_PLIES
+            or candidate_white.termination is Termination.MAX_PLIES
+        )
+    incomplete_games = sum(
+        record.termination is Termination.MAX_PLIES for record in records
+    )
+    return (
+        summarize_paired_arena(
+            paired_points,
+            incomplete_pairs=sum(incomplete_flags),
+            incomplete_games=incomplete_games,
+            opening_sfens=tuple(position.sfen for position in positions),
+            opening_keys=keys,
+            opening_hashes=tuple(position.sha256 for position in positions),
+            terminations=paired_terminations,
+            incomplete_by_opening=incomplete_flags,
+            legacy_single_opening=False,
+            promotion_eligible=False,
             promotion_min_pairs=promotion_min_pairs,
             promotion_lower_bound=promotion_lower_bound,
             bootstrap_iterations=bootstrap_iterations,

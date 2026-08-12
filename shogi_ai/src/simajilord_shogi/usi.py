@@ -9,6 +9,7 @@ from typing import TextIO
 
 from rsshogi.core import Board
 
+from .adjudication import can_declare_win_csa27
 from .branding import ENGINE_AUTHOR, ENGINE_USI_NAME
 from .config import SearchConfig
 from .evaluator import Evaluator
@@ -55,7 +56,7 @@ class UsiEngine:
             self.board.set_usi_position(line[len("position ") :])
             return []
         if command == "go":
-            if self.board.can_declare_win():
+            if can_declare_win_csa27(self.board):
                 return ["bestmove win"]
             if self.board.is_mated() or not self.board.legal_moves():
                 return ["bestmove resign"]

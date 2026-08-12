@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from itertools import count
@@ -9,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 from rsshogi.core import Board, Move
-from rsshogi.types import RepetitionState
 
+from .adjudication import adjudicate_board
 from .checkpoint import load_checkpoint
 from .compute_interlock import ComputeLeaseSettings, InterlockedEvaluator
 from .config import SearchConfig
@@ -18,6 +19,7 @@ from .domain import GameRecord, PositionSample, Termination
 from .game import play_game
 from .mcts import MCTS, choose_move
 from .model import MLXEvaluator
+from .multi_objective_distillation import all_legal_value_policy
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +80,7 @@ def batched_self_play(
     seed: int = 0,
     initial_sfens: list[str] | None = None,
     compute_interlock: ComputeLeaseSettings | None = None,
+    progress_callback: Callable[[dict[str, int]], None] | None = None,
 ) -> list[GameRecord]:
     """Advance many games together and batch every neural leaf evaluation."""
 
@@ -111,9 +114,10 @@ def batched_self_play(
         for index, board in enumerate(boards):
             if terminations[index] is not None:
                 continue
-            adjudication = _adjudicate(board)
+            adjudication = adjudicate_board(board)
             if adjudication is not None:
-                winners[index], terminations[index] = adjudication
+                winners[index] = adjudication.winner
+                terminations[index] = adjudication.termination
             else:
                 active.append(index)
         if not active:
@@ -134,6 +138,12 @@ def batched_self_play(
                 search_config.temperature if ply < search_config.temperature_moves else 0.0
             )
             move_usi = choose_move(result, temperature=temperature, rng=rngs[index])
+            implicit_target = all_legal_value_policy(
+                board,
+                result.q_values,
+                result.root_visits,
+                temperature=search_config.implicit_policy_temperature,
+            )
             sample_lists[index].append(
                 PositionSample(
                     sfen=board.to_sfen(),
@@ -154,6 +164,10 @@ def batched_self_play(
                     actor_source="meteo",
                     actor_peak_tree_nodes=result.peak_tree_nodes,
                     actor_tree_recycles=result.tree_recycles,
+                    actor_move_values=implicit_target.move_values,
+                    actor_move_visits=implicit_target.move_visits,
+                    actor_implicit_policy=(implicit_target.policy or None),
+                    actor_proven_mate_moves=implicit_target.proven_mate_moves,
                 )
             )
             move = Move.from_usi(move_usi)
@@ -162,13 +176,30 @@ def batched_self_play(
             board.apply_move(move)
             move_lists[index].append(move_usi)
 
+        if progress_callback is not None:
+            samples_generated = sum(len(samples) for samples in sample_lists)
+            progress_callback(
+                {
+                    "plies_completed": ply + 1,
+                    "active_games": len(active),
+                    "completed_games": sum(
+                        termination is not None for termination in terminations
+                    ),
+                    "samples_generated": samples_generated,
+                    "search_simulations_completed": (
+                        samples_generated * search_config.simulations
+                    ),
+                }
+            )
+
     for index, board in enumerate(boards):
         if terminations[index] is None:
-            adjudication = _adjudicate(board)
+            adjudication = adjudicate_board(board)
             if adjudication is None:
                 terminations[index] = Termination.MAX_PLIES
             else:
-                winners[index], terminations[index] = adjudication
+                winners[index] = adjudication.winner
+                terminations[index] = adjudication.termination
 
     records: list[GameRecord] = []
     for index in range(games):
@@ -193,18 +224,3 @@ def batched_self_play(
             )
         )
     return records
-
-
-def _adjudicate(board: Board) -> tuple[int | None, Termination] | None:
-    repetition = board.repetition_state()
-    if repetition != RepetitionState.NONE:
-        if repetition in (RepetitionState.WIN, RepetitionState.SUPERIOR):
-            return board.turn.value, Termination.REPETITION
-        if repetition in (RepetitionState.LOSE, RepetitionState.INFERIOR):
-            return board.turn.opponent().value, Termination.REPETITION
-        return None, Termination.REPETITION
-    if board.can_declare_win():
-        return board.turn.value, Termination.DECLARATION
-    if board.is_mated() or not board.legal_moves():
-        return board.turn.opponent().value, Termination.CHECKMATE
-    return None

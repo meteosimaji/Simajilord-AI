@@ -178,18 +178,24 @@ class PolicyValueResNet(nn.Module):
                     1,
                     bias=not config.dlshogi_legacy,
                 )
-                for _ in range(2)
+                for _ in range(config.canonical_teacher_count)
             ]
             if config.canonical_head_version == 2
             else None
         )
         self.teacher_policy_biases: list[mx.array] | None = (
-            [mx.zeros((MOVE_LABEL_COUNT,)) for _ in range(2)]
+            [
+                mx.zeros((MOVE_LABEL_COUNT,))
+                for _ in range(config.canonical_teacher_count)
+            ]
             if config.canonical_head_version == 2 and config.dlshogi_legacy
             else None
         )
         self.teacher_value_outputs: list[nn.Linear] | None = (
-            [nn.Linear(config.value_hidden, 1) for _ in range(2)]
+            [
+                nn.Linear(config.value_hidden, 1)
+                for _ in range(config.canonical_teacher_count)
+            ]
             if config.canonical_head_version == 2
             else None
         )
@@ -213,7 +219,7 @@ class PolicyValueResNet(nn.Module):
             destination.bias = mx.array(source.bias)
 
     def initialize_canonical_heads_from_play(self) -> None:
-        """Copy old play heads into both teacher heads during an explicit upgrade."""
+        """Copy old play heads into every teacher head during an explicit upgrade."""
 
         if self.config.canonical_head_version != 2:
             raise ValueError("canonical teacher heads are unavailable in a v1 model")
@@ -221,8 +227,10 @@ class PolicyValueResNet(nn.Module):
             raise AssertionError("canonical teacher heads were not initialized")
         for head in self.teacher_policies:
             head.weight = mx.array(self.policy.weight)
-            if self.policy.bias is not None and head.bias is not None:
-                head.bias = mx.array(self.policy.bias)
+            source_bias = getattr(self.policy, "bias", None)
+            destination_bias = getattr(head, "bias", None)
+            if source_bias is not None and destination_bias is not None:
+                head.bias = mx.array(source_bias)
         if self.policy_bias is not None:
             self.teacher_policy_biases = [
                 mx.array(self.policy_bias) for _head in self.teacher_policies
@@ -315,9 +323,9 @@ class PolicyValueResNet(nn.Module):
             raise ValueError("canonical-target-contract-v2 requires canonical head v2")
         if (
             self.teacher_policies is None
-            or len(self.teacher_policies) != 2
+            or len(self.teacher_policies) != self.config.canonical_teacher_count
             or self.teacher_value_outputs is None
-            or len(self.teacher_value_outputs) != 2
+            or len(self.teacher_value_outputs) != self.config.canonical_teacher_count
             or self.wdl_play_output is None
             or self.uncertainty_output is None
         ):
@@ -423,7 +431,11 @@ class MLXEvaluator:
         return results
 
 
-def upgrade_model_to_canonical_v2(model: PolicyValueResNet) -> PolicyValueResNet:
+def upgrade_model_to_canonical_v2(
+    model: PolicyValueResNet,
+    *,
+    teacher_count: int = 3,
+) -> PolicyValueResNet:
     """Warm-start v2 while preserving every legacy play prediction exactly.
 
     The old 119-plane trunk and play heads are copied by name.  The additional
@@ -435,12 +447,19 @@ def upgrade_model_to_canonical_v2(model: PolicyValueResNet) -> PolicyValueResNet
     if model.config.canonical_head_version == 2:
         if model.config.history_input_version != 2:
             raise AssertionError("canonical v2 model has an incompatible history input")
+        if model.config.canonical_teacher_count != teacher_count:
+            raise ValueError(
+                "canonical v2 checkpoint teacher count is stale: "
+                f"{model.config.canonical_teacher_count} != {teacher_count}; "
+                "start from the reviewed base checkpoint with fresh auxiliary heads"
+            )
         return model
     upgraded = PolicyValueResNet(
         replace(
             model.config,
             history_input_version=2,
             canonical_head_version=2,
+            canonical_teacher_count=teacher_count,
         )
     )
     legacy_weights = list(tree_flatten(model.parameters()))
@@ -482,11 +501,16 @@ def assert_model_shapes(model: PolicyValueResNet, batch_size: int = 2) -> None:
             canonical.wdl_play_logits,
             canonical.uncertainty,
         )
-        if canonical.policy_teachers.shape != (batch_size, 2, MOVE_LABEL_COUNT):
+        expected_teachers = model.config.canonical_teacher_count
+        if canonical.policy_teachers.shape != (
+            batch_size,
+            expected_teachers,
+            MOVE_LABEL_COUNT,
+        ):
             raise AssertionError(
                 f"unexpected canonical policy shape: {canonical.policy_teachers.shape}"
             )
-        if canonical.value_teachers.shape != (batch_size, 2):
+        if canonical.value_teachers.shape != (batch_size, expected_teachers):
             raise AssertionError(
                 f"unexpected canonical value shape: {canonical.value_teachers.shape}"
             )

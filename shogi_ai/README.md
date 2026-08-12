@@ -7,12 +7,73 @@
 保存します。
 
 たややん氏／水匠、やねうら王、WCSC公式資料の調査とMeteoへの反映方針は
-[`RESEARCH.md`](RESEARCH.md) に分離して記録します。
+[`RESEARCH.md`](RESEARCH.md) に分離して記録します。現在の学習方式、比較arm、receipt gate、
+1,000億局面の累計提示目標は[`LEARNING_STRATEGY.md`](LEARNING_STRATEGY.md)、
+教師の祖先関係・公開局面の再利用可否・水匠11型アンサンブル比較は
+[`TEACHER_LINEAGE.md`](TEACHER_LINEAGE.md)、Hugging Face同一配布者を含む全公開・
+ローカルcorpusの固定revision、bytes、形式probe、重複系譜、利用順は
+[`DATASET_AUDIT.md`](DATASET_AUDIT.md)に固定します。
+MLXの量子化学習、統合メモリcache、非同期dataset prefetch、transactional checkpointから得た
+CNN/Transformer/LLMにも再利用できる知見は
+[`NUMERICAL_TRAINING_GUIDE.md`](NUMERICAL_TRAINING_GUIDE.md)へ分離しています。
 外部モデルの利用可否は[`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)、実行済みの受入試験と
 4種の実エンジン対局・蒸留は[`VALIDATION.md`](VALIDATION.md)、Floodgate参加前の条件は
 [`FLOODGATE.md`](FLOODGATE.md)に記録します。
 
-## 現在できること
+## 現在の本学習経路: NAGISA型value-only NNUE
+
+現在のMeteo本学習は、旧MLX Policy+Value/MCTSモデルではなく、NAGISA V3.1と同じ公開構造の
+value-only NNUE/SFNNです。学生重みはランダム初期化し、NAGISAからコピーするのは局面進行度を
+9 bucketへ振り分ける`progress.bin`だけです。NAGISAの`nn.bin`はコピーしません。
+
+```text
+Soujou datasets_1（49,594,855,063 qsearch済み局面、Move16=0）
+  -> 固定revision・各shardのsize/LFS SHA-256を検証
+  -> 先に固定した1,000,000局面のheld-out tailを勾配から除外
+  -> DL水匠scalar scoreだけをvalue教師としてstream
+  -> 教師分布sigmoid(score/600)を保つscale-aligned WRM value loss
+  -> ±32000のmate近傍scoreもvalue教師に保持（policy headは存在しない）
+  -> CPUでTataraと同じPSV/特徴をdecodeし、local Apple GPU/MLXで学習
+  -> HalfKA_hm2(Friend) 73305 -> 1024x2 -> 15 -> 64、LayerStack 9
+  -> やねうら王用nn.bin + progress.bin + eval_options.txtへ変換
+```
+
+policy head、policy loss、MCTS、三教師探索はこの初回bootstrapにはありません。1000億目標は
+`cumulative_presentations=100,000,000,000`で、約495.95億の一意sourceを2周し、残りを3周目から
+読む計画です。同じ局面を2回読んでも一意局面を1000億とは報告しません。完了shardはcheckpointと
+optimizerの完全保存・再読込確認後に削除し、raw checkpoint、Tatara量子化bin、やねうら王exportは
+それぞれ最新と直前の2世代だけ保持します。
+
+`Eval_Coef=600`は教師側の勝率分布`sigmoid(score/600)`にだけ使います。ネット出力は
+`score/508`へ収束させます。`508=(127*64)/16`なので、量子化後のraw出力をやねうら王が
+`FV_SCALE=16`で割ると教師scoreの尺度に正確に戻ります。`FV_SCALE=14`と`nnue2score=600`の組合せで
+生じる約3.2%の系統的な縮小はありません。最初の1,024 optimizer stepはFTをFP16、denseをFP32で
+立ち上げ、その後はTatara/やねうら王の整数round・shift・factorizer foldingと同じforward値を使う
+STE-QATへ切り替えます。float masterとの差は診断として残し、QAT reference、速度用FP16-FT emulation、
+実際にexportしたnetworkのnative推論が一致することをsmokeと全世代の合否条件にします。
+
+本番はクラウドGPUを使わず、Apple M4 ProのMLX混合精度/QAT backendを使います。CPU companionは
+pinしたTataraのPackedSfenValue decode、HalfKA_hm2特徴、progress8kpabs bucket、量子化、
+やねうら王serializationを使います。MLX cacheは実測再利用量を保持できる24 GiBとし、現在shardの
+学習中に次の1 shardを空き容量gate付きでprefetchします。ETAはcompute-only probeではなく、
+実PSV・download・checkpointを含む`status-mlx`の実測throughputから再計算します。
+
+```bash
+uv run simajilord-nnue prepare artifacts/runs/meteo-nagisa-nnue-20260812-v1 \
+  --nagisa-archive /path/to/NAGISA_V3.1-release.zip \
+  --allow-user-attested-local-only
+
+# Apple Silicon Mac上
+uv run simajilord-nnue prepare-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
+uv run simajilord-nnue smoke-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
+uv run simajilord-nnue run-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
+uv run simajilord-nnue status-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
+```
+
+旧Policy+Valueコードは比較・対局・将来の自己対局研究用の互換経路として残しますが、その重みと
+世代成果物は現Meteoの本学習checkpointではありません。
+
+## 旧Policy+Value互換経路でできること
 
 - `rsshogi` による標準将棋の合法手、二歩・打ち歩詰め、千日手、入玉宣言、詰み判定
 - cshogi 実装に合わせた dlshogi 標準入力 `(62 + 57) x 9 x 9` と2187方策ラベル
@@ -39,41 +100,51 @@
 リポジトリに同梱する初期checkpointはランダム重みです。水匠やWCSC上位へ勝つという主張は、
 強い教師データで学習し、同一条件の多数局arenaで確認するまでは行いません。
 
-`canonical-target-contract-v2`では、NAGISAと水匠11Plusのpolicy/valueを別々のheadと
-別々のlossで保持します。単一valueを2教師へbroadcastして平均値へ収束させる旧v1経路は
-学習入口で拒否します。play headは、全候補を両canonical scorerが同一履歴・同一探索条件・
-複数budget・全合法応手込みで採点し、深さと応手に安定した**大域的な最悪教師regret最小手**が
-確定した局面だけ更新します。softmaxで劣る手へ正の確率を残さず、同率最善または内部証明済みの
-複数詰みだけを集合正解にします。教師対立、候補欠落、未証明詰み、不安定な大域最善手が一つでも
-あれば、その局面は`unresolved`としてplay policy/value/WDL lossをゼロにします。教師別headと
-uncertaintyだけは共有trunkからstop-gradientした特徴で更新し、局面を追加解析キューへ戻します。
-教師固有のCP温度soft policyは各教師の補助headを再現するためだけに使い、productionのplay target、
-着手選択、最悪regret判定へは混ぜません。
-canonical学習中はBatchNorm統計を固定し、unresolvedだけのcorpusではoptimizerを開始しません。
-unresolvedはresolvedのbatch枠や永続RNGを消費しない独立補助batchとして追加するため、未解決queueを
-付けても同じseed・同じresolved集合のplay/trunk更新は変わりません。
-候補familyは名前の配列だけで完了扱いせず、familyごとの生成者、provenance SHA-256、
-実際の候補手集合を保存し、その和集合がcanonical候補全体と完全一致することを要求します。
-各score matrixのQ値もsidecarの自己申告は信用しません。教師別・局面phase別の検証済み係数
-`C`と`D=2C`を固定し、CPは`root_q = sign * tanh(raw_cp / D)`、mateはroot視点の符号へ
-ローダが再変換します。候補手と全合法応手の両方にraw CP/mate、bound、nodes、depth、
-time、合法PVを必須とし、保存Qと一致しない場合は学習前に拒否します。
+旧Policy+Value研究経路の第一比較候補は`multi_proposer_single_scorer`です。NAGISA V3.1、
+水匠11Plus、奏乗TSEC7が候補手と
+応手候補を提案しますが、1局面の最終Q値は選択した1教師だけが同一条件・同一尺度で全候補を
+`searchmoves`再探索して付けます。教師値の平均、多数決、alpha-betaのroot node配分のpolicy化は
+行いません。暫定anchorは奏乗TSEC7ですが恒久固定ではありません。奏乗・NAGISA・水匠それぞれを
+単独scorerにしたRound A/Bを同一局面・seed・budgetで作り、深いregret、10倍budget安定性、
+mate見落とし、上位1%の大事故、校正、worst-group、fixed-node/time対局で選びます。
 
-入力も盤面119面だけでなく、直近8手、反復回数、連続王手、入玉宣言可否、絶対手数、履歴完全性の
+全候補がexactなら、等しい要求node budgetのQ値からsoftmax分布を作り、最善手だけでなく次善手との
+差も学びます。`lowerbound`/`upperbound`は点へ丸めず区間のまま保持します。候補`a*`について
+`LB(a*) > max UB(other) + margin`なら、全候補exactでなくても一意最善手を証明できます。
+区間が重なるときはpolicy lossを無効にして追加探索へ戻し、値の区間だけ信頼できる場合は区間内で
+損失0のhinge value lossだけを許します。教師報告のmateは再探索要求であり、内部solverが証明した
+mate集合だけを強いset-valued policy/value targetにします。
+
+既存`canonical-target-contract-v2`の三教師worst-regret委員会はRound Dの比較実験として残します。
+全会一致局面はRound Cの高純度対照群、厳格な20局面は2x32 `smoke`モデルの保存・再開・符号・lossを
+確認するだけの非昇格checkpointです。Round A（各単一教師）、Round B（全教師提案＋単一教師採点）、
+Round C（全会一致）、Round D（頑健合成）を同一条件で比較し、実測で勝った方式だけをproductionへ
+昇格します。契約は`simajilord-shogi learning-strategy`で機械可読JSONとして確認できます。
+
+完了した3教師committee benchmarkからRound Sを作るときは
+`simajilord-shogi build-unanimous-smoke BENCHMARK_ROOT OUTPUT`を使います。このbuilderはpair reportと
+score-matrixのSHA-256を照合し、root・複数budget・応手再解析が全てexactで3教師の一意最善手が同じ
+局面だけを採用します。実際に対局で選ばれた手、boundの中点、alpha-beta node配分、即詰み特殊値は
+labelにしません。split・score matrix・校正・権利sidecarをcreate-onlyで出力しますが、単一定跡root、
+履歴欠落、全合法手未網羅をreceiptにblockerとして残すため、生成checkpointは昇格できません。
+
+入力は盤面119面だけでなく、直近8手、反復回数、連続王手、入玉宣言可否、絶対手数、履歴完全性の
 46面を追加する`history-input-v2`です。同一SFENでも履歴が違えばtensorが異なります。既存stemは
 そのまま移植し、新しい履歴stemをゼロ初期化するため、upgrade直後のplay出力は旧checkpointと
-数値一致します。training-eligible v2 sidecarを実データから生成するscore-matrix builder、
-全候補familyの強制再採点、proof certificate、独立held-out重複除去はまだ未実装です。したがって
-現在のraw NAGISA／水匠出力やv1 sidecarから実学習を再開せず、builder完成までは検証用fixtureの
-一step学習だけに限定します。`train --canonical-teacher-only`もbuilder・校正artifact再検証・
-独立held-out receiptが実装されるまで常にfail closedし、手書きsidecarでゲートを越えられません。
+数値一致します。training-eligible v2 sidecarを実データから生成するproduction score-matrix builder、
+全合法候補familyの強制再採点、proof certificate、独立held-out重複除去はまだ未実装です。上記の
+全会一致builderはRound S専用であり、このproduction gateを解除しません。したがって現在のraw
+NAGISA／水匠／奏乗出力やv1 sidecarから20x256本学習を再開せず、2x32の非昇格スモークだけを許します。
+`train --canonical-teacher-only`もproduction builder・校正artifact再検証・独立held-out receiptが
+実装されるまで常にfail closedし、手書きsidecarでゲートを越えられません。
 
-応手gateは「相手に悪い応手もある」ことを不安定とは数えません。各候補で全合法応手を採点し、
-相手が選ぶ最小Qをbudgetごとにbackupした系列の変動だけをreply instabilityとします。これにより、
-相手の疑問手で高くなる枝を理由に健全な最悪応手評価を捨てず、同時に最善応手への脆弱性を平均で
-隠しません。
+応手gateは「相手に悪い応手もある」ことを不安定とは数えません。各候補で三教師が独立提案した
+principal replyの和集合をそのarmの単一scorerが全件採点し、相手が選ぶ最小Qをbudgetごとにbackupした系列の
+変動だけをreply instabilityとします。これにより、全合法応手の総当たりを避けながら、教師の
+一教師だけが発見した強い応手も同じ尺度で比較できます。相手の疑問手で高くなる枝を理由に健全な
+最悪応手評価を捨てず、同時に最善応手への脆弱性を平均で隠しません。
 
-## モデル
+## 旧Policy+Valueモデル
 
 | profile | 構成 | パラメータ | M4 Pro実測 | 用途 |
 | --- | --- | ---: | ---: | --- |
@@ -111,24 +182,34 @@ BatchNormの統計量、全層shape、同一SFENのpolicy/value数値一致を�
 実戦的な1億nodeには、compact native tree、置換表、tree reuse、非同期dynamic batchingが必要です。
 計測方法とFloodgate到達条件は[`FLOODGATE.md`](FLOODGATE.md)に固定しました。
 
-## 強い学習ループ
+## bootstrap後の強化学習ループ
 
 浅い自己対局は局面を広く作るactorであり、既定ではその浅いpolicyを直接教師にしません。
 
 ```text
 batched actor games
-  -> 同一SFENを6,400+ simulationsで再解析
+  -> Meteo自身が到達した同一履歴を三教師が再解析（OPD）
+  -> Meteo対全対戦相手と三教師相互対局も局面源へ加える
+  -> 実際の着手は正解にせず、候補・相手最善応手を三教師が再採点
   -> 不一致・低prior浮上・大regret局面をさらに深く読む
   -> actor/teacher探索比に応じてdeep policy/valueを段階導入
   -> 固定probe悪化・非有限loss・過大勾配を検知
-  -> candidate vs champion/history/水匠系のarena
-  -> 統計的に勝ったcandidateだけchampionへ昇格
+  -> 学習と重ならないNAGISA・水匠・奏乗等のreplayでpolicy/value非劣化を確認
+  -> candidate（最新）vs champion（直前）の色替わりarena
+  -> 独立検証とarenaの両方を通ったcandidateだけchampionへ昇格
 ```
 
-この一連は`improve`で1世代以上を連続実行できます。各世代は
+これは、自己対局の結果を報酬にした方策反復を、より深い探索のpolicy/value教師で安定化した
+AlphaZero型の強化学習ループです。この一連は`improve`で1世代以上を連続実行できます。各世代は
 `generation-NNNNNN/manifest.json`へ段階、checkpoint SHA-256、学習loss、arena結果を保存し、
-`state.json`のchampionポインタは昇格時だけ更新します。色替わりarenaに未完局が1局でも
-あれば昇格せず、既定では100局以上かつ勝点率のWilson 95%下限が0.5を超える必要があります。
+`state.json`のchampionポインタは昇格時だけ更新します。checkpoint本体は対局した「最新候補」と
+「その直前」の最大2件だけを保持し、完了済みの古い管理対象candidateを削除します。manifestと
+replayは小さい監査証跡として残します。色替わりarenaに未完局が1局でもあれば昇格せず、既定では
+32以上の独立opening pairについてcluster-bootstrap片側95%下限が0.5を超える必要があります。
+
+checkpoint lineageは親checkpointの全metadataや祖先を埋め込まず、SHA-256・step・model構成・
+権利制約だけの固定深度identityを保存します。`metadata.json`は1 MiBを上限とし、再帰的な祖先
+コピーや異常に大きいmetadataはcheckpoint作成前に拒否します。
 
 自己対局に最大手数は既定で設けません。詰み、投了、千日手、入玉宣言まで続けます。
 `--max-plies` はデバッグ用で、上限到達局は不完全データとして通常学習から除外します。
@@ -143,6 +224,30 @@ batched actor games
 
 `train --anchor-replay ...` で複数世代を混ぜられます。candidate昇格時には固定anchorの
 policy/value精度と過去championへの棋力を回帰検査します。
+
+## 巨大定跡への対策
+
+正規入手済みの新ペタショック`user_book1.ybb`は、15,018,656局面版を
+持つローカル限定の局面源です。構造監査では索引全件、move領域の連続性、packed SFENの一意性、
+登録手の合法性を確認します。対局相手として使う場合は`BookMoves=10000`、
+`BookIgnoreRate=0`、`IgnoreBookPly=false`を固定し、現在の最大203手目までを16手で途中打切り
+しません。0 nodeの着手だけをYBB索引の登録局面・登録候補手へ直接照合し、正のnodeを使った手は
+定跡を外れた後の通常探索として別集計します。定跡外から再び登録局面へ転位した場合も再合流として
+記録します。
+
+定跡の手・評価値・深さは、そのままMeteoの教師ラベルにはしません。YBBの全局面を136 shardで
+重複なく覆うローカル計画を使い、NAGISA・水匠11Plus・奏乗TSEC7をいずれも定跡なしで
+20,000 node / MultiPV 8から再解析します。教師不一致、探索深度での最善手反転、詰み、防御、
+定跡からの早期離脱、held-outで弱かった局面は200,000 node、さらに2,000,000 nodeへ上げます。
+三教師が提案した候補手と応手候補の和集合を全教師が`searchmoves`で再採点し、合意できない局面を
+平均化した中途半端な好手にはせず、
+追加探索対象として残します。
+
+実戦棋譜は局面生成と強化学習の勝敗信号には使えますが、実際に指された手を最善手ラベルとは扱いません。
+定跡入口、登録手からの分岐、最初のbook miss、その直前直後を別々に抽出し、canonical scorerの
+再解析結果だけをpolicy教師にします。固定したYBB索引または局面hashをheld-outへ先に隔離し、学習側へ
+混入した場合は昇格を拒否します。全shard・三教師のreceiptと独立held-out receiptが揃うまでは、
+canonical v2 optimizerのproduction gateを開きません。
 
 ## 相手の癖と弱点
 
@@ -170,14 +275,17 @@ smoke/debug専用として残していますが、同じ局面を反復しても
 ## 外部教師の権利スコープ
 
 外部教師は`public_release_allowed`、`local_authorized_only`、`not_authorized`の三つに分けます。
-価格だけで使用可否を決めません。公開版のやねうら王・水匠、AobaZero/AobaNNUE、公開WCSC・
-電竜戦棋譜、自己対局と深再解析はpublic経路の候補です。正規入手して実物と条件を確認した
-水匠11Plusは、元binary・評価関数・raw labelsを公開しない`local_authorized_only`教師として
-ローカル解析・蒸留・学習に使えます。ただし、それを消費したMeteo checkpointは権利者の明示許可
+価格だけで使用可否を決めません。現行9モデルのうち、NAGISA V3.1、AobaNNUE v1.1、水匠5、
+振電3、技巧2、Háo、tanuki- Lí-VENGEの7件はoutput-onlyのpublic経路、正規入手して実物と条件を確認した
+水匠11Plusとユーザー提供の奏乗TSEC7は、元binary・評価関数・raw labelsを公開しない
+`local_authorized_only`教師としてローカル解析・蒸留・学習に使えます。ただし、それらを消費した
+Meteo checkpointは権利者の明示許可
 receiptがない限り公開できません。無料か有料かにかかわらず、版ごとに権利と出力条件を確認します。
 
-`ExternalUsiTeacher` はNAGISA V3.1、AobaNNUE v1.1、技巧2、水匠5などを別processとして
-接続します。4種はこのMacで実際に終局対局とMultiPV蒸留まで確認済みです。
+`ExternalUsiTeacher` は現行9モデル（奏乗TSEC7、NAGISA V3.1、水匠11Plus、AobaNNUE v1.1、
+tanuki- Lí-VENGE、水匠5、振電3、技巧2、Háo）を別processとして接続します。奏乗は公式
+`sojo_tsec7` sourceからApple Silicon向けに
+再現buildし、exact `nn.bin`・`progress.bin`の読込と20,000 node探索を確認しています。
 実行ファイルや重みを本リポジトリへコピーしない境界です。教師ごとに次の許諾を明示し、
 学習利用が未確認ならfail closedします。
 
@@ -187,8 +295,8 @@ receiptがない限り公開できません。無料か有料かにかかわら�
 sidecarの`history_mode=game_prefix`がこの境界を示します。`benchmark-usi`の実対局も
 `play_direct_game`の初期SFENと実際の手順prefixを履歴対応教師へ渡し、reportに同じ
 `history_mode`を保存します。`history_mode`が無い旧生成物は`board_only`と扱い、
-後から履歴付きと再ラベルしません。AobaZero系など履歴依存の教師出力が必要な
-場合は、履歴付きprovenanceで再解析または再対局します。
+後から履歴付きと再ラベルしません。履歴依存の教師出力が必要な場合は、履歴付きprovenanceで
+再解析または再対局します。
 
 - 通常解析が許可されるか
 - 解析出力からの学習・蒸留が許可されるか
@@ -196,13 +304,13 @@ sidecarの`history_mode=game_prefix`がこの境界を示します。`benchmark-
 
 GPLv3 §2とGNU FAQに従い、別の出力制限が見つからないGPLエンジンの通常USI出力
 （指し手、数値評価、nodes、PV/MultiPV）はoutput-only蒸留可と判定します。これは元の評価関数や
-重みのコピー・変換・再配布を許す判定ではありません。モデル固有規約を必ず優先し、たとえば
-`dlshogi-dr2-exhi`は一般蒸留不可です。全24件の版固定判定は
+重みのコピー・変換・再配布を許す判定ではありません。モデル固有規約を必ず優先します。
+現行9件の版固定判定は
 [`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)を参照してください。
 
-水匠11Plusの正確なlocal profileは、`--local-only-user-authorized`とcreate-onlyな
-`--local-only-root`を明示したrunだけで起動できます。一般的な「水匠10/11」catch-allや、
-未入手・未審査モデルは`not_authorized`のままfail closedします。台帳・文書・releaseへ、有料配布
+水匠11Plusと奏乗TSEC7の正確なlocal profileは、`--local-only-user-authorized`とcreate-onlyな
+`--local-only-root`を明示したrunだけで起動できます。現行9件以外のIDは登録済みと推測せず、
+unknown profileとしてfail closedします。台帳・文書・releaseへ、有料配布
 ページ、元評価関数、private path、private artifact hashをコピーしません。ローカル学習の進行と
 公開可能なpublic championはlineageで完全に分離します。
 
@@ -278,6 +386,17 @@ uv run --project shogi_ai simajilord-shogi train-psv \
   --source-name reviewed-public-dataset --score-ponanza-coefficient 600 \
   --steps 1000 --batch-size 64
 
+# MIT確認済みHao/tanuki系から、旧labelを捨てて再解析待ちの局面だけRange取得
+uv run --project shogi_ai simajilord-shogi fetch-public-psv-seeds \
+  nodchip-shogi-hao-depth9 artifacts/public-seeds/hao-v1 \
+  --file-count 8 --records-per-file 4096 --seed meteo-bootstrap-v1
+
+`fetch-public-psv-seeds`の`positions.jsonl`はoptimizer入力ではありません。固定revisionの
+PSVから局面だけを抽出し、元のdepth-9 Move16・score・勝敗は`discarded_legacy_annotations`へ
+隔離します。CPU側で現在のNAGISA・水匠11Plus・奏乗による候補生成と単一scorer再探索を行い、
+新しいscore-matrix receiptが完成した後にだけGPU学習へ渡します。ライセンス未記載の
+DL水匠unique版やAobaZero外部棋譜は、このコマンドの許可リストに入りません。
+
 `--teacher-ponanza-coefficient` / `--score-ponanza-coefficient` の既定はPonanza
 勝率係数 `C=600` で、内部の符号付きvalue変換は `tanh(cp/(2C))`、すなわち分母
 `2C=1200` です。旧 `--teacher-value-scale` / `--score-scale` を明示した場合だけ、
@@ -289,7 +408,9 @@ uv run --project shogi_ai simajilord-shogi improve \
   artifacts/champion artifacts/improvement --generations 1 \
   --games 32 --actor-simulations 800 --teacher-simulations 6400 \
   --opening-suite openings.json --arena-simulations 1600 \
-  --promotion-min-pairs 32
+  --promotion-min-pairs 32 \
+  --validation-replay heldout-nagisa.jsonl \
+  --validation-replay heldout-suisho11plus.jsonl
 
 `openings.json`は次の厳格なread-only形式です。下記はschemaを示すため各splitを1件に
 短縮した例です。`actor`と`arena`にはそれぞれ完全なSFEN文字列を並べ、昇格可能な実行では
@@ -310,14 +431,20 @@ splitをまたぐ重複も入力時に拒否します。入力fileは`improve`�
 source SHA-256、正規化後SHA-256、各局面key/hashを固定します。generation途中で内容を変えると
 resumeを拒否するため、opening suiteはcreate-onlyの実験入力として扱ってください。
 
+各`--validation-replay`は学習replayと正規化局面が1件でも重なればfail closedします。候補の
+policy cross-entropyまたはvalue MSEが直前championより悪化した場合も昇格しません。許容差は
+`--max-validation-policy-cross-entropy-increase`と
+`--max-validation-value-mse-increase`で明示でき、既定はどちらも0です。独立検証を指定しない
+debug実行は対局できますが、promotionは無効です。
+
 arenaは各openingについてcandidate先手の1局、candidate後手の1局をこの順で実行し、この2局を
 1 clusterとして片側95% deterministic cluster-bootstrap下限を計算します。独立cluster数が
 `--promotion-min-pairs`（既定32）未満、未完局、学習replayとの正規化局面重複、opening反復の
 いずれかがあれば昇格しません。cluster結果、CI method/seed/iterations、block理由はmanifestに
 保存されます。旧`--arena-games`、`--promotion-min-games`、`--initial-sfen`は後方互換の
-smoke/debug用で、production昇格には使えません。旧schema 1の未完generation manifestは
-新しいpaired判定へresumeせず拒否します。その場合は既存checkpointをbootstrap championにして
-新しいworkdirでschema 2 generationを開始してください。
+smoke/debug用で、production昇格には使えません。generation manifestはschema 3です。旧schema 2は
+candidate学習前（`initialized`、`actor_saved`、`reanalysed`）に限り、同じ既存設定を確認してから
+独立検証設定を追加して移行できます。それ以降の旧manifestやschema 1はresumeせず拒否します。
 
 # 権利スコープ確認済みのUSIエンジンと直接対局
 uv run --project shogi_ai simajilord-shogi benchmark-usi \
@@ -346,6 +473,13 @@ opening suite/split/hash/key、CI seed/iterations/method、全終局理由と未
 明示したprivate rootの子に閉じ込めます。水匠11Plusの正確なlocal profileでは、
 `FV_SCALE=40`、`USI_OwnBook=false`、`BookFile=no_book`、`PvInterval=0`、`EvalDir`、
 `Threads`、`USI_Hash`を明示し、起動後にYaneuraOuの`getoption`で全実値を再確認します。
+この版のSFNN exporterとYaneuraOuは固定hash規約が異なるため、正しい組み合わせでも起動時に
+既知のNNUE hash警告を出します。一般のhash不一致は起動失敗とし、このexact local profileだけは
+global 1件・layer 10件の診断文、順序、件数がreview済み期待値と完全一致するときだけ受理します。
+`EvalDir/nn.bin`は明示的な`--artifact`がなくてもprivate reportへ自動でhash記録されます。
+Finny Tablesはやねうら王側のFT accumulator cacheであり、MeteoのResNet重みやcheckpoint系譜は
+変更しません。採用時は同一source・同一評価関数のFinny無効版と固定nodeで評価値、PV、最善手が
+一致することを確認してから、外部教師探索の高速化として扱います。
 ローカル対局・蒸留・学習の承認と、原評価関数または派生checkpointの公開許可は別のgateです。
 private bundle、第三者artifact、入手先URLはrepositoryやreleaseへ含めません。
 
@@ -376,7 +510,7 @@ uv run --project shogi_ai simajilord-shogi verify /tmp/simajilord-shogi-verify \
 - 1手詰めに加えたdf-pn、長手数詰み、必至探索
 - compact native tree、置換表、持時間配分、pondering、前局面からのtree reuse、resign calibration
 - opening book生成と定跡外しへの深探索
-- 水匠11・氷彗級、最新版dlshogi、過去championとの大規模固定条件arenaとSPRT
+- 現行9モデル・過去championとの大規模固定条件arenaとSPRT
 - USIの非同期`stop`、`ponderhit`、CSA bridge、Floodgate再接続、大会運用監視
 - strategy-conditioned policyと、標準将棋から隔離した二歩ありvariant backend
 - SFEN、MultiPV、regret、詰み証明をtoolとして渡す将棋LLMと、検証可能rewardによる強化学習

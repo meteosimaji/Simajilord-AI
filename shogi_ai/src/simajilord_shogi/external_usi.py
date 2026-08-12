@@ -40,6 +40,11 @@ _WARNING_MARKERS = (
     "can't",
     "not found",
 )
+_FATAL_STARTUP_MARKERS = (
+    "nnue header version mismatch",
+    "nnue hash mismatch",
+    "nn.bin hash mismatch",
+)
 
 
 class UsiOptionValueVerification(StrEnum):
@@ -106,6 +111,9 @@ class UsiStartupProvenance:
     stderr_bytes: int
     warnings: tuple[tuple[str, str], ...]
     warnings_sha256: str
+    fatal_diagnostics: tuple[tuple[str, str], ...]
+    expected_fatal_diagnostics: tuple[tuple[str, str], ...]
+    fatal_diagnostics_match_expected: bool
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -163,7 +171,10 @@ def _option_declaration(line: str) -> UsiOptionDeclaration | None:
     if not name or type_index + 1 >= len(tokens):
         raise ValueError(f"malformed USI option declaration: {line}")
     option_type = tokens[type_index + 1].casefold()
-    if option_type not in {"button", "check", "combo", "spin", "string"}:
+    # Gikou 2 advertises BookFile with the widely used ``filename`` extension.
+    # It has the same wire representation and validation requirements as a USI
+    # string, so retain the declared type in provenance while accepting it.
+    if option_type not in {"button", "check", "combo", "filename", "spin", "string"}:
         raise ValueError(f"unsupported USI option type {option_type!r} for {name!r}")
     tail = tokens[type_index + 2 :]
 
@@ -267,7 +278,7 @@ def _option_values_equal(
             return False
     if declaration.option_type in {"check", "combo"}:
         return requested.casefold() == applied.casefold()
-    if declaration.option_type == "string" and requested == "<empty>":
+    if declaration.option_type in {"filename", "string"} and requested == "<empty>":
         return applied == ""
     return requested == applied
 
@@ -381,6 +392,34 @@ class UsiPositionHistory:
         if not self.moves:
             return root
         return f"{root} moves {' '.join(self.moves)}"
+
+
+def _validated_searchmoves(board: Board, moves: tuple[str, ...]) -> tuple[str, ...]:
+    """Canonicalize a non-empty, duplicate-free set of legal USI root moves."""
+
+    if not moves:
+        raise ValueError("USI searchmoves requires at least one move")
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for raw_move in moves:
+        if not isinstance(raw_move, str) or not raw_move:
+            raise ValueError("USI searchmoves entries must be non-empty strings")
+        if any(character.isspace() for character in raw_move):
+            raise ValueError(f"USI searchmoves entry contains whitespace: {raw_move!r}")
+        try:
+            move = Move.from_usi(raw_move)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid USI searchmoves entry: {raw_move!r}") from error
+        move_usi = move.to_usi()
+        if move_usi in seen:
+            raise ValueError(f"duplicate USI searchmoves entry: {move_usi}")
+        if not board.is_legal_move(move):
+            raise ValueError(
+                f"illegal USI searchmoves entry {move_usi} at {board.to_sfen()}"
+            )
+        seen.add(move_usi)
+        canonical.append(move_usi)
+    return tuple(canonical)
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +631,7 @@ class ExternalUsiTeacher:
         value_scale: float = 1_200.0,
         option_value_verification: UsiOptionValueVerification = UsiOptionValueVerification.NONE,
         startup_provenance_path: Path | None = None,
+        expected_fatal_startup_diagnostics: tuple[tuple[str, str], ...] = (),
     ) -> None:
         if not command or nodes < 1 or multipv < 1 or timeout_seconds <= 0:
             raise ValueError("command, nodes, multipv, and timeout must be valid")
@@ -625,6 +665,27 @@ class ExternalUsiTeacher:
         self.policy_temperature = policy_temperature
         self.value_scale = value_scale
         self.option_value_verification = UsiOptionValueVerification(option_value_verification)
+        validated_expected_diagnostics: list[tuple[str, str]] = []
+        for diagnostic in expected_fatal_startup_diagnostics:
+            if len(diagnostic) != 2:
+                raise ValueError(
+                    "expected fatal USI startup diagnostics must be (channel, line) pairs"
+                )
+            channel, line = diagnostic
+            if channel not in {"stdout", "stderr"}:
+                raise ValueError(
+                    "expected fatal USI startup diagnostic channel must be stdout or stderr"
+                )
+            if not line or "\n" in line or "\r" in line:
+                raise ValueError(
+                    "expected fatal USI startup diagnostic must be a non-empty single line"
+                )
+            if not any(marker in line.casefold() for marker in _FATAL_STARTUP_MARKERS):
+                raise ValueError(
+                    "expected fatal USI startup diagnostic does not contain a fatal marker"
+                )
+            validated_expected_diagnostics.append((channel, line))
+        self.expected_fatal_startup_diagnostics = tuple(validated_expected_diagnostics)
         self.startup_provenance_path = (
             Path(os.path.abspath(os.fspath(startup_provenance_path.expanduser())))
             if startup_provenance_path is not None
@@ -721,11 +782,19 @@ class ExternalUsiTeacher:
                     )
                 )
             self._drain_startup_stderr()
-            self._startup_provenance = self._build_startup_provenance(
+            startup_provenance = self._build_startup_provenance(
                 resolved=resolved,
                 declarations=declarations,
                 applied_options=tuple(applied_options),
             )
+            if not startup_provenance.fatal_diagnostics_match_expected:
+                raise RuntimeError(
+                    "USI evaluation-network compatibility check failed: exact fatal startup "
+                    "diagnostics did not match the reviewed expectation; "
+                    f"observed={startup_provenance.fatal_diagnostics!r} "
+                    f"expected={startup_provenance.expected_fatal_diagnostics!r}"
+                )
+            self._startup_provenance = startup_provenance
             self._capturing_startup = False
             if provenance_path is not None:
                 self._startup_provenance.write_create_only(provenance_path)
@@ -836,8 +905,13 @@ class ExternalUsiTeacher:
             ensure_ascii=False,
             allow_nan=False,
         ).encode("utf-8")
+        fatal_diagnostics = tuple(
+            (channel, line)
+            for channel, line in warnings
+            if any(marker in line.casefold() for marker in _FATAL_STARTUP_MARKERS)
+        )
         return UsiStartupProvenance(
-            schema="meteo-usi-startup-provenance-v1",
+            schema="meteo-usi-startup-provenance-v2",
             resolved_executable=str(Path(resolved).resolve()),
             arguments=tuple(self.command[1:]),
             working_directory=str(self.working_directory or Path(resolved).resolve().parent),
@@ -856,6 +930,11 @@ class ExternalUsiTeacher:
             stderr_bytes=len(stderr),
             warnings=warnings,
             warnings_sha256=hashlib.sha256(warnings_bytes).hexdigest(),
+            fatal_diagnostics=fatal_diagnostics,
+            expected_fatal_diagnostics=self.expected_fatal_startup_diagnostics,
+            fatal_diagnostics_match_expected=(
+                fatal_diagnostics == self.expected_fatal_startup_diagnostics
+            ),
         )
 
     def _drain_startup_stderr(self) -> None:
@@ -906,21 +985,110 @@ class ExternalUsiTeacher:
         board = position.target_board()
         return self.target_from_analysis(board, self.analyse_with_history(position))
 
+    def training_target_with_history_searchmoves(
+        self,
+        position: UsiPositionHistory,
+        moves: tuple[str, ...],
+        *,
+        nodes: int | None = None,
+    ) -> ExternalTeacherTarget:
+        """Score an explicit legal branch with a rights-gated USI ``searchmoves`` search.
+
+        A normal MultiPV search is allowed to omit the move that was actually
+        played.  Substituting the worst reported MultiPV value only proves a
+        lower bound on regret; it does not evaluate that move.  This method
+        constrains the engine to the requested root branch and fails closed if
+        the engine does not return a scored variation for every requested move.
+        Callers that need a complete candidate matrix should normally pass one
+        move at a time so every branch receives the full node budget.
+        """
+
+        if not self.training_use:
+            raise PermissionError(
+                f"teacher {self.policy.name!r} was opened for analysis only, not training"
+            )
+        board = position.target_board()
+        requested = _validated_searchmoves(board, moves)
+        analysis = self.analyse_with_history_searchmoves(
+            position,
+            requested,
+            nodes=nodes,
+        )
+        if analysis.bestmove not in requested:
+            raise RuntimeError(
+                "USI searchmoves analysis returned a bestmove outside the requested set: "
+                f"requested={requested!r} bestmove={analysis.bestmove!r}"
+            )
+        target = self.target_from_analysis(board, analysis)
+        scored = {move for move, _value in target.move_values}
+        missing = sorted(set(requested) - scored)
+        outside = sorted(scored - set(requested))
+        if missing or outside:
+            raise RuntimeError(
+                "USI searchmoves analysis did not return the exact requested score set: "
+                f"missing={missing!r} outside={outside!r}"
+            )
+        return target
+
     def analyse(self, board: Board) -> UsiAnalysis:
         """Analyse one board without prior-move history for backward compatibility."""
 
         return self._analyse_command(f"position sfen {board.to_sfen()}")
+
+    def analyse_searchmoves(
+        self,
+        board: Board,
+        moves: tuple[str, ...],
+        *,
+        nodes: int | None = None,
+    ) -> UsiAnalysis:
+        """Analyse only explicit legal root moves without prior-move history."""
+
+        requested = _validated_searchmoves(board, moves)
+        return self._analyse_command(
+            f"position sfen {board.to_sfen()}",
+            search_moves=requested,
+            nodes=nodes,
+        )
 
     def analyse_with_history(self, position: UsiPositionHistory) -> UsiAnalysis:
         """Analyse a target using its validated initial position and move prefix."""
 
         return self._analyse_command(position.position_command())
 
-    def _analyse_command(self, position_command: str) -> UsiAnalysis:
+    def analyse_with_history_searchmoves(
+        self,
+        position: UsiPositionHistory,
+        moves: tuple[str, ...],
+        *,
+        nodes: int | None = None,
+    ) -> UsiAnalysis:
+        """Analyse explicit legal root branches while preserving the exact prefix."""
+
+        requested = _validated_searchmoves(position.target_board(), moves)
+        return self._analyse_command(
+            position.position_command(),
+            search_moves=requested,
+            nodes=nodes,
+        )
+
+    def _analyse_command(
+        self,
+        position_command: str,
+        *,
+        search_moves: tuple[str, ...] = (),
+        nodes: int | None = None,
+    ) -> UsiAnalysis:
         self.start()
+        requested_nodes = self.nodes if nodes is None else nodes
+        if requested_nodes < 1:
+            raise ValueError("USI analysis nodes must be positive")
         started = time.monotonic()
         self._send(position_command)
-        self._send(f"go nodes {self.nodes}")
+        search_suffix = (
+            "" if not search_moves else f" searchmoves {' '.join(search_moves)}"
+        )
+        self._send(f"go nodes {requested_nodes}{search_suffix}")
         candidates_by_rank: dict[int, TeacherVariation] = {}
         last_nodes: int | None = None
         last_time_ms: int | None = None

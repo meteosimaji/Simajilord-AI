@@ -7,12 +7,14 @@ from itertools import count
 
 import numpy as np
 from rsshogi.core import Board, Move
-from rsshogi.types import Color, RepetitionState
+from rsshogi.types import Color
 
+from .adjudication import adjudicate_board
 from .config import SearchConfig
 from .domain import GameRecord, PositionSample, Termination
 from .evaluator import Evaluator
 from .mcts import MCTS, choose_move
+from .multi_objective_distillation import all_legal_value_policy
 
 
 def play_game(
@@ -69,21 +71,10 @@ def play_match(
     max_plies = max(configured_limits) if len(configured_limits) == 2 else None
     plies = count() if max_plies is None else range(max_plies)
     for ply in plies:
-        repetition = board.repetition_state()
-        if repetition != RepetitionState.NONE:
-            if repetition in (RepetitionState.WIN, RepetitionState.SUPERIOR):
-                winner = board.turn.value
-            elif repetition in (RepetitionState.LOSE, RepetitionState.INFERIOR):
-                winner = board.turn.opponent().value
-            termination = Termination.REPETITION
-            break
-        if board.can_declare_win():
-            winner = board.turn.value
-            termination = Termination.DECLARATION
-            break
-        if board.is_mated() or not board.legal_moves():
-            winner = board.turn.opponent().value
-            termination = Termination.CHECKMATE
+        adjudication = adjudicate_board(board)
+        if adjudication is not None:
+            winner = adjudication.winner
+            termination = adjudication.termination
             break
 
         side_config = configs[board.turn.value]
@@ -99,6 +90,12 @@ def play_match(
 
         temperature = side_config.temperature if ply < side_config.temperature_moves else 0.0
         move_usi = choose_move(result, temperature=temperature, rng=rng)
+        implicit_target = all_legal_value_policy(
+            board,
+            result.q_values,
+            result.root_visits,
+            temperature=side_config.implicit_policy_temperature,
+        )
         pending_samples.append(
             PositionSample(
                 sfen=board.to_sfen(),
@@ -119,6 +116,10 @@ def play_match(
                 actor_source="meteo",
                 actor_peak_tree_nodes=result.peak_tree_nodes,
                 actor_tree_recycles=result.tree_recycles,
+                actor_move_values=implicit_target.move_values,
+                actor_move_visits=implicit_target.move_visits,
+                actor_implicit_policy=(implicit_target.policy or None),
+                actor_proven_mate_moves=implicit_target.proven_mate_moves,
             )
         )
         move = Move.from_usi(move_usi)

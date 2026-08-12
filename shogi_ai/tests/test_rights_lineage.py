@@ -7,6 +7,7 @@ import pytest
 
 from simajilord_shogi.rights_lineage import (
     RIGHTS_RESTRICTION_SUMMARY_SCHEMA,
+    expected_lineage_rights_summary,
     legacy_ancestor_restriction_id,
     merge_rights_restriction_summaries,
     summarize_teacher_sidecar,
@@ -44,9 +45,7 @@ def _suisho_provenance() -> dict[str, object]:
 
 def test_direct_nagisa_sidecar_is_publication_allowed_and_privacy_safe() -> None:
     sidecar_sha256 = "a" * 64
-    summary = summarize_teacher_sidecar(
-        _nagisa_provenance(), sidecar_sha256=sidecar_sha256
-    )
+    summary = summarize_teacher_sidecar(_nagisa_provenance(), sidecar_sha256=sidecar_sha256)
 
     assert summary["schema"] == RIGHTS_RESTRICTION_SUMMARY_SCHEMA
     assert summary["publication_allowed"] is True
@@ -97,50 +96,48 @@ def test_ensemble_resolves_generic_marker_to_nagisa_and_restricted_suisho() -> N
         "suisho11plus-wcsc36-20260525-local",
     }
     assert sources["nagisa-v3.1"]["publication_allowed"] is True
-    assert sources["suisho11plus-wcsc36-20260525-local"]["decision"] == (
-        "not_approved"
-    )
-    assert sources["suisho11plus-wcsc36-20260525-local"][
-        "publication_allowed"
-    ] is False
+    assert sources["suisho11plus-wcsc36-20260525-local"]["decision"] == ("not_approved")
+    assert sources["suisho11plus-wcsc36-20260525-local"]["publication_allowed"] is False
     assert merged["publication_allowed"] is False
     assert len(cast(list[str], merged["restriction_ids"])) == 1
     assert "meteo-teacher-ensemble" not in json.dumps(merged)
 
 
 def test_exact_resume_merge_preserves_parent_restrictions_and_sidecar_binding() -> None:
-    parent = summarize_teacher_sidecar(
-        _suisho_provenance(), sidecar_sha256="c" * 64
-    )
-    current = summarize_teacher_sidecar(
-        _nagisa_provenance(), sidecar_sha256="d" * 64
-    )
+    parent = summarize_teacher_sidecar(_suisho_provenance(), sidecar_sha256="c" * 64)
+    current = summarize_teacher_sidecar(_nagisa_provenance(), sidecar_sha256="d" * 64)
 
-    merged = merge_rights_restriction_summaries(
-        [parent, current], teacher_sources=["nagisa-v3.1"]
-    )
+    merged = merge_rights_restriction_summaries([parent, current], teacher_sources=["nagisa-v3.1"])
 
     assert merged["publication_allowed"] is False
     assert merged["sidecar_sha256s"] == ["c" * 64, "d" * 64]
     assert parent["restriction_ids"] == merged["restriction_ids"]
 
 
-def test_legacy_parent_without_summary_gets_stable_fail_closed_marker() -> None:
-    summary = merge_rights_restriction_summaries(
-        [], legacy_parent_missing_summary=True
+def test_bounded_parent_identity_preserves_rights_without_parent_lineage() -> None:
+    parent = summarize_teacher_sidecar(_suisho_provenance(), sidecar_sha256="c" * 64)
+    resolved = expected_lineage_rights_summary(
+        {
+            "schema": "meteo-training-lineage-v2",
+            "teacher_sources": [],
+            "training_inputs": [],
+            "parent_checkpoint": {"rights_restriction_summary": parent},
+        }
     )
 
+    assert resolved == parent
+
+
+def test_legacy_parent_without_summary_gets_stable_fail_closed_marker() -> None:
+    summary = merge_rights_restriction_summaries([], legacy_parent_missing_summary=True)
+
     assert summary["publication_allowed"] is False
-    assert summary["inherited_restriction_ids"] == [
-        legacy_ancestor_restriction_id()
-    ]
+    assert summary["inherited_restriction_ids"] == [legacy_ancestor_restriction_id()]
     assert summary["restriction_ids"] == [legacy_ancestor_restriction_id()]
 
 
 def test_summary_rejects_removed_or_fabricated_restriction_ids() -> None:
-    summary = summarize_teacher_sidecar(
-        _suisho_provenance(), sidecar_sha256="f" * 64
-    )
+    summary = summarize_teacher_sidecar(_suisho_provenance(), sidecar_sha256="f" * 64)
     tampered = json.loads(json.dumps(summary))
     tampered["restriction_ids"] = []
 

@@ -60,18 +60,19 @@ def write_canonical_v2_replay(
 
 
 def canonical_v2_rights_summary() -> dict[str, object]:
-    nagisa = summarize_teacher_sidecar(
-        {"rights": model_rights(CANONICAL_SCORER_IDS[0]).to_dict()},
-        sidecar_sha256="a" * 64,
-    )
-    suisho = summarize_teacher_sidecar(
-        {
-            "publication_allowed": False,
-            "rights": model_rights(CANONICAL_SCORER_IDS[1]).to_dict(),
-        },
-        sidecar_sha256="b" * 64,
-    )
-    return merge_rights_restriction_summaries([nagisa, suisho])
+    summaries = [
+        summarize_teacher_sidecar(
+            {
+                "publication_allowed": index == 0,
+                "rights": model_rights(scorer_id).to_dict(),
+            },
+            sidecar_sha256=marker * 64,
+        )
+        for index, (scorer_id, marker) in enumerate(
+            zip(CANONICAL_SCORER_IDS, ("a", "b", "c"), strict=True)
+        )
+    ]
+    return merge_rights_restriction_summaries(summaries)
 
 
 def calibrated_cp_and_q(desired_root_q: float, *, root_player_sign: int) -> tuple[int, float]:
@@ -86,10 +87,8 @@ def _candidate_score(
     q_value: float,
     depth: int,
     requested_nodes: int,
+    replies: list[str],
 ) -> dict[str, object]:
-    child = Board()
-    child.apply_move(Move.from_usi(move_usi))
-    replies = sorted(move.to_usi() for move in child.legal_moves())
     reply = replies[0]
     score_cp, calibrated_q = calibrated_cp_and_q(q_value, root_player_sign=1)
     reply_cp, reply_q = calibrated_cp_and_q(q_value - 0.05, root_player_sign=-1)
@@ -134,24 +133,37 @@ def _budget_score(
     *,
     budget: int,
     budget_index: int,
+    reply_candidates: list[dict[str, object]],
 ) -> dict[str, object]:
-    scored_candidates = [
-        _candidate_score(
-            move,
-            q_value=q_value,
-            depth=10 + budget_index,
-            requested_nodes=budget,
+    scored_candidates: list[dict[str, object]] = []
+    for move, q_value, reply_candidate in zip(
+        candidates, values, reply_candidates, strict=True
+    ):
+        raw_reply_moves = reply_candidate["reply_moves"]
+        assert isinstance(raw_reply_moves, list) and all(
+            isinstance(reply_move, str) for reply_move in raw_reply_moves
         )
-        for move, q_value in zip(candidates, values, strict=True)
-    ]
-    reported_nodes = sum(
-        int(candidate["reported_nodes"])
-        + sum(
-            int(reply["reported_nodes"])
-            for reply in candidate["principal_replies"]
+        scored_candidates.append(
+            _candidate_score(
+                move,
+                q_value=q_value,
+                depth=10 + budget_index,
+                requested_nodes=budget,
+                replies=list(raw_reply_moves),
+            )
         )
-        for candidate in scored_candidates
-    )
+    reported_nodes = 0
+    for candidate in scored_candidates:
+        candidate_nodes = candidate["reported_nodes"]
+        candidate_replies = candidate["principal_replies"]
+        assert isinstance(candidate_nodes, int)
+        assert isinstance(candidate_replies, list)
+        reported_nodes += candidate_nodes
+        for reply in candidate_replies:
+            assert isinstance(reply, dict)
+            reply_nodes = reply["reported_nodes"]
+            assert isinstance(reply_nodes, int)
+            reported_nodes += reply_nodes
     return {
         "requested_nodes": budget,
         "reported_nodes": reported_nodes,
@@ -164,16 +176,62 @@ def build_canonical_v2_payload(
     game: GameRecord,
     *,
     coverage_complete: bool = True,
+    unanimous: bool = True,
 ) -> dict[str, object]:
     candidates = ["2g2f", "7g7f"]
     budgets = [100, 200]
     scorer_values = (
-        ((-0.36, -0.31), (-0.35, -0.30)),
+        (
+            ((0.26, 0.18), (0.29, 0.20))
+            if unanimous
+            else ((-0.36, -0.31), (-0.35, -0.30))
+        ),
         ((0.38, 0.28), (0.40, 0.30)),
+        ((0.36, 0.29), (0.39, 0.31)),
     )
+    reply_proposals: list[dict[str, object]] = []
+    reply_candidates_by_budget: list[list[dict[str, object]]] = []
+    for budget_index, budget in enumerate(budgets):
+        reply_candidates: list[dict[str, object]] = []
+        for candidate_index, candidate in enumerate(candidates):
+            child = Board()
+            child.apply_move(Move.from_usi(candidate))
+            legal_replies = sorted(move.to_usi() for move in child.legal_moves())
+            proposed = (
+                legal_replies[0],
+                legal_replies[len(legal_replies) // 2],
+                legal_replies[-1],
+            )
+            union = sorted(set(proposed))
+            reply_candidates.append(
+                {
+                    "move": candidate,
+                    "proposals": [
+                        {
+                            "scorer_id": scorer_id,
+                            "provenance_sha256": hashlib.sha256(
+                                f"{budget_index}:{candidate_index}:{scorer_index}".encode()
+                            ).hexdigest(),
+                            "moves": [proposed[scorer_index]],
+                            "reported_nodes": budget,
+                            "depth": 9 + budget_index,
+                            "time_ms": 7,
+                        }
+                        for scorer_index, scorer_id in enumerate(CANONICAL_SCORER_IDS)
+                    ],
+                    "reply_moves": union,
+                }
+            )
+        reply_proposals.append(
+            {
+                "requested_nodes": budget,
+                "candidates": reply_candidates,
+            }
+        )
+        reply_candidates_by_budget.append(reply_candidates)
     descriptors = []
     for index, (scorer_id, family) in enumerate(
-        zip(CANONICAL_SCORER_IDS, ("nagisa", "suisho"), strict=True)
+        zip(CANONICAL_SCORER_IDS, ("nagisa", "suisho", "soujou"), strict=True)
     ):
         marker = str(index + 1)
         descriptors.append(
@@ -217,6 +275,7 @@ def build_canonical_v2_payload(
                         values,
                         budget=budget,
                         budget_index=budget_index,
+                        reply_candidates=reply_candidates_by_budget[budget_index],
                     )
                     for budget_index, (budget, values) in enumerate(
                         zip(budgets, budget_values, strict=True)
@@ -257,11 +316,11 @@ def build_canonical_v2_payload(
         )
     play = (
         {
-            "kind": "robust_consensus",
+            "kind": "unanimous_consensus",
             "train_play": True,
             "additional_search_required": False,
         }
-        if coverage_complete
+        if coverage_complete and unanimous
         else {
             "kind": "unresolved",
             "train_play": False,
@@ -277,7 +336,13 @@ def build_canonical_v2_payload(
         "position_identity": CANONICAL_POSITION_IDENTITY,
         "target_mode": CANONICAL_TARGET_V2_MODE,
         "canonical_scorers": descriptors,
-        "required_candidate_families": ["meteo", "nagisa", "suisho", "tactical"],
+        "required_candidate_families": [
+            "meteo",
+            "nagisa",
+            "soujou",
+            "suisho",
+            "tactical",
+        ],
         "rights_restriction_summary": canonical_v2_rights_summary(),
         "positions": [
             {
@@ -296,20 +361,22 @@ def build_canonical_v2_payload(
                         "moves": candidates,
                     }
                     for index, family in enumerate(
-                        ("meteo", "nagisa", "suisho", "tactical")
+                        ("meteo", "nagisa", "soujou", "suisho", "tactical")
                         if coverage_complete
-                        else ("nagisa", "suisho")
+                        else ("nagisa", "soujou", "suisho")
                     )
                 ],
                 "candidate_family_coverage_complete": coverage_complete,
                 "reply_coverage_complete": True,
                 "candidate_moves": candidates,
                 "budgets": budgets,
+                "reply_proposals": reply_proposals,
                 "score_matrix": matrices,
                 "thresholds": {
                     "regret": 0.05,
                     "depth_dispersion": 0.05,
                     "reply_dispersion": 0.05,
+                    "policy_temperature": 0.025,
                 },
                 "proof": {
                     "state": "not_applicable",

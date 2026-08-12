@@ -80,12 +80,18 @@ class PackedSfenValueDataset(Sequence[PositionSample]):
         record = self._records[self.offset + index * self.stride]
         board = Board()
         board.set_packed_sfen(record["sfen"].tobytes())
-        move = Move(int(record["move"]))
+        move16 = int(record["move"])
         if not board.is_valid():
             raise ValueError(f"invalid packed position at PSV sample {index}")
+        if move16 == 0:
+            raise ValueError(
+                "PSV sample has Move16=0 and is value-only; the policy-supervised "
+                "PackedSfenValueDataset must not invent a move target"
+            )
+        move = Move(move16)
         if not board.is_legal_move(move):
             raise ValueError(
-                f"illegal Move16 {int(record['move'])} at PSV sample {index}: {move.to_usi()}"
+                f"illegal Move16 {move16} at PSV sample {index}: {move.to_usi()}"
             )
         game_result = int(record["game_result"])
         if game_result not in {-1, 0, 1}:

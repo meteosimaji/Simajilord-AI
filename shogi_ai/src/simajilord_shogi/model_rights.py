@@ -14,7 +14,7 @@ from enum import StrEnum
 
 from .external_usi import ExternalTeacherPolicy
 
-RIGHTS_REVIEW_DATE = "2026-08-09"
+RIGHTS_REVIEW_DATE = "2026-08-12"
 
 
 class RightsDecision(StrEnum):
@@ -139,73 +139,6 @@ _GPL_OUTPUT_NOTE = (
 
 MODEL_RIGHTS: tuple[ModelRights, ...] = (
     ModelRights(
-        rights_id="aobazero-public-domain",
-        name="AobaZero",
-        version="original public releases",
-        family="DL/MCTS",
-        availability="free",
-        engine_license="GPL-3.0 for aobaz; other published artifacts declared public domain",
-        model_terms="README declares weights and game data outside aobaz public domain",
-        sources=("https://github.com/kobanium/aobazero",),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.ALLOWED,
-        original_artifact_redistribution=RightsDecision.ALLOWED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            "Best rights-clean bootstrap source among the reviewed neural projects.",
-            "Keep source and version provenance even where the author disclaims rights.",
-        ),
-    ),
-    ModelRights(
-        rights_id="yaneuraou-rezero",
-        name="YaneuraOu ReZero evaluation",
-        version="official public evaluation",
-        family="classical evaluation",
-        availability="free",
-        engine_license="GPL-3.0 engine",
-        model_terms="project README says no rights are asserted over the ReZero evaluation",
-        sources=("https://github.com/yaneurao/YaneuraOu",),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.ALLOWED,
-        original_artifact_redistribution=RightsDecision.ALLOWED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=("Rights-clean but much weaker than current top teachers.",),
-    ),
-    ModelRights(
-        rights_id="takewarabe-approx-v7.50-material9",
-        name="Takewarabe approximate V7.50 MaterialLv9",
-        version="YaneuraOu v7.50-wcsc32 / MATERIAL_LEVEL=9",
-        family="handcrafted material/effect evaluation",
-        availability="free",
-        engine_license="GPL-3.0 YaneuraOu source",
-        model_terms="not applicable; the approximate engine has no external evaluation file",
-        sources=(
-            "https://yaneuraou.yaneu.com/2020/11/18/takewarabe/",
-            "https://github.com/yaneurao/YaneuraOu/tree/v7.50-wcsc32",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.NOT_APPLICABLE,
-        original_artifact_redistribution=RightsDecision.CONDITIONAL_GPL,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            _GPL_OUTPUT_NOTE,
-            "The author states that YaneuraOu V7.50 material evaluation at "
-            "MATERIAL_LEVEL=9 is approximately Takewarabe and confirms OSX builds; label the "
-            "reproduction approximate rather than claiming it is the original binary.",
-            "Use it as an unusual weak/human-style opponent and position generator. Its moves "
-            "are not ground-truth labels; strong teachers must re-adjudicate the resulting "
-            "positions before Meteo trains on them.",
-            "Disable the opening book and vary nodes or clock deliberately when measuring how "
-            "Meteo handles off-book, human-like play.",
-        ),
-    ),
-    ModelRights(
         rights_id="aobannue-v1.1",
         name="AobaNNUE",
         version="v1.1",
@@ -234,30 +167,6 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         ),
     ),
     ModelRights(
-        rights_id="dlshogi-aoba-wcsc35",
-        name="AobaZero WCSC35 dlshogi_aoba",
-        version="v1 / 2025 weight",
-        family="DL/MCTS ResNet 30x384",
-        availability="free",
-        engine_license="GPL-3.0",
-        model_terms="GPL-3.0 repository explicitly releases the WCSC35 weight",
-        sources=(
-            "https://github.com/yssaya/dlshogi_aoba",
-            "https://github.com/yssaya/dlshogi_aoba/releases/tag/v1",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.CONDITIONAL_GPL,
-        original_artifact_redistribution=RightsDecision.CONDITIONAL_GPL,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            _GPL_OUTPUT_NOTE,
-            "Its additional ply, turn, and pawn-count features make the weight incompatible "
-            "with stock dlshogi and Meteo competition_v1.",
-        ),
-    ),
-    ModelRights(
         rights_id="nagisa-v3.1",
         name="NAGISA",
         version="v3.1",
@@ -276,6 +185,9 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
             _GPL_OUTPUT_NOTE,
             "The evaluation-file redistribution ban is honored; neither nn.bin nor a conversion "
             "of it may be placed in Meteo.",
+            "The private NAGISA-style NNUE run may extract progress.bin only as a fixed local "
+            "LayerStack router; it never copies nn.bin, and every resulting export remains "
+            "local-only unless separate redistribution permission is recorded.",
         ),
     ),
     ModelRights(
@@ -418,184 +330,6 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         ),
     ),
     ModelRights(
-        rights_id="dlshogi-gct-wcsc31",
-        name="dlshogi with GCT",
-        version="WCSC31 release",
-        family="DL/MCTS",
-        availability="free",
-        engine_license="GPL-3.0",
-        model_terms=(
-            "the GPL-3.0 project release bundles models, but the release text and archive do not "
-            "state model-specific terms"
-        ),
-        sources=(
-            "https://github.com/TadaoYamaoka/DeepLearningShogi/releases/tag/wcwc31",
-            "https://github.com/TadaoYamaoka/DeepLearningShogi",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            _GPL_OUTPUT_NOTE,
-            "Bundling by a GPL repository is not treated as an artifact-specific grant for the "
-            "ONNX models; use this release only through ordinary USI output.",
-        ),
-    ),
-    ModelRights(
-        rights_id="dlshogi-dr2-exhi",
-        name="dlshogi Denryu2 exhibition model",
-        version="dr2_exhi",
-        family="DL/MCTS",
-        availability="free-with-separate-terms",
-        engine_license="GPL-3.0 code",
-        model_terms="separate model terms prohibit extra training, parameter reuse, modification, "
-        "reverse engineering, and redistribution",
-        sources=(
-            "https://github.com/TadaoYamaoka/DeepLearningShogi/releases/tag/dr2_exhi",
-            "https://tadaoyamaoka.hatenablog.com/entry/2021/08/17/000710",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.LIMITED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
-        notes=(
-            "The narrow tournament permission for generating model-learning game records is not "
-            "treated as permission for general soft-label distillation or Apache publication.",
-        ),
-    ),
-    ModelRights(
-        rights_id="zimetu-2026-01-26",
-        name="zimetu",
-        version="2026-01-26",
-        family="NNUE HalfKP256",
-        availability="free",
-        engine_license="GPL-3.0 source",
-        model_terms="free product page states no separate output restriction",
-        sources=(
-            "https://booth.pm/ja/items/7916789",
-            "https://github.com/nodchip/tanuki-/tree/zimetu.2026-01-26",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            _GPL_OUTPUT_NOTE,
-            "A style-specialized diversity teacher; its product page does not separately license "
-            "the evaluation file for copying.",
-        ),
-    ),
-    ModelRights(
-        rights_id="apery-public",
-        name="Apery",
-        version="2019-06-17 official evaluation binaries",
-        family="alpha-beta / learned evaluation",
-        availability="free",
-        engine_license="GPL-3.0-or-later",
-        model_terms="the separate official evaluation-binaries repository declares MIT",
-        sources=(
-            "https://github.com/HiraokaTakuya/apery",
-            "https://bitbucket.org/hiraoka64/apery-evaluation-binaries-2019-06-17/"
-            "src/master/README.md",
-            "https://bitbucket.org/hiraoka64/apery-evaluation-binaries-2019-06-17/"
-            "src/master/LICENSE-MIT",
-        ),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.ALLOWED,
-        original_artifact_redistribution=RightsDecision.ALLOWED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(
-            _GPL_OUTPUT_NOTE,
-            "Keep the MIT copyright and permission notice when copying or redistributing these "
-            "exact evaluation binaries.",
-        ),
-    ),
-    ModelRights(
-        rights_id="elmo-wcsc27",
-        name="elmo",
-        version="WCSC27 public evaluation",
-        family="alpha-beta / learned evaluation",
-        availability="free",
-        engine_license="GPL-3.0 evaluation-generation code",
-        model_terms="no separate output restriction found in the official public repository",
-        sources=("https://github.com/mk-takizawa/elmo_for_learn",),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.CONDITIONAL_GPL,
-        original_artifact_redistribution=RightsDecision.CONDITIONAL_GPL,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(_GPL_OUTPUT_NOTE,),
-    ),
-    ModelRights(
-        rights_id="gpsfish-public",
-        name="GPSFish",
-        version="public release line",
-        family="alpha-beta / classical evaluation",
-        availability="free",
-        engine_license="GPL-3.0",
-        model_terms="official project publishes source and data as free software",
-        sources=("https://gps.tanaka.ecc.u-tokyo.ac.jp/gpsshogi/",),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.CONDITIONAL_GPL,
-        original_artifact_redistribution=RightsDecision.CONDITIONAL_GPL,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=(_GPL_OUTPUT_NOTE,),
-    ),
-    ModelRights(
-        rights_id="sunfish4",
-        name="Sunfish 4",
-        version="public repository",
-        family="alpha-beta / classical evaluation",
-        availability="free",
-        engine_license="MIT",
-        model_terms="MIT repository; no separately restricted neural weight",
-        sources=("https://github.com/sunfish-shogi/sunfish4",),
-        analysis=RightsDecision.ALLOWED,
-        output_distillation=RightsDecision.ALLOWED,
-        hard_game_training=RightsDecision.ALLOWED,
-        direct_weight_use=RightsDecision.NOT_APPLICABLE,
-        original_artifact_redistribution=RightsDecision.ALLOWED,
-        output_only_meteo_publication=RightsDecision.ALLOWED,
-        notes=("Useful mainly for diversity and regression, not current top strength.",),
-    ),
-    ModelRights(
-        rights_id="hisui-wcsc36-hosted",
-        name="Hisui (氷彗)",
-        version="WCSC36 champion",
-        family="NNUE / custom YaneuraOu search",
-        availability="paid",
-        engine_license="YaneuraOu-based; downloadable corresponding source/model not published",
-        model_terms="available as a hosted Kishin Analytics engine; training data is private",
-        sources=(
-            "https://www.apply.computer-shogi.org/wcsc36/appeal/hisui/hisui_detail.pdf",
-            "https://note.com/kishin_analytics/n/n0effe0c2e5d9",
-        ),
-        analysis=RightsDecision.NOT_APPROVED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.LIMITED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
-        notes=(
-            "No downloadable WCSC36 binary or weight was found in the official sources.",
-            "Public WCSC games may be imported separately as hard behavioral examples; that is "
-            "not equivalent to distilling Hisui's evaluation or MultiPV distribution.",
-            "The public appeal says Hisui itself used knowledge distillation from dlshogi.",
-        ),
-    ),
-    ModelRights(
         rights_id="suisho11plus-wcsc36-20260525-local",
         name="Suisho11Plus WCSC36 2026-05-25 local teacher",
         version="WCSC36 / 2026-05-25 SFNN",
@@ -627,93 +361,33 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         ),
     ),
     ModelRights(
-        rights_id="suisho10-11-supporter",
-        name="Unreviewed Suisho 10/11 supporter builds",
-        version="generic catch-all excluding the exact Suisho11Plus local profile",
-        family="NNUE/SFNN",
-        availability="paid",
-        engine_license="GPL-3.0 YaneuraOu engine",
-        model_terms=(
-            "no run-specific lawful-acquisition acknowledgement or exact artifact review is "
-            "attached to this generic catch-all profile"
-        ),
-        sources=("https://github.com/yaneurao/YaneuraOu",),
-        analysis=RightsDecision.NOT_APPROVED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.NOT_APPROVED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
-        notes=(
-            "This generic row is not an exclusion of the user's lawfully acquired "
-            "Suisho11Plus copy.  That exact engine/evaluation pair has the separate "
-            "suisho11plus-wcsc36-20260525-local profile and is authorized for private local "
-            "label generation and training.",
-            "Other supporter builds remain unreviewed until they receive their own exact "
-            "profile and run-specific acknowledgement.  Public release is a separate gate.",
-        ),
-    ),
-    ModelRights(
-        rights_id="tanuki-wcsc36-paid",
-        name="tanuki- WCSC36 (六角堂狸)",
-        version="WCSC36",
-        family="SFNN",
-        availability="paid",
-        engine_license="GPL-3.0 source",
-        model_terms="paid evaluation distribution; no purchase terms were accepted",
-        sources=("https://github.com/nodchip/tanuki-",),
-        analysis=RightsDecision.NOT_APPROVED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.NOT_APPROVED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
-        notes=(
-            "This exact paid artifact has not been lawfully acquired and reviewed in this "
-            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
-            "and explicit authorization evidence before use.",
-        ),
-    ),
-    ModelRights(
         rights_id="soujou-tsec7-paid",
         name="奏乗 TSEC7",
-        version="TSEC7",
-        family="NNUE",
+        version="TSEC7 / SOJO_TSEC7 NNUE 9.60 exact local profile",
+        family="NNUE / HalfKaHmMerged / layer-stack 9",
         availability="paid",
-        engine_license="GPL-3.0-derived engine source",
-        model_terms="paid evaluation distribution; no purchase terms were accepted",
-        sources=("https://www.apply.computer-shogi.org/",),
-        analysis=RightsDecision.NOT_APPROVED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.NOT_APPROVED,
-        direct_weight_use=RightsDecision.NOT_APPROVED,
-        original_artifact_redistribution=RightsDecision.NOT_APPROVED,
-        output_only_meteo_publication=RightsDecision.NOT_APPROVED,
-        notes=(
-            "This exact paid artifact has not been lawfully acquired and reviewed in this "
-            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
-            "and explicit authorization evidence before use.",
+        engine_license="GPL-3.0 YaneuraOu-derived source",
+        model_terms=(
+            "lawfully acquired user-supplied evaluation archive; archive has no LICENSE; "
+            "ordinary USI labels are approved only for private local distillation"
         ),
-    ),
-    ModelRights(
-        rights_id="kanade-wcsc35-paid",
-        name="Kanade",
-        version="WCSC35 commercial model",
-        family="DL",
-        availability="paid",
-        engine_license="external dlshogi-compatible engine",
-        model_terms="paid model-only distribution; no purchase terms were accepted",
-        sources=("https://www.apply.computer-shogi.org/wcsc35/",),
-        analysis=RightsDecision.NOT_APPROVED,
-        output_distillation=RightsDecision.NOT_APPROVED,
-        hard_game_training=RightsDecision.NOT_APPROVED,
+        sources=(
+            "https://booth.pm/ja/items/8606196",
+            "https://github.com/keinoda/YaneuraOu/tree/sojo_tsec7",
+        ),
+        analysis=RightsDecision.LIMITED,
+        output_distillation=RightsDecision.LIMITED,
+        hard_game_training=RightsDecision.LIMITED,
         direct_weight_use=RightsDecision.NOT_APPROVED,
         original_artifact_redistribution=RightsDecision.NOT_APPROVED,
         output_only_meteo_publication=RightsDecision.NOT_APPROVED,
         notes=(
-            "This exact paid artifact has not been lawfully acquired and reviewed in this "
-            "workspace. Price alone is not the exclusion criterion; add a pinned local profile "
-            "and explicit authorization evidence before use.",
+            "The user supplied the exact TSEC7 archive for this private local run; its original "
+            "download and evaluation artifact must never enter the repository or a release.",
+            "Run only through the pinned external USI engine with FV_SCALE=28, "
+            "LS_BUCKET_MODE=progress8kpabs, and the supplied progress.bin.",
+            "Raw labels and every checkpoint descended from them remain local until the rights "
+            "holder explicitly clears publication of distilled Meteo weights.",
         ),
     ),
 )

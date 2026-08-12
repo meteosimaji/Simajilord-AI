@@ -1,0 +1,132 @@
+diff --git a/bins/net_to_yo/src/main.rs b/bins/net_to_yo/src/main.rs
+index 13474ea..3886756 100644
+--- a/bins/net_to_yo/src/main.rs
++++ b/bins/net_to_yo/src/main.rs
+@@ -15,6 +15,7 @@ const YO_LAYER_STACKS: usize = YANEURAOU_LAYER_STACKS;
+ /// 巨大値) が overflow や過大 allocation を起こす前に弾くための健全性ガード。
+ const MAX_FT_OUT: usize = 8192;
+ const MAX_HIDDEN_DIM: usize = 4096;
++const PROGRESS_KPABS_BYTES: u64 = (81 * 1548 * std::mem::size_of::<f64>()) as u64;
+ 
+ /// tatara `.bin` header から読み取った変換対象アーキ。
+ #[derive(Debug)]
+@@ -36,8 +37,16 @@ struct Args {
+     output: PathBuf,
+     /// Assert that the input was trained with `--bucket-mode kingrank9`.
+     /// Quantised `.bin` files do not record their bucket routing mode.
+-    #[arg(long)]
++    #[arg(long, conflicts_with = "assume_progress8kpabs")]
+     assume_kingrank9: bool,
++    /// Assert that the input was trained with `--bucket-mode progress8kpabs`.
++    /// The resulting nn.bin must be distributed with the exact progress file
++    /// and `LS_BUCKET_MODE=progress8kpabs` engine option.
++    #[arg(long, conflicts_with = "assume_kingrank9")]
++    assume_progress8kpabs: bool,
++    /// Exact progress.bin used while training a progress8kpabs network.
++    #[arg(long, requires = "assume_progress8kpabs")]
++    progress_coeff: Option<PathBuf>,
+ }
+ 
+ fn main() -> Result<(), Box<dyn std::error::Error>> {
+@@ -45,7 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     if args.input == args.output {
+         return Err("input and output must be different paths".into());
+     }
+-    require_kingrank9_assertion(args.assume_kingrank9)?;
++    require_bucket_routing_assertion(
++        args.assume_kingrank9,
++        args.assume_progress8kpabs,
++        args.progress_coeff.as_deref(),
++    )?;
+ 
+     let detect_input = File::open(&args.input)?;
+     let arch = detect_arch(&mut BufReader::new(detect_input))?;
+@@ -69,12 +82,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     Ok(())
+ }
+ 
+-fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
+-    if !assume_kingrank9 {
++fn require_bucket_routing_assertion(
++    assume_kingrank9: bool,
++    assume_progress8kpabs: bool,
++    progress_coeff: Option<&std::path::Path>,
++) -> io::Result<()> {
++    if !assume_kingrank9 && !assume_progress8kpabs {
+         return invalid_input(
+-            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9",
++            "tatara .bin files do not record bucket routing; pass exactly one of --assume-kingrank9 or --assume-progress8kpabs",
+         );
+     }
++    if assume_kingrank9 {
++        if progress_coeff.is_some() {
++            return invalid_input("kingrank9 conversion must not provide --progress-coeff");
++        }
++        return Ok(());
++    }
++    let progress = progress_coeff.ok_or_else(|| {
++        invalid_input_err(
++            "progress8kpabs conversion requires the exact --progress-coeff file".into(),
++        )
++    })?;
++    let metadata = std::fs::symlink_metadata(progress).map_err(|error| {
++        invalid_input_err(format!(
++            "failed to inspect progress coefficient '{}': {error}",
++            progress.display()
++        ))
++    })?;
++    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
++        return invalid_input("progress coefficient must be a regular non-symlink file");
++    }
++    if metadata.len() != PROGRESS_KPABS_BYTES {
++        return invalid_input(format!(
++            "progress coefficient size mismatch: expected {PROGRESS_KPABS_BYTES}, got {}",
++            metadata.len()
++        ));
++    }
+     Ok(())
+ }
+ 
+@@ -217,6 +260,7 @@ fn read_u32<R: Read>(reader: &mut R) -> io::Result<u32> {
+ mod tests {
+     use super::*;
+     use nnue_format::layerstack_weights::build_arch_str;
++    use std::io::Write as _;
+ 
+     fn detected(
+         feature_set: FeatureSet,
+@@ -232,6 +276,34 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn routing_assertion_accepts_kingrank9_without_progress() {
++        require_bucket_routing_assertion(true, false, None).unwrap();
++    }
++
++    #[test]
++    fn routing_assertion_accepts_progress8_with_exact_coefficients() {
++        let path = std::env::temp_dir().join(format!(
++            "tatara-progress-converter-{}-{}.bin",
++            std::process::id(),
++            std::thread::current().name().unwrap_or("test")
++        ));
++        let mut file = std::fs::File::create(&path).unwrap();
++        file.set_len(PROGRESS_KPABS_BYTES).unwrap();
++        file.flush().unwrap();
++        require_bucket_routing_assertion(false, true, Some(&path)).unwrap();
++        std::fs::remove_file(path).unwrap();
++    }
++
++    #[test]
++    fn routing_assertion_rejects_missing_or_bad_progress() {
++        assert!(require_bucket_routing_assertion(false, false, None).is_err());
++        assert!(require_bucket_routing_assertion(false, true, None).is_err());
++        assert!(
++            require_bucket_routing_assertion(true, false, Some(std::path::Path::new("x"))).is_err()
++        );
++    }
++
+     #[test]
+     fn parse_arch_str_roundtrips_build_arch_str_over_dims_and_features() {
+         let configs = [

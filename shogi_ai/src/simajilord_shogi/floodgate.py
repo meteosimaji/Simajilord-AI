@@ -38,8 +38,8 @@ from typing import Final
 from urllib.parse import unquote, urlparse
 
 from rsshogi.core import Board
-from rsshogi.types import RepetitionState
 
+from .adjudication import terminal_repetition_adjudication
 from .artifact_provenance import canonical_json_sha256, identify_file
 from .domain import GameRecord, PositionSample, Termination
 from .ensemble import normalized_sfen
@@ -1058,9 +1058,10 @@ def _termination_and_winner(
     if code == "%TORYO":
         return Termination.RESIGNATION, opponent, "protocol_forfeit_no_board_proof_required"
     if code == "%SENNICHITE":
-        if board.repetition_state() == RepetitionState.NONE:
+        repetition = terminal_repetition_adjudication(board)
+        if repetition is None:
             raise ValueError("CSA %SENNICHITE position is not a legal repetition")
-        return Termination.REPETITION, None, "locally_verified_repetition"
+        return Termination.REPETITION, repetition.winner, "locally_verified_repetition"
     if code == "%KACHI":
         return (
             Termination.DECLARATION,

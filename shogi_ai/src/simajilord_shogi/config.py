@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
@@ -34,6 +35,7 @@ class ModelConfig:
     dlshogi_legacy: bool = False
     history_input_version: int = 1
     canonical_head_version: int = 1
+    canonical_teacher_count: int = 2
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -56,6 +58,10 @@ class ModelConfig:
             raise ValueError("canonical_head_version must be 1 or 2")
         if self.canonical_head_version == 2 and self.history_input_version != 2:
             raise ValueError("canonical head v2 requires history input v2")
+        if self.canonical_teacher_count < 2:
+            raise ValueError("canonical_teacher_count must be at least two")
+        if self.canonical_head_version == 1 and self.canonical_teacher_count != 2:
+            raise ValueError("canonical head v1 retains the historical teacher count")
         for label, interval in (
             ("transformer_interval", self.transformer_interval),
             ("se_interval", self.se_interval),
@@ -76,6 +82,7 @@ def model_config_payload(config: ModelConfig) -> dict[str, Any]:
     if config.history_input_version == 1 and config.canonical_head_version == 1:
         payload.pop("history_input_version")
         payload.pop("canonical_head_version")
+        payload.pop("canonical_teacher_count")
     return payload
 
 
@@ -91,6 +98,10 @@ class SearchConfig:
     dirichlet_fraction: float = 0.25
     temperature_moves: int = 24
     temperature: float = 1.0
+    # Q is already bounded to [-1, 1].  This separate temperature converts the
+    # complete all-legal root Q map into an auxiliary policy target; it does not
+    # change move selection or PUCT traversal.
+    implicit_policy_temperature: float = 0.10
     max_plies: int | None = None
     resign_threshold: float | None = -0.98
     resign_min_ply: int = 60
@@ -120,6 +131,11 @@ class SearchConfig:
             raise ValueError("dirichlet_fraction must be between 0 and 1")
         if self.temperature_moves < 0 or self.temperature < 0:
             raise ValueError("temperature settings must be non-negative")
+        if (
+            not math.isfinite(self.implicit_policy_temperature)
+            or self.implicit_policy_temperature <= 0
+        ):
+            raise ValueError("implicit policy temperature must be finite and positive")
         if self.max_plies is not None and self.max_plies < 1:
             raise ValueError("max_plies must be positive when configured")
         if self.resign_threshold is not None and not -1 <= self.resign_threshold <= 0:

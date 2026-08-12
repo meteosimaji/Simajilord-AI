@@ -98,6 +98,26 @@ def test_psv_rejects_non_side_to_move_results(tmp_path: Path) -> None:
         _ = dataset[0]
 
 
+def test_policy_supervised_psv_rejects_value_only_move16_zero(tmp_path: Path) -> None:
+    board = Board()
+    raw = bytearray(
+        board.to_psv(
+            mv=Move.from_usi("7g7f"),
+            score=10,
+            game_result=0,
+            game_ply=1,
+        )
+    )
+    record = np.frombuffer(raw, dtype=PackedSfenValue, count=1)
+    record["move"][0] = 0
+    path = tmp_path / "value-only.psv"
+    path.write_bytes(raw)
+    dataset = PackedSfenValueDataset(path, source_name="value-only-fixture")
+
+    with pytest.raises(ValueError, match="Move16=0 and is value-only"):
+        _ = dataset[0]
+
+
 def test_train_psv_records_ponanza_coefficient_and_tanh_denominator_lineage(
     tmp_path: Path,
 ) -> None:

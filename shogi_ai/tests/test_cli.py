@@ -5,14 +5,19 @@ from pathlib import Path
 
 import pytest
 
+import simajilord_shogi.cli as cli_module
 from simajilord_shogi.cli import (
     _artifact_provenance,
     _depth_pass_inputs,
     _disagreement_teacher_inputs,
     _engine_options,
     _require_limited_local_destinations,
+    _require_suisho11plus_opponent_options,
     _require_suisho11plus_teacher_options,
     _resolve_ponanza_value_scale,
+    _soujou_tsec7_compatibility_receipt,
+    _suisho11plus_compatibility_receipt,
+    _with_required_artifact,
     build_parser,
 )
 from simajilord_shogi.trainer import TrainingInterlockConfig
@@ -179,6 +184,118 @@ def test_suisho11plus_options_require_no_book_fv40_and_yaneuraou_hash(
         _require_suisho11plus_teacher_options(
             {**options, "EvalDir": str(eval_link)}, multipv=8
         )
+
+
+def test_suisho11plus_petashock_is_opponent_only_and_resolves_ybb_fallback(
+    tmp_path: Path,
+) -> None:
+    eval_directory = tmp_path / "eval"
+    eval_directory.mkdir()
+    book_directory = tmp_path / "book"
+    book_directory.mkdir()
+    book = book_directory / "user_book1.ybb"
+    book.write_bytes(b"YANE-BINBOOK-V1 reviewed fixture")
+    common = {
+        "EvalDir": str(eval_directory),
+        "FV_SCALE": "40",
+        "Threads": "1",
+        "USI_Hash": "64",
+        "PvInterval": "0",
+    }
+    petashock = {
+        **common,
+        "USI_OwnBook": "true",
+        "BookFile": "user_book1.db",
+        "BookDir": str(book_directory),
+        "BookMoves": str(cli_module._SUISHO11PLUS_PETASHOCK_FULL_BOOK_MOVES),
+        "BookIgnoreRate": "0",
+        "BookEvalDiff": "0",
+        "BookEvalBlackLimit": "-99999",
+        "BookEvalWhiteLimit": "-99999",
+        "BookDepthLimit": "0",
+        "BookOnTheFly": "true",
+        "ConsiderBookMoveCount": "false",
+        "BookPvMoves": "8",
+        "IgnoreBookPly": "false",
+        "FlippedBook": "false",
+    }
+
+    assert _require_suisho11plus_opponent_options(petashock) == book.resolve()
+    with pytest.raises(ValueError, match=r"usi_ownbook.*false"):
+        _require_suisho11plus_teacher_options(petashock, multipv=8)
+
+    no_book = {
+        **common,
+        "USI_OwnBook": "false",
+        "BookFile": "no_book",
+    }
+    assert _require_suisho11plus_opponent_options(no_book) is None
+
+    with pytest.raises(ValueError, match=r"BookMoves|bookmoves"):
+        incomplete = dict(petashock)
+        incomplete.pop("BookMoves")
+        _require_suisho11plus_opponent_options(incomplete)
+
+    with pytest.raises(ValueError, match=r"BookMoves|bookmoves"):
+        _require_suisho11plus_opponent_options({**petashock, "BookMoves": "16"})
+
+
+def test_suisho11plus_compatibility_receipt_binds_nn_bin_and_diagnostics(
+    tmp_path: Path,
+) -> None:
+    eval_directory = tmp_path / "eval"
+    eval_directory.mkdir()
+    eval_file = eval_directory / "nn.bin"
+    eval_bytes = b"exact reviewed fixture"
+    eval_file.write_bytes(eval_bytes)
+
+    resolved, diagnostics = _suisho11plus_compatibility_receipt(
+        {"EvalDir": str(eval_directory)}
+    )
+
+    assert resolved == eval_file.resolve()
+    assert diagnostics == cli_module._SUISHO11PLUS_EXPECTED_FATAL_STARTUP_DIAGNOSTICS
+    assert _with_required_artifact([], resolved) == [resolved]
+    assert _with_required_artifact([resolved], resolved) == [resolved]
+
+    eval_file.write_bytes(b"")
+    with pytest.raises(ValueError, match="must not be empty"):
+        _suisho11plus_compatibility_receipt({"EvalDir": str(eval_directory)})
+
+
+def test_soujou_tsec7_compatibility_receipt_binds_layer_stack_files(
+    tmp_path: Path,
+) -> None:
+    eval_directory = tmp_path / "eval"
+    eval_directory.mkdir()
+    eval_file = eval_directory / "nn.bin"
+    progress_file = tmp_path / "progress.bin"
+    eval_file.write_bytes(b"reviewed soujou network")
+    progress_file.write_bytes(b"reviewed progress model")
+    options = {
+        "BookFile": "no_book",
+        "EnteringKingRule": "CSARule27",
+        "EvalDir": str(eval_directory),
+        "FV_SCALE": "28",
+        "LS_BUCKET_MODE": "progress8kpabs",
+        "LS_PROGRESS_COEFF": str(progress_file),
+        "PvInterval": "0",
+        "Threads": "1",
+        "USI_Hash": "64",
+        "USI_OwnBook": "false",
+    }
+
+    artifacts, diagnostics = _soujou_tsec7_compatibility_receipt(options)
+
+    assert artifacts == (eval_file.resolve(), progress_file.resolve())
+    assert diagnostics == cli_module._SOUJOU_TSEC7_EXPECTED_FATAL_STARTUP_DIAGNOSTICS
+    assert diagnostics[0] == (
+        "stdout",
+        cli_module._SOUJOU_TSEC7_HEADER_VERSION_DIAGNOSTIC,
+    )
+
+    with pytest.raises(ValueError, match=r"(?i)fv_scale"):
+        _soujou_tsec7_compatibility_receipt({**options, "FV_SCALE": "16"})
 
 
 def test_limited_local_outputs_must_stay_below_explicit_root(tmp_path: Path) -> None:

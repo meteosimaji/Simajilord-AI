@@ -15,17 +15,51 @@ from simajilord_shogi.model_rights import (
     public_distillable_rights_ids,
 )
 
+CURRENT_RIGHTS_IDS = {
+    "aobannue-v1.1",
+    "gikou2-v2.0.2",
+    "hao-2023-05-08",
+    "nagisa-v3.1",
+    "shinden3-2025-02-21",
+    "soujou-tsec7-paid",
+    "suisho11plus-wcsc36-20260525-local",
+    "suisho5",
+    "tanuki-dr4-2023-12-03",
+}
+
+RETIRED_RIGHTS_IDS = {
+    "aobazero-public-domain",
+    "apery-public",
+    "dlshogi-aoba-wcsc35",
+    "dlshogi-dr2-exhi",
+    "dlshogi-gct-wcsc31",
+    "elmo-wcsc27",
+    "gpsfish-public",
+    "hisui-wcsc36-hosted",
+    "kanade-wcsc35-paid",
+    "suisho10-11-supporter",
+    "sunfish4",
+    "takewarabe-approx-v7.50-material9",
+    "tanuki-wcsc36-paid",
+    "yaneuraou-rezero",
+    "zimetu-2026-01-26",
+}
+
 
 def test_rights_registry_has_no_identifier_or_casefold_name_collisions() -> None:
     assert len({record.rights_id for record in MODEL_RIGHTS}) == len(MODEL_RIGHTS)
     assert len({record.name.casefold() for record in MODEL_RIGHTS}) == len(MODEL_RIGHTS)
 
 
+def test_rights_registry_contains_exactly_the_selected_nine_models() -> None:
+    assert len(MODEL_RIGHTS) == 9
+    assert {record.rights_id for record in MODEL_RIGHTS} == CURRENT_RIGHTS_IDS
+
+
 @pytest.mark.parametrize(
     "rights_id",
     [
         "aobannue-v1.1",
-        "dlshogi-gct-wcsc31",
         "nagisa-v3.1",
         "shinden3-2025-02-21",
         "suisho5",
@@ -41,6 +75,13 @@ def test_output_distillation_is_separate_from_artifact_reuse(rights_id: str) -> 
     assert rights_id in distillable_rights_ids()
 
 
+def test_nagisa_progress_router_exception_does_not_approve_weight_copy() -> None:
+    rights = model_rights("nagisa-v3.1")
+
+    assert rights.direct_weight_use == RightsDecision.NOT_APPROVED
+    assert any("progress.bin" in note and "local-only" in note for note in rights.notes)
+
+
 def test_artifacts_with_explicit_terms_retain_their_distinct_decisions() -> None:
     assert model_rights("gikou2-v2.0.2").direct_weight_use == RightsDecision.CONDITIONAL_GPL
     assert model_rights("hao-2023-05-08").direct_weight_use == RightsDecision.CONDITIONAL_GPL
@@ -48,49 +89,34 @@ def test_artifacts_with_explicit_terms_retain_their_distinct_decisions() -> None
         model_rights("tanuki-dr4-2023-12-03").direct_weight_use
         == RightsDecision.CONDITIONAL_GPL
     )
-    assert model_rights("aobazero-public-domain").direct_weight_use == RightsDecision.ALLOWED
-    assert model_rights("yaneuraou-rezero").direct_weight_use == RightsDecision.ALLOWED
-    apery = model_rights("apery-public")
-    assert apery.direct_weight_use == RightsDecision.ALLOWED
-    assert apery.original_artifact_redistribution == RightsDecision.ALLOWED
 
 
-def test_takewarabe_approximation_is_an_opponent_without_external_weights() -> None:
-    takewarabe = model_rights("takewarabe-approx-v7.50-material9")
-
-    assert takewarabe.analysis == RightsDecision.ALLOWED
-    assert takewarabe.hard_game_training == RightsDecision.ALLOWED
-    assert takewarabe.direct_weight_use == RightsDecision.NOT_APPLICABLE
-    assert takewarabe.original_artifact_redistribution == RightsDecision.CONDITIONAL_GPL
-    assert takewarabe.rights_id in distillable_rights_ids()
-
-
-def test_separate_dlshogi_model_terms_override_general_gpl_output_default() -> None:
-    restricted = model_rights("dlshogi-dr2-exhi")
-
-    assert restricted.output_distillation == RightsDecision.NOT_APPROVED
-    assert restricted.hard_game_training == RightsDecision.LIMITED
-    assert restricted.rights_id not in distillable_rights_ids()
-
-
-def test_gikou_is_approved_but_hosted_hisui_is_not_locally_distillable() -> None:
+def test_selected_public_profiles_are_approved_for_analysis_and_distillation() -> None:
     approved = set(distillable_rights_ids())
     analysable = set(analysable_rights_ids())
 
-    assert "gikou2-v2.0.2" in approved
-    assert "hao-2023-05-08" in approved
-    assert "shinden3-2025-02-21" in approved
-    assert "tanuki-dr4-2023-12-03" in approved
-    assert "tanuki-wcsc36-paid" not in approved
-    assert "hisui-wcsc36-hosted" not in approved
-    assert "hisui-wcsc36-hosted" not in analysable
+    assert approved == {
+        "aobannue-v1.1",
+        "gikou2-v2.0.2",
+        "hao-2023-05-08",
+        "nagisa-v3.1",
+        "shinden3-2025-02-21",
+        "suisho5",
+        "tanuki-dr4-2023-12-03",
+    }
     assert approved <= analysable
-    with pytest.raises(PermissionError, match="not approved for analysis"):
-        model_rights("hisui-wcsc36-hosted").teacher_policy().require_analysis_permission()
 
 
-def test_suisho11plus_is_explicit_local_only_and_never_public_by_default() -> None:
-    rights_id = "suisho11plus-wcsc36-20260525-local"
+@pytest.mark.parametrize(
+    "rights_id",
+    [
+        "suisho11plus-wcsc36-20260525-local",
+        "soujou-tsec7-paid",
+    ],
+)
+def test_reviewed_paid_teacher_is_explicit_local_only_and_never_public_by_default(
+    rights_id: str,
+) -> None:
     rights = model_rights(rights_id)
 
     assert rights.analysis == RightsDecision.LIMITED
@@ -101,7 +127,7 @@ def test_suisho11plus_is_explicit_local_only_and_never_public_by_default() -> No
     assert rights_id not in distillable_rights_ids()
     assert rights_id not in public_distillable_rights_ids()
     assert rights_id in locally_distillable_rights_ids()
-    assert local_only_distillable_rights_ids() == (rights_id,)
+    assert rights_id in local_only_distillable_rights_ids()
     with pytest.raises(PermissionError, match="public-release-safe teacher set"):
         rights.teacher_policy().require_training_permission()
 
@@ -110,6 +136,13 @@ def test_suisho11plus_is_explicit_local_only_and_never_public_by_default() -> No
     assert local_policy.training_outputs_local_only
     assert not local_policy.redistribution_allowed
     assert not local_policy.requires_explicit_local_authorization
+
+
+def test_local_only_teacher_registry_contains_exact_reviewed_profiles() -> None:
+    assert set(local_only_distillable_rights_ids()) == {
+        "soujou-tsec7-paid",
+        "suisho11plus-wcsc36-20260525-local",
+    }
 
 
 def test_rights_scopes_partition_the_registry_without_using_price_as_a_gate() -> None:
@@ -124,6 +157,16 @@ def test_rights_scopes_partition_the_registry_without_using_price_as_a_gate() ->
         record.rights_id for record in MODEL_RIGHTS
     }
     assert public | local_only == set(locally_distillable_rights_ids())
+    assert not not_authorized
+
+
+@pytest.mark.parametrize("rights_id", sorted(RETIRED_RIGHTS_IDS))
+def test_retired_profiles_fail_closed(rights_id: str) -> None:
+    assert rights_id not in CURRENT_RIGHTS_IDS
+    assert rights_id not in analysable_rights_ids()
+    assert rights_id not in locally_distillable_rights_ids()
+    with pytest.raises(ValueError, match="unknown model-rights profile"):
+        model_rights(rights_id)
 
 
 def test_unknown_rights_profile_fails_closed() -> None:

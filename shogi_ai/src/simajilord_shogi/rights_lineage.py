@@ -203,10 +203,7 @@ def _assemble_summary(
         "schema": RIGHTS_RESTRICTION_SUMMARY_SCHEMA,
         "publication_allowed": not restriction_ids,
         "sidecar_sha256s": sorted(
-            {
-                _require_sha256(item, label="teacher sidecar SHA-256")
-                for item in sidecar_sha256s
-            }
+            {_require_sha256(item, label="teacher sidecar SHA-256") for item in sidecar_sha256s}
         ),
         "sources": ordered_rows,
         "inherited_restriction_ids": inherited,
@@ -239,11 +236,7 @@ def summarize_teacher_sidecar(
         decision = _registry_decision(rights_id)
         reported = rights_value.get("output_only_meteo_publication")
         reported_matches = reported is None or reported == decision
-        allowed = (
-            not blocked
-            and decision == RightsDecision.ALLOWED.value
-            and reported_matches
-        )
+        allowed = not blocked and decision == RightsDecision.ALLOWED.value and reported_matches
         observations[rights_id] = observations.get(rights_id, True) and allowed
 
     def visit(value: object, *, inherited_blocked: bool) -> bool:
@@ -266,18 +259,14 @@ def summarize_teacher_sidecar(
             for key in sorted(mapping):
                 if key == "rights" and isinstance(rights_value, dict):
                     continue
-                found_rights = (
-                    visit(mapping[key], inherited_blocked=blocked) or found_rights
-                )
+                found_rights = visit(mapping[key], inherited_blocked=blocked) or found_rights
             if local_blocked and not found_rights:
                 unattributed_block = True
             return found_rights
         elif isinstance(value, list):
             found_rights = False
             for item in value:
-                found_rights = (
-                    visit(item, inherited_blocked=inherited_blocked) or found_rights
-                )
+                found_rights = visit(item, inherited_blocked=inherited_blocked) or found_rights
             return found_rights
         return False
 
@@ -291,9 +280,7 @@ def summarize_teacher_sidecar(
         for rights_id, allowed in observations.items()
     }
     unattributed = (
-        [_unattributed_sidecar_restriction_id(sidecar_sha256)]
-        if unattributed_block
-        else []
+        [_unattributed_sidecar_restriction_id(sidecar_sha256)] if unattributed_block else []
     )
     summary = _assemble_summary(
         rows=rows,
@@ -347,9 +334,7 @@ def validate_rights_restriction_summary(
             "restriction_ids",
         }:
             raise ValueError("teacher rights source fields do not match its schema")
-        rights_id = _require_rights_id(
-            source["rights_id"], label="teacher rights source rights_id"
-        )
+        rights_id = _require_rights_id(source["rights_id"], label="teacher rights source rights_id")
         if rights_id in rows:
             raise ValueError("duplicate teacher rights source")
         decision = source["decision"]
@@ -502,9 +487,7 @@ def expected_lineage_rights_summary(
     if not isinstance(raw_inputs, list):
         raise ValueError("training lineage training_inputs must be a list")
     for input_index, raw_input in enumerate(raw_inputs):
-        training_input = _mapping(
-            raw_input, label=f"training lineage input {input_index}"
-        )
+        training_input = _mapping(raw_input, label=f"training lineage input {input_index}")
         raw_sidecars = training_input.get("lineage_sidecars", [])
         if not isinstance(raw_sidecars, list):
             raise ValueError("training lineage sidecars must be a list")
@@ -523,20 +506,14 @@ def expected_lineage_rights_summary(
                 )
             summary = validate_rights_restriction_summary(raw_summary)
             if summary["sidecar_sha256s"] != [sidecar_sha256]:
-                raise ValueError(
-                    "lineage sidecar rights summary is not bound to its exact SHA-256"
-                )
+                raise ValueError("lineage sidecar rights summary is not bound to its exact SHA-256")
             current_sidecars.append(summary)
 
     raw_canonical_summary = lineage.get("canonical_target_rights_restriction_summary")
     if raw_canonical_summary is not None:
         if not isinstance(raw_canonical_summary, dict):
-            raise ValueError(
-                "canonical target rights restriction summary must be a JSON object"
-            )
-        current_sidecars.append(
-            validate_rights_restriction_summary(raw_canonical_summary)
-        )
+            raise ValueError("canonical target rights restriction summary must be a JSON object")
+        current_sidecars.append(validate_rights_restriction_summary(raw_canonical_summary))
 
     current = merge_rights_restriction_summaries(
         current_sidecars,
@@ -546,11 +523,19 @@ def expected_lineage_rights_summary(
     raw_parent = lineage.get("parent_checkpoint")
     if isinstance(raw_parent, dict):
         parent = _mapping(raw_parent, label="training lineage parent checkpoint")
+        raw_parent_summary = parent.get("rights_restriction_summary")
+        if raw_parent_summary is not None:
+            if not isinstance(raw_parent_summary, dict):
+                raise ValueError(
+                    "parent checkpoint rights restriction summary must be a JSON object"
+                )
+            parent_summary = validate_rights_restriction_summary(raw_parent_summary)
+            return merge_rights_restriction_summaries([parent_summary, current])
+        if parent.get("legacy_teacher_lineage_summary_missing") is True:
+            return merge_rights_restriction_summaries([current], legacy_parent_missing_summary=True)
         raw_parent_lineage = parent.get("lineage")
         if isinstance(raw_parent_lineage, dict):
-            parent_lineage = _mapping(
-                raw_parent_lineage, label="parent checkpoint lineage"
-            )
+            parent_lineage = _mapping(raw_parent_lineage, label="parent checkpoint lineage")
 
     if parent_lineage is None:
         return current

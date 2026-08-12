@@ -119,6 +119,15 @@ class PositionSample:
     actor_source: str | None = None
     actor_peak_tree_nodes: int | None = None
     actor_tree_recycles: int = 0
+    actor_resignation_overridden: bool = False
+    # Complete root-search evidence.  The implicit policy is derived only when
+    # these maps exactly cover every legal move and every move has a real visit.
+    # Proven immediate mates are a set-valued target and intentionally leave
+    # ``actor_implicit_policy`` empty instead of inventing a dense distribution.
+    actor_move_values: dict[str, float] | None = None
+    actor_move_visits: dict[str, int] | None = None
+    actor_implicit_policy: dict[str, float] | None = None
+    actor_proven_mate_moves: tuple[str, ...] = ()
     teacher_best_move: str | None = None
     teacher_regret: float | None = None
     teacher_regret_is_lower_bound: bool = False
@@ -129,9 +138,28 @@ class PositionSample:
     teacher_depth: int | None = None
     teacher_source: str | None = None
     teacher_context: str | None = None
+    teacher_move_values: dict[str, float] | None = None
+    teacher_move_visits: dict[str, int] | None = None
+    teacher_implicit_policy: dict[str, float] | None = None
+    teacher_proven_mate_moves: tuple[str, ...] = ()
     teacher_variations: tuple[TeacherVariation, ...] | None = None
     teacher_policy_temperature: float | None = None
     teacher_value_scale: float | None = None
+    # Exact full-budget evaluation of the move actually played.  A normal
+    # MultiPV row may omit that move, so this evidence comes from a separate
+    # USI ``searchmoves <chosen_move>`` branch search and must not be inferred
+    # from the worst visible candidate.
+    teacher_played_move_value: float | None = None
+    teacher_played_move_nodes: int | None = None
+    teacher_played_move_time_ms: int | None = None
+    teacher_played_move_nps: int | None = None
+    teacher_played_move_depth: int | None = None
+    teacher_played_move_exact: bool = False
+    teacher_played_move_variation: TeacherVariation | None = None
+    # In-memory self-play replay annotation.  A value of one is the actionable
+    # position immediately before the mating move; terminal boards themselves
+    # have no legal policy target and are never added as samples.
+    terminal_checkmate_distance: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,10 +167,19 @@ class PositionSample:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> PositionSample:
         fields = dict(value)
+        for field_name in ("actor_proven_mate_moves", "teacher_proven_mate_moves"):
+            moves = fields.get(field_name)
+            if moves is not None:
+                fields[field_name] = tuple(str(move) for move in moves)
         variations = fields.get("teacher_variations")
         if variations is not None:
             fields["teacher_variations"] = tuple(
                 TeacherVariation.from_dict(variation) for variation in variations
+            )
+        played_variation = fields.get("teacher_played_move_variation")
+        if played_variation is not None:
+            fields["teacher_played_move_variation"] = TeacherVariation.from_dict(
+                played_variation
             )
         return cls(**fields)
 

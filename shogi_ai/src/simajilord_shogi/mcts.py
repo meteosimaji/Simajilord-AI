@@ -8,8 +8,8 @@ from time import perf_counter
 
 import numpy as np
 from rsshogi.core import Board, Move
-from rsshogi.types import RepetitionState
 
+from .adjudication import adjudicate_board
 from .config import SearchConfig
 from .evaluator import Evaluation, Evaluator, normalize_legal_policy
 from .memory import SearchMemoryGuard
@@ -51,6 +51,7 @@ class _LeafReservation:
 class SearchResult:
     policy: dict[str, float]
     q_values: dict[str, float]
+    root_visits: dict[str, int]
     root_value: float
     best_move: str
     simulations: int
@@ -64,18 +65,12 @@ class SearchResult:
 def terminal_value(board: Board) -> float | None:
     """Value from the current side-to-move perspective, or None if playable."""
 
-    repetition = board.repetition_state()
-    if repetition == RepetitionState.WIN or repetition == RepetitionState.SUPERIOR:
-        return 1.0
-    if repetition == RepetitionState.LOSE or repetition == RepetitionState.INFERIOR:
-        return -1.0
-    if repetition == RepetitionState.DRAW:
+    adjudication = adjudicate_board(board)
+    if adjudication is None:
+        return None
+    if adjudication.winner is None:
         return 0.0
-    if board.can_declare_win():
-        return 1.0
-    if board.is_mated() or not board.legal_moves():
-        return -1.0
-    return None
+    return 1.0 if adjudication.winner == board.turn.value else -1.0
 
 
 class MCTS:
@@ -360,6 +355,7 @@ class MCTS:
         return SearchResult(
             policy=policy,
             q_values=q_values,
+            root_visits=visits,
             root_value=float(root_value),
             best_move=best_move,
             simulations=simulations,

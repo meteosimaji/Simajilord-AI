@@ -1,0 +1,18 @@
+[package]
+name = "meteo-mlx-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+nnue-format = { path = "../tatara/crates/nnue-format" }
+nnue-train = { path = "../tatara/crates/nnue-train" }
+rayon = "1.11"
+safetensors = "0.6"
+shogi-features = { path = "../tatara/crates/shogi-features" }
+shogi-format = { path = "../tatara/crates/shogi-format" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"

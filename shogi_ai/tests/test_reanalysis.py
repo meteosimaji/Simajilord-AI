@@ -16,6 +16,7 @@ from simajilord_shogi.external_usi import ExternalTeacherPolicy, ExternalUsiTeac
 from simajilord_shogi.reanalysis import (
     reanalyse_game,
     reanalyse_game_external,
+    reanalyse_games,
     sample_weight,
 )
 from simajilord_shogi.replay import append_games, load_games
@@ -37,6 +38,23 @@ class _HistoryInspectingEvaluator:
             policy={move: 1.0 / len(legal) for move in legal},
             value=0.0,
         )
+
+
+class _BatchInspectingEvaluator:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    @staticmethod
+    def evaluate(board: Board) -> Evaluation:
+        legal = [move.to_usi() for move in board.legal_moves()]
+        return Evaluation(
+            policy={move: 1.0 / len(legal) for move in legal},
+            value=0.0,
+        )
+
+    def evaluate_batch(self, boards: list[Board]) -> list[Evaluation]:
+        self.batch_sizes.append(len(boards))
+        return [self.evaluate(board) for board in boards]
 
 
 def test_same_position_deep_reanalysis_records_policy_reversal() -> None:
@@ -121,6 +139,52 @@ def test_same_model_reanalysis_preserves_the_exact_game_prefix() -> None:
     assert evaluator.calls > 0
 
 
+def test_same_model_reanalysis_batches_independent_game_positions() -> None:
+    boards: list[Board] = []
+    board = Board()
+    for _index in range(4):
+        boards.append(Board(board.to_sfen()))
+        board.apply_move(board.legal_moves()[0])
+    games: list[GameRecord] = []
+    for item in boards:
+        legal_move = item.legal_moves()[0].to_usi()
+        sample = PositionSample(
+            sfen=item.to_sfen(),
+            ply=0,
+            turn=item.turn.value,
+            policy={legal_move: 1.0},
+            root_value=0.0,
+            chosen_move=legal_move,
+            actor_best_move=legal_move,
+            actor_simulations=1,
+        )
+        games.append(
+            GameRecord(
+                initial_sfen=item.to_sfen(),
+                moves=(),
+                samples=(sample,),
+                winner=None,
+                termination=Termination.AGREED_DRAW,
+            )
+        )
+    evaluator = _BatchInspectingEvaluator()
+
+    revised = reanalyse_games(
+        games,
+        evaluator,
+        SearchConfig(simulations=1, root_min_visits=1, dirichlet_fraction=0),
+        ReanalysisConfig(
+            teacher_simulation_multiplier=2,
+            minimum_teacher_simulations=2,
+            reanalyse_fraction=1.0,
+        ),
+        max_parallel_positions=4,
+    )
+
+    assert max(evaluator.batch_sizes) == 4
+    assert all(game.samples[0].teacher_policy is not None for game in revised)
+
+
 def test_external_tactical_reanalysis_records_versioned_teacher_source(
     tmp_path: Path,
 ) -> None:
@@ -136,14 +200,23 @@ for raw in sys.stdin:
     elif command == 'isready':
         print('readyok', flush=True)
     elif command.startswith('go '):
-        print(
-            'info depth 8 multipv 1 score cp 1200 nodes 321 time 10 nps 32100 pv G*5b',
-            flush=True,
-        )
-        print(
-            'info depth 8 multipv 2 score cp -100 nodes 321 time 10 nps 32100 pv 6c7d',
-            flush=True,
-        )
+        if ' searchmoves ' in command:
+            move = command.rsplit(' searchmoves ', 1)[1]
+            score = 1200 if move == 'G*5b' else -100
+            print(
+                f'info depth 8 multipv 1 score cp {score} nodes 321 '
+                f'time 10 nps 32100 pv {move}',
+                flush=True,
+            )
+        else:
+            print(
+                'info depth 8 multipv 1 score cp 1200 nodes 321 time 10 nps 32100 pv G*5b',
+                flush=True,
+            )
+            print(
+                'info depth 8 multipv 2 score cp -100 nodes 321 time 10 nps 32100 pv 6c7d',
+                flush=True,
+            )
         print('bestmove G*5b', flush=True)
     elif command == 'quit':
         break
@@ -209,6 +282,14 @@ for raw in sys.stdin:
     assert revised_sample.teacher_variations[0].pv == ("G*5b",)
     assert revised_sample.teacher_policy_temperature == 250.0
     assert revised_sample.teacher_value_scale == 750.0
+    assert revised_sample.teacher_played_move_value == revised_sample.teacher_value
+    assert revised_sample.teacher_played_move_nodes == 321
+    assert revised_sample.teacher_played_move_time_ms == 10
+    assert revised_sample.teacher_played_move_nps == 32100
+    assert revised_sample.teacher_played_move_depth == 8
+    assert revised_sample.teacher_played_move_exact
+    assert revised_sample.teacher_played_move_variation is not None
+    assert revised_sample.teacher_played_move_variation.move == "G*5b"
     assert not revised_sample.policy_reversal
 
     serialized = json.loads(json.dumps(revised.to_dict()))
@@ -216,6 +297,92 @@ for raw in sys.stdin:
     assert restored.teacher_variations == revised_sample.teacher_variations
     assert restored.teacher_policy_temperature == 250.0
     assert restored.teacher_value_scale == 750.0
+    assert (
+        restored.teacher_played_move_variation
+        == revised_sample.teacher_played_move_variation
+    )
+
+
+def test_external_reanalysis_scores_an_omitted_played_move_with_searchmoves(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_branch_usi.py"
+    script.write_text(
+        """import sys
+for raw in sys.stdin:
+    command = raw.strip()
+    if command == 'usi':
+        print('id name fake-branch', flush=True)
+        print('option name MultiPV type spin default 1 min 1 max 32', flush=True)
+        print('usiok', flush=True)
+    elif command == 'isready':
+        print('readyok', flush=True)
+    elif command.startswith('go '):
+        if ' searchmoves ' in command:
+            move = command.rsplit(' searchmoves ', 1)[1]
+            score = -300 if move == '6c7d' else 1200
+            print(f'info depth 10 score cp {score} nodes 500 pv {move}', flush=True)
+            print(f'bestmove {move}', flush=True)
+        else:
+            print('info depth 10 multipv 1 score cp 1200 nodes 500 pv G*5b', flush=True)
+            print('bestmove G*5b', flush=True)
+    elif command == 'quit':
+        break
+""",
+        encoding="utf-8",
+    )
+    sample = PositionSample(
+        sfen=MATE_IN_ONE_SFEN,
+        ply=0,
+        turn=0,
+        policy={"6c7d": 1.0},
+        root_value=0.0,
+        chosen_move="6c7d",
+        actor_best_move="6c7d",
+        actor_simulations=8,
+    )
+    game = GameRecord(
+        initial_sfen=MATE_IN_ONE_SFEN,
+        moves=("6c7d",),
+        samples=(sample,),
+        winner=None,
+        termination=Termination.RESIGNATION,
+    )
+    policy = ExternalTeacherPolicy(
+        policy_id="test-exact-played-move",
+        name="exact-played-move",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+
+    with ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=500,
+        multipv=1,
+        value_scale=1_200.0,
+    ) as teacher:
+        revised = reanalyse_game_external(
+            game,
+            teacher,
+            ReanalysisConfig(reanalyse_fraction=1.0),
+            selection="all",
+        )
+
+    result = revised.samples[0]
+    assert result.teacher_best_move == "G*5b"
+    assert result.teacher_policy is not None
+    assert "6c7d" not in result.teacher_policy
+    assert result.teacher_played_move_value == pytest.approx(
+        -0.24491866240370913
+    )
+    assert result.teacher_played_move_exact
+    assert result.teacher_regret == pytest.approx(
+        0.7615941559557649 - (-0.24491866240370913)
+    )
+    assert not result.teacher_regret_is_lower_bound
 
 
 def test_external_reanalysis_cli_defaults_to_c600_and_records_both_scales(
@@ -234,8 +401,13 @@ for raw in sys.stdin:
     elif command == 'isready':
         print('readyok', flush=True)
     elif command.startswith('go '):
-        print('info depth 8 multipv 1 score cp 1200 nodes 321 pv G*5b', flush=True)
-        print('info depth 8 multipv 2 score cp -100 nodes 321 pv 6c7d', flush=True)
+        if ' searchmoves ' in command:
+            move = command.rsplit(' searchmoves ', 1)[1]
+            score = 1200 if move == 'G*5b' else -100
+            print(f'info depth 8 multipv 1 score cp {score} nodes 321 pv {move}', flush=True)
+        else:
+            print('info depth 8 multipv 1 score cp 1200 nodes 321 pv G*5b', flush=True)
+            print('info depth 8 multipv 2 score cp -100 nodes 321 pv 6c7d', flush=True)
         print('bestmove G*5b', flush=True)
     elif command == 'quit':
         break
@@ -308,6 +480,9 @@ for raw in sys.stdin:
     assert provenance["history_mode"] == "game_prefix"
     assert provenance["history_mode_missing_field_means"] == "board_only"
     assert provenance["history_source"] == "GameRecord.initial_sfen + moves[:PositionSample.ply]"
+    assert provenance["played_moves_searchmoves_evaluated"] == 1
+    assert provenance["played_moves_exact_bound"] == 1
+    assert provenance["reported_played_move_search_nodes"] == 321
 
     legacy_output = tmp_path / "teacher-legacy-scale600.jsonl"
     assert (
@@ -434,6 +609,12 @@ for raw in sys.stdin:
 
     assert command_log.read_text(encoding="utf-8").splitlines() == [
         "position startpos",
+        "position startpos",
+        "position startpos moves 7g7f",
         "position startpos moves 7g7f",
     ]
     assert [sample.teacher_best_move for sample in revised.samples] == ["7g7f", "3c3d"]
+    assert all(sample.teacher_played_move_exact for sample in revised.samples)
+    assert [sample.teacher_played_move_value for sample in revised.samples] == [
+        sample.teacher_value for sample in revised.samples
+    ]

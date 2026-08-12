@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -41,20 +42,36 @@ def test_v2_binds_runtime_rights_history_and_independent_teacher_targets(
     assert loaded.play_eligible_positions == 1
     assert loaded.unresolved_positions == 0
     assert loaded.rights_restriction_summary["publication_allowed"] is False
-    assert loaded.positions[0].play.kind is PlayTargetKind.ROBUST_CONSENSUS
-    assert loaded.positions[0].play.policy == {"2g2f": 1.0}
+    assert loaded.positions[0].play.kind is PlayTargetKind.UNANIMOUS_CONSENSUS
+    assert set(loaded.positions[0].play.policy) == {"2g2f", "7g7f"}
+    assert loaded.positions[0].play.policy["2g2f"] > loaded.positions[0].play.policy["7g7f"]
+    assert math.fsum(loaded.positions[0].play.policy.values()) == pytest.approx(1.0)
     assert loaded.positions[0].play.robust_best_moves == ("2g2f",)
-    assert loaded.positions[0].scorers[0].value < 0.0
-    assert loaded.positions[0].scorers[1].value > 0.0
+    assert len(loaded.positions[0].reply_proposals) == 2
+    assert len(loaded.positions[0].reply_proposals[0].candidates[0].proposals) == 3
+    assert (
+        loaded.positions[0].reply_proposals[0].candidates[0].reply_moves
+        == tuple(
+            reply.move
+            for reply in loaded.positions[0]
+            .score_matrix[0]
+            .budgets[0]
+            .candidates[0]
+            .principal_replies
+        )
+    )
+    assert loaded.positions[0].scorers[0].value > 0.0
+    assert loaded.positions[0].scorers[0].value < loaded.positions[0].scorers[2].value
+    assert loaded.positions[0].scorers[2].value < loaded.positions[0].scorers[1].value
+    assert loaded.positions[0].unanimous_bootstrap.best_move == "2g2f"
+    assert loaded.positions[0].unanimous_bootstrap.stable_across_budgets is True
     reply = loaded.positions[0].score_matrix[0].budgets[0].candidates[0].principal_replies[0]
     assert reply.root_player_sign == -1
     assert reply.score_cp is not None
     assert reply.reported_nodes == 100
     assert reply.pv == (reply.move,)
     assert set(loaded.positions[0].disagreement_reasons) == {
-        CanonicalDisagreementReason.TEACHER_BEST_MOVE,
         CanonicalDisagreementReason.TEACHER_POLICY_DISTRIBUTION,
-        CanonicalDisagreementReason.TEACHER_VALUE_SIGN,
     }
     assert resolve_canonical_target_sidecar_v2(replay) == sidecar.resolve()
 
@@ -76,6 +93,30 @@ def test_v2_empty_or_incomplete_consensus_stays_out_of_training(tmp_path: Path) 
     assert target.play.train_play is False
     assert target.play.additional_search_required is True
     assert target.uncertainty_target == 1.0
+
+
+def test_v2_round_zero_rejects_cross_teacher_top1_disagreement(tmp_path: Path) -> None:
+    replay = tmp_path / "actor.jsonl"
+    game = write_canonical_v2_replay(replay)
+    sidecar = tmp_path / "targets.json"
+    write_canonical_v2_sidecar(
+        sidecar,
+        build_canonical_v2_payload(replay, game, unanimous=False),
+    )
+
+    loaded = load_canonical_target_sidecar_v2(replay, sidecar, games=[game])
+    target = loaded.positions[0]
+
+    assert target.play.kind is PlayTargetKind.UNRESOLVED
+    assert target.play.train_play is False
+    assert target.play.additional_search_required is True
+    assert target.unanimous_bootstrap.best_move is None
+    assert target.unanimous_bootstrap.unanimous_across_teachers is False
+    assert target.unanimous_bootstrap.value_sign_compatible is False
+    assert CanonicalDisagreementReason.TEACHER_TOP1_NOT_UNANIMOUS in (
+        target.disagreement_reasons
+    )
+    assert CanonicalDisagreementReason.VALUE_SIGN_CONFLICT in target.disagreement_reasons
 
 
 def test_v2_arbitrary_opening_root_matches_inference_history_completeness(
@@ -142,7 +183,7 @@ def test_v2_rejects_missing_family_reply_and_mismatched_search_settings(
     candidates[0]["principal_replies"] = []
     candidates[0]["pv"] = [candidates[0]["move"]]
     write_canonical_v2_sidecar(sidecar, payload)
-    with pytest.raises(ValueError, match="at least one scored principal reply"):
+    with pytest.raises(ValueError, match="cross-teacher proposal union"):
         load_canonical_target_sidecar_v2(replay, sidecar, games=[game])
 
     payload = build_canonical_v2_payload(replay, game)
@@ -162,7 +203,7 @@ def test_v2_rejects_missing_family_reply_and_mismatched_search_settings(
         removed["reported_nodes"]
     )
     write_canonical_v2_sidecar(sidecar, payload)
-    with pytest.raises(ValueError, match="scoring every legal reply"):
+    with pytest.raises(ValueError, match="cross-teacher proposal union"):
         load_canonical_target_sidecar_v2(replay, sidecar, games=[game])
 
     payload = build_canonical_v2_payload(replay, game)
@@ -277,7 +318,7 @@ def test_v2_requires_per_family_candidate_and_provenance_receipts(
         ("value", 0.0, "teacher value does not match"),
         (
             "policy",
-            {"2g2f": 0.4, "7g7f": 0.6},
+            {"2g2f": 0.9, "7g7f": 0.1},
             "teacher policy does not match",
         ),
     ],
@@ -378,7 +419,7 @@ def test_bad_opponent_replies_do_not_make_a_sound_worst_reply_unstable(
 
     loaded = load_canonical_target_sidecar_v2(replay, sidecar, games=[game])
 
-    assert loaded.positions[0].play.kind is PlayTargetKind.ROBUST_CONSENSUS
+    assert loaded.positions[0].play.kind is PlayTargetKind.UNANIMOUS_CONSENSUS
     assert CanonicalDisagreementReason.REPLY_INSTABILITY not in (
         loaded.positions[0].disagreement_reasons
     )
@@ -438,11 +479,11 @@ def test_reported_mate_without_internal_proof_cannot_train_play_head(
     assert loaded.positions[0].play.kind is PlayTargetKind.UNRESOLVED
 
 
-def test_v1_sidecar_is_rejected_for_the_structural_midpoint_bug(tmp_path: Path) -> None:
+def test_v1_sidecar_is_rejected_for_the_structural_mean_bug(tmp_path: Path) -> None:
     replay = tmp_path / "actor.jsonl"
     game = write_canonical_v2_replay(replay)
     sidecar = tmp_path / "targets.json"
     sidecar.write_text(json.dumps(build_v1_payload(replay, game)) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="arithmetic midpoint"):
+    with pytest.raises(ValueError, match="arithmetic mean"):
         load_canonical_target_sidecar_v2(replay, sidecar, games=[game])

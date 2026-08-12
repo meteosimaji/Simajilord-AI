@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -26,6 +27,14 @@ from .trainer import TrainingState, TrainingTracePoint
 
 FORMAT_VERSION = 1
 TRAINING_STATE_SCHEMA = "meteo-exact-training-state-v1"
+CHECKPOINT_IDENTITY_SCHEMA = "meteo-bounded-checkpoint-identity-v1"
+CHECKPOINT_COMPLETE_SCHEMA = "meteo-checkpoint-complete-v1"
+CHECKPOINT_COMPLETE_MARKER = "COMPLETE.json"
+# Checkpoint metadata is control-plane data, not a place to copy prior
+# checkpoints.  One MiB is ample for the model contract, direct-parent
+# identity, rights summary, and exact-resume file receipts while making a
+# recursively embedded ancestry fail before another large artifact is written.
+MAX_CHECKPOINT_METADATA_BYTES = 1024 * 1024
 
 
 def _sha256_file(path: Path) -> str:
@@ -34,6 +43,268 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _reject_duplicate_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> object:
+    raise ValueError(f"non-finite JSON constant is forbidden: {value}")
+
+
+def _read_strict_json(path: Path, *, label: str) -> object:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        return json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(f"{label} is not valid strict UTF-8 JSON: {path}") from error
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_bytes_durable(path: Path, payload: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _checkpoint_file_records(directory: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for child in sorted(directory.iterdir(), key=lambda item: item.name):
+        if child.name == CHECKPOINT_COMPLETE_MARKER:
+            continue
+        if child.is_symlink() or not child.is_file():
+            raise ValueError(f"checkpoint contains a non-regular artifact: {child}")
+        records.append(
+            {
+                "name": child.name,
+                "sha256": _sha256_file(child),
+                "bytes": child.stat().st_size,
+            }
+        )
+    return records
+
+
+def _complete_marker_payload(directory: Path, *, step: int) -> dict[str, object]:
+    records = _checkpoint_file_records(directory)
+    return {
+        "schema": CHECKPOINT_COMPLETE_SCHEMA,
+        "format_version": FORMAT_VERSION,
+        "step": step,
+        "files": records,
+        "file_count": len(records),
+        "total_bytes": sum(cast(int, record["bytes"]) for record in records),
+    }
+
+
+def validate_checkpoint_complete(
+    directory: Path,
+    *,
+    require_marker: bool = False,
+) -> dict[str, object] | None:
+    """Verify the durable completion marker when present.
+
+    Markerless format-v1 checkpoints remain readable for backward compatibility.
+    A checkpoint carrying a marker, however, is accepted only when the marker
+    names every other top-level artifact and every byte count and hash matches.
+    """
+
+    directory = directory.expanduser()
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError(f"checkpoint must be a non-symlink directory: {directory}")
+    marker_path = directory / CHECKPOINT_COMPLETE_MARKER
+    if marker_path.is_symlink():
+        raise ValueError(f"checkpoint completion marker must not be a symlink: {marker_path}")
+    if not marker_path.exists():
+        if require_marker:
+            raise ValueError(f"checkpoint completion marker is missing: {marker_path}")
+        return None
+    if not marker_path.is_file():
+        raise ValueError(f"checkpoint completion marker is not a regular file: {marker_path}")
+    raw_marker = _read_strict_json(marker_path, label="checkpoint completion marker")
+    marker = _mapping(raw_marker, label="checkpoint completion marker")
+    expected_keys = {
+        "schema",
+        "format_version",
+        "step",
+        "files",
+        "file_count",
+        "total_bytes",
+    }
+    if set(marker) != expected_keys:
+        raise ValueError("checkpoint completion marker fields do not match its schema")
+    if marker["schema"] != CHECKPOINT_COMPLETE_SCHEMA:
+        raise ValueError("unsupported checkpoint completion marker schema")
+    if marker["format_version"] != FORMAT_VERSION:
+        raise ValueError("checkpoint completion marker format version is unsupported")
+    if not isinstance(marker["step"], int) or marker["step"] < 0:
+        raise ValueError("checkpoint completion marker step must be non-negative")
+    raw_records = marker["files"]
+    if not isinstance(raw_records, list):
+        raise ValueError("checkpoint completion marker files must be a list")
+    records: list[dict[str, object]] = []
+    names: set[str] = set()
+    for raw_record in raw_records:
+        record = _mapping(raw_record, label="checkpoint completion file record")
+        if set(record) != {"name", "sha256", "bytes"}:
+            raise ValueError("checkpoint completion file record fields are invalid")
+        name = record["name"]
+        digest = record["sha256"]
+        byte_count = record["bytes"]
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name == CHECKPOINT_COMPLETE_MARKER
+            or name in names
+        ):
+            raise ValueError("checkpoint completion marker contains an unsafe or duplicate name")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError(f"checkpoint completion marker has an invalid SHA-256 for {name}")
+        if not isinstance(byte_count, int) or byte_count < 0:
+            raise ValueError(f"checkpoint completion marker has an invalid byte count for {name}")
+        names.add(name)
+        records.append(record)
+    actual_records = _checkpoint_file_records(directory)
+    if records != actual_records:
+        raise ValueError("checkpoint completion marker does not match checkpoint artifacts")
+    if marker["file_count"] != len(records):
+        raise ValueError("checkpoint completion marker file count is inconsistent")
+    if marker["total_bytes"] != sum(cast(int, record["bytes"]) for record in records):
+        raise ValueError("checkpoint completion marker byte count is inconsistent")
+    return cast(dict[str, object], marker)
+
+
+def _read_checkpoint_metadata(directory: Path) -> dict[str, Any]:
+    marker = validate_checkpoint_complete(directory)
+    metadata_path = directory / "metadata.json"
+    if not metadata_path.is_file() or metadata_path.is_symlink():
+        raise FileNotFoundError(metadata_path)
+    metadata_bytes = metadata_path.stat().st_size
+    if metadata_bytes > MAX_CHECKPOINT_METADATA_BYTES:
+        raise ValueError(
+            "checkpoint metadata exceeds the bounded metadata limit: "
+            f"{metadata_bytes} > {MAX_CHECKPOINT_METADATA_BYTES} bytes"
+        )
+    value = _read_strict_json(metadata_path, label="checkpoint metadata")
+    metadata = _mapping(value, label="checkpoint metadata")
+    if marker is not None and (
+        marker["format_version"] != metadata.get("format_version")
+        or marker["step"] != metadata.get("step")
+    ):
+        raise ValueError("checkpoint completion marker and metadata disagree")
+    return metadata
+
+
+def bounded_checkpoint_provenance(directory: Path) -> dict[str, object]:
+    """Return a constant-depth identity for one complete checkpoint.
+
+    The result deliberately excludes paths, complete metadata, file listings,
+    and parent lineage.  It can therefore be embedded as a direct-parent
+    receipt without recursively copying every ancestor into every descendant.
+    """
+
+    supplied = directory.expanduser()
+    if supplied.is_symlink():
+        raise ValueError(f"checkpoint directory must not be a symlink: {supplied}")
+    try:
+        resolved = supplied.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"checkpoint does not exist or is not readable: {directory}") from error
+    if not resolved.is_dir():
+        raise NotADirectoryError(resolved)
+    entries = sorted(resolved.rglob("*"), key=lambda item: item.relative_to(resolved).as_posix())
+    symlinks = [entry for entry in entries if entry.is_symlink()]
+    if symlinks:
+        raise ValueError(f"checkpoint must not contain symlinks: {symlinks[0]}")
+    files = [entry for entry in entries if entry.is_file()]
+    metadata_path = resolved / "metadata.json"
+    weights_path = resolved / "weights.safetensors"
+    if not metadata_path.is_file() or not weights_path.is_file():
+        raise ValueError("checkpoint requires metadata.json and weights.safetensors")
+    metadata = _read_checkpoint_metadata(resolved)
+    if metadata.get("format_version") != FORMAT_VERSION:
+        raise ValueError("unsupported checkpoint format")
+    raw_model = metadata.get("model")
+    if not isinstance(raw_model, dict):
+        raise ValueError("checkpoint model metadata must be a JSON object")
+
+    aggregate = hashlib.sha256()
+    total_bytes = 0
+    identities: dict[str, dict[str, object]] = {}
+    for file_path in files:
+        relative = file_path.relative_to(resolved).as_posix()
+        byte_count = file_path.stat().st_size
+        relative_bytes = relative.encode("utf-8")
+        aggregate.update(len(relative_bytes).to_bytes(8, "big"))
+        aggregate.update(relative_bytes)
+        aggregate.update(byte_count.to_bytes(8, "big"))
+        file_digest = hashlib.sha256()
+        with file_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                aggregate.update(chunk)
+                file_digest.update(chunk)
+        total_bytes += byte_count
+        if file_path in (metadata_path, weights_path):
+            identities[file_path.name] = {
+                "sha256": file_digest.hexdigest(),
+                "bytes": byte_count,
+            }
+
+    load_digest = hashlib.sha256()
+    for file_path in (metadata_path, weights_path):
+        with file_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                load_digest.update(chunk)
+
+    identity: dict[str, object] = {
+        "schema": CHECKPOINT_IDENTITY_SCHEMA,
+        "format_version": FORMAT_VERSION,
+        "step": int(metadata["step"]),
+        "model": json.loads(json.dumps(raw_model, allow_nan=False, sort_keys=True)),
+        "all_files_sha256": aggregate.hexdigest(),
+        "load_checkpoint_sha256": load_digest.hexdigest(),
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "metadata": identities["metadata.json"],
+        "weights": identities["weights.safetensors"],
+    }
+    raw_lineage = metadata.get("lineage")
+    if isinstance(raw_lineage, dict):
+        raw_summary = raw_lineage.get("rights_restriction_summary")
+        if raw_summary is not None:
+            if not isinstance(raw_summary, dict):
+                raise ValueError("checkpoint rights restriction summary must be a JSON object")
+            identity["rights_restriction_summary"] = validate_rights_restriction_summary(
+                raw_summary
+            )
+        elif lineage_has_teacher_evidence(raw_lineage):
+            identity["legacy_teacher_lineage_summary_missing"] = True
+    encoded_identity = json.dumps(identity, allow_nan=False, sort_keys=True).encode("utf-8")
+    if len(encoded_identity) > MAX_CHECKPOINT_METADATA_BYTES:
+        raise ValueError("bounded checkpoint identity unexpectedly exceeds its size limit")
+    return identity
 
 
 def _encoded_training_state(
@@ -77,14 +348,12 @@ def _encoded_training_state(
             raise ValueError("training trace extends beyond its training state")
         previous_optimizer_step = optimizer_step
     trace_bytes = b"".join(
-        (
-            json.dumps(row, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n"
-        ).encode("utf-8")
+        (json.dumps(row, allow_nan=False, separators=(",", ":"), sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
         for row in trace_rows
     )
-    numpy_rng_state = json.loads(
-        json.dumps(state.numpy_rng_state, allow_nan=False, sort_keys=True)
-    )
+    numpy_rng_state = json.loads(json.dumps(state.numpy_rng_state, allow_nan=False, sort_keys=True))
     if not isinstance(numpy_rng_state, dict):
         raise TypeError("NumPy RNG state must be a JSON object")
     payload: dict[str, Any] = {
@@ -171,9 +440,7 @@ def save_checkpoint(
         if raw_rights_summary is not None:
             if not isinstance(raw_rights_summary, dict):
                 raise ValueError("checkpoint rights restriction summary must be a JSON object")
-            canonical_rights_summary = validate_rights_restriction_summary(
-                raw_rights_summary
-            )
+            canonical_rights_summary = validate_rights_restriction_summary(raw_rights_summary)
             if decoded_lineage.get("schema") == "meteo-training-lineage-v2":
                 expected_rights_summary = expected_lineage_rights_summary(decoded_lineage)
                 if canonical_rights_summary != expected_rights_summary:
@@ -183,19 +450,30 @@ def save_checkpoint(
             decoded_lineage["rights_restriction_summary"] = canonical_rights_summary
         metadata["lineage"] = decoded_lineage
 
+    preflight_metadata = (
+        json.dumps(metadata, allow_nan=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(preflight_metadata) > MAX_CHECKPOINT_METADATA_BYTES:
+        raise ValueError(
+            "checkpoint metadata exceeds the bounded metadata limit: "
+            f"{len(preflight_metadata)} > {MAX_CHECKPOINT_METADATA_BYTES} bytes"
+        )
+
     directory.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{directory.name}.tmp-", dir=str(directory.parent))
-    )
+    temporary = Path(tempfile.mkdtemp(prefix=f".{directory.name}.tmp-", dir=str(directory.parent)))
+    published = False
     try:
-        model.save_weights(str(temporary / "weights.safetensors"))
+        weights_path = temporary / "weights.safetensors"
+        model.save_weights(str(weights_path))
+        _fsync_file(weights_path)
         if encoded_state is not None:
             state_payload, optimizer_tensors, trace_bytes = encoded_state
             optimizer_path = temporary / "optimizer.safetensors"
             trace_path = temporary / "training_trace.jsonl"
             state_path = temporary / "training_state.json"
             mx.save_safetensors(str(optimizer_path), optimizer_tensors)
-            trace_path.write_bytes(trace_bytes)
+            _fsync_file(optimizer_path)
+            _write_bytes_durable(trace_path, trace_bytes)
             state_payload["files"] = {
                 "optimizer": {
                     "name": optimizer_path.name,
@@ -208,9 +486,11 @@ def save_checkpoint(
                     "bytes": trace_path.stat().st_size,
                 },
             }
-            state_path.write_text(
-                json.dumps(state_payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
+            _write_bytes_durable(
+                state_path,
+                (
+                    json.dumps(state_payload, allow_nan=False, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8"),
             )
             metadata["training_state"] = {
                 "schema": TRAINING_STATE_SCHEMA,
@@ -219,21 +499,60 @@ def save_checkpoint(
                 "sha256": _sha256_file(state_path),
                 "bytes": state_path.stat().st_size,
             }
-        encoded_metadata = (
-            json.dumps(metadata, allow_nan=False, indent=2, sort_keys=True) + "\n"
+        encoded_metadata = json.dumps(metadata, allow_nan=False, indent=2, sort_keys=True) + "\n"
+        encoded_metadata_bytes = encoded_metadata.encode("utf-8")
+        if len(encoded_metadata_bytes) > MAX_CHECKPOINT_METADATA_BYTES:
+            raise ValueError(
+                "checkpoint metadata exceeds the bounded metadata limit after state encoding: "
+                f"{len(encoded_metadata_bytes)} > {MAX_CHECKPOINT_METADATA_BYTES} bytes"
+            )
+        _write_bytes_durable(temporary / "metadata.json", encoded_metadata_bytes)
+
+        # A file existing is not sufficient evidence that a resumable checkpoint
+        # was saved.  Exercise the same strict loader used by a future process
+        # before publishing the directory or deleting any previous generation.
+        _reloaded_model, reloaded_step, reloaded_state, _reloaded_trace = (
+            load_checkpoint_with_training_state(temporary)
         )
-        (temporary / "metadata.json").write_text(encoded_metadata, encoding="utf-8")
+        if reloaded_step != step:
+            raise ValueError("staged checkpoint reloaded with the wrong model step")
+        if encoded_state is not None:
+            if training_state is None:
+                raise AssertionError("encoded training state requires its source state")
+            if reloaded_state is None:
+                raise ValueError("staged checkpoint lost its exact training state")
+            if (
+                reloaded_state.model_step != training_state.model_step
+                or reloaded_state.optimizer_step != training_state.optimizer_step
+            ):
+                raise ValueError("staged checkpoint reloaded with the wrong training state")
+        elif reloaded_state is not None:
+            raise ValueError("staged inference checkpoint unexpectedly contains training state")
+
+        marker_payload = _complete_marker_payload(temporary, step=step)
+        marker_bytes = (
+            json.dumps(marker_payload, allow_nan=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        _write_bytes_durable(temporary / CHECKPOINT_COMPLETE_MARKER, marker_bytes)
+        validate_checkpoint_complete(temporary, require_marker=True)
+        _fsync_directory(temporary)
         if directory.exists():
             raise FileExistsError(f"refusing to overwrite checkpoint: {directory}")
         temporary.rename(directory)
+        published = True
+        _fsync_directory(directory.parent)
+        validate_checkpoint_complete(directory, require_marker=True)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
+        if published:
+            shutil.rmtree(directory, ignore_errors=True)
         raise
     return directory
 
 
 def load_checkpoint(directory: Path) -> tuple[PolicyValueResNet, int]:
-    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    directory = directory.expanduser().resolve()
+    metadata = _read_checkpoint_metadata(directory)
     if metadata.get("format_version") != FORMAT_VERSION:
         raise ValueError("unsupported checkpoint format")
     config = ModelConfig(**metadata["model"])
@@ -254,7 +573,7 @@ def _verified_child(directory: Path, record: Mapping[str, Any]) -> Path:
     if not isinstance(expected_bytes, int) or expected_bytes < 0:
         raise ValueError(f"checkpoint state contains an invalid byte count for {name}")
     child = directory / name
-    if not child.is_file():
+    if child.is_symlink() or not child.is_file():
         raise FileNotFoundError(child)
     if child.stat().st_size != expected_bytes or _sha256_file(child) != expected_sha256:
         raise ValueError(f"checkpoint state file identity mismatch: {child}")
@@ -273,10 +592,7 @@ def load_training_state(
     """Load and hash-verify optional exact-resume state and step telemetry."""
 
     directory = directory.expanduser().resolve()
-    metadata = _mapping(
-        json.loads((directory / "metadata.json").read_text(encoding="utf-8")),
-        label="checkpoint metadata",
-    )
+    metadata = _read_checkpoint_metadata(directory)
     summary_value = metadata.get("training_state")
     if summary_value is None:
         return None
@@ -285,7 +601,7 @@ def load_training_state(
         raise ValueError("unsupported or inexact checkpoint training state")
     state_path = _verified_child(directory, summary)
     payload = _mapping(
-        json.loads(state_path.read_text(encoding="utf-8")),
+        _read_strict_json(state_path, label="checkpoint training state"),
         label="checkpoint training state",
     )
     if payload.get("schema") != TRAINING_STATE_SCHEMA:
@@ -347,7 +663,17 @@ def load_training_state(
         for line_number, line in enumerate(stream, start=1):
             if not line.strip():
                 raise ValueError(f"blank training trace row at line {line_number}")
-            row = _mapping(json.loads(line), label=f"training trace row {line_number}")
+            try:
+                raw_row = json.loads(
+                    line,
+                    object_pairs_hook=_reject_duplicate_json_object,
+                    parse_constant=_reject_nonfinite_json_constant,
+                )
+            except (json.JSONDecodeError, ValueError) as error:
+                raise ValueError(
+                    f"training trace row {line_number} is not strict JSON"
+                ) from error
+            row = _mapping(raw_row, label=f"training trace row {line_number}")
             trace.append(TrainingTracePoint(**row))
     if len(trace) != expected_points:
         raise ValueError("training trace point count does not match the state manifest")

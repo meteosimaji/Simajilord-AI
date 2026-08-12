@@ -114,6 +114,7 @@ def _fake_yaneuraou_getoption_usi(
     path: Path,
     *,
     force_fv_scale_after_ready: int | None = None,
+    startup_warning: str = "fixture warning",
 ) -> None:
     path.write_text(
         f"""import sys
@@ -134,7 +135,7 @@ for raw in sys.stdin:
     elif command == 'isready':
         if {force_fv_scale_after_ready!r} is not None:
             options['FV_SCALE'] = str({force_fv_scale_after_ready!r})
-        print('NNUE hash mismatch: fixture warning', file=sys.stderr, flush=True)
+        print({startup_warning!r}, file=sys.stderr, flush=True)
         print('readyok', flush=True)
     elif command.startswith('getoption '):
         name = command.removeprefix('getoption ')
@@ -244,6 +245,74 @@ def test_history_aware_target_sends_prefix_and_board_only_api_remains_compatible
         "position startpos moves 7g7f",
         f"position sfen {MATE_IN_ONE_SFEN}",
     ]
+
+
+def test_searchmoves_scores_only_the_requested_legal_history_branch(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_searchmoves.py"
+    command_log = tmp_path / "commands.txt"
+    script.write_text(
+        f"""import sys
+log_path = {str(command_log)!r}
+for raw in sys.stdin:
+    command = raw.strip()
+    with open(log_path, 'a', encoding='utf-8') as stream:
+        stream.write(command + '\\n')
+    if command == 'usi':
+        print('id name fake-searchmoves', flush=True)
+        print('option name MultiPV type spin default 1 min 1 max 32', flush=True)
+        print('usiok', flush=True)
+    elif command == 'isready':
+        print('readyok', flush=True)
+    elif command.startswith('go '):
+        move = command.rsplit(' searchmoves ', 1)[1]
+        print(f'info depth 9 score cp 250 nodes 17 time 2 nps 8500 pv {{move}}', flush=True)
+        print(f'bestmove {{move}}', flush=True)
+    elif command == 'quit':
+        break
+""",
+        encoding="utf-8",
+    )
+    policy = ExternalTeacherPolicy(
+        policy_id="test-searchmoves",
+        name="searchmoves",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+    start = Board().to_sfen()
+    after_black = _board_after(start, "7g7f")
+    history = UsiPositionHistory(start, ("7g7f",), after_black.to_sfen())
+
+    with ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=3,
+        multipv=8,
+    ) as teacher:
+        target = teacher.training_target_with_history_searchmoves(
+            history,
+            ("3c3d",),
+            nodes=17,
+        )
+        with pytest.raises(ValueError, match="duplicate"):
+            teacher.training_target_with_history_searchmoves(
+                history,
+                ("3c3d", "3c3d"),
+            )
+        with pytest.raises(ValueError, match="illegal"):
+            teacher.training_target_with_history_searchmoves(
+                history,
+                ("7g7f",),
+            )
+
+    assert target.bestmove == "3c3d"
+    assert target.move_values == (("3c3d", pytest.approx(0.205370675)),)
+    assert target.nodes == 17
+    assert "position startpos moves 7g7f" in command_log.read_text(encoding="utf-8")
+    assert "go nodes 17 searchmoves 3c3d" in command_log.read_text(encoding="utf-8")
 
 
 def test_unknown_teacher_rights_fail_closed() -> None:
@@ -511,6 +580,47 @@ def test_requested_option_must_match_engine_declaration_not_similar_name(
     assert teacher.process is None
 
 
+def test_filename_option_extension_is_validated_like_string(tmp_path: Path) -> None:
+    script = tmp_path / "fake_filename_option.py"
+    script.write_text(
+        """import sys
+for raw in sys.stdin:
+    command = raw.strip()
+    if command == 'usi':
+        print('id name fake-filename-option', flush=True)
+        print('option name MultiPV type spin default 1 min 1 max 32', flush=True)
+        print('option name BookFile type filename default book.bin', flush=True)
+        print('usiok', flush=True)
+    elif command == 'isready':
+        print('readyok', flush=True)
+    elif command == 'quit':
+        break
+""",
+        encoding="utf-8",
+    )
+    policy = ExternalTeacherPolicy(
+        policy_id="test-filename-option",
+        name="fake-filename-option",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+
+    with ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=1,
+        options={"BookFile": "custom book.bin"},
+    ) as teacher:
+        startup = teacher.startup_provenance
+
+    declarations = {entry.name: entry for entry in startup.option_declarations}
+    assert declarations["BookFile"].option_type == "filename"
+    applied = {entry.name: entry for entry in startup.applied_options}
+    assert applied["BookFile"].requested_value == "custom book.bin"
+
+
 def test_yaneuraou_getoption_verifies_values_and_hashes_complete_startup_transcript(
     tmp_path: Path,
 ) -> None:
@@ -537,7 +647,7 @@ def test_yaneuraou_getoption_verifies_values_and_hashes_complete_startup_transcr
     ) as teacher:
         startup = teacher.startup_provenance
 
-    assert startup.schema == "meteo-usi-startup-provenance-v1"
+    assert startup.schema == "meteo-usi-startup-provenance-v2"
     assert startup.identity_lines == ("id name fake-yaneuraou-getoption",)
     assert {declaration.name for declaration in startup.option_declarations} == {
         "MultiPV",
@@ -551,13 +661,16 @@ def test_yaneuraou_getoption_verifies_values_and_hashes_complete_startup_transcr
     assert applied["FV_SCALE"].applied_value == "40"
     assert applied["Threads"].applied_value == "1"
     assert all(option.verified for option in applied.values())
-    assert startup.stderr_lines == ("NNUE hash mismatch: fixture warning",)
-    assert startup.warnings == (("stderr", "NNUE hash mismatch: fixture warning"),)
+    assert startup.stderr_lines == ("fixture warning",)
+    assert startup.warnings == (("stderr", "fixture warning"),)
+    assert startup.fatal_diagnostics == ()
+    assert startup.expected_fatal_diagnostics == ()
+    assert startup.fatal_diagnostics_match_expected is True
     assert startup.stdout_sha256 == hashlib.sha256(
         "\n".join(startup.stdout_lines).encode() + b"\n"
     ).hexdigest()
     assert startup.stderr_sha256 == hashlib.sha256(
-        b"NNUE hash mismatch: fixture warning\n"
+        b"fixture warning\n"
     ).hexdigest()
 
     saved = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -571,7 +684,7 @@ def test_yaneuraou_getoption_verifies_values_and_hashes_complete_startup_transcr
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
-    assert saved["warnings"] == [["stderr", "NNUE hash mismatch: fixture warning"]]
+    assert saved["warnings"] == [["stderr", "fixture warning"]]
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         startup.write_create_only(sidecar)
 
@@ -605,6 +718,142 @@ def test_yaneuraou_getoption_rejects_post_ready_value_override(tmp_path: Path) -
 
     assert teacher.process is None
     assert not sidecar.exists()
+
+
+def test_nnue_hash_mismatch_fails_startup_before_provenance_is_accepted(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_yaneuraou.py"
+    sidecar = tmp_path / "must-not-exist.json"
+    _fake_yaneuraou_getoption_usi(
+        script,
+        startup_warning="info string Warning: NNUE hash mismatch: expected 1 got 2",
+    )
+    policy = ExternalTeacherPolicy(
+        policy_id="test-nnue-hash-mismatch",
+        name="fake-yaneuraou",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+    teacher = ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=1,
+        option_value_verification=UsiOptionValueVerification.YANEURAOU_GETOPTION,
+        startup_provenance_path=sidecar,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"evaluation-network compatibility check failed.*NNUE hash mismatch",
+    ):
+        teacher.start()
+
+    assert teacher.process is None
+    assert not sidecar.exists()
+
+
+def test_nnue_header_version_mismatch_fails_closed_unless_exactly_expected(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_header_mismatch.py"
+    diagnostic = (
+        "info string NNUE header version mismatch: expected 2062757654 "
+        "got 2062757665 (continuing anyway)"
+    )
+    _fake_yaneuraou_getoption_usi(script, startup_warning=diagnostic)
+    policy = ExternalTeacherPolicy(
+        policy_id="test-header-version-mismatch",
+        name="fake-yaneuraou",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+
+    with (
+        pytest.raises(RuntimeError, match="evaluation-network compatibility check failed"),
+        ExternalUsiTeacher(
+            command=[sys.executable, str(script)],
+            policy=policy,
+            nodes=1,
+            options={"Threads": "1", "USI_Hash": "64", "FV_SCALE": "40"},
+            option_value_verification=UsiOptionValueVerification.YANEURAOU_GETOPTION,
+        ),
+    ):
+        pass
+
+    with ExternalUsiTeacher(
+        command=[sys.executable, str(script)],
+        policy=policy,
+        nodes=1,
+        options={"Threads": "1", "USI_Hash": "64", "FV_SCALE": "40"},
+        option_value_verification=UsiOptionValueVerification.YANEURAOU_GETOPTION,
+        expected_fatal_startup_diagnostics=(("stderr", diagnostic),),
+    ) as teacher:
+        startup = teacher.startup_provenance
+
+    assert startup.fatal_diagnostics == (("stderr", diagnostic),)
+    assert startup.fatal_diagnostics_match_expected is True
+
+
+def test_exact_reviewed_nnue_hash_diagnostics_can_be_accepted_and_are_recorded(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_yaneuraou.py"
+    diagnostic = "info string Warning: NNUE hash mismatch: expected 1 got 2"
+    _fake_yaneuraou_getoption_usi(script, startup_warning=diagnostic)
+    policy = ExternalTeacherPolicy(
+        policy_id="test-reviewed-nnue-hash-mismatch",
+        name="fake-yaneuraou",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+
+    with ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=1,
+        option_value_verification=UsiOptionValueVerification.YANEURAOU_GETOPTION,
+        expected_fatal_startup_diagnostics=(("stderr", diagnostic),),
+    ) as teacher:
+        startup = teacher.startup_provenance
+
+    assert startup.fatal_diagnostics == (("stderr", diagnostic),)
+    assert startup.expected_fatal_diagnostics == (("stderr", diagnostic),)
+    assert startup.fatal_diagnostics_match_expected is True
+
+
+def test_stale_reviewed_nnue_hash_diagnostic_expectation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake_yaneuraou.py"
+    diagnostic = "info string Warning: NNUE hash mismatch: expected 1 got 2"
+    _fake_yaneuraou_getoption_usi(script, startup_warning="fixture warning")
+    policy = ExternalTeacherPolicy(
+        policy_id="test-stale-nnue-hash-mismatch",
+        name="fake-yaneuraou",
+        source="test fixture",
+        analysis_allowed=True,
+        training_outputs_allowed=True,
+        redistribution_allowed=True,
+    )
+    teacher = ExternalUsiTeacher(
+        [sys.executable, str(script)],
+        policy,
+        nodes=1,
+        option_value_verification=UsiOptionValueVerification.YANEURAOU_GETOPTION,
+        expected_fatal_startup_diagnostics=(("stderr", diagnostic),),
+    )
+
+    with pytest.raises(RuntimeError, match="did not match the reviewed expectation"):
+        teacher.start()
+
+    assert teacher.process is None
 
 
 def test_standard_usi_teacher_keeps_legacy_compatibility_without_getoption(

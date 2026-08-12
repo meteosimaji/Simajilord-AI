@@ -46,6 +46,7 @@ def _replay(path: Path, *, termination: Termination = Termination.RESIGNATION) -
 def _payload(replay: Path, game: GameRecord) -> dict[str, object]:
     policy_nagisa = {"7g7f": 0.7, "2g2f": 0.2, "8g8f": 0.1}
     policy_suisho = {"2g2f": 0.55, "7g7f": 0.35, "8g8f": 0.1}
+    policy_soujou = {"2g2f": 0.6, "7g7f": 0.3, "8g8f": 0.1}
     return {
         "schema": CANONICAL_TARGET_SIDECAR_SCHEMA,
         "replay": {
@@ -63,6 +64,11 @@ def _payload(replay: Path, game: GameRecord) -> dict[str, object]:
             {
                 "scorer_id": CANONICAL_SCORER_IDS[1],
                 "family": "suisho",
+                "role": "canonical_scorer",
+            },
+            {
+                "scorer_id": CANONICAL_SCORER_IDS[2],
+                "family": "soujou",
                 "role": "canonical_scorer",
             },
         ],
@@ -87,6 +93,12 @@ def _payload(replay: Path, game: GameRecord) -> dict[str, object]:
                         "policy": policy_suisho,
                         "value": -0.2,
                     },
+                    {
+                        "scorer_id": CANONICAL_SCORER_IDS[2],
+                        "best_move": "2g2f",
+                        "policy": policy_soujou,
+                        "value": -0.1,
+                    },
                 ],
                 "canonical_best_union": ["2g2f", "7g7f"],
                 "equivalence_groups": [
@@ -104,6 +116,7 @@ def _payload(replay: Path, game: GameRecord) -> dict[str, object]:
                 "canonical_values": {
                     CANONICAL_SCORER_IDS[0]: -0.4,
                     CANONICAL_SCORER_IDS[1]: -0.2,
+                    CANONICAL_SCORER_IDS[2]: -0.1,
                 },
                 "history_training_weight": 1.0,
             }
@@ -133,6 +146,7 @@ def test_canonical_sidecar_binds_exact_replay_history_and_dual_scorers(
     assert loaded.positions[0].canonical_values == {
         CANONICAL_SCORER_IDS[0]: -0.4,
         CANONICAL_SCORER_IDS[1]: -0.2,
+        CANONICAL_SCORER_IDS[2]: -0.1,
     }
     assert resolve_canonical_target_sidecar(replay) == sidecar.resolve()
 
@@ -150,7 +164,7 @@ def test_anonymous_ensemble_or_incomplete_scorer_pair_is_rejected(tmp_path: Path
     assert isinstance(scorers, list)
     scorers[0]["scorer_id"] = "meteo-teacher-ensemble"
     _write_sidecar(sidecar, payload)
-    with pytest.raises(ValueError, match="exactly NAGISA and Suisho11Plus"):
+    with pytest.raises(ValueError, match="exactly NAGISA, Suisho11Plus, and Soujou"):
         load_canonical_target_sidecar(replay, sidecar, games=[game])
 
 
@@ -190,7 +204,7 @@ def test_canonical_scorer_best_move_must_be_legal_and_present_in_policy(tmp_path
     assert isinstance(position, dict)
     position["scorers"] = position["scorers"][:1]
     _write_sidecar(sidecar, payload)
-    with pytest.raises(ValueError, match="exactly NAGISA and Suisho11Plus"):
+    with pytest.raises(ValueError, match="exactly NAGISA, Suisho11Plus, and Soujou"):
         load_canonical_target_sidecar(replay, sidecar, games=[game])
 
 

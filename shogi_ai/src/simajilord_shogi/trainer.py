@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib.metadata import version
@@ -30,11 +30,20 @@ from .distillation_targets import (
     CanonicalDistillationTarget,
     ProvenMateStatus,
 )
-from .distillation_targets_v2 import CanonicalDistillationTargetV2
+from .distillation_targets_v2 import (
+    CanonicalDistillationTargetV2,
+    PlayTargetKind,
+)
 from .domain import PositionSample
 from .encoding import combined_features, combined_features_with_history
 from .ensemble import normalized_sfen
 from .model import PolicyValueResNet
+from .multi_objective_distillation import (
+    blend_visit_and_value_policy,
+    proven_mate_in_one_moves,
+)
+
+TRAINING_BATCH_CACHE_LIMIT_BYTES = 8 * 1024**3
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,18 +127,25 @@ class TrainingMetrics:
     gradient_clipped_fraction: float
     teacher_policy_mix: float
     teacher_value_mix: float
+    implicit_policy_mix: float
+    proven_mate_policy_loss_weight: float
+    probe_proven_mate_rows: int
+    checkmate_sample_priority: float
+    checkmate_horizon_plies: int
     probe_effective_teacher_policy_mix_min: float
     probe_effective_teacher_policy_mix_mean: float
     probe_effective_teacher_policy_mix_max: float
     probe_loss_ratio: float
     legal_label_smoothing: float
+    training_batch_cache_enabled: bool
+    training_batch_cache_bytes: int
     mlx_peak_memory_bytes: int
     telemetry_points: int
     compute_interlock_enabled: bool
     compute_interlock_acquisitions: int
     compute_interlock_wait_seconds: float
-    canonical_teacher_policy_losses: tuple[float, float] | None
-    canonical_teacher_value_losses: tuple[float, float] | None
+    canonical_teacher_policy_losses: tuple[float, ...] | None
+    canonical_teacher_value_losses: tuple[float, ...] | None
     canonical_play_policy_loss: float | None
     canonical_play_interval_value_loss: float | None
     canonical_wdl_loss: float | None
@@ -202,6 +218,34 @@ def _effective_teacher_mix(
     return base_mix * min(1.0, curriculum_scale)
 
 
+def _validated_unit_value(value: float, *, label: str, ply: int) -> float:
+    numeric = float(value)
+    if not math.isfinite(numeric) or not -1.0 <= numeric <= 1.0:
+        raise ValueError(f"{label} must be finite and within [-1, 1] at ply {ply}")
+    return numeric
+
+
+def _sample_sampling_weight(
+    sample: PositionSample,
+    *,
+    reversal_priority: float,
+    blunder_priority: float,
+    checkmate_sample_priority: float,
+    checkmate_horizon_plies: int,
+) -> float:
+    weight = (reversal_priority if sample.policy_reversal else 1.0) * (
+        1.0 + blunder_priority * max(0.0, sample.teacher_regret or 0.0)
+    )
+    distance = sample.terminal_checkmate_distance
+    if distance is not None and (
+        not isinstance(distance, int) or isinstance(distance, bool) or distance < 1
+    ):
+        raise ValueError("terminal checkmate distance must be a positive integer")
+    if distance is not None and distance <= checkmate_horizon_plies:
+        weight *= 1.0 + checkmate_sample_priority / math.sqrt(distance)
+    return weight
+
+
 def _make_batch(
     samples: list[PositionSample],
     *,
@@ -210,12 +254,46 @@ def _make_batch(
     legal_label_smoothing: float,
     curriculum_depth_ratio: float,
     minimum_teacher_policy_mix: float,
-) -> tuple[mx.array, mx.array, mx.array]:
+    implicit_policy_mix: float = 0.0,
+    with_policy_constraints: bool = False,
+) -> tuple[mx.array, ...]:
     features = np.stack([combined_features(Board(sample.sfen)) for sample in samples])
     policies = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.float32)
     values = np.empty((len(samples), 1), dtype=np.float32)
+    legal_masks = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.bool_)
+    proof_masks = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.bool_)
+    proof_active = np.zeros((len(samples),), dtype=np.bool_)
     for row, sample in enumerate(samples):
         board = Board(sample.sfen)
+        if sample.ply < 0:
+            raise ValueError("training sample ply must be non-negative")
+        if sample.turn != board.turn.value:
+            raise ValueError(f"training sample turn disagrees with SFEN at ply {sample.ply}")
+        _validated_unit_value(sample.root_value, label="actor root value", ply=sample.ply)
+        outcome_value = _validated_unit_value(
+            sample.value_target,
+            label="game outcome value target",
+            ply=sample.ply,
+        )
+        teacher_value = (
+            None
+            if sample.teacher_value is None
+            else _validated_unit_value(
+                sample.teacher_value,
+                label="teacher value target",
+                ply=sample.ply,
+            )
+        )
+        if sample.teacher_depth_ratio is not None and (
+            not math.isfinite(sample.teacher_depth_ratio) or sample.teacher_depth_ratio <= 0
+        ):
+            raise ValueError(f"teacher depth ratio must be finite and positive at ply {sample.ply}")
+        if sample.terminal_checkmate_distance is not None and (
+            sample.terminal_checkmate_distance < 1
+        ):
+            raise ValueError(
+                f"terminal checkmate distance must be positive at ply {sample.ply}"
+            )
         teacher_mix = (
             _effective_teacher_mix(
                 sample,
@@ -226,38 +304,103 @@ def _make_batch(
             if sample.teacher_policy is not None
             else 0.0
         )
-        targets: tuple[tuple[dict[str, float], float], ...] = (
-            ((sample.policy, 1.0 - teacher_mix), (sample.teacher_policy, teacher_mix))
-            if sample.teacher_policy is not None
-            else ((sample.policy, 1.0),)
+        actor_policy = blend_visit_and_value_policy(
+            sample.policy,
+            sample.actor_implicit_policy,
+            implicit_weight=implicit_policy_mix,
         )
+        teacher_policy = (
+            None
+            if sample.teacher_policy is None
+            else blend_visit_and_value_policy(
+                sample.teacher_policy,
+                sample.teacher_implicit_policy,
+                implicit_weight=implicit_policy_mix,
+            )
+        )
+        if sample.teacher_policy is not None:
+            if teacher_policy is None:
+                raise AssertionError("teacher policy blend unexpectedly disappeared")
+            targets: tuple[tuple[dict[str, float], float], ...] = (
+                (actor_policy, 1.0 - teacher_mix),
+                (teacher_policy, teacher_mix),
+            )
+        else:
+            targets = ((actor_policy, 1.0),)
         for target, target_weight in targets:
+            if not target:
+                raise ValueError(f"empty source policy target at ply {sample.ply}")
+            source_total = 0.0
             for move_usi, probability in target.items():
+                numeric_probability = float(probability)
+                if not math.isfinite(numeric_probability) or numeric_probability < 0:
+                    raise ValueError(
+                        f"policy probability must be finite and non-negative at ply {sample.ply}"
+                    )
                 move = Move.from_usi(move_usi)
                 if not board.is_legal_move(move):
                     raise ValueError(f"illegal target move {move_usi} at ply {sample.ply}")
-                policies[row, move_label(move, board.turn)] += float(probability) * target_weight
-        legal_moves = board.legal_moves()
+                policies[row, move_label(move, board.turn)] += (
+                    numeric_probability * target_weight
+                )
+                source_total += numeric_probability
+            if source_total <= 0:
+                raise ValueError(f"zero-mass source policy target at ply {sample.ply}")
+        legal_moves = tuple(board.legal_moves())
+        if not legal_moves:
+            raise ValueError(f"terminal position cannot be a training sample at ply {sample.ply}")
+        legal_move_usi = {move.to_usi() for move in legal_moves}
+        legal_labels = [move_label(move, board.turn) for move in legal_moves]
+        legal_masks[row, legal_labels] = True
+        claimed_mates = tuple(
+            sorted(
+                set(sample.actor_proven_mate_moves)
+                | set(sample.teacher_proven_mate_moves)
+            )
+        )
+        if claimed_mates:
+            actual_mates = proven_mate_in_one_moves(board)
+            if not set(claimed_mates).issubset(actual_mates):
+                raise ValueError(
+                    f"unverified proven mate move at ply {sample.ply}: "
+                    f"claimed={claimed_mates!r}, verified={actual_mates!r}"
+                )
+            if not set(claimed_mates).issubset(legal_move_usi):
+                raise ValueError(f"illegal proven mate move at ply {sample.ply}")
+            proof_active[row] = True
+            # Once one claimed proof has been independently verified, enumerate
+            # the complete mate-in-one set so an unlisted but equally valid mate
+            # is never penalized by the set-mass objective.
+            for move_usi in actual_mates:
+                proof_masks[row, move_label(Move.from_usi(move_usi), board.turn)] = True
         if legal_label_smoothing:
             policies[row] *= 1.0 - legal_label_smoothing
             legal_probability = legal_label_smoothing / len(legal_moves)
             for move in legal_moves:
                 policies[row, move_label(move, board.turn)] += legal_probability
         total = float(policies[row].sum())
-        if total <= 0:
+        if not math.isfinite(total) or total <= 0:
             raise ValueError(f"empty policy target at ply {sample.ply}")
         policies[row] /= total
-        values[row, 0] = sample.value_target
-        if sample.teacher_value is not None:
+        values[row, 0] = outcome_value
+        if teacher_value is not None:
             value_curriculum_scale = (
                 teacher_mix / teacher_policy_mix if teacher_policy_mix > 0 else 0.0
             )
             effective_teacher_value_mix = teacher_value_mix * value_curriculum_scale
             values[row, 0] = (
-                effective_teacher_value_mix * sample.teacher_value
-                + (1.0 - effective_teacher_value_mix) * sample.value_target
+                effective_teacher_value_mix * teacher_value
+                + (1.0 - effective_teacher_value_mix) * outcome_value
             )
-    return mx.array(features), mx.array(policies), mx.array(values)
+    result = (mx.array(features), mx.array(policies), mx.array(values))
+    if not with_policy_constraints:
+        return result
+    return (
+        *result,
+        mx.array(legal_masks),
+        mx.array(proof_masks),
+        mx.array(proof_active),
+    )
 
 
 def _make_canonical_batch(
@@ -291,7 +434,7 @@ def _make_canonical_batch(
 
         scorer_by_id = {scorer.scorer_id: scorer for scorer in target.scorers}
         if tuple(scorer_by_id) != CANONICAL_SCORER_IDS:
-            raise ValueError(f"canonical target row {row} lacks the required scorer pair")
+            raise ValueError(f"canonical target row {row} lacks the required scorer set")
         scorer_values[row] = [
             target.canonical_values[scorer_id] for scorer_id in CANONICAL_SCORER_IDS
         ]
@@ -358,6 +501,8 @@ def _make_canonical_v2_batch(
     value_upper = np.zeros((len(samples), 1), dtype=np.float32)
     wdl_targets = np.zeros((len(samples), 3), dtype=np.float32)
     wdl_active = np.zeros((len(samples),), dtype=np.bool_)
+    play_proof_masks = np.zeros((len(samples), MOVE_LABEL_COUNT), dtype=np.bool_)
+    play_proof_active = np.zeros((len(samples),), dtype=np.bool_)
     uncertainty_targets = np.empty((len(samples), 1), dtype=np.float32)
     for row, (sample, target) in enumerate(zip(samples, targets, strict=True)):
         if target.play.train_play == target.play.additional_search_required:
@@ -376,7 +521,7 @@ def _make_canonical_v2_batch(
             raise ValueError(f"legal moves collide in policy-label space at row {row}")
         legal_masks[row, list(legal_labels)] = True
         if tuple(scorer.scorer_id for scorer in target.scorers) != CANONICAL_SCORER_IDS:
-            raise ValueError(f"canonical v2 target row {row} lacks the required scorer pair")
+            raise ValueError(f"canonical v2 target row {row} lacks the required scorer set")
         for scorer_index, scorer in enumerate(target.scorers):
             teacher_values[row, scorer_index] = scorer.value
             for move_usi, probability in scorer.policy.items():
@@ -429,6 +574,9 @@ def _make_canonical_v2_batch(
         if target.play.wdl is not None:
             wdl_targets[row] = target.play.wdl
             wdl_active[row] = True
+        if target.play.kind is PlayTargetKind.PROVEN_MATE:
+            play_proof_active[row] = True
+            play_proof_masks[row, robust_labels] = True
     resolved_rows = np.flatnonzero(play_active)
     if resolved_rows.size == 0:
         raise ValueError("canonical v2 optimizer batch requires at least one resolved row")
@@ -444,6 +592,8 @@ def _make_canonical_v2_batch(
         mx.array(value_upper[resolved_rows]),
         mx.array(wdl_targets[resolved_rows]),
         mx.array(wdl_active[resolved_rows]),
+        mx.array(play_proof_masks[resolved_rows]),
+        mx.array(play_proof_active[resolved_rows]),
         mx.array(uncertainty_targets),
     )
 
@@ -568,16 +718,17 @@ def _canonical_v2_loss(
     model: PolicyValueResNet,
     *batch: mx.array,
     value_loss_weight: float,
+    proven_mate_policy_loss_weight: float = 0.25,
     uncertainty_loss_weight: float = 0.1,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
     """Independent teacher losses plus evidence-gated play losses.
 
-    The two teacher value predictions have shape ``[B, 2]`` and are compared
-    elementwise with ``[B, 2]`` targets.  No scalar-to-two-teacher broadcast is
-    possible.  The model detaches auxiliary heads from the shared trunk.
+    Teacher value predictions have shape ``[B, T]`` and are compared
+    elementwise with ``[B, T]`` targets.  No scalar-to-multi-teacher broadcast
+    is possible.  The model detaches auxiliary heads from the shared trunk.
     """
 
-    if len(batch) != 12:
+    if len(batch) != 14:
         raise ValueError("canonical v2 training batch has an invalid tensor contract")
     (
         teacher_policy_losses,
@@ -586,7 +737,11 @@ def _canonical_v2_loss(
         interval_value_loss,
         wdl_loss,
         uncertainty_loss,
-    ) = _canonical_v2_monitor_losses(model, *batch)
+    ) = _canonical_v2_monitor_losses(
+        model,
+        *batch,
+        proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
+    )
     teacher_policy_loss = mx.mean(teacher_policy_losses)
     teacher_value_loss = mx.mean(teacher_value_losses)
     policy_component = (
@@ -603,10 +758,11 @@ def _canonical_v2_loss(
 def _canonical_v2_monitor_losses(
     model: PolicyValueResNet,
     *batch: mx.array,
+    proven_mate_policy_loss_weight: float = 0.25,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array, mx.array, mx.array]:
     """Return per-teacher and play-head losses without averaging their identities."""
 
-    if len(batch) != 12:
+    if len(batch) != 14:
         raise ValueError("canonical v2 training batch has an invalid tensor contract")
     if model.training:
         raise ValueError(
@@ -625,6 +781,8 @@ def _canonical_v2_monitor_losses(
         value_upper,
         wdl_targets,
         wdl_active,
+        play_proof_mask,
+        play_proof_active,
         uncertainty_targets,
     ) = batch
     output = model.forward_canonical(inputs)
@@ -641,11 +799,31 @@ def _canonical_v2_monitor_losses(
         mx.reshape(teacher_policies, (-1, MOVE_LABEL_COUNT)),
         reduction="none",
     )
-    teacher_policy_losses = mx.mean(mx.reshape(teacher_policy_rows, (-1, 2)), axis=0)
-    play_policy_loss = nn.losses.cross_entropy(
+    teacher_policy_losses = mx.mean(
+        mx.reshape(teacher_policy_rows, (-1, len(CANONICAL_SCORER_IDS))),
+        axis=0,
+    )
+    dense_play_policy_losses = nn.losses.cross_entropy(
         play_logits,
         play_policies,
-        reduction="mean",
+        reduction="none",
+    )
+    mate_play_policy_losses = _proof_mate_set_mass_losses(
+        play_output.policy_play,
+        play_legal_mask,
+        play_proof_mask,
+    )
+    if (
+        not math.isfinite(proven_mate_policy_loss_weight)
+        or not 0.0 <= proven_mate_policy_loss_weight <= 1.0
+    ):
+        raise ValueError("proven-mate policy loss weight must be finite in [0, 1]")
+    play_policy_loss = mx.mean(
+        mx.where(
+            play_proof_active,
+            proven_mate_policy_loss_weight * mate_play_policy_losses,
+            dense_play_policy_losses,
+        )
     )
     teacher_value_losses = mx.mean(
         mx.square(output.value_teachers - teacher_values), axis=0
@@ -698,6 +876,46 @@ def _proof_mate_set_mass_losses(
     legal_log_mass = _masked_logsumexp(logits, legal_mask, axis=1)
     proof_log_mass = _masked_logsumexp(logits, proof_mask, axis=1)
     return legal_log_mass - proof_log_mass
+
+
+def _legacy_policy_loss(
+    logits: mx.array,
+    policies: mx.array,
+    legal_mask: mx.array,
+    proof_mask: mx.array,
+    proof_active: mx.array,
+    *,
+    proven_mate_policy_loss_weight: float,
+) -> mx.array:
+    """Use dense CE normally and a capped set-mass objective for proven mates.
+
+    Dense cross entropy over a uniform mate distribution would train arbitrary
+    preferences *inside* a set of equally proven mating moves.  The set-mass
+    loss only asks the model to put probability somewhere in that verified set.
+    Its independent weight prevents saturated mate rows from dominating the
+    ordinary policy distribution while value/outcome learning remains active.
+    """
+
+    if len(logits.shape) != 2 or logits.shape != policies.shape:
+        raise ValueError("legacy policy logits and targets must be aligned rank-two tensors")
+    if legal_mask.shape != logits.shape or proof_mask.shape != logits.shape:
+        raise ValueError("legacy policy masks must match the logits")
+    if proof_active.ndim != 1 or proof_active.shape[0] != logits.shape[0]:
+        raise ValueError("legacy proof-active mask must match the batch")
+    if (
+        not math.isfinite(proven_mate_policy_loss_weight)
+        or not 0.0 <= proven_mate_policy_loss_weight <= 1.0
+    ):
+        raise ValueError("proven-mate policy loss weight must be finite in [0, 1]")
+    normal_losses = nn.losses.cross_entropy(logits, policies, reduction="none")
+    proof_losses = _proof_mate_set_mass_losses(logits, legal_mask, proof_mask)
+    return mx.mean(
+        mx.where(
+            proof_active,
+            proven_mate_policy_loss_weight * proof_losses,
+            normal_losses,
+        )
+    )
 
 
 def _equivalence_group_mass_loss(
@@ -901,10 +1119,14 @@ def _training_configuration_fingerprint(
     seed: int,
     reversal_priority: float,
     blunder_priority: float,
+    checkmate_sample_priority: float,
+    checkmate_horizon_plies: int,
     require_teacher: bool,
     prevalidated_teacher_samples: bool,
     teacher_policy_mix: float,
     teacher_value_mix: float,
+    implicit_policy_mix: float,
+    proven_mate_policy_loss_weight: float,
     legal_label_smoothing: float,
     curriculum_depth_ratio: float,
     minimum_teacher_policy_mix: float,
@@ -916,13 +1138,16 @@ def _training_configuration_fingerprint(
     best_union_top5_weight: float,
 ) -> str:
     legacy_compatible = not canonical_teacher_only and (
-        value_loss_weight == 1.0 and best_union_top5_weight == 0.0
+        value_loss_weight == 1.0
+        and best_union_top5_weight == 0.0
+        and implicit_policy_mix == 0.0
+        and proven_mate_policy_loss_weight == 1.0
     )
     payload: dict[str, Any] = {
         "schema": (
             "meteo-training-configuration-v1"
             if legacy_compatible
-            else "meteo-training-configuration-v2"
+            else "meteo-training-configuration-v3"
         ),
         "model": model_config_payload(model.config),
         "sample_count": sample_count,
@@ -931,10 +1156,14 @@ def _training_configuration_fingerprint(
         "seed": seed,
         "reversal_priority": reversal_priority,
         "blunder_priority": blunder_priority,
+        "checkmate_sample_priority": checkmate_sample_priority,
+        "checkmate_horizon_plies": checkmate_horizon_plies,
         "require_teacher": require_teacher,
         "prevalidated_teacher_samples": prevalidated_teacher_samples,
         "teacher_policy_mix": teacher_policy_mix,
         "teacher_value_mix": teacher_value_mix,
+        "implicit_policy_mix": implicit_policy_mix,
+        "proven_mate_policy_loss_weight": proven_mate_policy_loss_weight,
         "legal_label_smoothing": legal_label_smoothing,
         "curriculum_depth_ratio": curriculum_depth_ratio,
         "minimum_teacher_policy_mix": minimum_teacher_policy_mix,
@@ -960,7 +1189,7 @@ def _training_configuration_fingerprint(
                 "value_loss_weight": value_loss_weight,
                 "best_union_top5_weight": best_union_top5_weight,
                 "canonical_policy_loss": (
-                    "independent-teacher-policy-ce-plus-minimax-regret-play-policy-v2"
+                    "independent-teacher-distribution-ce-plus-worst-regret-distribution-ce-v3"
                     if canonical_target_version == 2
                     else "canonical-v1-training-disabled"
                 ),
@@ -993,10 +1222,14 @@ def _train_impl(
     seed: int,
     reversal_priority: float,
     blunder_priority: float,
+    checkmate_sample_priority: float,
+    checkmate_horizon_plies: int,
     require_teacher: bool,
     prevalidated_teacher_samples: bool,
     teacher_policy_mix: float,
     teacher_value_mix: float,
+    implicit_policy_mix: float,
+    proven_mate_policy_loss_weight: float,
     legal_label_smoothing: float,
     curriculum_depth_ratio: float,
     minimum_teacher_policy_mix: float,
@@ -1013,11 +1246,12 @@ def _train_impl(
     resume_state: TrainingState | None,
     telemetry_interval: int,
     training_interlock: TrainingInterlockConfig | None,
+    progress_callback: Callable[[dict[str, int | float]], None] | None,
 ) -> TrainingRun:
     if canonical_targets is not None:
         raise ValueError(
             "canonical target v1 training is disabled because one value head broadcast over "
-            "two teacher values converges to their arithmetic midpoint; rebuild a complete "
+            "all teacher values converges to their arithmetic mean; rebuild a complete "
             "canonical-target-contract-v2 sidecar"
         )
     if canonical_teacher_only:
@@ -1046,7 +1280,11 @@ def _train_impl(
             raise ValueError("packed PSV data cannot use canonical teacher-only targets")
         if len(canonical_targets_v2) != len(samples):
             raise ValueError("canonical target count must exactly match the training samples")
-        if model.config.canonical_head_version != 2 or model.config.history_input_version != 2:
+        if (
+            model.config.canonical_head_version != 2
+            or model.config.history_input_version != 2
+            or model.config.canonical_teacher_count != len(CANONICAL_SCORER_IDS)
+        ):
             raise ValueError(
                 "canonical-target-contract-v2 requires an explicitly upgraded model with "
                 "independent heads and history-input-v2"
@@ -1078,6 +1316,13 @@ def _train_impl(
         raise ValueError("telemetry interval must be positive")
     if not 0 < teacher_policy_mix <= 1 or not 0 <= teacher_value_mix <= 1:
         raise ValueError("teacher policy/value mixes must be in (0, 1] and [0, 1]")
+    if not math.isfinite(implicit_policy_mix) or not 0.0 <= implicit_policy_mix <= 1.0:
+        raise ValueError("implicit policy mix must be finite in [0, 1]")
+    if (
+        not math.isfinite(proven_mate_policy_loss_weight)
+        or not 0.0 <= proven_mate_policy_loss_weight <= 1.0
+    ):
+        raise ValueError("proven-mate policy loss weight must be finite in [0, 1]")
     if not 0 <= legal_label_smoothing < 1:
         raise ValueError("legal_label_smoothing must be in [0, 1)")
     if curriculum_depth_ratio < 1:
@@ -1090,10 +1335,14 @@ def _train_impl(
         raise ValueError("value_loss_weight must be finite and non-negative")
     if not math.isfinite(best_union_top5_weight) or best_union_top5_weight < 0:
         raise ValueError("best_union_top5_weight must be finite and non-negative")
+    if not math.isfinite(checkmate_sample_priority) or checkmate_sample_priority < 0:
+        raise ValueError("checkmate sample priority must be finite and non-negative")
+    if checkmate_horizon_plies < 1:
+        raise ValueError("checkmate horizon plies must be positive")
     if best_union_top5_weight != 0.0:
         raise ValueError(
             "best-union top-5 is a disabled canonical-v1 auxiliary; canonical v2 derives a "
-            "top-1-preserving minimax-regret play policy"
+            "top-1-preserving worst-teacher-regret play distribution"
         )
     if exact_resume_eligible and (
         len(dataset_fingerprint) != 64
@@ -1108,10 +1357,14 @@ def _train_impl(
         seed=seed,
         reversal_priority=reversal_priority,
         blunder_priority=blunder_priority,
+        checkmate_sample_priority=checkmate_sample_priority,
+        checkmate_horizon_plies=checkmate_horizon_plies,
         require_teacher=require_teacher,
         prevalidated_teacher_samples=prevalidated_teacher_samples,
         teacher_policy_mix=teacher_policy_mix,
         teacher_value_mix=teacher_value_mix,
+        implicit_policy_mix=implicit_policy_mix,
+        proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
         legal_label_smoothing=legal_label_smoothing,
         curriculum_depth_ratio=curriculum_depth_ratio,
         minimum_teacher_policy_mix=minimum_teacher_policy_mix,
@@ -1176,8 +1429,13 @@ def _train_impl(
     if not prevalidated_teacher_samples and not canonical_teacher_only:
         sample_probabilities = np.asarray(
             [
-                (reversal_priority if sample.policy_reversal else 1.0)
-                * (1.0 + blunder_priority * max(0.0, sample.teacher_regret or 0.0))
+                _sample_sampling_weight(
+                    sample,
+                    reversal_priority=reversal_priority,
+                    blunder_priority=blunder_priority,
+                    checkmate_sample_priority=checkmate_sample_priority,
+                    checkmate_horizon_plies=checkmate_horizon_plies,
+                )
                 for sample in training_samples
             ],
             dtype=np.float64,
@@ -1190,12 +1448,20 @@ def _train_impl(
                 model,
                 *batch,
                 value_loss_weight=value_loss_weight,
+                proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
             )
-        if len(batch) != 3:
+        if len(batch) != 6:
             raise ValueError("legacy training batch has an invalid tensor contract")
-        inputs, policies, values = batch
+        inputs, policies, values, legal_mask, proof_mask, proof_active = batch
         logits, predictions = model(inputs)
-        policy_loss = nn.losses.cross_entropy(logits, policies, reduction="mean")
+        policy_loss = _legacy_policy_loss(
+            logits,
+            policies,
+            legal_mask,
+            proof_mask,
+            proof_active,
+            proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
+        )
         value_loss = mx.mean(mx.square(predictions - values))
         return _combine_policy_value_loss(
             policy_loss,
@@ -1204,12 +1470,39 @@ def _train_impl(
         ), (policy_loss, value_loss)
 
     value_and_grad = nn.value_and_grad(model, loss_fn)
-    batch_options: dict[str, float] = {
+    compiled_state = [model.state, optimizer.state, mx.random.state]
+
+    def optimization_step(*batch: mx.array) -> tuple[mx.array, ...]:
+        (loss, (policy_loss, value_loss)), gradients = value_and_grad(*batch)
+        if canonical_teacher_only:
+            clipped_gradients, gradient_norm = _canonical_v2_clip_gradients(
+                gradients,
+                max_norm=maximum_gradient_norm,
+            )
+        else:
+            clipped_gradients, gradient_norm = optim.clip_grad_norm(
+                gradients, max_norm=maximum_gradient_norm
+            )
+        optimizer.update(model, clipped_gradients)
+        return loss, policy_loss, value_loss, gradient_norm
+
+    # MLX compilation captures and updates BatchNorm/model, AdamW, and random
+    # state as one graph.  Keeping the outer optimization step intact lets MLX
+    # fuse forward/backward/update work instead of launching hundreds of small
+    # kernels per batch.
+    compiled_optimization_step = mx.compile(
+        optimization_step,
+        inputs=compiled_state,
+        outputs=compiled_state,
+    )
+    batch_options: dict[str, Any] = {
         "teacher_policy_mix": teacher_policy_mix,
         "teacher_value_mix": teacher_value_mix,
+        "implicit_policy_mix": implicit_policy_mix,
         "legal_label_smoothing": legal_label_smoothing,
         "curriculum_depth_ratio": curriculum_depth_ratio,
         "minimum_teacher_policy_mix": minimum_teacher_policy_mix,
+        "with_policy_constraints": True,
     }
     probe_count = min(256, len(training_samples))
     probe_indices = np.linspace(0, len(training_samples) - 1, probe_count, dtype=np.int64)
@@ -1249,6 +1542,22 @@ def _train_impl(
             probe_samples,
             **batch_options,
         )
+    cached_training_batch: tuple[mx.array, ...] | None = None
+    training_batch_cache_bytes = 0
+    if not canonical_teacher_only and not prevalidated_teacher_samples:
+        probe_tensor_bytes = sum(int(tensor.nbytes) for tensor in probe_batch)
+        estimated_cache_bytes = math.ceil(
+            probe_tensor_bytes * len(training_samples) / len(probe_samples)
+        )
+        if estimated_cache_bytes <= TRAINING_BATCH_CACHE_LIMIT_BYTES:
+            cached_training_batch = _make_batch(
+                list(training_samples),
+                **batch_options,
+            )
+            mx.eval(cached_training_batch)
+            training_batch_cache_bytes = sum(
+                int(tensor.nbytes) for tensor in cached_training_batch
+            )
     model.eval()
     initial_wait_started = perf_counter()
     with _training_compute_lease(training_interlock) as initial_lease:
@@ -1312,21 +1621,20 @@ def _train_impl(
                     selected_targets_v2,
                 )
             else:
-                batch = _make_batch(
-                    selected_samples,
-                    **batch_options,
-                )
-            (loss, (policy_loss, value_loss)), gradients = value_and_grad(*batch)
-            if canonical_teacher_only:
-                clipped_gradients, gradient_norm = _canonical_v2_clip_gradients(
-                    gradients,
-                    max_norm=maximum_gradient_norm,
-                )
-            else:
-                clipped_gradients, gradient_norm = optim.clip_grad_norm(  # type: ignore[no-untyped-call]
-                    gradients, max_norm=maximum_gradient_norm
-                )
-            optimizer.update(model, clipped_gradients)
+                if cached_training_batch is None:
+                    batch = _make_batch(
+                        selected_samples,
+                        **batch_options,
+                    )
+                else:
+                    index_array = mx.array(np.asarray(indices, dtype=np.int32))
+                    batch = tuple(
+                        mx.take(tensor, index_array, axis=0)
+                        for tensor in cached_training_batch
+                    )
+            loss, policy_loss, value_loss, gradient_norm = compiled_optimization_step(
+                *batch
+            )
             # MLX is lazy: the lease must cover mx.eval of model and optimizer
             # state, not merely optimizer.update.
             mx.eval(
@@ -1334,8 +1642,7 @@ def _train_impl(
                 policy_loss,
                 value_loss,
                 gradient_norm,
-                model.parameters(),
-                optimizer.state,
+                compiled_state,
             )
             if step_lease is not None:
                 step_lease.assert_healthy()
@@ -1362,6 +1669,23 @@ def _train_impl(
         observed_sum_gradient_norm += gradient_norm_value
         optimizer_step_after = optimizer_step_before + 1
         model_step_after = model_step_start + local_step + 1
+        progress_interval = max(1, steps // 100)
+        if progress_callback is not None and (
+            local_step == 0
+            or local_step == steps - 1
+            or (local_step + 1) % progress_interval == 0
+        ):
+            progress_callback(
+                {
+                    "steps_completed": local_step + 1,
+                    "steps_total": steps,
+                    "model_step": model_step_after,
+                    "optimizer_step": optimizer_step_after,
+                    "batch_loss": batch_loss_value,
+                    "policy_loss": policy_loss_value,
+                    "value_loss": value_loss_value,
+                }
+            )
         if (
             optimizer_step_after % telemetry_interval == 0
             or local_step == 0
@@ -1391,7 +1715,9 @@ def _train_impl(
         final, (final_policy, final_value) = loss_fn(*probe_batch)
         if canonical_teacher_only:
             canonical_monitor_values = _canonical_v2_monitor_losses(
-                model, *probe_batch
+                model,
+                *probe_batch,
+                proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
             )
             mx.eval(
                 final,
@@ -1417,8 +1743,8 @@ def _train_impl(
             f"{optimizer_step_end} != {expected_optimizer_step_end}"
         )
     model_step_end = model_step_start + steps
-    canonical_teacher_policy_losses: tuple[float, float] | None = None
-    canonical_teacher_value_losses: tuple[float, float] | None = None
+    canonical_teacher_policy_losses: tuple[float, ...] | None = None
+    canonical_teacher_value_losses: tuple[float, ...] | None = None
     canonical_play_policy_loss: float | None = None
     canonical_play_interval_value_loss: float | None = None
     canonical_wdl_loss: float | None = None
@@ -1434,13 +1760,11 @@ def _train_impl(
         ) = canonical_monitor_values
         teacher_policy_array = np.asarray(teacher_policy_losses, dtype=np.float64)
         teacher_value_array = np.asarray(teacher_value_losses, dtype=np.float64)
-        canonical_teacher_policy_losses = (
-            float(teacher_policy_array[0]),
-            float(teacher_policy_array[1]),
+        canonical_teacher_policy_losses = tuple(
+            float(value) for value in teacher_policy_array
         )
-        canonical_teacher_value_losses = (
-            float(teacher_value_array[0]),
-            float(teacher_value_array[1]),
+        canonical_teacher_value_losses = tuple(
+            float(value) for value in teacher_value_array
         )
         canonical_play_policy_loss = float(play_policy_loss.item())
         canonical_play_interval_value_loss = float(play_interval_value_loss.item())
@@ -1465,11 +1789,28 @@ def _train_impl(
         gradient_clipped_fraction=clipped_steps / steps,
         teacher_policy_mix=1.0 if canonical_teacher_only else teacher_policy_mix,
         teacher_value_mix=1.0 if canonical_teacher_only else teacher_value_mix,
+        implicit_policy_mix=0.0 if canonical_teacher_only else implicit_policy_mix,
+        proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
+        probe_proven_mate_rows=(
+            sum(
+                target.play.kind is PlayTargetKind.PROVEN_MATE
+                for target in (training_targets_v2 or ())
+            )
+            if canonical_teacher_only
+            else sum(
+                bool(sample.actor_proven_mate_moves or sample.teacher_proven_mate_moves)
+                for sample in probe_samples
+            )
+        ),
+        checkmate_sample_priority=checkmate_sample_priority,
+        checkmate_horizon_plies=checkmate_horizon_plies,
         probe_effective_teacher_policy_mix_min=min(probe_effective_mixes),
         probe_effective_teacher_policy_mix_mean=float(np.mean(probe_effective_mixes)),
         probe_effective_teacher_policy_mix_max=max(probe_effective_mixes),
         probe_loss_ratio=final_loss / max(initial_loss, 1e-12),
         legal_label_smoothing=0.0 if canonical_teacher_only else legal_label_smoothing,
+        training_batch_cache_enabled=cached_training_batch is not None,
+        training_batch_cache_bytes=training_batch_cache_bytes,
         mlx_peak_memory_bytes=int(mx.get_peak_memory()),
         telemetry_points=len(trace),
         compute_interlock_enabled=training_interlock is not None,
@@ -1509,10 +1850,14 @@ def train_resumable(
     seed: int = 0,
     reversal_priority: float = 4.0,
     blunder_priority: float = 3.0,
+    checkmate_sample_priority: float = 0.0,
+    checkmate_horizon_plies: int = 16,
     require_teacher: bool = True,
     prevalidated_teacher_samples: bool = False,
     teacher_policy_mix: float = 0.75,
     teacher_value_mix: float = 0.5,
+    implicit_policy_mix: float = 0.5,
+    proven_mate_policy_loss_weight: float = 0.25,
     legal_label_smoothing: float = 0.01,
     curriculum_depth_ratio: float = 64.0,
     minimum_teacher_policy_mix: float = 0.1,
@@ -1527,6 +1872,7 @@ def train_resumable(
     resume_state: TrainingState | None = None,
     telemetry_interval: int = 1,
     training_interlock: TrainingInterlockConfig | None = None,
+    progress_callback: Callable[[dict[str, int | float]], None] | None = None,
 ) -> TrainingRun:
     """Train and return a serializable, fail-closed exact-resume state."""
 
@@ -1539,10 +1885,14 @@ def train_resumable(
         seed=seed,
         reversal_priority=reversal_priority,
         blunder_priority=blunder_priority,
+        checkmate_sample_priority=checkmate_sample_priority,
+        checkmate_horizon_plies=checkmate_horizon_plies,
         require_teacher=require_teacher,
         prevalidated_teacher_samples=prevalidated_teacher_samples,
         teacher_policy_mix=teacher_policy_mix,
         teacher_value_mix=teacher_value_mix,
+        implicit_policy_mix=implicit_policy_mix,
+        proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
         legal_label_smoothing=legal_label_smoothing,
         curriculum_depth_ratio=curriculum_depth_ratio,
         minimum_teacher_policy_mix=minimum_teacher_policy_mix,
@@ -1559,6 +1909,7 @@ def train_resumable(
         resume_state=resume_state,
         telemetry_interval=telemetry_interval,
         training_interlock=training_interlock,
+        progress_callback=progress_callback,
     )
 
 
@@ -1572,10 +1923,14 @@ def train(
     seed: int = 0,
     reversal_priority: float = 4.0,
     blunder_priority: float = 3.0,
+    checkmate_sample_priority: float = 0.0,
+    checkmate_horizon_plies: int = 16,
     require_teacher: bool = True,
     prevalidated_teacher_samples: bool = False,
     teacher_policy_mix: float = 0.75,
     teacher_value_mix: float = 0.5,
+    implicit_policy_mix: float = 0.5,
+    proven_mate_policy_loss_weight: float = 0.25,
     legal_label_smoothing: float = 0.01,
     curriculum_depth_ratio: float = 64.0,
     minimum_teacher_policy_mix: float = 0.1,
@@ -1587,6 +1942,7 @@ def train(
     value_loss_weight: float = 1.0,
     best_union_top5_weight: float = 0.0,
     training_interlock: TrainingInterlockConfig | None = None,
+    progress_callback: Callable[[dict[str, int | float]], None] | None = None,
 ) -> TrainingMetrics:
     """Backward-compatible warm-start API without a resumable data identity."""
 
@@ -1599,10 +1955,14 @@ def train(
         seed=seed,
         reversal_priority=reversal_priority,
         blunder_priority=blunder_priority,
+        checkmate_sample_priority=checkmate_sample_priority,
+        checkmate_horizon_plies=checkmate_horizon_plies,
         require_teacher=require_teacher,
         prevalidated_teacher_samples=prevalidated_teacher_samples,
         teacher_policy_mix=teacher_policy_mix,
         teacher_value_mix=teacher_value_mix,
+        implicit_policy_mix=implicit_policy_mix,
+        proven_mate_policy_loss_weight=proven_mate_policy_loss_weight,
         legal_label_smoothing=legal_label_smoothing,
         curriculum_depth_ratio=curriculum_depth_ratio,
         minimum_teacher_policy_mix=minimum_teacher_policy_mix,
@@ -1619,4 +1979,5 @@ def train(
         resume_state=None,
         telemetry_interval=max(1, steps),
         training_interlock=training_interlock,
+        progress_callback=progress_callback,
     ).metrics

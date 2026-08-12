@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 import time
 from dataclasses import replace
@@ -40,6 +41,7 @@ from simajilord_shogi.trainer import (
     _make_batch,
     _make_canonical_batch,
     _proof_mate_set_mass_loss,
+    _sample_sampling_weight,
     train_resumable,
 )
 
@@ -69,6 +71,12 @@ def _canonical_target(
                 policy={"6c5b+": 1.0},
                 value=-0.6,
             ),
+            CanonicalScorerTarget(
+                scorer_id=CANONICAL_SCORER_IDS[2],
+                best_move="G*5b",
+                policy={"G*5b": 1.0},
+                value=-0.7,
+            ),
         ),
         canonical_best_union=best_union,
         equivalence_groups=(
@@ -89,6 +97,7 @@ def _canonical_target(
         canonical_values={
             CANONICAL_SCORER_IDS[0]: -0.8,
             CANONICAL_SCORER_IDS[1]: -0.6,
+            CANONICAL_SCORER_IDS[2]: -0.7,
         },
         history_training_weight=1.0,
     )
@@ -155,6 +164,79 @@ def test_legal_label_smoothing_never_assigns_probability_to_illegal_labels() -> 
     assert float(np.asarray(policies).sum()) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"turn": 1}, "turn disagrees with SFEN"),
+        ({"root_value": math.inf}, "actor root value"),
+        ({"value_target": 1.01}, "game outcome value target"),
+        ({"teacher_value": math.nan}, "teacher value target"),
+        ({"policy": {"G*5b": -0.1}}, "finite and non-negative"),
+        ({"policy": {"G*5b": math.nan}}, "finite and non-negative"),
+    ],
+)
+def test_training_batch_rejects_malformed_perspective_value_and_policy_targets(
+    change: dict[str, object], message: str
+) -> None:
+    sample = PositionSample(
+        sfen=MATE_IN_ONE_SFEN,
+        ply=0,
+        turn=0,
+        policy={"G*5b": 1.0},
+        root_value=0.0,
+        value_target=1.0,
+        teacher_policy={"G*5b": 1.0},
+        teacher_value=1.0,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _make_batch(
+            [replace(sample, **change)],  # type: ignore[arg-type]
+            teacher_policy_mix=0.75,
+            teacher_value_mix=0.0,
+            legal_label_smoothing=0.0,
+            curriculum_depth_ratio=64.0,
+            minimum_teacher_policy_mix=0.1,
+        )
+
+
+def test_checkmate_horizon_prioritizes_last_actionable_mating_position() -> None:
+    base = PositionSample(
+        sfen=MATE_IN_ONE_SFEN,
+        ply=0,
+        turn=0,
+        policy={"G*5b": 1.0},
+        root_value=1.0,
+        value_target=1.0,
+    )
+
+    ordinary = _sample_sampling_weight(
+        base,
+        reversal_priority=4.0,
+        blunder_priority=3.0,
+        checkmate_sample_priority=2.0,
+        checkmate_horizon_plies=16,
+    )
+    mating = _sample_sampling_weight(
+        replace(base, terminal_checkmate_distance=1),
+        reversal_priority=4.0,
+        blunder_priority=3.0,
+        checkmate_sample_priority=2.0,
+        checkmate_horizon_plies=16,
+    )
+    outside_horizon = _sample_sampling_weight(
+        replace(base, terminal_checkmate_distance=17),
+        reversal_priority=4.0,
+        blunder_priority=3.0,
+        checkmate_sample_priority=2.0,
+        checkmate_horizon_plies=16,
+    )
+
+    assert ordinary == 1.0
+    assert mating == 3.0
+    assert outside_horizon == 1.0
+
+
 def test_canonical_batch_assigns_zero_actor_mass_and_zero_game_outcome_contribution() -> None:
     board = Board(MATE_IN_ONE_SFEN)
     sample = PositionSample(
@@ -179,7 +261,10 @@ def test_canonical_batch_assigns_zero_actor_mass_and_zero_game_outcome_contribut
     assert group_mask[nagisa_label]
     assert group_mask[suisho_label]
     assert not np.asarray(batch[5]).any()
-    np.testing.assert_array_equal(scorer_values, np.asarray([-0.8, -0.6], dtype=np.float32))
+    np.testing.assert_array_equal(
+        scorer_values,
+        np.asarray([-0.8, -0.6, -0.7], dtype=np.float32),
+    )
     assert 1.0 not in scorer_values
 
 
@@ -646,7 +731,7 @@ def test_v1_optimizer_state_cannot_silently_resume_canonical_v2_loss() -> None:
         maximum_probe_loss_ratio=100.0,
     )
 
-    with pytest.raises(ValueError, match="arithmetic midpoint"):
+    with pytest.raises(ValueError, match="arithmetic mean"):
         train_resumable(
             model,
             [sample],

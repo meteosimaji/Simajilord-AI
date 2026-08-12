@@ -1,6 +1,6 @@
 # Meteo 将棋AI調査メモ
 
-更新: 2026-08-09
+更新: 2026-08-11
 
 このメモは、「めてお / Meteo」を公開可能な系統と正規承認済みlocal-only系統に分けて
 大会級将棋AIへ育てるために、
@@ -99,6 +99,74 @@
     扱い、少数simulationでの改善を報告しています。これはMeteoの探索高速化ablation候補ですが、
     canonical教師targetの正しさを保証するものではなく、現PUCTとの同一wall-clock対局を通すまで
     productionへ置換しません。
+18. やねうら王公式の[finny tables実装記事](https://yaneuraou.yaneu.com/2026/08/11/finny-tables-implemented-in-yaneuraou/)
+    は、玉位置ごとのfeature-transformer accumulatorをcacheして、玉移動時の全特徴再計算を
+    差分へ置き換える手法を説明しています。記事掲載値はNNUE推論部30〜50%程度、NPS約15%の
+    高速化です。これはNNUE教師のラベル生成速度を上げ得ますが、MeteoのDL networkへ直接移植する
+    手法ではありません。またNAGISA、水匠11Plus、奏乗は各配布元の探索・build条件も棋力の一部なので、
+    最新やねうら王へ差し替えた版は別engine profileとして同条件arenaで比較してから教師へ採用します。
+19. たややん氏の[HiraganaSuisho](https://github.com/tayayan/HiraganaSuisho)と
+    [230906 release](https://github.com/tayayan/HiraganaSuisho/releases/tag/230906)を、tag commit
+    `2bfb018215ddf91d949f1f025ae94a11e0216219`で監査しました。これはNNUE学習器ではなく、
+    USIエンジンの連続対局から定跡木を広げるMITライセンスの生成器です。frontier探索、ランダムな
+    枝被覆、終局時だけのtransactional merge、訪問回数、定期snapshotは局面採掘へ再利用できます。
+    一方、同tagの反復判定は過去の同一盤面出現を調べる簡略形で、投了結果を枝へ直接伝播するheuristicも
+    canonicalな最善手証拠には不足します。生成局面だけを取り込み、現行ルールでreplay検証後、三教師が
+    定跡なしで再解析します。
+20. [On-Policy Distillationの2026年研究](https://arxiv.org/abs/2604.13016)は、studentが実際に訪れた
+    状態の高確率出力へ教師信号を返すこと、失敗時のoff-policy cold start、studentとteacherの
+    思考分布の互換性、新能力を持つ教師の必要性を報告しています。
+    [OPD survey](https://arxiv.org/abs/2604.00626)もstudent-sampled trajectoryへの反復feedbackを
+    exposure bias対策として整理します。将棋への対応は、Meteo自己対局の実到達局面を三教師で
+    再解析するonline distillationです。ただし初期random modelだけの自己対局は局面分布が狭いため、
+    三教師相互対局、全登録対手、定跡木、詰み・千日手anchorをoff-policy seedとして併用します。
+21. [PRO](https://arxiv.org/abs/2306.17492)は複数候補の順位を一対比較へ潰さず学習するranking loss、
+    [PLaD](https://arxiv.org/abs/2406.02886)はteacher/student出力からpseudo-preference pairを作る
+    蒸留を提案しています。Meteoでは順位だけのPROを主損失にはしません。三教師のraw CP/mateを
+    校正したsoft distributionは、最善・次善・それ以下の差の大きさまで保持できるため、教師別CEと
+    最悪regret分布CEを主にします。PRO型の順序lossは同点・mate・boundを正しく扱う補助ablation、
+    終局WDLは全手を指し切った後の低比重auxiliaryとします。人間選好のRLHFではなく、三教師による
+    RLAIF/online distillationと探索policy improvementの組合せです。
+22. [dlshogi公式network実装](https://github.com/TadaoYamaoka/DeepLearningShogi/blob/master/dlshogi/network/policy_value_network_resnet.py)は、
+    同じ局面表現から全指し手のlogitを出すpolicy headと、1個の期待勝率を出すvalue headを持ちます。
+    [公式train実装](https://github.com/TadaoYamaoka/DeepLearningShogi/blob/master/dlshogi/train.py)はpolicyへ
+    soft-target cross entropy、valueへ終局結果と探索評価値のBCEを使います。
+    [公式HCPE/HCPE3 decoder](https://github.com/TadaoYamaoka/DeepLearningShogi/blob/master/cppshogi/python_module.cpp)は、
+    旧HCPEでは教師最善手をone-hot policyにし、HCPE3では各候補手の探索訪問回数を
+    `visit^(1/temperature)`で正規化したsoft policy（temperature 0なら最多訪問手のone-hot）へ
+    変換します。したがって「分布を学ぶか」は教師データ形式次第ですが、HCPE3は明確に
+    最善・次善以下を含む探索後の訪問分布を学習します。
+    [ふかうら王の公式UCT実装](https://github.com/yaneurao/YaneuraOu/blob/master/source/engine/dlshogi-engine/UctSearch.cpp)では、
+    policy確率をp-UCBのprior、valueを未探索leafの期待勝率に使い、訪問後は探索で蓄積した勝率へ
+    置き換えます。したがってDLが直接覚える主対象は「探索コード」ではなく指し手分布と局面価値で、
+    良いpriorとleaf評価によって同じsimulation数で有望枝へ探索を集中できることが探索効率化です。
+    一方、[やねうら王公式NNUE architecture](https://github.com/yaneurao/YaneuraOu/blob/master/source/eval/nnue/architectures/README.md)は
+    最終出力が1値の局面評価関数です。NAGISA、水匠11Plus、奏乗のNNUE/SFNNはpolicy分布を直接出さず、
+    指し手生成・枝刈り・反復深化はαβ探索側が担います。
+
+## 配布物に残る学習メモの監査
+
+- NAGISA V3.1のZIPには実行ファイル、`eval/nn.bin`、`progress.bin`、`eval_options.txt`、連絡先だけが
+  あり、学習データ、optimizer、epochの説明はありません。headerからSFNN HalfKA_hm2 1024・
+  LayerStack 9、optionsから`progress8kpabs`と外部`progress.bin`の指定だけを確認できます。
+  `FV_SCALE`や学習時score scaleは同梱optionsにないため、それ以上を推測しません。
+- 水匠11Plusの配布archiveは`nn.bin`と短いengine optionsが中心で、学習手順メモはありません。
+  architecture headerは構造識別であって、教師データや学習率の証拠ではありません。
+- 奏乗TSEC7のZIPは`engine_options.txt`、`eval/nn.bin`、`progress.bin`、Windows実行ファイルで、
+  学習手順メモや独自ライセンス文書は見つかりません。確認できるのはHalfKaHmMerged 2048x2、
+  LayerStack 9、`FV_SCALE=28`、`progress8kpabs`等の実行条件までです。
+- AobaNNUE v1.1の同梱`aobannue.txt`には最も詳しい記録があります。`shogi_hao_depth9`の80億局面を
+  WCSC35 AobaZeroの0手読み評価で上書きし、静止探索で局面を書き換え、epoch-size 1,000万を
+  32,000 epoch（延べ3,200億局面提示）、minibatch 8192、RTX 4090で15日、27,000 epoch以降
+  2,000 stepごとに学習率半減、label smoothing 0.001、momentum 0.9と記録されています。
+  `HalfKP_768_x2_16_64`が同時間比較で最良だったという作者の実測もあり、Meteoではデータ再評価、
+  大量反復、schedule、architecture-vs-NPS ablationの参考にします。
+- 技巧2の同梱READMEと`learning.cc`には、進行度→評価関数→指し手実現確率→定跡の順と、
+  `generate-positions`＋RootStrapを反復する強化学習が残っています。さらに自己対局の終局勝敗を使う
+  logistic regressionをRootStrapへ足す方が若干強かったと作者が記録しています。Meteoではこれを
+  「手ごとの深い三教師分布を主信号、終局WDLを補助信号」に対応させます。
+- 振電3、tanuki DR4、Háo、水匠5の手元runtimeからは、版・architecture・options以外の
+  十分な学習履歴は確認できませんでした。binary中の偶然の文字列を学習metadataとは扱いません。
 
 ## Meteoへの反映
 
@@ -112,20 +180,38 @@
   warmup + cosine、教師源ごとのvalue calibration、負けた定跡枝の自動再採掘を追加します。
 - 定跡は単純な勝数集計にしません。深教師で逆転勝ちと誤評価を除外し、対局数と不確実性を
   持つゲーム木として管理します。
-- AobaNNUE、公開版水匠、やねうら王系に加え、正規入手済み水匠11Plusのexact local profileを
-  外部USI教師・arenaに使います。NAGISA V3.1、AobaNNUE v1.1、技巧2 v2.0.2、水匠5、
-  水匠11Plusは実際に起動し、終局対局またはMultiPV解析を確認しました。版別の利用・再配布判定は
+- 現行9モデル（奏乗TSEC7、NAGISA V3.1、水匠11Plus、AobaNNUE v1.1、tanuki- Lí-VENGE、
+  水匠5、振電3、技巧2 v2.0.2、Háo）を外部USI教師・arenaに使います。全9件で実際の起動と
+  終局対局を確認しました。版別の利用・再配布判定は
   [`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)へ固定し、未登録モデルはfail closedします。
-- canonical v1の単一valueへの2教師broadcastは算術中点へ収束するため学習禁止にしました。
-  v2はNAGISA／水匠のpolicy/valueを独立headで監視し、全候補・複数budget・全合法応手を両教師が
+- canonical v1の単一valueへの全教師broadcastは算術平均へ収束するため学習禁止にしました。
+  v2はNAGISA／水匠11Plus／奏乗TSEC7のpolicy/valueを三つの独立headで監視し、候補和集合・
+  複数budget・三者が提案したprincipal reply和集合を全三教師が
   再採点したときだけ、最悪教師regretの大域的argminをplay targetにします。教師が解消不能に
   対立する局面はplayを学習せず追加解析へ戻します。最善手をsoftmax温度で意図せず薄めません。
   ただし実データ用score-matrix builder、校正artifactの再計算receipt、独立held-out splitは
   未実装です。内部整合する手書きsidecarは実学習の根拠にならないため、canonical v2のtrain CLIは
   これらのreceiptを実装するまでfail closedとし、synthetic fixtureの勾配検証だけを許します。
+- 上記canonical v2のworst-regret合成は、現在はRound Dの対照群です。主経路は三教師が
+  候補を提案し、1教師だけが全候補と応手を同条件で再採点するmulti-proposer/single-scorerに
+  更新しました。奏乗は暫定scorerであり、A-N/A-W/A-SとB-N/B-W/B-SでNAGISA・
+  水匠11Plus・奏乗の全員をscorer候補に残します。Round DがA/Bをheld-out regret、
+  fixed-node/time、worst-group、arenaで上回るまで、合成値をproduction正解にしません。
+- Meteoの実戦推論で現在使う出力はplay policyと符号付きplay valueの2つです。policyはMCTSの
+  PUCT prior、valueはleaf評価となり、探索後のroot訪問回数分布が実際の手選択になります。
+  canonical v2はこれに三教師別policy/value、WDL、教師不一致uncertaintyを学習用headとして加えますが、
+  三教師別headは教師同士の戦略差を失わない監視用、WDL/uncertaintyは補助信号であり、現行
+  `MLXEvaluator`は実戦時にそれらを直接読みません。play policyには三教師の最悪regret全分布、
+  play valueには再解析後の区間、WDLには終局結果を入れる設計です。2026-08-11時点のclean-reset
+  checkpointはstep 0のrandom初期値で、実score-matrix builder receiptが未実装なため学習processは
+  再開していません。つまり設計済みのtargetと、実際に学習済みの重みを区別します。
 - PSVは`numpy.memmap`で40-byteレコードを遅延復号し、教師源、offset、strideを指定して
   学習できるようにしました。`game_result`は手番側視点、dropを含むYaneuraOu Move16として
   検証し、不正サイズ・不正結果・非合法手を拒否します。
+- 奏乗系公開unique corpusの抽出100 recordは全て`Move16=0`でした。現行のpolicy教師
+  loaderはvalue-only PSVから合法手を捜造せず明示拒否します。利用許諾とsample別の
+  policy-loss maskを備えたvalue専用経路を実装するまで学習に投入しません。系譜、
+  正確なrecord数、再利用判定は[`TEACHER_LINEAGE.md`](TEACHER_LINEAGE.md)に固定しました。
 - candidate/championの色替わりarenaと自己改善世代manifestを実装しました。勝点率だけでなく
   Wilson 95%下限、最小局数、未完局0を同時に満たしたcandidateだけを昇格させます。
 - 評価値labelはPonanza係数600、dlshogiの正確な756.086496、教師別fitを同一局面数・

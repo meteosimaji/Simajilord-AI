@@ -20,6 +20,7 @@ import rsshogi
 from rsshogi.core import Board, Move
 from rsshogi.types import Color
 
+from .adjudication import can_declare_win_csa27
 from .arbitration import (
     ArbitrationConfig,
     DepthPassInput,
@@ -27,7 +28,12 @@ from .arbitration import (
     write_depth_arbitration,
 )
 from .arena import PairedArenaSummary, benchmark_checkpoint_vs_external
-from .checkpoint import load_checkpoint, load_checkpoint_with_training_state, save_checkpoint
+from .checkpoint import (
+    bounded_checkpoint_provenance,
+    load_checkpoint,
+    load_checkpoint_with_training_state,
+    save_checkpoint,
+)
 from .compute_interlock import InterlockedEvaluator
 from .config import (
     ModelProfile,
@@ -75,6 +81,7 @@ from .floodgate import (
     stream_7z_csa_sources,
 )
 from .game import play_game, replay_and_validate
+from .learning_strategy import learning_strategy_contract
 from .mcts import MCTS
 from .memory import MemoryBudget, configure_mlx_memory
 from .model import (
@@ -97,6 +104,7 @@ from .model_rights import (
 from .opening_suite import OpeningPosition, load_opening_suite
 from .opponent import OpponentProfile
 from .policy_calibration import PolicyCalibrationConfig, calibrate_teacher_policies
+from .public_psv import available_public_psv_corpora, fetch_public_psv_position_seeds
 from .reanalysis import reanalyse_game, reanalyse_game_external
 from .replay import (
     append_games,
@@ -106,6 +114,7 @@ from .replay import (
     position_samples,
     search_telemetry,
 )
+from .replay_integrity import sanitize_replay_rules
 from .rights_lineage import (
     expected_lineage_rights_summary,
     summarize_teacher_sidecar,
@@ -115,8 +124,10 @@ from .self_improvement import SelfImprovementConfig, run_self_improvement
 from .selfplay import batched_self_play, parallel_self_play
 from .teacher_data import PackedSfenValueDataset
 from .teacher_dedup import build_single_teacher_dedup, write_single_teacher_dedup
+from .teacher_lineage import teacher_lineage_contract
 from .trainer import TrainingInterlockConfig, train, train_resumable
 from .tsume import mine_unique_tsume
+from .unanimous_smoke import build_unanimous_smoke_corpus
 from .usi import UsiEngine
 from .value_scale_ablation import (
     PONANZA_COEFFICIENT_600,
@@ -129,6 +140,40 @@ from .ybb_book import build_ybb_reanalysis_plan, write_ybb_reanalysis_plan
 _INTERNAL_HARD_GAME_ACTOR_SOURCES: frozenset[str] = frozenset(
     {"meteo", "floodgate-original-candidate"}
 )
+_SUISHO11PLUS_GLOBAL_HASH_DIAGNOSTIC = (
+    "info string Warning: NNUE hash mismatch: expected 1008745266 got 1008746012 "
+    "arch_in_file=ModelType=SFNNWithoutPsqt;Features=HalfKA(Friend)"
+    "[131949->1024x2],Network=AffineTransform[1<-64](ClippedReLU[64]"
+    "(AffineTransform[64<-7](ClippedReLU[7](AffineTransform[7<-2048]"
+    "(InputSlice[2048(0:2048)]))))){LayerStack=9} "
+    "arch_expected=ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)"
+    "[131949->1024x2],Network=SFNN_HALFKA2_1024_7_64_K3K3{LayerStack=9}"
+)
+_SUISHO11PLUS_LAYER_HASH_DIAGNOSTIC = "info string Warning : nn.bin hash mismatch."
+_SUISHO11PLUS_EXPECTED_FATAL_STARTUP_DIAGNOSTICS = (
+    (("stdout", _SUISHO11PLUS_GLOBAL_HASH_DIAGNOSTIC),)
+    + (("stdout", _SUISHO11PLUS_LAYER_HASH_DIAGNOSTIC),) * 10
+)
+_SOUJOU_TSEC7_GLOBAL_HASH_DIAGNOSTIC = (
+    "info string Warning: NNUE hash mismatch: expected 1008745266 got 471869926 "
+    "arch_in_file=Features=HalfKaHmMerged(Friend)[73305->2048x2],"
+    "Network=AffineTransform[1<-64](ClippedReLU[64](AffineTransform[64<-30]"
+    "(SqrClippedReLU[30](AffineTransform[16<-4096](InputSlice[4096(0:4096)]))))),"
+    "fv_scale=28 arch_expected=ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2(Friend)[73305->2048x2],"
+    "Network=SFNN_HALFKAHM2_2048_15_64_K3K3{LayerStack=9}"
+)
+_SOUJOU_TSEC7_HEADER_VERSION_DIAGNOSTIC = (
+    "info string NNUE header version mismatch: expected 2062757654 got 2062757665 "
+    "(continuing anyway)"
+)
+_SOUJOU_TSEC7_LAYER_HASH_DIAGNOSTIC = "info string Warning : nn.bin hash mismatch."
+_SOUJOU_TSEC7_EXPECTED_FATAL_STARTUP_DIAGNOSTICS = (
+    (("stdout", _SOUJOU_TSEC7_HEADER_VERSION_DIAGNOSTIC),)
+    + (("stdout", _SOUJOU_TSEC7_GLOBAL_HASH_DIAGNOSTIC),)
+    + (("stdout", _SOUJOU_TSEC7_LAYER_HASH_DIAGNOSTIC),) * 10
+)
+_SUISHO11PLUS_PETASHOCK_FULL_BOOK_MOVES = 10_000
 
 
 def _profile(value: str) -> ModelProfile:
@@ -178,14 +223,33 @@ def _require_suisho11plus_teacher_options(
 ) -> None:
     """Reject a runnable-looking but misconfigured Suisho11Plus teacher."""
 
-    normalized = {name.casefold(): str(value).strip() for name, value in options.items()}
-    required = {
-        "fv_scale": "40",
+    normalized = _require_suisho11plus_common_options(options)
+    for name, expected in {
         "usi_ownbook": "false",
         "bookfile": "no_book",
-        "pvinterval": "0",
-    }
-    for name, expected in required.items():
+    }.items():
+        observed = normalized.get(name)
+        if observed is None:
+            raise ValueError(f"Suisho11Plus requires explicit engine option {name}")
+        if observed.casefold() != expected:
+            raise ValueError(
+                f"Suisho11Plus engine option {name} must be {expected!r}, got {observed!r}"
+            )
+    if minimum_multipv < 1:
+        raise ValueError("minimum MultiPV must be positive")
+    if multipv < minimum_multipv:
+        raise ValueError(
+            f"Suisho11Plus requires MultiPV of at least {minimum_multipv} for this operation"
+        )
+
+
+def _require_suisho11plus_common_options(
+    options: dict[str, str | int],
+) -> dict[str, str]:
+    """Validate the network/search settings shared by teacher and opponent roles."""
+
+    normalized = {name.casefold(): str(value).strip() for name, value in options.items()}
+    for name, expected in {"fv_scale": "40", "pvinterval": "0"}.items():
         observed = normalized.get(name)
         if observed is None:
             raise ValueError(f"Suisho11Plus requires explicit engine option {name}")
@@ -214,12 +278,175 @@ def _require_suisho11plus_teacher_options(
             raise ValueError(f"Suisho11Plus engine option {name} must be positive")
     if "hash" in normalized:
         raise ValueError("Suisho11Plus uses USI_Hash, not Hash")
-    if minimum_multipv < 1:
-        raise ValueError("minimum MultiPV must be positive")
-    if multipv < minimum_multipv:
+    return normalized
+
+
+def _require_suisho11plus_opponent_options(
+    options: dict[str, str | int],
+) -> Path | None:
+    """Validate a no-book or full-strength Petashock Water11 opponent profile.
+
+    Teacher labels stay on the stricter no-book path above.  For an opponent,
+    the reviewed Petashock profile may use ``user_book1.db``; current YaneuraOu
+    resolves that configured name to the adjacent ``user_book1.ybb`` binary.
+    Returning the resolved binary makes the benchmark hash it as an immutable
+    input instead of treating the book as an unrecorded engine side effect.
+    """
+
+    normalized = _require_suisho11plus_common_options(options)
+    own_book = normalized.get("usi_ownbook")
+    book_file = normalized.get("bookfile")
+    if own_book is None or book_file is None:
         raise ValueError(
-            f"Suisho11Plus requires MultiPV of at least {minimum_multipv} for this operation"
+            "Suisho11Plus opponent requires explicit USI_OwnBook and BookFile options"
         )
+    if own_book.casefold() == "false":
+        if book_file.casefold() != "no_book":
+            raise ValueError(
+                "Suisho11Plus no-book opponent requires BookFile='no_book'"
+            )
+        return None
+    if own_book.casefold() != "true":
+        raise ValueError("Suisho11Plus USI_OwnBook must be true or false")
+    if book_file.casefold() == "no_book" or Path(book_file).name != book_file:
+        raise ValueError(
+            "Suisho11Plus Petashock opponent requires one basename BookFile, not no_book"
+        )
+    required_book_options = {
+        # The reviewed YBB currently reaches game ply 203.  Pinning the engine's
+        # maximum value prevents a benchmark from silently becoming an
+        # early-book-only test when a later Petashock release grows deeper.
+        "bookmoves": str(_SUISHO11PLUS_PETASHOCK_FULL_BOOK_MOVES),
+        "bookignorerate": "0",
+        "bookevaldiff": "0",
+        "bookevalblacklimit": "-99999",
+        "bookevalwhitelimit": "-99999",
+        "bookdepthlimit": "0",
+        "bookonthefly": "true",
+        "considerbookmovecount": "false",
+        "bookpvmoves": "8",
+        "ignorebookply": "false",
+        "flippedbook": "false",
+    }
+    for name, expected in required_book_options.items():
+        observed = normalized.get(name)
+        if observed is None:
+            raise ValueError(
+                f"Suisho11Plus Petashock opponent requires explicit engine option {name}"
+            )
+        if observed.casefold() != expected:
+            raise ValueError(
+                f"Suisho11Plus Petashock option {name} must be {expected!r}, "
+                f"got {observed!r}"
+            )
+    book_directory = normalized.get("bookdir")
+    if not book_directory:
+        raise ValueError("Suisho11Plus Petashock opponent requires a non-empty BookDir")
+    expanded_book_directory = Path(book_directory).expanduser()
+    if expanded_book_directory.is_symlink():
+        raise ValueError("Suisho11Plus BookDir must be an existing non-symlink directory")
+    resolved_book_directory = expanded_book_directory.resolve()
+    if not resolved_book_directory.is_dir():
+        raise ValueError("Suisho11Plus BookDir must be an existing non-symlink directory")
+    configured_book = resolved_book_directory / book_file
+    candidates = [configured_book]
+    if configured_book.suffix.casefold() == ".db":
+        candidates.append(configured_book.with_suffix(".ybb"))
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise ValueError("Suisho11Plus opening book must not be a symlink")
+        if candidate.is_file():
+            resolved = candidate.resolve(strict=True)
+            if resolved.stat().st_size == 0:
+                raise ValueError("Suisho11Plus opening book must not be empty")
+            return resolved
+    raise FileNotFoundError(
+        "Suisho11Plus opening book was not found as the configured file or its .ybb fallback: "
+        f"{[str(candidate) for candidate in candidates]}"
+    )
+
+
+def _suisho11plus_compatibility_receipt(
+    options: dict[str, str | int],
+) -> tuple[Path, tuple[tuple[str, str], ...]]:
+    """Bind the exact local profile to its reviewed network and legacy hash diagnostics."""
+
+    normalized = {name.casefold(): str(value).strip() for name, value in options.items()}
+    eval_directory = normalized.get("evaldir")
+    if not eval_directory:
+        raise ValueError("Suisho11Plus compatibility receipt requires EvalDir")
+    eval_file = Path(eval_directory).expanduser() / "nn.bin"
+    if eval_file.is_symlink():
+        raise ValueError("Suisho11Plus nn.bin must not be a symlink")
+    resolved_eval_file = eval_file.resolve(strict=True)
+    if not resolved_eval_file.is_file():
+        raise FileNotFoundError(resolved_eval_file)
+    if resolved_eval_file.stat().st_size == 0:
+        raise ValueError("Suisho11Plus nn.bin must not be empty")
+    return resolved_eval_file, _SUISHO11PLUS_EXPECTED_FATAL_STARTUP_DIAGNOSTICS
+
+
+def _soujou_tsec7_compatibility_receipt(
+    options: dict[str, str | int],
+) -> tuple[tuple[Path, Path], tuple[tuple[str, str], ...]]:
+    """Bind奏乗's reviewed layer-stack files and their exact legacy diagnostics."""
+
+    normalized = {name.casefold(): str(value).strip() for name, value in options.items()}
+    required_values = {
+        "bookfile": "no_book",
+        "enteringkingrule": "CSARule27",
+        "fv_scale": "28",
+        "ls_bucket_mode": "progress8kpabs",
+        "pvinterval": "0",
+        "usi_ownbook": "false",
+    }
+    for name, expected in required_values.items():
+        observed = normalized.get(name)
+        if observed is None:
+            raise ValueError(f"Soujou TSEC7 requires explicit engine option {name}")
+        if observed.casefold() != expected.casefold():
+            raise ValueError(
+                f"Soujou TSEC7 engine option {name} must be {expected!r}, got {observed!r}"
+            )
+    resolved_files: list[Path] = []
+    for name, relative in (("evaldir", "nn.bin"), ("ls_progress_coeff", None)):
+        configured = normalized.get(name)
+        if not configured:
+            raise ValueError(f"Soujou TSEC7 requires a non-empty engine option {name}")
+        path = Path(configured).expanduser()
+        candidate = path / relative if relative is not None else path
+        if candidate.is_symlink():
+            raise ValueError(f"Soujou TSEC7 {name} artifact must not be a symlink")
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_file() or resolved.stat().st_size == 0:
+            raise ValueError(f"Soujou TSEC7 {name} artifact must be a non-empty file")
+        resolved_files.append(resolved)
+    for name in ("threads", "usi_hash"):
+        raw_value = normalized.get(name)
+        if raw_value is None:
+            raise ValueError(f"Soujou TSEC7 requires explicit engine option {name}")
+        try:
+            value = int(raw_value)
+        except ValueError as error:
+            raise ValueError(f"Soujou TSEC7 engine option {name} must be an integer") from error
+        if value < 1:
+            raise ValueError(f"Soujou TSEC7 engine option {name} must be positive")
+    if "hash" in normalized:
+        raise ValueError("Soujou TSEC7 uses USI_Hash, not Hash")
+    return (
+        (resolved_files[0], resolved_files[1]),
+        _SOUJOU_TSEC7_EXPECTED_FATAL_STARTUP_DIAGNOSTICS,
+    )
+
+
+def _with_required_artifact(paths: Sequence[Path], required: Path) -> list[Path]:
+    """Append one required artifact unless the caller already supplied the same file."""
+
+    required_resolved = required.expanduser().resolve(strict=True)
+    result = list(paths)
+    if not any(path.expanduser().resolve(strict=True) == required_resolved for path in result):
+        result.append(required_resolved)
+    return result
 
 
 def _resolve_ponanza_value_scale(
@@ -235,9 +462,7 @@ def _resolve_ponanza_value_scale(
     """
 
     if ponanza_coefficient is not None and legacy_tanh_denominator is not None:
-        raise ValueError(
-            "Ponanza coefficient and legacy tanh denominator are mutually exclusive"
-        )
+        raise ValueError("Ponanza coefficient and legacy tanh denominator are mutually exclusive")
     if ponanza_coefficient is None and legacy_tanh_denominator is None:
         ponanza_coefficient = PONANZA_COEFFICIENT_600
         convention = "default_ponanza_coefficient"
@@ -467,12 +692,8 @@ def _paired_elo_report(summary: PairedArenaSummary) -> dict[str, object]:
     return {
         "eligible": True,
         "estimate": _score_to_elo(summary.score),
-        "cluster_bootstrap_lower_95": _score_to_elo(
-            summary.cluster_bootstrap_lower_95
-        ),
-        "cluster_bootstrap_upper_95": _score_to_elo(
-            summary.cluster_bootstrap_upper_95
-        ),
+        "cluster_bootstrap_lower_95": _score_to_elo(summary.cluster_bootstrap_lower_95),
+        "cluster_bootstrap_upper_95": _score_to_elo(summary.cluster_bootstrap_upper_95),
         "method": "logistic transform of opening-cluster mean and one-sided bootstrap bounds",
         "unbounded_endpoint_is_null": True,
         "blockers": [],
@@ -570,9 +791,7 @@ def _training_lineage_sidecar_record(
     try:
         sidecar_payload: object = json.loads(sidecar_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(
-            f"training lineage sidecar is not valid UTF-8 JSON: {sidecar}"
-        ) from error
+        raise ValueError(f"training lineage sidecar is not valid UTF-8 JSON: {sidecar}") from error
     if not isinstance(sidecar_payload, dict) or not all(
         isinstance(key, str) for key in sidecar_payload
     ):
@@ -597,9 +816,7 @@ def _training_lineage_sidecar_record(
         if observed_identity != expected_identity:
             raise ValueError("external benchmark report is not bound to this exact replay")
         raw_rights = sidecar_payload.get("rights")
-        if not isinstance(raw_rights, dict) or not isinstance(
-            raw_rights.get("rights_id"), str
-        ):
+        if not isinstance(raw_rights, dict) or not isinstance(raw_rights.get("rights_id"), str):
             raise ValueError("external benchmark report lacks an exact rights profile")
         rights = model_rights(str(raw_rights["rights_id"]))
         benchmark_rights_id = rights.rights_id
@@ -763,9 +980,7 @@ def _training_dataset_fingerprint(
 
     identities: list[dict[str, object]] = []
     records = (
-        _training_input_provenance(paths)
-        if input_provenance is None
-        else list(input_provenance)
+        _training_input_provenance(paths) if input_provenance is None else list(input_provenance)
     )
     if len(records) != len(paths):
         raise ValueError("training provenance count does not match the ordered inputs")
@@ -840,6 +1055,9 @@ def _training_lineage(
     )
     if not isinstance(training_inputs, list):
         raise TypeError("training input provenance must be a JSON list")
+    parent_identity = bounded_checkpoint_provenance(parent_path)
+    if parent_identity["step"] != current_step:
+        raise ValueError("loaded parent step disagrees with bounded checkpoint identity")
     lineage: dict[str, object] = {
         "schema": "meteo-training-lineage-v2",
         "created_at": datetime.now(UTC).isoformat(),
@@ -848,10 +1066,7 @@ def _training_lineage(
             if optimizer_state_restored
             else "warm-start first exact-state teacher-distillation segment"
         ),
-        "parent_checkpoint": {
-            **_checkpoint_provenance(parent_path),
-            "step": current_step,
-        },
+        "parent_checkpoint": parent_identity,
         "training_inputs": training_inputs,
         "dataset_fingerprint": dataset_fingerprint,
         "teacher_sources": sorted(set(teacher_sources)),
@@ -876,9 +1091,7 @@ def _training_lineage(
     }
     if canonical_target_rights_restriction_summary is not None:
         lineage["canonical_target_rights_restriction_summary"] = (
-            validate_rights_restriction_summary(
-                canonical_target_rights_restriction_summary
-            )
+            validate_rights_restriction_summary(canonical_target_rights_restriction_summary)
         )
     lineage["rights_restriction_summary"] = expected_lineage_rights_summary(lineage)
     return lineage
@@ -926,9 +1139,7 @@ def _ensemble_teacher_inputs(
     )
 
 
-def _named_text_specs(
-    specs: Sequence[str], *, option_name: str
-) -> dict[str, tuple[str, str]]:
+def _named_text_specs(specs: Sequence[str], *, option_name: str) -> dict[str, tuple[str, str]]:
     """Parse repeatable NAME=VALUE options with case-insensitive collision checks."""
 
     parsed: dict[str, tuple[str, str]] = {}
@@ -981,8 +1192,7 @@ def _depth_pass_inputs(
             missing = sorted(set(replays) - set(supplied))
             extra = sorted(set(supplied) - set(replays))
             raise ValueError(
-                f"{option_name} labels must exactly match passes; "
-                f"missing={missing}, extra={extra}"
+                f"{option_name} labels must exactly match passes; missing={missing}, extra={extra}"
             )
     unknown_scopes = sorted(set(scopes) - set(replays))
     if unknown_scopes:
@@ -1005,9 +1215,7 @@ def _depth_pass_inputs(
     return tuple(parsed)
 
 
-def _positive_named_floats(
-    specs: Sequence[str], *, option_name: str
-) -> dict[str, float]:
+def _positive_named_floats(specs: Sequence[str], *, option_name: str) -> dict[str, float]:
     parsed = _named_text_specs(specs, option_name=option_name)
     result: dict[str, float] = {}
     for _key, (name, raw_value) in parsed.items():
@@ -1061,16 +1269,12 @@ def _positive_phase_family_floats(
                 f"{option_name} must be numeric: {phase}:{family}={raw_value}"
             ) from error
         if not math.isfinite(value) or value <= 0:
-            raise ValueError(
-                f"{option_name} must be finite and positive: {phase}:{family}"
-            )
+            raise ValueError(f"{option_name} must be finite and positive: {phase}:{family}")
         result.setdefault(previous_phase, {})[family] = value
     return result
 
 
-def _require_limited_local_destinations(
-    local_root: Path, destinations: Sequence[Path]
-) -> Path:
+def _require_limited_local_destinations(local_root: Path, destinations: Sequence[Path]) -> Path:
     """Keep restricted teacher artifacts outside Git, or under an ignored local root."""
 
     expanded_root = local_root.expanduser()
@@ -1115,9 +1319,35 @@ def _require_limited_local_destinations(
     return root
 
 
-def _add_distillation_safety_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_distillation_safety_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    teacher_value_mix_default: float = 0.5,
+) -> None:
     parser.add_argument("--teacher-policy-mix", type=float, default=0.75)
-    parser.add_argument("--teacher-value-mix", type=float, default=0.5)
+    parser.add_argument(
+        "--teacher-value-mix",
+        type=float,
+        default=teacher_value_mix_default,
+    )
+    parser.add_argument(
+        "--implicit-policy-mix",
+        type=float,
+        default=0.5,
+        help=(
+            "auxiliary weight for a policy derived from complete all-legal root Q values; "
+            "missing legacy targets remain visit-policy-only"
+        ),
+    )
+    parser.add_argument(
+        "--proven-mate-policy-loss-weight",
+        type=float,
+        default=0.25,
+        help=(
+            "independent weight for internally verified mate-set mass loss; value learning "
+            "remains active"
+        ),
+    )
     parser.add_argument("--legal-label-smoothing", type=float, default=0.01)
     parser.add_argument("--curriculum-depth-ratio", type=float, default=64.0)
     parser.add_argument("--minimum-teacher-policy-mix", type=float, default=0.1)
@@ -1220,6 +1450,21 @@ def build_parser() -> argparse.ArgumentParser:
     initialize = subparsers.add_parser("init", help="create a random initial checkpoint")
     initialize.add_argument("output", type=Path)
     initialize.add_argument("--profile", type=_profile, default="smoke")
+    initialize.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="non-negative MLX seed recorded in the random-initialization lineage",
+    )
+    initialize.add_argument(
+        "--canonical-v2",
+        action="store_true",
+        help=(
+            "initialize independent NAGISA/Suisho11Plus/Soujou auxiliary heads and guarded "
+            "distributional play heads "
+            "directly, without copying any teacher weights"
+        ),
+    )
 
     selfplay = subparsers.add_parser("selfplay", help="generate parallel self-play games")
     selfplay.add_argument("checkpoint", type=Path)
@@ -1333,6 +1578,13 @@ def build_parser() -> argparse.ArgumentParser:
     teacher_dedup.add_argument("--split", required=True)
     teacher_dedup.add_argument("--forbid-overlap-with", type=Path, action="append", default=[])
     teacher_dedup.add_argument("--manifest", type=Path)
+
+    sanitize_replay = subparsers.add_parser(
+        "sanitize-replay-rules",
+        help="drop falsely terminal repetition games and write a provenance receipt",
+    )
+    sanitize_replay.add_argument("source", type=Path)
+    sanitize_replay.add_argument("output", type=Path)
 
     floodgate_corpus = subparsers.add_parser(
         "prepare-floodgate-corpus",
@@ -1542,9 +1794,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one family per teacher; correlated teachers share the same family value",
     )
     disagreement_selection.add_argument("--high-js-threshold", type=float, default=0.25)
-    disagreement_selection.add_argument(
-        "--value-neutral-threshold", type=float, default=0.05
-    )
+    disagreement_selection.add_argument("--value-neutral-threshold", type=float, default=0.05)
     disagreement_selection.add_argument(
         "--maximum",
         type=int,
@@ -1670,8 +1920,7 @@ def build_parser() -> argparse.ArgumentParser:
     value_scale_ablation = subparsers.add_parser(
         "prepare-value-scale-ablation",
         help=(
-            "create equal-data Ponanza-600, dlshogi-756, and heldout-gated "
-            "teacher-fit value arms"
+            "create equal-data Ponanza-600, dlshogi-756, and heldout-gated teacher-fit value arms"
         ),
     )
     value_scale_ablation.add_argument("train_replay", type=Path)
@@ -1690,9 +1939,7 @@ def build_parser() -> argparse.ArgumentParser:
     value_scale_ablation.add_argument("--minimum-fit-samples", type=int, default=200)
     value_scale_ablation.add_argument("--minimum-validation-games", type=int, default=10)
     value_scale_ablation.add_argument("--minimum-validation-samples", type=int, default=100)
-    value_scale_ablation.add_argument(
-        "--minimum-heldout-bce-improvement", type=float, default=0.0
-    )
+    value_scale_ablation.add_argument("--minimum-heldout-bce-improvement", type=float, default=0.0)
     value_scale_ablation.add_argument("--minimum-coefficient", type=float, default=1.0)
     value_scale_ablation.add_argument("--maximum-coefficient", type=float, default=500_000.0)
     _add_distillation_safety_arguments(value_scale_ablation)
@@ -1750,6 +1997,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="show only exact profiles that remain unavailable for label generation",
     )
 
+    subparsers.add_parser(
+        "learning-strategy",
+        help=(
+            "print the staged multi-proposer/single-scorer learning contract, "
+            "receipt gates, baselines, and lifetime data target"
+        ),
+    )
+    subparsers.add_parser(
+        "teacher-lineage",
+        help=(
+            "print audited main-teacher ancestry, public corpus identities, "
+            "and fail-closed reuse requirements"
+        ),
+    )
+    public_psv = subparsers.add_parser(
+        "fetch-public-psv-seeds",
+        help=(
+            "range-fetch deterministic positions from a reviewed PSV corpus; discard "
+            "legacy labels and emit a rights-scoped relabel-required receipt"
+        ),
+    )
+    public_psv.add_argument("corpus_id", choices=available_public_psv_corpora())
+    public_psv.add_argument("output", type=Path)
+    public_psv.add_argument("--file-count", type=int, default=8)
+    public_psv.add_argument("--records-per-file", type=int, default=4096)
+    public_psv.add_argument("--seed", default="meteo-public-position-seeds-v1")
+    public_psv.add_argument("--timeout-seconds", type=float, default=60.0)
+    public_psv.add_argument(
+        "--allow-user-attested-local-only",
+        action="store_true",
+        help=(
+            "explicitly acknowledge a user-reported local reuse permission; all source "
+            "ranges and derived artifacts remain non-public"
+        ),
+    )
+    unanimous_smoke = subparsers.add_parser(
+        "build-unanimous-smoke",
+        help=(
+            "extract exact, budget-stable, root-and-reply unanimous positions from a "
+            "complete three-teacher committee benchmark"
+        ),
+    )
+    unanimous_smoke.add_argument("benchmark_root", type=Path)
+    unanimous_smoke.add_argument("output", type=Path)
+    unanimous_smoke.add_argument(
+        "--scorer-id",
+        choices=CANONICAL_SCORER_IDS,
+        default="soujou-tsec7-paid",
+    )
+    unanimous_smoke.add_argument("--train-count", type=int, default=20)
+    unanimous_smoke.add_argument("--calibration-count", type=int, default=10)
+    unanimous_smoke.add_argument("--heldout-count", type=int, default=10)
+    unanimous_smoke.add_argument("--policy-temperature", type=float, default=0.05)
+    unanimous_smoke.add_argument(
+        "--split-seed",
+        default="meteo-strict-unanimous-smoke-v1",
+    )
+
     tsume = subparsers.add_parser(
         "tsume-mine", help="mine unique forced mates from replay positions"
     )
@@ -1799,8 +2104,44 @@ def build_parser() -> argparse.ArgumentParser:
     improve.add_argument("--games", type=int, default=32)
     improve.add_argument("--actor-simulations", type=int, default=800)
     improve.add_argument("--actor-temperature-moves", type=int, default=24)
+    improve.add_argument(
+        "--actor-resign-threshold",
+        type=float,
+        default=None,
+        help=(
+            "opt-in self-play resignation threshold in [-1, 0]; disabled by default so a "
+            "weak or newly bootstrapped network cannot manufacture outcome labels"
+        ),
+    )
     improve.add_argument("--teacher-simulations", type=int, default=6400)
     improve.add_argument("--reanalyse-fraction", type=float, default=0.5)
+    improve.add_argument(
+        "--reanalysis-parallel-positions",
+        type=int,
+        default=64,
+        help=(
+            "independent deep-teacher roots evaluated together; each root keeps its own "
+            "full PUCT budget"
+        ),
+    )
+    improve.add_argument(
+        "--replay-window-generations",
+        type=int,
+        default=8,
+        help="train on complete positions from this many recent RL generations",
+    )
+    improve.add_argument(
+        "--checkmate-sample-priority",
+        type=float,
+        default=2.0,
+        help="extra sampling priority near a rules-verified checkmate",
+    )
+    improve.add_argument(
+        "--checkmate-horizon-plies",
+        type=int,
+        default=16,
+        help="number of actionable positions before mate eligible for extra sampling",
+    )
     improve.add_argument("--steps", type=int, default=1000)
     improve.add_argument("--batch-size", type=int, default=64)
     improve.add_argument("--learning-rate", type=float, default=1e-4)
@@ -1836,8 +2177,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="legacy single-opening smoke/debug mode only; candidate promotion is disabled",
     )
     improve.add_argument("--anchor-replay", type=Path, action="append", default=[])
+    improve.add_argument(
+        "--validation-replay",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "independent teacher-labelled replay; repeat for NAGISA, Suisho, or other "
+            "held-out gates (promotion is disabled when none is supplied)"
+        ),
+    )
+    improve.add_argument("--validation-batch-size", type=int, default=64)
+    improve.add_argument(
+        "--max-validation-policy-cross-entropy-increase",
+        type=float,
+        default=0.0,
+    )
+    improve.add_argument(
+        "--max-validation-value-mse-increase",
+        type=float,
+        default=0.0,
+    )
     improve.add_argument("--seed", type=int, default=0)
-    _add_distillation_safety_arguments(improve)
+    improve.add_argument(
+        "--implicit-policy-temperature",
+        type=float,
+        default=0.10,
+        help="temperature for the auxiliary softmax over complete all-legal root Q values",
+    )
+    _add_distillation_safety_arguments(improve, teacher_value_mix_default=0.0)
     _add_search_memory_arguments(improve)
     _add_training_interlock_arguments(improve)
 
@@ -1887,9 +2255,7 @@ def build_parser() -> argparse.ArgumentParser:
     opening_mode.add_argument(
         "--opening-suite",
         type=Path,
-        help=(
-            "read-only meteo-opening-suite-v1 JSON; required for a production/Elo benchmark"
-        ),
+        help=("read-only meteo-opening-suite-v1 JSON; required for a production/Elo benchmark"),
     )
     opening_mode.add_argument(
         "--legacy-single-opening-debug",
@@ -2007,8 +2373,7 @@ def _distillation_evaluation_report(
         return history_input_sha256(history)
 
     teacher_unique_positions = {
-        evaluation_position_key(sample, history)
-        for sample, history in teacher_rows
+        evaluation_position_key(sample, history) for sample, history in teacher_rows
     }
     teacher_source_positions = {
         (
@@ -2049,9 +2414,7 @@ def _distillation_evaluation_report(
             "evaluated_samples": alignment.overall.samples,
             "evaluated_unique_positions": alignment.overall.unique_positions,
             "history_identity": (
-                "exact-history-sha256-v2"
-                if exact_histories
-                else "normalized-sfen-v1"
+                "exact-history-sha256-v2" if exact_histories else "normalized-sfen-v1"
             ),
         },
         "batch_size": batch_size,
@@ -2163,7 +2526,7 @@ def _interactive_play(
     plies = 0
     while max_plies is None or plies < max_plies:
         print(board.to_bod())
-        if board.can_declare_win():
+        if can_declare_win_csa27(board):
             print(f"{board.turn} wins by declaration")
             return 0
         if board.is_mated() or not board.legal_moves():
@@ -2336,9 +2699,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "init":
+        if args.seed < 0:
+            raise ValueError("random initialization seed must be non-negative")
+        mx.random.seed(args.seed)
         model = PolicyValueResNet(model_profile(args.profile))
+        if args.canonical_v2:
+            model = upgrade_model_to_canonical_v2(model)
         assert_model_shapes(model, batch_size=1)
-        print(save_checkpoint(model, args.output, step=0))
+        print(
+            save_checkpoint(
+                model,
+                args.output,
+                step=0,
+                lineage={
+                    "schema": "meteo-random-initialization-v1",
+                    "method": "random_initialization",
+                    "profile": args.profile,
+                    "seed": args.seed,
+                    "teacher_weights_copied": False,
+                    "canonical_target_version": 2 if args.canonical_v2 else None,
+                    "history_input_version": model.config.history_input_version,
+                    "canonical_head_version": model.config.canonical_head_version,
+                    "canonical_teacher_count": model.config.canonical_teacher_count,
+                    "source_tree": _source_tree_provenance(),
+                    "git": _git_source_identity(),
+                    "runtime": {
+                        "python": platform.python_version(),
+                        "platform": platform.platform(),
+                        "mlx": getattr(mx, "__version__", None),
+                    },
+                },
+            )
+        )
         return 0
     if args.command == "selfplay":
         search_config = _search_from_args(args)
@@ -2378,6 +2770,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command == "sanitize-replay-rules":
+        print(json.dumps(sanitize_replay_rules(args.source, args.output), indent=2))
+        return 0
     if args.command == "deduplicate-teacher-replay":
         build = build_single_teacher_dedup(
             args.input,
@@ -2397,9 +2792,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.maximum_csa_bytes < 1:
             raise ValueError("--maximum-csa-bytes must be positive")
         if args.extraction_batch_bytes < args.maximum_csa_bytes:
-            raise ValueError(
-                "--extraction-batch-bytes must be at least --maximum-csa-bytes"
-            )
+            raise ValueError("--extraction-batch-bytes must be at least --maximum-csa-bytes")
         if args.extraction_batch_members < 1:
             raise ValueError("--extraction-batch-members must be positive")
         if args.extraction_timeout_seconds <= 0:
@@ -2488,9 +2881,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "source": plan.source.to_dict(),
                     "source_archive": archive_identity,
                     "positions": plan.header.record_count,
-                    "move_records_referenced": (
-                        plan.structural_audit.move_records_referenced
-                    ),
+                    "move_records_referenced": (plan.structural_audit.move_records_referenced),
                     "teachers": list(plan.required_teacher_ids),
                     "shards": len(plan.shards),
                     "book_moves_used_as_labels": False,
@@ -2503,8 +2894,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "train":
         _require_new_checkpoint_output(args.output, parent=args.checkpoint)
         training_interlock = _training_interlock_from_args(args)
-        model, current_step, resume_state, _parent_trace = (
-            load_checkpoint_with_training_state(args.checkpoint)
+        model, current_step, resume_state, _parent_trace = load_checkpoint_with_training_state(
+            args.checkpoint
         )
         legacy_canonical_sidecar_path = resolve_canonical_target_sidecar(args.replay)
         canonical_sidecar_path = resolve_canonical_target_sidecar_v2(
@@ -2522,15 +2913,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if legacy_canonical_sidecar_path is not None:
                     raise ValueError(
                         "canonical target v1 training is disabled because its single value head "
-                        "converges to the arithmetic midpoint of two teachers; build a complete "
+                        "converges to the arithmetic mean of all teachers; build a complete "
                         "canonical-target-contract-v2 sidecar"
                     )
                 raise ValueError(
                     "canonical teacher-only training requires one explicit or adjacent v2 sidecar"
                 )
-            if (
-                legacy_canonical_sidecar_path is not None
-                and not canonical_sidecar_path.samefile(legacy_canonical_sidecar_path)
+            if legacy_canonical_sidecar_path is not None and not canonical_sidecar_path.samefile(
+                legacy_canonical_sidecar_path
             ):
                 raise ValueError("adjacent canonical v1 and v2 sidecars are ambiguous")
         elif (
@@ -2563,12 +2953,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             canonical_targets_v2 = canonical_sidecar.positions
             canonical_rights_summary = canonical_sidecar.rights_restriction_summary
-            canonical_production_training_eligible = (
-                canonical_sidecar.production_training_eligible
-            )
-            canonical_production_training_blockers = (
-                canonical_sidecar.production_training_blockers
-            )
+            canonical_production_training_eligible = canonical_sidecar.production_training_eligible
+            canonical_production_training_blockers = canonical_sidecar.production_training_blockers
         if args.canonical_teacher_only and not canonical_production_training_eligible:
             raise RuntimeError(
                 "canonical-target-contract-v2 is inspection/test-only until the real "
@@ -2587,12 +2973,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif (
                 model.config.canonical_head_version != 2
                 or model.config.history_input_version != 2
+                or model.config.canonical_teacher_count != len(CANONICAL_SCORER_IDS)
             ):
                 raise ValueError("canonical v2 checkpoint has an incompatible model contract")
-        elif (
-            model.config.canonical_head_version != 1
-            or model.config.history_input_version != 1
-        ):
+        elif model.config.canonical_head_version != 1 or model.config.history_input_version != 1:
             raise ValueError(
                 "history-input-v2/canonical-head-v2 checkpoints require canonical v2 targets"
             )
@@ -2641,6 +3025,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "require_teacher": not args.allow_actor_targets,
             "teacher_policy_mix": args.teacher_policy_mix,
             "teacher_value_mix": args.teacher_value_mix,
+            "implicit_policy_mix": args.implicit_policy_mix,
+            "proven_mate_policy_loss_weight": args.proven_mate_policy_loss_weight,
             "legal_label_smoothing": args.legal_label_smoothing,
             "curriculum_depth_ratio": args.curriculum_depth_ratio,
             "minimum_teacher_policy_mix": args.minimum_teacher_policy_mix,
@@ -2663,9 +3049,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             training_hyperparameters.update(
                 {
                     "canonical_teacher_only": args.canonical_teacher_only,
-                    "actor_policy_target_mass": (
-                        0.0 if args.canonical_teacher_only else None
-                    ),
+                    "actor_policy_target_mass": (0.0 if args.canonical_teacher_only else None),
                     "game_outcome_value_contribution": (
                         0.0 if args.canonical_teacher_only else None
                     ),
@@ -2680,8 +3064,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "scorer_ids": list(CANONICAL_SCORER_IDS),
                             "positions": len(canonical_targets_v2 or ()),
                             "play_eligible_positions": sum(
-                                target.play.train_play
-                                for target in canonical_targets_v2 or ()
+                                target.play.train_play for target in canonical_targets_v2 or ()
                             ),
                             "unresolved_positions_auxiliary_heads_only": sum(
                                 target.play.additional_search_required
@@ -2690,7 +3073,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "teacher_policy_heads": "independent",
                             "teacher_value_heads": "independent",
                             "teacher_auxiliary_gradient_to_play_trunk": "stopped",
-                            "play_policy_target": "argmin-worst-teacher-regret-only",
+                            "play_policy_target": (
+                                "top-1-preserving-softmax-over-worst-teacher-regret"
+                            ),
                             "history_input_version": 2,
                             "sidecar_bytes_bound_only_in_dataset_fingerprint": True,
                             "sidecar_path_or_raw_hash_recorded": False,
@@ -2712,6 +3097,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_teacher=not args.allow_actor_targets,
             teacher_policy_mix=args.teacher_policy_mix,
             teacher_value_mix=args.teacher_value_mix,
+            implicit_policy_mix=args.implicit_policy_mix,
+            proven_mate_policy_loss_weight=args.proven_mate_policy_loss_weight,
             legal_label_smoothing=args.legal_label_smoothing,
             curriculum_depth_ratio=args.curriculum_depth_ratio,
             minimum_teacher_policy_mix=args.minimum_teacher_policy_mix,
@@ -2726,9 +3113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             telemetry_interval=args.telemetry_interval,
             training_interlock=training_interlock,
         )
-        _verify_training_input_provenance_unchanged(
-            replay_files, training_input_provenance
-        )
+        _verify_training_input_provenance_unchanged(replay_files, training_input_provenance)
         if canonical_sidecar_path is not None:
             assert canonical_sidecar_identity is not None
             if canonical_sidecar_identity != {
@@ -2826,8 +3211,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             input_provenance=psv_input_provenance,
         )
-        model, current_step, resume_state, _parent_trace = (
-            load_checkpoint_with_training_state(args.checkpoint)
+        model, current_step, resume_state, _parent_trace = load_checkpoint_with_training_state(
+            args.checkpoint
         )
         dataset = PackedSfenValueDataset(
             args.psv,
@@ -2855,6 +3240,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "signed_value_formula": "2p - 1 = tanh(cp / (2C))",
             "teacher_policy_mix": args.teacher_policy_mix,
             "teacher_value_mix": args.teacher_value_mix,
+            "implicit_policy_mix": args.implicit_policy_mix,
+            "proven_mate_policy_loss_weight": args.proven_mate_policy_loss_weight,
             "legal_label_smoothing": args.legal_label_smoothing,
             "curriculum_depth_ratio": args.curriculum_depth_ratio,
             "minimum_teacher_policy_mix": args.minimum_teacher_policy_mix,
@@ -2879,6 +3266,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             prevalidated_teacher_samples=True,
             teacher_policy_mix=args.teacher_policy_mix,
             teacher_value_mix=args.teacher_value_mix,
+            implicit_policy_mix=args.implicit_policy_mix,
+            proven_mate_policy_loss_weight=args.proven_mate_policy_loss_weight,
             legal_label_smoothing=args.legal_label_smoothing,
             curriculum_depth_ratio=args.curriculum_depth_ratio,
             minimum_teacher_policy_mix=args.minimum_teacher_policy_mix,
@@ -2982,9 +3371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.output.exists():
             raise FileExistsError(f"refusing to append duplicate teacher replay: {args.output}")
         provenance_path = args.output.with_suffix(args.output.suffix + ".provenance.json")
-        startup_provenance_path = args.output.with_suffix(
-            args.output.suffix + ".startup.json"
-        )
+        startup_provenance_path = args.output.with_suffix(args.output.suffix + ".startup.json")
         if provenance_path.exists():
             raise FileExistsError(f"refusing to overwrite provenance: {provenance_path}")
         if startup_provenance_path.exists() or startup_provenance_path.is_symlink():
@@ -3009,8 +3396,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "local-only acknowledgement options are only valid for a LIMITED_LOCAL profile"
             )
         options = _engine_options(args.option)
+        artifact_paths = list(args.artifact)
+        reanalysis_expected_fatal_diagnostics: tuple[tuple[str, str], ...] = ()
         if rights.rights_id == "suisho11plus-wcsc36-20260525-local":
             _require_suisho11plus_teacher_options(options, multipv=args.multipv)
+            suisho_eval_file, reanalysis_expected_fatal_diagnostics = (
+                _suisho11plus_compatibility_receipt(options)
+            )
+            artifact_paths = _with_required_artifact(artifact_paths, suisho_eval_file)
+        elif rights.rights_id == "soujou-tsec7-paid":
+            soujou_artifacts, reanalysis_expected_fatal_diagnostics = (
+                _soujou_tsec7_compatibility_receipt(options)
+            )
+            for soujou_artifact in soujou_artifacts:
+                artifact_paths = _with_required_artifact(artifact_paths, soujou_artifact)
         config = ReanalysisConfig(
             reanalyse_fraction=args.fraction,
             uncertainty_threshold=args.uncertainty_threshold,
@@ -3029,7 +3428,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         option_value_verification = (
             UsiOptionValueVerification.YANEURAOU_GETOPTION
             if args.verify_yaneuraou_options
-            or rights.rights_id == "suisho11plus-wcsc36-20260525-local"
+            or rights.rights_id
+            in {"suisho11plus-wcsc36-20260525-local", "soujou-tsec7-paid"}
             else UsiOptionValueVerification.NONE
         )
         startup_provenance: dict[str, object]
@@ -3046,6 +3446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             value_scale=teacher_value_tanh_denominator,
             option_value_verification=option_value_verification,
             startup_provenance_path=startup_provenance_path,
+            expected_fatal_startup_diagnostics=reanalysis_expected_fatal_diagnostics,
         ) as external:
             startup_provenance = external.startup_provenance.to_dict()
             for game in source_games:
@@ -3072,9 +3473,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "rights_mode": "limited_local" if limited_local else "public_output_only",
             "local_only_user_authorized": args.local_only_user_authorized,
             "local_only_root": str(local_only_root) if local_only_root is not None else None,
-            "publication_allowed": (
-                rights.output_only_meteo_publication == RightsDecision.ALLOWED
-            ),
+            "publication_allowed": (rights.output_only_meteo_publication == RightsDecision.ALLOWED),
             "public_release_gate": (
                 "blocked_pending_rights_holder_permission"
                 if limited_local
@@ -3091,7 +3490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "startup_provenance_file": str(startup_provenance_path.resolve()),
             "startup_provenance_sha256": _sha256_file(startup_provenance_path),
             "engine_sha256": _sha256_file(engine_path) if engine_path.is_file() else None,
-            "artifacts": _artifact_provenance(args.artifact),
+            "artifacts": _artifact_provenance(artifact_paths),
             "nodes_per_position": args.nodes,
             "multipv": args.multipv,
             "teacher_policy_temperature": args.teacher_policy_temperature,
@@ -3119,8 +3518,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "lower_bound_regrets": sum(
                 sample.teacher_regret_is_lower_bound for sample in teacher_samples
             ),
-            "reported_teacher_nodes": sum(
-                sample.teacher_nodes or 0 for sample in teacher_samples
+            "played_moves_searchmoves_evaluated": sum(
+                sample.teacher_played_move_value is not None for sample in teacher_samples
+            ),
+            "played_moves_exact_bound": sum(
+                sample.teacher_played_move_exact for sample in teacher_samples
+            ),
+            "reported_teacher_nodes": sum(sample.teacher_nodes or 0 for sample in teacher_samples),
+            "reported_played_move_search_nodes": sum(
+                sample.teacher_played_move_nodes or 0 for sample in teacher_samples
             ),
             "teacher_nps": {
                 "minimum": min(
@@ -3233,9 +3639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "output_normalized_positions": arbitration_payload[
                         "output_normalized_positions"
                     ],
-                    "unresolved_top1_positions": arbitration_payload[
-                        "unresolved_top1_positions"
-                    ],
+                    "unresolved_top1_positions": arbitration_payload["unresolved_top1_positions"],
                     "internally_proven_mate_positions": arbitration_payload[
                         "internally_proven_mate_positions"
                     ],
@@ -3395,6 +3799,49 @@ def main(argv: Sequence[str] | None = None) -> int:
             records = [record for record in records if record.rights_id in approved]
         print(json.dumps([record.to_dict() for record in records], indent=2))
         return 0
+    if args.command == "learning-strategy":
+        print(json.dumps(learning_strategy_contract(), indent=2, sort_keys=True))
+        return 0
+    if args.command == "teacher-lineage":
+        print(json.dumps(teacher_lineage_contract(), indent=2, sort_keys=True))
+        return 0
+    if args.command == "fetch-public-psv-seeds":
+        print(
+            json.dumps(
+                fetch_public_psv_position_seeds(
+                    args.corpus_id,
+                    args.output,
+                    file_count=args.file_count,
+                    records_per_file=args.records_per_file,
+                    seed=args.seed,
+                    timeout_seconds=args.timeout_seconds,
+                    allow_user_attested_local_only=(
+                        args.allow_user_attested_local_only
+                    ),
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "build-unanimous-smoke":
+        print(
+            json.dumps(
+                build_unanimous_smoke_corpus(
+                    args.benchmark_root,
+                    args.output,
+                    scorer_id=args.scorer_id,
+                    train_count=args.train_count,
+                    calibration_count=args.calibration_count,
+                    heldout_count=args.heldout_count,
+                    policy_temperature=args.policy_temperature,
+                    split_seed=args.split_seed,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "tsume-mine":
         puzzles = mine_unique_tsume(
             load_games(args.replay),
@@ -3480,8 +3927,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             actor_games=args.games,
             actor_simulations=args.actor_simulations,
             actor_temperature_moves=args.actor_temperature_moves,
+            actor_resign_threshold=args.actor_resign_threshold,
             teacher_simulations=args.teacher_simulations,
             reanalyse_fraction=args.reanalyse_fraction,
+            reanalysis_parallel_positions=args.reanalysis_parallel_positions,
+            replay_window_generations=args.replay_window_generations,
+            checkmate_sample_priority=args.checkmate_sample_priority,
+            checkmate_horizon_plies=args.checkmate_horizon_plies,
             training_steps=args.steps,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
@@ -3500,8 +3952,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             arena_opening_split=args.arena_opening_split,
             seed=args.seed,
             anchor_replays=tuple(str(path.resolve()) for path in args.anchor_replay),
+            validation_replays=tuple(str(path.resolve()) for path in args.validation_replay),
+            validation_batch_size=args.validation_batch_size,
+            maximum_validation_policy_cross_entropy_increase=(
+                args.max_validation_policy_cross_entropy_increase
+            ),
+            maximum_validation_value_mse_increase=(args.max_validation_value_mse_increase),
             teacher_policy_mix=args.teacher_policy_mix,
             teacher_value_mix=args.teacher_value_mix,
+            implicit_policy_temperature=args.implicit_policy_temperature,
+            implicit_policy_mix=args.implicit_policy_mix,
+            proven_mate_policy_loss_weight=args.proven_mate_policy_loss_weight,
             legal_label_smoothing=args.legal_label_smoothing,
             curriculum_depth_ratio=args.curriculum_depth_ratio,
             minimum_teacher_policy_mix=args.minimum_teacher_policy_mix,
@@ -3542,9 +4003,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("benchmark output must not be the checkpoint or a checkpoint child")
         options = _engine_options(args.option)
         rights = model_rights(args.rights_profile)
-        limited_local = (
-            rights.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
-        )
+        artifact_paths = list(args.artifact)
+        benchmark_expected_fatal_diagnostics: tuple[tuple[str, str], ...] = ()
+        opponent_opening_book: Path | None = None
+        limited_local = rights.distillation_scope is DistillationScope.LOCAL_AUTHORIZED_ONLY
         if limited_local:
             if not args.local_only_user_authorized or args.local_only_root is None:
                 raise PermissionError(
@@ -3558,21 +4020,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "LOCAL_AUTHORIZED_ONLY profile"
             )
         if rights.rights_id == "suisho11plus-wcsc36-20260525-local":
-            _require_suisho11plus_teacher_options(
-                options,
-                multipv=args.multipv,
-                minimum_multipv=1,
+            opponent_opening_book = _require_suisho11plus_opponent_options(options)
+            suisho_eval_file, benchmark_expected_fatal_diagnostics = (
+                _suisho11plus_compatibility_receipt(options)
             )
+            artifact_paths = _with_required_artifact(artifact_paths, suisho_eval_file)
+            if opponent_opening_book is not None:
+                artifact_paths = _with_required_artifact(
+                    artifact_paths,
+                    opponent_opening_book,
+                )
+        elif rights.rights_id == "soujou-tsec7-paid":
+            soujou_artifacts, benchmark_expected_fatal_diagnostics = (
+                _soujou_tsec7_compatibility_receipt(options)
+            )
+            for soujou_artifact in soujou_artifacts:
+                artifact_paths = _with_required_artifact(artifact_paths, soujou_artifact)
         option_value_verification = (
             UsiOptionValueVerification.YANEURAOU_GETOPTION
             if args.verify_yaneuraou_options
-            or rights.rights_id == "suisho11plus-wcsc36-20260525-local"
+            or rights.rights_id
+            in {"suisho11plus-wcsc36-20260525-local", "soujou-tsec7-paid"}
             else UsiOptionValueVerification.NONE
         )
         benchmark_interlock = _training_interlock_from_args(args)
-        openings, opening_manifest, legacy_single_opening = (
-            _benchmark_opening_configuration(args)
-        )
+        openings, opening_manifest, legacy_single_opening = _benchmark_opening_configuration(args)
         search = SearchConfig(
             simulations=args.simulations,
             max_plies=optional_max_plies(args.max_plies),
@@ -3595,7 +4067,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not engine_path.is_file():
             raise ValueError(f"USI engine is not a regular file: {engine_path}")
         engine_identity = _artifact_provenance([engine_path])[0]
-        artifact_identities = _artifact_provenance(args.artifact)
+        artifact_identities = _artifact_provenance(artifact_paths)
         engine_working_directory = (
             args.engine_cwd.expanduser().resolve(strict=True)
             if args.engine_cwd is not None
@@ -3628,6 +4100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 training_use=False,
                 working_directory=engine_working_directory,
                 option_value_verification=option_value_verification,
+                expected_fatal_startup_diagnostics=benchmark_expected_fatal_diagnostics,
             ) as external:
                 benchmark_startup_provenance = external.startup_provenance.to_dict()
                 summary, benchmark_games = benchmark_checkpoint_vs_external(
@@ -3644,13 +4117,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     compute_interlock=benchmark_interlock,
                 )
 
-            if len(benchmark_games) != 2 * len(openings) or summary.games != len(
-                benchmark_games
-            ):
+            if len(benchmark_games) != 2 * len(openings) or summary.games != len(benchmark_games):
                 raise RuntimeError("USI benchmark returned a mismatched game count")
-            reported_keys = tuple(
-                cluster.normalized_key for cluster in summary.cluster_results
-            )
+            reported_keys = tuple(cluster.normalized_key for cluster in summary.cluster_results)
             expected_keys = tuple(
                 OpeningPosition.from_sfen(opening).normalized_key for opening in openings
             )
@@ -3659,8 +4128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for opening_index, expected_key in enumerate(expected_keys):
                 records_for_opening = benchmark_games[2 * opening_index : 2 * opening_index + 2]
                 if any(
-                    OpeningPosition.from_sfen(record.initial_sfen).normalized_key
-                    != expected_key
+                    OpeningPosition.from_sfen(record.initial_sfen).normalized_key != expected_key
                     for record in records_for_opening
                 ):
                     raise RuntimeError("USI benchmark replay does not match the opening manifest")
@@ -3680,7 +4148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise RuntimeError("checkpoint changed during USI benchmark")
             if _artifact_provenance([engine_path])[0] != engine_identity:
                 raise RuntimeError("USI engine executable changed during benchmark")
-            if _artifact_provenance(args.artifact) != artifact_identities:
+            if _artifact_provenance(artifact_paths) != artifact_identities:
                 raise RuntimeError("USI engine artifact changed during benchmark")
             if _source_tree_provenance() != source_tree:
                 raise RuntimeError("Meteo source tree changed during benchmark")
@@ -3712,6 +4180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "opening": opening_manifest,
                 "engine": {
                     "name": rights.name,
+                    "role": "opponent_only_not_teacher_label",
                     "executable": engine_identity,
                     "arguments": list(args.engine_arg),
                     "working_directory": str(engine_working_directory),
@@ -3730,6 +4199,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "declaration_win": 1.0,
                     },
                     "artifacts": artifact_identities,
+                    "opening_book": {
+                        "enabled": opponent_opening_book is not None,
+                        "configured_book_file": options.get("BookFile"),
+                        "resolved_artifact": (
+                            None
+                            if opponent_opening_book is None
+                            else next(
+                                artifact
+                                for artifact in artifact_identities
+                                if artifact["path"] == str(opponent_opening_book)
+                            )
+                        ),
+                        "training_label_use": False,
+                    },
                 },
                 "rights": rights.to_dict(),
                 "rights_mode": "limited_local" if limited_local else "public_output_only",

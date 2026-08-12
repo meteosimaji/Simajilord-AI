@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -22,10 +24,12 @@ from simajilord_shogi.arena import (
 )
 from simajilord_shogi.checkpoint import save_checkpoint
 from simajilord_shogi.config import SearchConfig, model_profile
-from simajilord_shogi.domain import GameRecord, Termination
+from simajilord_shogi.distillation_metrics import AlignmentMetrics, AlignmentReport
+from simajilord_shogi.domain import GameRecord, PositionSample, Termination
 from simajilord_shogi.external_usi import ExternalTeacherPolicy, ExternalUsiTeacher
 from simajilord_shogi.model import PolicyValueResNet, upgrade_model_to_canonical_v2
 from simajilord_shogi.opening_suite import OpeningPosition, load_opening_suite
+from simajilord_shogi.replay import append_games
 from simajilord_shogi.self_improvement import SelfImprovementConfig, run_generation
 from simajilord_shogi.trainer import TrainingInterlockConfig
 
@@ -67,8 +71,8 @@ for raw in sys.stdin:
 
 def _fake_yaneuraou_benchmark_usi(path: Path) -> None:
     path.write_text(
-        """import sys
-options = {
+        f"""import sys
+options = {{
     'MultiPV': '1',
     'EvalDir': '',
     'FV_SCALE': '16',
@@ -77,7 +81,7 @@ options = {
     'USI_OwnBook': 'true',
     'BookFile': 'standard_book.db',
     'PvInterval': '300',
-}
+}}
 for raw in sys.stdin:
     command = raw.strip()
     if command == 'usi':
@@ -96,13 +100,18 @@ for raw in sys.stdin:
         name, value = setting.split(' value ', 1)
         options[name] = value
     elif command == 'isready':
+        for channel, diagnostic in {
+            shogi_cli._SUISHO11PLUS_EXPECTED_FATAL_STARTUP_DIAGNOSTICS!r
+        }:
+            assert channel == 'stdout'
+            print(diagnostic, flush=True)
         print('readyok', flush=True)
     elif command.startswith('getoption '):
         name = command.removeprefix('getoption ')
         if name in options:
-            print(f'Options[{name}] = {options[name]}', flush=True)
+            print(f'Options[{{name}}] = {{options[name]}}', flush=True)
         else:
-            print(f'No such option: {name}', flush=True)
+            print(f'No such option: {{name}}', flush=True)
     elif command.startswith('go '):
         print('info depth 1 nodes 1 score cp 9999 pv G*5b', flush=True)
         print('bestmove G*5b', flush=True)
@@ -277,9 +286,10 @@ def test_external_benchmark_real_smoke_path_returns_one_paired_cluster(
     assert summary.opening_pairs == 1
     assert summary.independent_opening_pairs == 1
     assert summary.incomplete_games == 2
-    assert summary.cluster_results[0].normalized_key == OpeningPosition.from_sfen(
-        MATE_IN_ONE_SFEN
-    ).normalized_key
+    assert (
+        summary.cluster_results[0].normalized_key
+        == OpeningPosition.from_sfen(MATE_IN_ONE_SFEN).normalized_key
+    )
     assert "legacy_single_opening_debug_only" in summary.promotion_blockers
     assert not summary.promoted
     assert not any((interlock.state_root / "training-step-leases").iterdir())
@@ -420,6 +430,8 @@ def test_suisho11plus_benchmark_is_verified_private_and_unpublishable(
     save_checkpoint(PolicyValueResNet(model_profile("smoke")), checkpoint, step=0)
     eval_directory = tmp_path / "eval"
     eval_directory.mkdir()
+    eval_file = eval_directory / "nn.bin"
+    eval_file.write_bytes(b"reviewed-water11plus-test-network")
     private_root = tmp_path / "private"
     private_root.mkdir()
     output = private_root / "benchmark"
@@ -500,6 +512,15 @@ def test_suisho11plus_benchmark_is_verified_private_and_unpublishable(
     assert report["public_release_gate"] == "blocked_pending_rights_holder_permission"
     assert report["rights"]["distillation_scope"] == "local_authorized_only"
     assert report["engine"]["option_value_verification"] == "yaneuraou_getoption"
+    startup = report["engine"]["startup_provenance"]
+    assert startup["fatal_diagnostics_match_expected"] is True
+    assert startup["fatal_diagnostics"] == [
+        list(diagnostic)
+        for diagnostic in shogi_cli._SUISHO11PLUS_EXPECTED_FATAL_STARTUP_DIAGNOSTICS
+    ]
+    assert any(
+        artifact["path"] == str(eval_file.resolve()) for artifact in report["engine"]["artifacts"]
+    )
     applied = report["engine"]["startup_provenance"]["applied_options"]
     assert applied
     assert all(option["verified"] for option in applied)
@@ -663,12 +684,10 @@ def test_production_benchmark_pins_opening_checkpoint_source_and_ci(
     assert report["elo"]["eligible"] is True
     assert report["elo"]["estimate"] == 0.0
     assert report["checkpoint"]["lineage"] == {"parent_checkpoint": "fixture-parent"}
-    assert report["checkpoint"]["file_count"] == 2
+    assert report["checkpoint"]["file_count"] == 3
     assert report["human_play_compute_interlock"]["enabled"] is True
     assert report["human_play_compute_interlock"]["state_root_recorded"] is False
-    assert "private-benchmark-state-token" not in json.dumps(
-        report["human_play_compute_interlock"]
-    )
+    assert "private-benchmark-state-token" not in json.dumps(report["human_play_compute_interlock"])
     assert report["source"]["tree"]["sha256"]
     assert report["source"]["git"]["commit"]
     assert report["engine"]["executable"]["sha256"]
@@ -1006,7 +1025,14 @@ def test_external_benchmark_uses_unique_opening_pairs_and_per_game_seeds(
         "MctsPlayer",
         lambda evaluator, _config, *, seed: (evaluator, seed),
     )
-    monkeypatch.setattr(arena_module, "ExternalUsiPlayer", lambda _external: opponent)
+    def fake_external_player(
+        engine: object, *, continue_after_resign: bool = False
+    ) -> object:
+        assert engine is external
+        assert continue_after_resign
+        return opponent
+
+    monkeypatch.setattr(arena_module, "ExternalUsiPlayer", fake_external_player)
 
     def fake_direct_game(
         black: object,
@@ -1090,6 +1116,16 @@ def test_improve_cli_wires_opening_suite_and_pair_threshold(
                 "40",
                 "--arena-bootstrap-iterations",
                 "1234",
+                "--validation-replay",
+                str(tmp_path / "nagisa-validation.jsonl"),
+                "--validation-replay",
+                str(tmp_path / "suisho-validation.jsonl"),
+                "--validation-batch-size",
+                "17",
+                "--max-validation-policy-cross-entropy-increase",
+                "0.01",
+                "--max-validation-value-mse-increase",
+                "0.02",
             ]
         )
         == 0
@@ -1101,13 +1137,53 @@ def test_improve_cli_wires_opening_suite_and_pair_threshold(
     assert captured[0].arena_opening_split == "heldout"
     assert captured[0].promotion_min_pairs == 40
     assert captured[0].arena_bootstrap_iterations == 1234
+    assert captured[0].validation_replays == (
+        str((tmp_path / "nagisa-validation.jsonl").resolve()),
+        str((tmp_path / "suisho-validation.jsonl").resolve()),
+    )
+    assert captured[0].validation_batch_size == 17
+    assert captured[0].maximum_validation_policy_cross_entropy_increase == 0.01
+    assert captured[0].maximum_validation_value_mse_increase == 0.02
+    assert captured[0].actor_resign_threshold is None
+    assert captured[0].replay_window_generations == 8
+    assert captured[0].teacher_value_mix == 0.0
+    assert captured[0].checkmate_sample_priority == 2.0
+    assert captured[0].checkmate_horizon_plies == 16
 
 
-def test_one_self_improvement_generation_is_manifested_and_gated(tmp_path: Path) -> None:
+def test_one_self_improvement_generation_is_manifested_and_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     mx.random.seed(0)
     champion = tmp_path / "champion"
     save_checkpoint(PolicyValueResNet(model_profile("smoke")), champion, step=0)
     workdir = tmp_path / "loop"
+    captured_training: list[dict[str, object]] = []
+    captured_actor_resign: list[float | None] = []
+    captured_arena_resign: list[float | None] = []
+    original_train = improvement.train
+    original_self_play = improvement.batched_self_play
+    original_arena = improvement.evaluate_checkpoint_pair
+
+    def capture_train(*args: object, **kwargs: object) -> object:
+        captured_training.append(dict(kwargs))
+        return original_train(*args, **kwargs)  # type: ignore[arg-type]
+
+    def capture_self_play(*args: object, **kwargs: object) -> object:
+        search = args[1]
+        assert isinstance(search, SearchConfig)
+        captured_actor_resign.append(search.resign_threshold)
+        return original_self_play(*args, **kwargs)  # type: ignore[arg-type]
+
+    def capture_arena(*args: object, **kwargs: object) -> object:
+        search = args[2]
+        assert isinstance(search, SearchConfig)
+        captured_arena_resign.append(search.resign_threshold)
+        return original_arena(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(improvement, "train", capture_train)
+    monkeypatch.setattr(improvement, "batched_self_play", capture_self_play)
+    monkeypatch.setattr(improvement, "evaluate_checkpoint_pair", capture_arena)
     result = run_generation(
         champion,
         workdir,
@@ -1137,9 +1213,18 @@ def test_one_self_improvement_generation_is_manifested_and_gated(tmp_path: Path)
     assert result.arena.incomplete_games == 0
     assert result.arena.legacy_single_opening
     assert "legacy_single_opening_debug_only" in result.arena.promotion_blockers
-    assert manifest["schema"] == 2
+    assert manifest["schema"] == 5
+    assert manifest["generation_seed"] == 0
     assert manifest["stage"] == "complete"
     assert manifest["deep_teacher_samples"] == 2
+    assert captured_training[0]["require_teacher"] is False
+    assert captured_training[0]["checkmate_sample_priority"] == 2.0
+    assert captured_actor_resign == [None]
+    assert captured_arena_resign == [None]
+    assert manifest["rl_training_contract"]["schema"] == "meteo-self-play-rl-contract-v1"
+    assert manifest["rl_training_contract"]["self_play_outcome_samples"] == 2
+    assert manifest["rl_training_contract"]["actor_mcts_policy_samples"] == 2
+    assert manifest["rl_training_contract"]["teacher_value_mix"] == 0.0
     assert manifest["opening_suite"]["mode"] == "legacy_single_opening_debug_only"
     assert manifest["arena_opening_normalized_keys"]
     assert manifest["arena_opening_sha256"]
@@ -1152,6 +1237,101 @@ def test_one_self_improvement_generation_is_manifested_and_gated(tmp_path: Path)
     }
     assert Path(result.candidate, "weights.safetensors").is_file()
     assert state["champion"] == str(champion.resolve())
+    assert state["rl_contract_schema"] == "meteo-self-play-rl-contract-v1"
+    assert state["checkpoint_history_limit"] == 2
+    assert [row["path"] for row in state["checkpoint_history"]] == [
+        result.candidate,
+        str(champion.resolve()),
+    ]
+    assert manifest["validation"] == {
+        "configured": False,
+        "passed": False,
+        "blockers": ["independent_validation_not_configured"],
+        "replays": [],
+        "training_overlap": {
+            "count": 0,
+            "sha256": hashlib.sha256().hexdigest(),
+            "examples": [],
+            "examples_truncated": False,
+        },
+    }
+
+
+def test_self_play_rl_dataset_keeps_actor_only_positions_and_checks_perspective(
+    tmp_path: Path,
+) -> None:
+    board = Board()
+    black_move = next(iter(board.legal_moves())).to_usi()
+    black = PositionSample(
+        sfen=board.to_sfen(),
+        ply=0,
+        turn=board.turn.value,
+        policy={black_move: 1.0},
+        root_value=0.0,
+        value_target=1.0,
+    )
+    board.apply_move(next(move for move in board.legal_moves() if move.to_usi() == black_move))
+    white_move = next(iter(board.legal_moves())).to_usi()
+    white = PositionSample(
+        sfen=board.to_sfen(),
+        ply=1,
+        turn=board.turn.value,
+        policy={white_move: 1.0},
+        root_value=0.0,
+        value_target=-1.0,
+        teacher_policy={white_move: 1.0},
+        teacher_value=0.25,
+    )
+    replay = tmp_path / "deep.jsonl"
+    append_games(
+        replay,
+        [
+            GameRecord(
+                initial_sfen=Board().to_sfen(),
+                moves=(black_move, white_move),
+                samples=(black, white),
+                winner=0,
+                termination=Termination.CHECKMATE,
+            )
+        ],
+    )
+
+    samples, contract = improvement._self_play_training_dataset(
+        (replay.resolve(),),
+        (),
+        actor_resign_threshold=None,
+        teacher_policy_mix=0.75,
+        teacher_value_mix=0.0,
+        checkmate_horizon_plies=16,
+    )
+
+    assert [sample.terminal_checkmate_distance for sample in samples] == [2, 1]
+    assert contract["self_play_outcome_samples"] == 2
+    assert contract["deep_policy_overlay_samples"] == 1
+    assert contract["training_samples"] == 2
+
+    bad_replay = tmp_path / "bad-perspective.jsonl"
+    append_games(
+        bad_replay,
+        [
+            GameRecord(
+                initial_sfen=Board().to_sfen(),
+                moves=(black_move,),
+                samples=(replace(black, value_target=-1.0),),
+                winner=0,
+                termination=Termination.CHECKMATE,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="wrong side-to-move perspective"):
+        improvement._self_play_training_dataset(
+            (bad_replay.resolve(),),
+            (),
+            actor_resign_threshold=None,
+            teacher_policy_mix=0.75,
+            teacher_value_mix=0.0,
+            checkmate_horizon_plies=16,
+        )
 
 
 def test_legacy_self_improvement_rejects_v2_champion_before_writing(tmp_path: Path) -> None:
@@ -1186,7 +1366,9 @@ def test_legacy_self_improvement_rejects_v2_champion_before_writing(tmp_path: Pa
     assert not workdir.exists()
 
 
-def test_split_opening_generation_records_production_pair_manifest(tmp_path: Path) -> None:
+def test_split_opening_generation_records_production_pair_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     mx.random.seed(0)
     champion = tmp_path / "champion"
     save_checkpoint(PolicyValueResNet(model_profile("smoke")), champion, step=0)
@@ -1203,6 +1385,50 @@ def test_split_opening_generation_records_production_pair_manifest(tmp_path: Pat
         ),
         encoding="utf-8",
     )
+    captured_arena_max_plies: list[int | None] = []
+
+    def complete_paired_arena(
+        _candidate: Path,
+        _champion: Path,
+        search: SearchConfig,
+        **kwargs: object,
+    ) -> tuple[arena_module.PairedArenaSummary, list[GameRecord]]:
+        captured_arena_max_plies.append(search.max_plies)
+        raw_openings = kwargs["openings"]
+        assert isinstance(raw_openings, list)
+        assert all(isinstance(opening, str) for opening in raw_openings)
+        openings = list(raw_openings)
+        positions = [OpeningPosition.from_sfen(opening) for opening in openings]
+        assert kwargs["promotion_eligible"] is False
+        summary = summarize_paired_arena(
+            [(0.5, 0.5)] * len(openings),
+            opening_sfens=openings,
+            opening_keys=[position.normalized_key for position in positions],
+            opening_hashes=[position.sha256 for position in positions],
+            terminations=[
+                (Termination.AGREED_DRAW.value, Termination.AGREED_DRAW.value)
+                for _ in openings
+            ],
+            promotion_eligible=False,
+            promotion_min_pairs=32,
+            promotion_lower_bound=0.5,
+            bootstrap_iterations=500,
+            seed=1_000_000,
+        )
+        records = [
+            GameRecord(
+                initial_sfen=opening,
+                moves=(),
+                samples=(),
+                winner=None,
+                termination=Termination.AGREED_DRAW,
+            )
+            for opening in openings
+            for _ in range(2)
+        ]
+        return summary, records
+
+    monkeypatch.setattr(improvement, "evaluate_checkpoint_pair", complete_paired_arena)
 
     result = run_generation(
         champion,
@@ -1226,11 +1452,14 @@ def test_split_opening_generation_records_production_pair_manifest(tmp_path: Pat
 
     manifest = json.loads(Path(result.manifest).read_text(encoding="utf-8"))
     assert not result.promoted
-    assert result.arena.promotion_eligible
+    assert not result.arena.promotion_eligible
+    assert "promotion_disabled" in result.arena.promotion_blockers
     assert result.arena.independent_opening_pairs == 32
-    assert result.arena.incomplete_pairs == 32
+    assert result.arena.incomplete_pairs == 0
+    assert result.arena.incomplete_games == 0
     assert result.arena.repeated_opening_pairs == 0
     assert len(result.arena.cluster_results) == 32
+    assert captured_arena_max_plies == [None]
     assert manifest["opening_suite"]["mode"] == "immutable_split_suite"
     assert len(manifest["arena_opening_normalized_keys"]) == 32
     assert len(manifest["arena_opening_sha256"]) == 32
@@ -1272,3 +1501,140 @@ def test_interrupted_generation_resumes_from_json_manifest(
     result = run_generation(champion, tmp_path / "loop", config)
     assert result.status == "rejected"
     assert json.loads(Path(result.manifest).read_text(encoding="utf-8"))["stage"] == "complete"
+
+
+def test_self_improvement_retains_only_latest_trial_and_its_parent(
+    tmp_path: Path,
+) -> None:
+    mx.random.seed(0)
+    champion = tmp_path / "champion"
+    save_checkpoint(PolicyValueResNet(model_profile("smoke")), champion, step=0)
+    workdir = tmp_path / "loop"
+    config = SelfImprovementConfig(
+        actor_games=1,
+        actor_simulations=1,
+        actor_temperature_moves=0,
+        teacher_simulations=2,
+        reanalyse_fraction=1.0,
+        training_steps=1,
+        batch_size=1,
+        learning_rate=1e-6,
+        arena_games=2,
+        arena_simulations=1,
+        promotion_min_games=2,
+        max_plies=2,
+        initial_sfen=MATE_IN_ONE_SFEN,
+        replay_window_generations=1,
+    )
+
+    first = run_generation(champion, workdir, config)
+    second = run_generation(champion, workdir, config)
+    state = json.loads((workdir / "state.json").read_text(encoding="utf-8"))
+    first_manifest = json.loads(Path(first.manifest).read_text(encoding="utf-8"))
+    second_manifest = json.loads(Path(second.manifest).read_text(encoding="utf-8"))
+
+    assert not Path(first.candidate).exists()
+    assert Path(second.candidate, "weights.safetensors").is_file()
+    assert [row["path"] for row in state["checkpoint_history"]] == [
+        second.candidate,
+        str(champion.resolve()),
+    ]
+    assert (
+        sum(
+            (generation / "candidate").is_dir()
+            for generation in workdir.glob("generation-[0-9][0-9][0-9][0-9][0-9][0-9]")
+        )
+        == 1
+    )
+    assert first_manifest["generation_seed"] == 0
+    assert second_manifest["generation_seed"] == improvement.GENERATION_SEED_STRIDE
+    assert state["cumulative_positions_seen"] == 2
+    first_generation = workdir / "generation-000001"
+    assert not (first_generation / "actor.jsonl").exists()
+    assert not (first_generation / "deep.jsonl").exists()
+    assert not (first_generation / "arena.jsonl").exists()
+    assert first_manifest["actor_replay"]["sha256"]
+    assert first_manifest["deep_replay"]["sha256"]
+    assert first_manifest["arena_replay"]["sha256"]
+    removed_names = {
+        row["name"] for row in second_manifest["replay_retention_after_completion"]["removed"]
+    }
+    assert removed_names == {"actor.jsonl", "deep.jsonl", "arena.jsonl"}
+    assert second_manifest["replay_retention_after_completion"]["reclaimed_bytes"] > 0
+
+
+def test_validation_gate_blocks_policy_and_value_regression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    champion = tmp_path / "champion"
+    candidate = tmp_path / "candidate"
+    model = PolicyValueResNet(model_profile("smoke"))
+    save_checkpoint(model, champion, step=0)
+    save_checkpoint(model, candidate, step=1)
+
+    board = Board()
+    training_sfen = board.to_sfen()
+    board.apply_move(next(iter(board.legal_moves())))
+    validation_sfen = board.to_sfen()
+
+    def replay(path: Path, sfen: str) -> None:
+        replay_board = Board(sfen)
+        move = next(iter(replay_board.legal_moves())).to_usi()
+        sample = PositionSample(
+            sfen=sfen,
+            ply=0,
+            turn=replay_board.turn.value,
+            policy={move: 1.0},
+            root_value=0.0,
+            teacher_policy={move: 1.0},
+            teacher_value=0.0,
+        )
+        append_games(
+            path,
+            [GameRecord(sfen, (), (sample,), None, Termination.AGREED_DRAW)],
+        )
+
+    training_replay = tmp_path / "training.jsonl"
+    validation_replay = tmp_path / "validation.jsonl"
+    replay(training_replay, training_sfen)
+    replay(validation_replay, validation_sfen)
+
+    def report(policy_cross_entropy: float, value_mse: float) -> AlignmentReport:
+        metrics = AlignmentMetrics(
+            samples=1,
+            unique_positions=1,
+            policy_cross_entropy=policy_cross_entropy,
+            policy_js_divergence=0.0,
+            teacher_mass_at_1=1.0,
+            teacher_mass_at_3=1.0,
+            teacher_mass_at_5=1.0,
+            teacher_best_top_1=1.0,
+            teacher_best_top_3=1.0,
+            teacher_best_top_5=1.0,
+            value_samples=1,
+            value_mse=value_mse,
+            value_brier=value_mse / 4.0,
+        )
+        return AlignmentReport(metrics, {"teacher": metrics}, {"opening": metrics})
+
+    reports = iter((report(1.0, 0.2), report(1.1, 0.3)))
+    monkeypatch.setattr(
+        improvement,
+        "evaluate_teacher_alignment",
+        lambda *_args, **_kwargs: next(reports),
+    )
+
+    gate = improvement._validation_gate(
+        candidate,
+        champion,
+        training_replay_paths=[training_replay],
+        config=SelfImprovementConfig(validation_replays=(str(validation_replay),)),
+        compute_interlock=None,
+    )
+
+    assert not gate["passed"]
+    assert gate["blockers"] == [
+        "validation_policy_regression:0",
+        "validation_value_regression:0",
+    ]
+    assert gate["training_overlap"]["count"] == 0

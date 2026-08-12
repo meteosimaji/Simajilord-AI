@@ -97,24 +97,27 @@ def test_v2_batch_keeps_teacher_policy_and_value_targets_independent(
     play_inputs = np.asarray(batch[4])
     play_policy = np.asarray(batch[6])
 
-    assert teacher_policies.shape[1] == 2
+    assert teacher_policies.shape[1] == 3
     assert teacher_policies[0, 0, seven_six] == pytest.approx(
         targets[0].scorers[0].policy["7g7f"]
     )
     assert teacher_policies[0, 1, two_six] == pytest.approx(
         targets[0].scorers[1].policy["2g2f"]
     )
+    assert teacher_policies[0, 2, two_six] == pytest.approx(
+        targets[0].scorers[2].policy["2g2f"]
+    )
     np.testing.assert_array_equal(
         teacher_values,
         np.asarray(
-            [[targets[0].scorers[0].value, targets[0].scorers[1].value]],
+            [[scorer.value for scorer in targets[0].scorers]],
             dtype=np.float32,
         ),
     )
-    assert teacher_values[0, 0] < 0.0 < teacher_values[0, 1]
+    assert 0.0 < teacher_values[0, 0] < teacher_values[0, 2] < teacher_values[0, 1]
     assert play_inputs.shape[0] == 1
-    assert play_policy[0, two_six] == 1.0
-    assert play_policy[0, seven_six] == 0.0
+    assert play_policy[0, two_six] > play_policy[0, seven_six] > 0.0
+    assert play_policy[0].sum() == pytest.approx(1.0)
 
 
 def test_v2_training_updates_distinct_teacher_heads_without_scalar_broadcast(
@@ -125,10 +128,11 @@ def test_v2_training_updates_distinct_teacher_heads_without_scalar_broadcast(
     batch = _make_canonical_v2_batch([game.samples[0]], targets)
     before = model.forward_canonical(batch[0])
     mx.eval(before.value_teachers)
-    np.testing.assert_array_equal(
-        np.asarray(before.value_teachers[:, 0]),
-        np.asarray(before.value_teachers[:, 1]),
-    )
+    for teacher_index in range(1, 3):
+        np.testing.assert_array_equal(
+            np.asarray(before.value_teachers[:, 0]),
+            np.asarray(before.value_teachers[:, teacher_index]),
+        )
 
     initial_loss, final_loss = _canonical_v2_test_step(
         model,
@@ -140,6 +144,9 @@ def test_v2_training_updates_distinct_teacher_heads_without_scalar_broadcast(
 
     assert float(after.value_teachers[0, 0].item()) < float(
         after.value_teachers[0, 1].item()
+    )
+    assert float(after.value_teachers[0, 0].item()) < float(
+        after.value_teachers[0, 2].item()
     )
     assert final_loss < initial_loss
 
@@ -160,6 +167,7 @@ def _unresolved_copy(
             policy={"2g2f": 0.1, "7g7f": 0.9},
             value=-0.8,
         ),
+        target.scorers[2],
     )
     return replace(
         target,
@@ -192,7 +200,8 @@ def test_unresolved_rows_train_only_detached_teacher_and_uncertainty_heads(
     assert np.asarray(batch[4]).shape[0] == 1
     assert np.asarray(batch[6]).shape[0] == 1
     np.testing.assert_array_equal(
-        np.asarray(batch[2])[1], np.asarray([0.8, -0.8], dtype=np.float32)
+        np.asarray(batch[2])[1],
+        np.asarray([0.8, -0.8, resolved.scorers[2].value], dtype=np.float32),
     )
 
     mx.random.seed(20260809)

@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import IO, Any, cast
 from zipfile import ZipFile, ZipInfo
 
+from .checkpoint import CHECKPOINT_COMPLETE_MARKER, validate_checkpoint_complete
 from .rights_lineage import (
     DERIVED_TEACHER_SOURCE_IDS,
     legacy_ancestor_restriction_id,
@@ -273,11 +274,18 @@ def _restricted_distribution_findings(path: str, text: str) -> list[ReleaseFindi
     ]
 
 
-def _looks_like_suisho_raw_record(path: PurePosixPath, text: str) -> bool:
+_LOCAL_ONLY_TEACHER_MARKERS = frozenset(
+    {
+        "soujou-tsec7-paid",
+        "suisho11plus-wcsc36-20260525-local",
+    }
+)
+
+
+def _looks_like_local_only_teacher_raw_record(path: PurePosixPath, text: str) -> bool:
     lowered_path = path.as_posix().casefold()
     lowered = text.casefold()
-    teacher_marker = "suisho11plus-wcsc36-20260525-local"
-    if teacher_marker not in lowered:
+    if not any(marker in lowered for marker in _LOCAL_ONLY_TEACHER_MARKERS):
         return False
     if path.suffix.casefold() == ".jsonl":
         return True
@@ -312,7 +320,7 @@ def _looks_like_generated_private_record(path: PurePosixPath, text: str) -> bool
     lowered = text.casefold()
     if "meteo-usi-startup-provenance-v1" in lowered:
         return True
-    return "suisho11plus-wcsc36-20260525-local" in lowered and any(
+    return any(marker in lowered for marker in _LOCAL_ONLY_TEACHER_MARKERS) and any(
         marker in lowered
         for marker in (
             '"artifacts"',
@@ -398,12 +406,12 @@ def _text_findings(path: PurePosixPath, raw: bytes) -> list[ReleaseFinding]:
     findings = _restricted_distribution_findings(path.as_posix(), text)
     findings.extend(_private_location_findings(path.as_posix(), text))
     if path.suffix.casefold() in DATA_BEARING_TEXT_SUFFIXES:
-        if _looks_like_suisho_raw_record(path, text):
+        if _looks_like_local_only_teacher_raw_record(path, text):
             findings.append(
                 ReleaseFinding(
                     path.as_posix(),
                     "restricted-teacher-record",
-                    "contains raw Suisho11Plus startup/replay/provenance data",
+                    "contains raw local-only teacher startup/replay/provenance data",
                 )
             )
         elif _looks_like_generated_private_record(path, text):
@@ -1227,8 +1235,13 @@ def audit_checkpoint_release(
     checkpoint = checkpoint.expanduser().resolve()
     if not checkpoint.is_dir() or checkpoint.is_symlink():
         raise ValueError("checkpoint release candidate must be a non-symlink directory")
+    validate_checkpoint_complete(checkpoint)
     findings: list[ReleaseFinding] = []
-    allowed_artifacts = {"metadata.json", "weights.safetensors"}
+    allowed_artifacts = {
+        CHECKPOINT_COMPLETE_MARKER,
+        "metadata.json",
+        "weights.safetensors",
+    }
     allowed_ancillary_names = {
         "license",
         "notice",
@@ -1259,7 +1272,7 @@ def audit_checkpoint_release(
         if not path.is_file():
             continue
         if relative.parent == PurePosixPath(".") and relative.name in allowed_artifacts:
-            if relative.name == "metadata.json":
+            if relative.name in {CHECKPOINT_COMPLETE_MARKER, "metadata.json"}:
                 findings.extend(_text_findings(relative, path.read_bytes()))
             continue
         if (

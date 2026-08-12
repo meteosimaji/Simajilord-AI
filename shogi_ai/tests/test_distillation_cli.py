@@ -30,9 +30,7 @@ from .canonical_v2_fixtures import (
 from .test_mcts_game import MATE_IN_ONE_SFEN
 
 
-def _teacher_replay(
-    path: Path, *, teacher_source: str = "held-out-teacher"
-) -> None:
+def _teacher_replay(path: Path, *, teacher_source: str = "held-out-teacher") -> None:
     sample = PositionSample(
         sfen=MATE_IN_ONE_SFEN,
         ply=0,
@@ -162,9 +160,7 @@ def test_evaluate_distillation_cli_writes_hashed_wrapper_report(
 
 
 def test_evaluate_distillation_parser_defaults_to_batch_size_32() -> None:
-    args = build_parser().parse_args(
-        ["evaluate-distillation", "checkpoint", "held-out.jsonl"]
-    )
+    args = build_parser().parse_args(["evaluate-distillation", "checkpoint", "held-out.jsonl"])
 
     assert args.batch_size == 32
     assert args.output is None
@@ -196,14 +192,12 @@ def test_train_cli_persists_and_then_restores_exact_adamw_state(
     ]
 
     assert (
-        main(
-            ["train", str(base), shared_arguments[0], str(first_output), *shared_arguments[1:]]
-        )
+        main(["train", str(base), shared_arguments[0], str(first_output), *shared_arguments[1:]])
         == 0
     )
     first_report = json.loads(capsys.readouterr().out)
-    first_model, first_step, first_state, first_trace = (
-        load_checkpoint_with_training_state(first_output)
+    first_model, first_step, first_state, first_trace = load_checkpoint_with_training_state(
+        first_output
     )
     assert first_model is not None
     assert first_step == 4
@@ -226,8 +220,8 @@ def test_train_cli_persists_and_then_restores_exact_adamw_state(
         == 0
     )
     second_report = json.loads(capsys.readouterr().out)
-    _second_model, second_step, second_state, second_trace = (
-        load_checkpoint_with_training_state(second_output)
+    _second_model, second_step, second_state, second_trace = load_checkpoint_with_training_state(
+        second_output
     )
     assert second_step == 5
     assert second_state is not None
@@ -237,12 +231,18 @@ def test_train_cli_persists_and_then_restores_exact_adamw_state(
     metadata = json.loads((second_output / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["lineage"]["exact_resume_from_parent"] is True
     assert metadata["lineage"]["optimizer"]["state_restored"] is True
-    first_metadata = json.loads(
-        (first_output / "metadata.json").read_text(encoding="utf-8")
+    first_metadata = json.loads((first_output / "metadata.json").read_text(encoding="utf-8"))
+    assert (
+        metadata["lineage"]["rights_restriction_summary"]
+        == (first_metadata["lineage"]["rights_restriction_summary"])
     )
-    assert metadata["lineage"]["rights_restriction_summary"] == (
-        first_metadata["lineage"]["rights_restriction_summary"]
-    )
+    parent_identity = metadata["lineage"]["parent_checkpoint"]
+    assert parent_identity["schema"] == "meteo-bounded-checkpoint-identity-v1"
+    assert parent_identity["step"] == 4
+    assert "path" not in parent_identity
+    assert "lineage" not in parent_identity
+    assert set(parent_identity["metadata"]) == {"sha256", "bytes"}
+    assert len((second_output / "metadata.json").read_bytes()) < 1024 * 1024
 
     with pytest.raises(ValueError, match="new checkpoint"):
         main(["train", str(second_output), str(replay), str(second_output), "--steps", "1"])
@@ -265,9 +265,7 @@ def test_train_cli_flattens_ensemble_rights_without_private_sidecar_fields(
                 "inputs": [
                     {
                         "provenance": {
-                            "engine_working_directory": (
-                                "/" + "Users" + "/private/nagisa"
-                            ),
+                            "engine_working_directory": ("/" + "Users" + "/private/nagisa"),
                             "engine_sha256": "e" * 64,
                             "rights": {
                                 "rights_id": "nagisa-v3.1",
@@ -283,9 +281,7 @@ def test_train_cli_flattens_ensemble_rights_without_private_sidecar_fields(
                             "local_only_root": "/" + "private" + "/tmp/suisho",
                             "startup_provenance_sha256": "f" * 64,
                             "rights": {
-                                "rights_id": (
-                                    "suisho11plus-wcsc36-20260525-local"
-                                ),
+                                "rights_id": ("suisho11plus-wcsc36-20260525-local"),
                                 "output_only_meteo_publication": "not_approved",
                                 "sources": ["https://example.invalid/paid-suisho"],
                             },
@@ -663,11 +659,16 @@ def test_canonical_cli_refuses_real_training_until_builder_receipt_exists(
     ):
         main(
             [
-                "train", str(base), str(replay), str(canonical),
+                "train",
+                str(base),
+                str(replay),
+                str(canonical),
                 "--canonical-teacher-only",
                 "--reset-optimizer-state",
-                "--steps", "1",
-                "--batch-size", "1",
+                "--steps",
+                "1",
+                "--batch-size",
+                "1",
             ]
         )
     assert not canonical.exists()

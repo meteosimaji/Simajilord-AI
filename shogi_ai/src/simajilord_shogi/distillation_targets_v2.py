@@ -1,8 +1,8 @@
 """Fail-closed canonical multi-teacher targets with guarded play supervision.
 
-Contract v1 preserved NAGISA and Suisho11Plus as separate records, but its
-training path still compared one scalar value head with both values.  The
-mathematical optimum of that broadcast MSE is their arithmetic midpoint.
+Contract v1 preserved canonical scorers as separate records, but its
+training path still compared one scalar value head with every teacher value.
+The mathematical optimum of that broadcast MSE is their arithmetic mean.
 Contract v2 therefore has two deliberately different responsibilities:
 
 * independent teacher policy/value targets train independent auxiliary heads;
@@ -37,6 +37,7 @@ from .distillation_targets import (
     CANONICAL_POSITION_IDENTITY,
     CANONICAL_SCORER_IDS,
     NAGISA_SCORER_ID,
+    SOUJOU_TSEC7_SCORER_ID,
     SUISHO11PLUS_SCORER_ID,
     CanonicalReplayIdentity,
     CanonicalScorerTarget,
@@ -84,6 +85,9 @@ class PlayTargetKind(StrEnum):
     """Why the play head is active, or why it is deliberately masked."""
 
     UNRESOLVED = "unresolved"
+    UNANIMOUS_CONSENSUS = "unanimous_consensus"
+    # Retained only so an older experimental payload fails with a precise
+    # derived-declaration mismatch instead of an unknown-enum parse error.
     ROBUST_CONSENSUS = "robust_consensus"
     PROVEN_MATE = "proven_mate"
 
@@ -94,6 +98,9 @@ class CanonicalDisagreementReason(StrEnum):
     TEACHER_BEST_MOVE = "teacher_best_move"
     TEACHER_POLICY_DISTRIBUTION = "teacher_policy_distribution"
     TEACHER_VALUE_SIGN = "teacher_value_sign"
+    TEACHER_TOP1_NOT_UNANIMOUS = "teacher_top1_not_unanimous"
+    BUDGET_TOP1_INSTABILITY = "budget_top1_instability"
+    VALUE_SIGN_CONFLICT = "value_sign_conflict"
     CANDIDATE_FAMILY_COVERAGE = "candidate_family_coverage_incomplete"
     REPLY_COVERAGE = "reply_coverage_incomplete"
     CALIBRATION = "calibration_unverified"
@@ -138,7 +145,7 @@ class CandidateScoreEvidence:
     time_ms: int
     pv: tuple[str, ...]
     principal_replies: tuple[PrincipalReplyScore, ...]
-    legal_reply_coverage_complete: bool
+    reply_proposal_coverage_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +156,33 @@ class CandidateFamilyProposal:
     producer: str
     provenance_sha256: str
     moves: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PrincipalReplyProposal:
+    """One canonical scorer's provenance-bound opponent-reply proposal."""
+
+    scorer_id: str
+    provenance_sha256: str
+    moves: tuple[str, ...]
+    reported_nodes: int
+    depth: int
+    time_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReplyProposals:
+    """Cross-teacher reply union for one already-selected root candidate."""
+
+    move: str
+    proposals: tuple[PrincipalReplyProposal, ...]
+    reply_moves: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetReplyProposals:
+    requested_nodes: int
+    candidates: tuple[CandidateReplyProposals, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +220,7 @@ class RobustnessThresholds:
     regret: float
     depth_dispersion: float
     reply_dispersion: float
+    policy_temperature: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +261,18 @@ class GuardedPlayTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class UnanimousBootstrapEvidence:
+    """Strict Round-0 gate derived from the common constrained-search matrix."""
+
+    best_move: str | None
+    unique_top1_per_search: bool
+    stable_across_budgets: bool
+    unanimous_across_teachers: bool
+    value_sign_compatible: bool
+    deepest_values: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalDistillationTargetV2:
     game_index: int
     sample_index: int
@@ -239,9 +286,11 @@ class CanonicalDistillationTargetV2:
     reply_coverage_complete: bool
     candidate_moves: tuple[str, ...]
     budgets: tuple[int, ...]
+    reply_proposals: tuple[BudgetReplyProposals, ...]
     score_matrix: tuple[CanonicalScorerMatrix, ...]
     thresholds: RobustnessThresholds
     proof: VerifiedMateProof
+    unanimous_bootstrap: UnanimousBootstrapEvidence
     play: GuardedPlayTarget
     uncertainty_target: float
     worst_teacher_regret: dict[str, float]
@@ -446,6 +495,7 @@ def _v2_descriptor(value: object, *, index: int) -> CanonicalScorerDescriptorV2:
     expected_family = {
         NAGISA_SCORER_ID: "nagisa",
         SUISHO11PLUS_SCORER_ID: "suisho",
+        SOUJOU_TSEC7_SCORER_ID: "soujou",
     }.get(cast(str, scorer_id))
     if (
         not isinstance(scorer_id, str)
@@ -454,7 +504,7 @@ def _v2_descriptor(value: object, *, index: int) -> CanonicalScorerDescriptorV2:
         or role != "canonical_scorer"
         or family != expected_family
     ):
-        raise ValueError("canonical v2 scorer descriptor is not the exact reviewed pair")
+        raise ValueError("canonical v2 scorer descriptor is not in the exact reviewed trio")
     if row["history_mode"] != "game_prefix":
         raise ValueError("canonical v2 scorer must receive the exact game-prefix history")
     if row["book_enabled"] is not False:
@@ -724,6 +774,7 @@ def _v2_candidate_score(
     *,
     root: Board,
     expected_move: str,
+    expected_reply_moves: tuple[str, ...],
     requested_nodes: int,
     calibration: ScoreCalibration,
     label: str,
@@ -782,7 +833,6 @@ def _v2_candidate_score(
         pv_board.apply_move(Move.from_usi(pv_move))
     child = root.copy()
     child.apply_move(Move.from_usi(move))
-    expected_reply_moves = tuple(sorted(reply.to_usi() for reply in child.legal_moves()))
     replies = tuple(
         _v2_reply(
             reply,
@@ -798,10 +848,12 @@ def _v2_candidate_score(
     observed_reply_moves = tuple(reply.move for reply in replies)
     if observed_reply_moves != tuple(sorted(set(observed_reply_moves))):
         raise ValueError(f"{label} principal replies must be unique and sorted")
+    if observed_reply_moves != expected_reply_moves:
+        raise ValueError(
+            f"{label} principal replies must exactly cover the cross-teacher proposal union"
+        )
     if len(pv) > 1 and pv[1] not in {reply.move for reply in replies}:
         raise ValueError(f"{label} PV reply must be represented in principal_replies")
-    if expected_reply_moves and not replies:
-        raise ValueError(f"{label} requires at least one scored principal reply")
     return CandidateScoreEvidence(
         move=move,
         q_value=q_value,
@@ -817,7 +869,7 @@ def _v2_candidate_score(
         time_ms=time_ms,
         pv=tuple(pv),
         principal_replies=replies,
-        legal_reply_coverage_complete=observed_reply_moves == expected_reply_moves,
+        reply_proposal_coverage_complete=observed_reply_moves == expected_reply_moves,
     )
 
 
@@ -828,6 +880,7 @@ def _v2_scorer_matrix(
     scorer_id: str,
     budgets: tuple[int, ...],
     candidates: tuple[str, ...],
+    reply_proposals: tuple[BudgetReplyProposals, ...],
 ) -> CanonicalScorerMatrix:
     row = _v2_mapping(value, label=f"score matrix {scorer_id}")
     _v2_exact_fields(
@@ -855,8 +908,8 @@ def _v2_scorer_matrix(
     if len(raw_budgets) != len(budgets):
         raise ValueError(f"{scorer_id} must cover every requested node budget")
     parsed: list[BudgetScoreEvidence] = []
-    for index, (raw_budget, requested_nodes) in enumerate(
-        zip(raw_budgets, budgets, strict=True)
+    for index, (raw_budget, requested_nodes, budget_reply_proposals) in enumerate(
+        zip(raw_budgets, budgets, reply_proposals, strict=True)
     ):
         budget_row = _v2_mapping(raw_budget, label=f"{scorer_id} budget {index}")
         _v2_exact_fields(
@@ -885,11 +938,17 @@ def _v2_scorer_matrix(
                 raw_candidate,
                 root=root,
                 expected_move=candidate,
+                expected_reply_moves=candidate_reply_proposals.reply_moves,
                 requested_nodes=requested_nodes,
                 calibration=calibration,
                 label=f"{scorer_id} budget {requested_nodes} candidate {candidate}",
             )
-            for raw_candidate, candidate in zip(raw_candidates, candidates, strict=True)
+            for raw_candidate, candidate, candidate_reply_proposals in zip(
+                raw_candidates,
+                candidates,
+                budget_reply_proposals.candidates,
+                strict=True,
+            )
         )
         measured_nodes = sum(
             candidate.reported_nodes
@@ -919,18 +978,24 @@ def _v2_thresholds(value: object) -> RobustnessThresholds:
     row = _v2_mapping(value, label="robustness thresholds")
     _v2_exact_fields(
         row,
-        {"regret", "depth_dispersion", "reply_dispersion"},
+        {"regret", "depth_dispersion", "reply_dispersion", "policy_temperature"},
         label="robustness thresholds",
     )
     regret = _v2_finite(row["regret"], label="regret threshold")
     depth = _v2_finite(row["depth_dispersion"], label="depth-dispersion threshold")
     reply = _v2_finite(row["reply_dispersion"], label="reply-dispersion threshold")
+    policy_temperature = _v2_finite(
+        row["policy_temperature"], label="robust-policy temperature"
+    )
     if regret < 0.0 or depth < 0.0 or reply < 0.0:
         raise ValueError("robustness thresholds must be non-negative")
+    if policy_temperature <= 0.0:
+        raise ValueError("robust-policy temperature must be positive")
     return RobustnessThresholds(
         regret=regret,
         depth_dispersion=depth,
         reply_dispersion=reply,
+        policy_temperature=policy_temperature,
     )
 
 
@@ -1127,11 +1192,195 @@ def _v2_candidate_proposal(
     )
 
 
+def _v2_reply_proposals(
+    value: object,
+    *,
+    root: Board,
+    budgets: tuple[int, ...],
+    candidates: tuple[str, ...],
+) -> tuple[BudgetReplyProposals, ...]:
+    """Validate the efficient cross-teacher principal-reply coverage contract.
+
+    Exhaustively scoring every legal reply is wasteful and does not correspond
+    to rational minimax search.  Instead, each canonical scorer independently
+    proposes principal opponent replies after every root candidate.  Their
+    union is immutable evidence, and every scorer must then score every member
+    of that union with a constrained full-budget search.
+    """
+
+    rows = _v2_sequence(value, label="reply_proposals")
+    if len(rows) != len(budgets):
+        raise ValueError("reply proposals must cover every requested node budget")
+    parsed_budgets: list[BudgetReplyProposals] = []
+    for budget_index, (raw_budget, requested_nodes) in enumerate(
+        zip(rows, budgets, strict=True)
+    ):
+        budget_row = _v2_mapping(
+            raw_budget,
+            label=f"reply proposals budget {budget_index}",
+        )
+        _v2_exact_fields(
+            budget_row,
+            {"requested_nodes", "candidates"},
+            label=f"reply proposals budget {budget_index}",
+        )
+        if _v2_integer(
+            budget_row["requested_nodes"],
+            label="reply proposal requested_nodes",
+            minimum=1,
+        ) != requested_nodes:
+            raise ValueError("reply-proposal node budgets do not match score-matrix budgets")
+        raw_candidates = _v2_sequence(
+            budget_row["candidates"],
+            label=f"reply proposals budget {requested_nodes} candidates",
+        )
+        if len(raw_candidates) != len(candidates):
+            raise ValueError("reply proposals must cover every root candidate")
+        parsed_candidates: list[CandidateReplyProposals] = []
+        for candidate_index, (raw_candidate, expected_candidate) in enumerate(
+            zip(raw_candidates, candidates, strict=True)
+        ):
+            label = (
+                f"reply proposals budget {requested_nodes} candidate {candidate_index}"
+            )
+            candidate_row = _v2_mapping(raw_candidate, label=label)
+            _v2_exact_fields(
+                candidate_row,
+                {"move", "proposals", "reply_moves"},
+                label=label,
+            )
+            candidate_move = _v2_legal_move(
+                candidate_row["move"],
+                board=root,
+                label=f"{label} root move",
+            )
+            if candidate_move != expected_candidate:
+                raise ValueError(
+                    "reply-proposal candidates must follow the canonical sorted move order"
+                )
+            child = root.copy()
+            child.apply_move(Move.from_usi(candidate_move))
+            legal_replies = {move.to_usi() for move in child.legal_moves()}
+            raw_proposals = _v2_sequence(
+                candidate_row["proposals"],
+                label=f"{label} canonical scorer proposals",
+            )
+            if len(raw_proposals) != len(CANONICAL_SCORER_IDS):
+                raise ValueError(
+                    "every candidate requires reply proposals from every canonical scorer"
+                )
+            proposals: list[PrincipalReplyProposal] = []
+            for proposal_index, (raw_proposal, scorer_id) in enumerate(
+                zip(raw_proposals, CANONICAL_SCORER_IDS, strict=True)
+            ):
+                proposal_label = f"{label} proposal {proposal_index}"
+                proposal_row = _v2_mapping(raw_proposal, label=proposal_label)
+                _v2_exact_fields(
+                    proposal_row,
+                    {
+                        "scorer_id",
+                        "provenance_sha256",
+                        "moves",
+                        "reported_nodes",
+                        "depth",
+                        "time_ms",
+                    },
+                    label=proposal_label,
+                )
+                if proposal_row["scorer_id"] != scorer_id:
+                    raise ValueError(
+                        "reply-proposal scorer order must match the canonical scorer trio"
+                    )
+                moves = tuple(
+                    _v2_legal_move(
+                        move,
+                        board=child,
+                        label=f"{proposal_label} move",
+                    )
+                    for move in _v2_sequence(
+                        proposal_row["moves"],
+                        label=f"{proposal_label} moves",
+                    )
+                )
+                if moves != tuple(sorted(set(moves))):
+                    raise ValueError("principal reply proposals must be unique and sorted")
+                if legal_replies and not moves:
+                    raise ValueError(
+                        "each canonical scorer must propose at least one legal principal reply"
+                    )
+                if not legal_replies and moves:
+                    raise ValueError("a terminal child cannot have principal reply proposals")
+                minimum_nodes = requested_nodes if legal_replies else 0
+                proposals.append(
+                    PrincipalReplyProposal(
+                        scorer_id=scorer_id,
+                        provenance_sha256=_v2_sha256(
+                            proposal_row["provenance_sha256"],
+                            label=f"{proposal_label} provenance SHA-256",
+                        ),
+                        moves=moves,
+                        reported_nodes=_v2_integer(
+                            proposal_row["reported_nodes"],
+                            label=f"{proposal_label} reported_nodes",
+                            minimum=minimum_nodes,
+                        ),
+                        depth=_v2_integer(
+                            proposal_row["depth"],
+                            label=f"{proposal_label} depth",
+                            minimum=1 if legal_replies else 0,
+                        ),
+                        time_ms=_v2_integer(
+                            proposal_row["time_ms"],
+                            label=f"{proposal_label} time_ms",
+                        ),
+                    )
+                )
+            reply_moves = tuple(
+                _v2_legal_move(
+                    move,
+                    board=child,
+                    label=f"{label} union reply",
+                )
+                for move in _v2_sequence(
+                    candidate_row["reply_moves"],
+                    label=f"{label} reply_moves",
+                )
+            )
+            if reply_moves != tuple(sorted(set(reply_moves))):
+                raise ValueError("reply-proposal union must be unique and sorted")
+            proposal_union = set().union(*(set(proposal.moves) for proposal in proposals))
+            if set(reply_moves) != proposal_union:
+                raise ValueError(
+                    "reply_moves must exactly equal the canonical-scorer proposal union"
+                )
+            parsed_candidates.append(
+                CandidateReplyProposals(
+                    move=candidate_move,
+                    proposals=tuple(proposals),
+                    reply_moves=reply_moves,
+                )
+            )
+        parsed_budgets.append(
+            BudgetReplyProposals(
+                requested_nodes=requested_nodes,
+                candidates=tuple(parsed_candidates),
+            )
+        )
+    return tuple(parsed_budgets)
+
+
 def _v2_policy_tv(scorers: tuple[CanonicalScorerTarget, ...]) -> float:
+    """Return the largest pairwise total-variation distance."""
+
     moves = set().union(*(set(scorer.policy) for scorer in scorers))
-    return 0.5 * math.fsum(
-        abs(scorers[0].policy.get(move, 0.0) - scorers[1].policy.get(move, 0.0))
-        for move in moves
+    return max(
+        0.5
+        * math.fsum(
+            abs(left.policy.get(move, 0.0) - right.policy.get(move, 0.0))
+            for move in moves
+        )
+        for left_index, left in enumerate(scorers)
+        for right in scorers[left_index + 1 :]
     )
 
 
@@ -1191,16 +1440,100 @@ def _v2_derive_evidence(
     return worst_regret, maximum_depth, maximum_reply, exact
 
 
+def _v2_backed_up_candidate_value(candidate: CandidateScoreEvidence) -> float:
+    """Return the root value after the adversarial principal-reply union."""
+
+    return min(
+        candidate.q_value,
+        *(reply.q_value for reply in candidate.principal_replies),
+    )
+
+
+def _v2_unanimous_bootstrap_evidence(
+    matrices: tuple[CanonicalScorerMatrix, ...],
+) -> UnanimousBootstrapEvidence:
+    """Require one exact top move to survive every teacher and every budget.
+
+    MultiPV is not interpreted as a native policy here.  It only supplied the
+    candidate union; this decision is rebuilt from the individually constrained
+    scalar searches (including the opponent-reply backup) in the score matrix.
+    """
+
+    per_teacher_best: list[str | None] = []
+    deepest_values: dict[str, float] = {}
+    unique_top1_per_search = True
+    stable_across_budgets = True
+    for matrix in matrices:
+        budget_best: list[str | None] = []
+        for budget in matrix.budgets:
+            values = {
+                candidate.move: _v2_backed_up_candidate_value(candidate)
+                for candidate in budget.candidates
+            }
+            maximum = max(values.values())
+            best = tuple(
+                move
+                for move, score in values.items()
+                if maximum - score <= _DERIVATION_TOLERANCE
+            )
+            unique = best[0] if len(best) == 1 else None
+            unique_top1_per_search = unique_top1_per_search and unique is not None
+            budget_best.append(unique)
+        stable = (
+            all(move is not None for move in budget_best)
+            and len(set(budget_best)) == 1
+        )
+        stable_across_budgets = stable_across_budgets and stable
+        deepest_best = budget_best[-1]
+        per_teacher_best.append(deepest_best)
+        if deepest_best is not None:
+            deepest_candidate = next(
+                candidate
+                for candidate in matrix.budgets[-1].candidates
+                if candidate.move == deepest_best
+            )
+            deepest_values[matrix.scorer_id] = _v2_backed_up_candidate_value(
+                deepest_candidate
+            )
+
+    unanimous = (
+        all(move is not None for move in per_teacher_best)
+        and len(set(per_teacher_best)) == 1
+    )
+    best_move = per_teacher_best[0] if unanimous else None
+    signed_values = tuple(deepest_values.values())
+    has_positive = any(value > _DERIVATION_TOLERANCE for value in signed_values)
+    has_negative = any(value < -_DERIVATION_TOLERANCE for value in signed_values)
+    value_sign_compatible = len(signed_values) == len(matrices) and not (
+        has_positive and has_negative
+    )
+    return UnanimousBootstrapEvidence(
+        best_move=best_move,
+        unique_top1_per_search=unique_top1_per_search,
+        stable_across_budgets=stable_across_budgets,
+        unanimous_across_teachers=unanimous,
+        value_sign_compatible=value_sign_compatible,
+        deepest_values=deepest_values,
+    )
+
+
 def _v2_robust_policy(
     candidates: Sequence[str],
     regrets: Mapping[str, float],
+    *,
+    temperature: float,
 ) -> tuple[dict[str, float], tuple[str, ...]]:
-    """Put target mass only on exact minimax-regret argmin moves.
+    """Preserve the exact minimax-regret top move and learn the ranked distribution.
 
-    A softmax over regret necessarily assigns non-zero mass to inferior moves.
-    That is useful as an exploratory search prior, but it is not acceptable as
-    the production best-move label requested by this contract.
+    The student must understand second-best and lower candidate moves so search
+    remains calibrated after leaving the principal variation.  A softmax over
+    *worst-teacher* regret provides that distribution without averaging away a
+    teacher's objection.  Exact argmin moves retain equal maximum mass; every
+    strictly worse move receives strictly less mass.
     """
+
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("robust policy temperature must be finite and positive")
 
     minimum = min(regrets[move] for move in candidates)
     robust_best = tuple(
@@ -1210,7 +1543,12 @@ def _v2_robust_policy(
             if math.isclose(regrets[move], minimum, rel_tol=0.0, abs_tol=1e-12)
         )
     )
-    policy = {move: 1.0 / len(robust_best) for move in robust_best}
+    weights = {
+        move: math.exp(-(regrets[move] - minimum) / temperature)
+        for move in candidates
+    }
+    total = math.fsum(weights.values())
+    policy = {move: weight / total for move, weight in weights.items()}
     return policy, robust_best
 
 
@@ -1246,6 +1584,7 @@ def _v2_position(
             "reply_coverage_complete",
             "candidate_moves",
             "budgets",
+            "reply_proposals",
             "score_matrix",
             "thresholds",
             "proof",
@@ -1277,7 +1616,9 @@ def _v2_position(
         for index, scorer in enumerate(_v2_sequence(row["scorers"], label="scorers"))
     )
     if tuple(scorer.scorer_id for scorer in scorers) != CANONICAL_SCORER_IDS:
-        raise ValueError("canonical v2 requires exactly NAGISA then Suisho11Plus targets")
+        raise ValueError(
+            "canonical v2 requires exactly NAGISA, Suisho11Plus, then Soujou TSEC7 targets"
+        )
     candidate_proposals = tuple(
         _v2_candidate_proposal(proposal, board=board, index=index)
         for index, proposal in enumerate(
@@ -1311,9 +1652,15 @@ def _v2_position(
     )
     if len(budgets) < 2 or budgets != tuple(sorted(set(budgets))):
         raise ValueError("canonical v2 requires at least two strictly increasing node budgets")
+    reply_proposals = _v2_reply_proposals(
+        row["reply_proposals"],
+        root=board,
+        budgets=budgets,
+        candidates=candidates,
+    )
     raw_matrices = _v2_sequence(row["score_matrix"], label="score_matrix")
     if len(raw_matrices) != len(CANONICAL_SCORER_IDS):
-        raise ValueError("score matrix requires exactly two canonical scorers")
+        raise ValueError("score matrix requires the exact canonical scorer trio")
     matrices = tuple(
         _v2_scorer_matrix(
             raw,
@@ -1321,6 +1668,7 @@ def _v2_position(
             scorer_id=scorer_id,
             budgets=budgets,
             candidates=candidates,
+            reply_proposals=reply_proposals,
         )
         for raw, scorer_id in zip(raw_matrices, CANONICAL_SCORER_IDS, strict=True)
     )
@@ -1331,17 +1679,19 @@ def _v2_position(
     regrets, depth_dispersion, reply_dispersion, exact_bounds = _v2_derive_evidence(
         candidates=candidates, matrices=matrices
     )
+    unanimous_bootstrap = _v2_unanimous_bootstrap_evidence(matrices)
     coverage_complete = row["candidate_family_coverage_complete"]
     declared_reply_complete = row["reply_coverage_complete"]
     derived_reply_complete = all(
-        candidate.legal_reply_coverage_complete
+        candidate.reply_proposal_coverage_complete
         for matrix in matrices
         for budget in matrix.budgets
         for candidate in budget.candidates
     )
     if declared_reply_complete and not derived_reply_complete:
         raise ValueError(
-            "reply_coverage_complete cannot be asserted without scoring every legal reply"
+            "reply_coverage_complete cannot be asserted without every scorer scoring "
+            "the exact cross-teacher reply-proposal union"
         )
     reply_complete = declared_reply_complete and derived_reply_complete
     if coverage_complete and candidate_families != required_candidate_families:
@@ -1363,7 +1713,11 @@ def _v2_position(
     )
     if proof.state is MateProofState.PROVEN_WIN and not set(proof.moves).issubset(candidates):
         raise ValueError("every internally proven mate move must be in the candidate union")
-    robust_policy, robust_best = _v2_robust_policy(candidates, regrets)
+    robust_policy, robust_best = _v2_robust_policy(
+        candidates,
+        regrets,
+        temperature=thresholds.policy_temperature,
+    )
     regret_consensus_exists = all(
         regrets[move] <= thresholds.regret + _DERIVATION_TOLERANCE
         for move in robust_best
@@ -1390,6 +1744,10 @@ def _v2_position(
         and reply_complete
         and calibration_complete
         and exact_bounds
+        and unanimous_bootstrap.unique_top1_per_search
+        and unanimous_bootstrap.stable_across_budgets
+        and unanimous_bootstrap.unanimous_across_teachers
+        and unanimous_bootstrap.value_sign_compatible
         and regret_consensus_exists
         and depth_stable
         and reply_stable
@@ -1397,11 +1755,14 @@ def _v2_position(
         and proof.state
         in {MateProofState.NOT_APPLICABLE, MateProofState.PROVEN_NO_MATE_WITHIN_BOUND}
     ):
-        expected_kind = PlayTargetKind.ROBUST_CONSENSUS
+        expected_kind = PlayTargetKind.UNANIMOUS_CONSENSUS
         expected_train = True
         expected_search = False
         play_policy = robust_policy
-        scorer_values = [scorer.value for scorer in scorers]
+        if unanimous_bootstrap.best_move is None:
+            raise AssertionError("eligible unanimous bootstrap target lacks its best move")
+        robust_best = (unanimous_bootstrap.best_move,)
+        scorer_values = tuple(unanimous_bootstrap.deepest_values.values())
         value_interval = (min(scorer_values), max(scorer_values))
         wdl = None
     else:
@@ -1431,18 +1792,23 @@ def _v2_position(
         ):
             raise AssertionError("derived robust best move is not policy top-1")
     policy_uncertainty = _v2_policy_tv(scorers)
-    value_uncertainty = abs(scorers[0].value - scorers[1].value) / 2.0
+    scorer_values_for_uncertainty = [scorer.value for scorer in scorers]
+    value_uncertainty = (
+        max(scorer_values_for_uncertainty) - min(scorer_values_for_uncertainty)
+    ) / 2.0
     uncertainty = (
         1.0
         if not expected_train
         else min(1.0, max(policy_uncertainty, value_uncertainty))
     )
     reasons: set[CanonicalDisagreementReason] = set()
-    if scorers[0].best_move != scorers[1].best_move:
+    if len({scorer.best_move for scorer in scorers}) > 1:
         reasons.add(CanonicalDisagreementReason.TEACHER_BEST_MOVE)
     if policy_uncertainty > _DERIVATION_TOLERANCE:
         reasons.add(CanonicalDisagreementReason.TEACHER_POLICY_DISTRIBUTION)
-    if scorers[0].value * scorers[1].value < 0.0:
+    if any(scorer.value < 0.0 for scorer in scorers) and any(
+        scorer.value > 0.0 for scorer in scorers
+    ):
         reasons.add(CanonicalDisagreementReason.TEACHER_VALUE_SIGN)
     if not coverage_complete:
         reasons.add(CanonicalDisagreementReason.CANDIDATE_FAMILY_COVERAGE)
@@ -1458,6 +1824,14 @@ def _v2_position(
         reasons.add(CanonicalDisagreementReason.REPLY_INSTABILITY)
     if not regret_consensus_exists:
         reasons.add(CanonicalDisagreementReason.EMPTY_CONSENSUS)
+    if not unanimous_bootstrap.unique_top1_per_search:
+        reasons.add(CanonicalDisagreementReason.TEACHER_TOP1_NOT_UNANIMOUS)
+    if not unanimous_bootstrap.stable_across_budgets:
+        reasons.add(CanonicalDisagreementReason.BUDGET_TOP1_INSTABILITY)
+    if not unanimous_bootstrap.unanimous_across_teachers:
+        reasons.add(CanonicalDisagreementReason.TEACHER_TOP1_NOT_UNANIMOUS)
+    if not unanimous_bootstrap.value_sign_compatible:
+        reasons.add(CanonicalDisagreementReason.VALUE_SIGN_CONFLICT)
     if reported_winning_mate and proof.state is not MateProofState.PROVEN_WIN:
         reasons.add(CanonicalDisagreementReason.REPORTED_MATE_UNPROVEN)
     if proof.state is MateProofState.UNKNOWN_LIMIT:
@@ -1475,9 +1849,11 @@ def _v2_position(
         reply_coverage_complete=reply_complete,
         candidate_moves=candidates,
         budgets=budgets,
+        reply_proposals=reply_proposals,
         score_matrix=matrices,
         thresholds=thresholds,
         proof=proof,
+        unanimous_bootstrap=unanimous_bootstrap,
         play=GuardedPlayTarget(
             kind=expected_kind,
             train_play=expected_train,
@@ -1503,11 +1879,11 @@ def _v2_validate_rights_summary(value: object) -> dict[str, object]:
     if tuple(cast(str, source["rights_id"]) for source in raw_sources) != tuple(
         sorted(CANONICAL_SCORER_IDS)
     ):
-        raise ValueError("canonical v2 rights summary must bind exactly NAGISA and Suisho11Plus")
+        raise ValueError("canonical v2 rights summary must bind the exact canonical scorer trio")
     if any(not cast(list[str], source["sidecar_sha256s"]) for source in raw_sources):
         raise ValueError("each canonical v2 teacher requires source-sidecar evidence")
     if summary["publication_allowed"] is not False:
-        raise ValueError("Suisho11Plus canonical v2 targets must remain local-only")
+        raise ValueError("local-only canonical v2 targets must remain local-only")
     return summary
 
 
@@ -1528,7 +1904,7 @@ def load_canonical_target_sidecar_v2(
         if schema == "meteo-canonical-distillation-targets-v1":
             raise ValueError(
                 "canonical target v1 is training-disabled: its single value head broadcasts "
-                "over two teacher values and converges to their arithmetic midpoint; rebuild "
+                "over all teacher values and converges to their arithmetic mean; rebuild "
                 "a complete canonical-target-contract-v2 sidecar"
             )
         raise ValueError("unsupported canonical target sidecar schema")
@@ -1567,7 +1943,9 @@ def load_canonical_target_sidecar_v2(
         )
     )
     if tuple(descriptor.scorer_id for descriptor in descriptors) != CANONICAL_SCORER_IDS:
-        raise ValueError("canonical v2 scorer order must be NAGISA then Suisho11Plus")
+        raise ValueError(
+            "canonical v2 scorer order must be NAGISA, Suisho11Plus, then Soujou TSEC7"
+        )
     shared_search_settings = {
         (descriptor.threads, descriptor.hash_mb, descriptor.multipv)
         for descriptor in descriptors
@@ -1586,10 +1964,10 @@ def load_canonical_target_sidecar_v2(
     required_candidate_families = tuple(cast(list[str], raw_required_families))
     if required_candidate_families != tuple(sorted(set(required_candidate_families))):
         raise ValueError("required candidate families must be unique and sorted")
-    mandatory_families = {"meteo", "nagisa", "suisho", "tactical"}
+    mandatory_families = {"meteo", "nagisa", "soujou", "suisho", "tactical"}
     if not mandatory_families.issubset(required_candidate_families):
         raise ValueError(
-            "canonical v2 requires nagisa, suisho, meteo, and tactical candidate families"
+            "canonical v2 requires meteo, nagisa, soujou, suisho, and tactical candidate families"
         )
     rights_summary = _v2_validate_rights_summary(payload["rights_restriction_summary"])
     for game_index, game in enumerate(source_games):

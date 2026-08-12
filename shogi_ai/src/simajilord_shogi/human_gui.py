@@ -38,8 +38,9 @@ from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from rsshogi.core import Board, Move
-from rsshogi.types import Color, RepetitionState
+from rsshogi.types import Color
 
+from .adjudication import adjudicate_board, can_declare_win_csa27
 from .arena import DirectPlayer, MctsPlayer
 from .checkpoint import load_checkpoint
 from .config import SearchConfig
@@ -1524,18 +1525,10 @@ class SessionStore:
 
 
 def _adjudicate(board: Board) -> tuple[int | None, str] | None:
-    repetition = board.repetition_state()
-    if repetition != RepetitionState.NONE:
-        if repetition in (RepetitionState.WIN, RepetitionState.SUPERIOR):
-            return board.turn.value, "repetition"
-        if repetition in (RepetitionState.LOSE, RepetitionState.INFERIOR):
-            return board.turn.opponent().value, "repetition"
-        return None, "repetition"
-    if board.can_declare_win():
-        return board.turn.value, "entering_king_declaration"
-    if board.is_mated() or not board.legal_moves():
-        return board.turn.opponent().value, "checkmate"
-    return None
+    adjudication = adjudicate_board(board)
+    if adjudication is None:
+        return None
+    return adjudication.winner, adjudication.termination.value
 
 
 def _session_board(session: HumanSession) -> Board:
@@ -1616,7 +1609,7 @@ class HumanGuiService:
                     termination="resignation",
                     updated_unix_seconds=time.time(),
                 )
-            if not board.can_declare_win():
+            if not can_declare_win_csa27(board):
                 raise ValueError("AI declared win without a legal entering-king declaration")
             return replace(
                 session,

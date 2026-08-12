@@ -12,6 +12,8 @@ from rsshogi.core import Board, Move
 from rsshogi.policy import MOVE_LABEL_COUNT, move_label
 from rsshogi.types import Color, PieceType, Square
 
+from .adjudication import can_declare_win_csa27
+
 BOARD_SIZE = 9
 SQUARES = 81
 PIECE_TYPES: tuple[PieceType, ...] = (
@@ -175,7 +177,7 @@ def encode_history(history: HistoryInput) -> FloatFeatures:
     result[summary] = min(occurrence_count, 4) / 4.0
     result[summary + 1] = min(consecutive_checks[Color.BLACK.value], 8) / 8.0
     result[summary + 2] = min(consecutive_checks[Color.WHITE.value], 8) / 8.0
-    result[summary + 3] = float(board.can_declare_win())
+    result[summary + 3] = float(can_declare_win_csa27(board))
     result[summary + 4] = min(max(board.game_ply - 1, 0), 511) / 511.0
     result[summary + 5] = float(history.complete)
     return result

@@ -29,14 +29,19 @@ from .external_usi import UsiPositionHistory
 from .replay import load_games
 
 CANONICAL_TARGET_SIDECAR_SCHEMA = "meteo-canonical-distillation-targets-v1"
-CANONICAL_TARGET_MODE = "canonical_dual_teacher"
+CANONICAL_TARGET_MODE = "canonical_multi_teacher"
 CANONICAL_POSITION_IDENTITY = (
     "game_index + sample_index + validated exact history + normalized SFEN(board/turn/hands)"
 )
 CANONICAL_TARGET_SUFFIX = ".distillation-targets.json"
 NAGISA_SCORER_ID = "nagisa-v3.1"
 SUISHO11PLUS_SCORER_ID = "suisho11plus-wcsc36-20260525-local"
-CANONICAL_SCORER_IDS = (NAGISA_SCORER_ID, SUISHO11PLUS_SCORER_ID)
+SOUJOU_TSEC7_SCORER_ID = "soujou-tsec7-paid"
+CANONICAL_SCORER_IDS = (
+    NAGISA_SCORER_ID,
+    SUISHO11PLUS_SCORER_ID,
+    SOUJOU_TSEC7_SCORER_ID,
+)
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -253,6 +258,7 @@ def _scorer_descriptor(value: object, *, index: int) -> CanonicalScorerDescripto
     expected_family = {
         NAGISA_SCORER_ID: "nagisa",
         SUISHO11PLUS_SCORER_ID: "suisho",
+        SOUJOU_TSEC7_SCORER_ID: "soujou",
     }.get(cast(str, scorer_id))
     if expected_family is None or family != expected_family:
         raise ValueError(f"unexpected canonical scorer descriptor: {scorer_id!r}/{family!r}")
@@ -453,7 +459,9 @@ def _position_target(
         for index, scorer in enumerate(_sequence(row["scorers"], label="canonical target scorers"))
     )
     if tuple(scorer.scorer_id for scorer in scorers) != CANONICAL_SCORER_IDS:
-        raise ValueError("every canonical target requires exactly NAGISA and Suisho11Plus")
+        raise ValueError(
+            "every canonical target requires exactly NAGISA, Suisho11Plus, and Soujou TSEC7"
+        )
     expected_best_union = tuple(sorted({scorer.best_move for scorer in scorers}))
     best_union = tuple(
         _legal_move(move, board=board, label="canonical best-union move")
@@ -500,7 +508,9 @@ def _position_target(
         )
     raw_values = _mapping(row["canonical_values"], label="canonical values")
     if set(raw_values) != set(CANONICAL_SCORER_IDS):
-        raise ValueError("canonical_values must contain exactly NAGISA and Suisho11Plus")
+        raise ValueError(
+            "canonical_values must contain exactly NAGISA, Suisho11Plus, and Soujou TSEC7"
+        )
     canonical_values = {
         scorer_id: _finite_float(raw_values[scorer_id], label=f"canonical value {scorer_id}")
         for scorer_id in CANONICAL_SCORER_IDS
@@ -557,7 +567,7 @@ def load_canonical_target_sidecar(
     if payload["position_identity"] != CANONICAL_POSITION_IDENTITY:
         raise ValueError("canonical target position_identity contract does not match")
     if payload["target_mode"] != CANONICAL_TARGET_MODE:
-        raise ValueError("canonical target mode must be canonical_dual_teacher")
+        raise ValueError("canonical target mode must be canonical_multi_teacher")
 
     replay_row = _mapping(payload["replay"], label="canonical target replay identity")
     _exact_fields(replay_row, {"sha256", "bytes"}, label="canonical target replay identity")
@@ -577,7 +587,9 @@ def load_canonical_target_sidecar(
         )
     )
     if tuple(descriptor.scorer_id for descriptor in descriptors) != CANONICAL_SCORER_IDS:
-        raise ValueError("canonical sidecar requires NAGISA then Suisho11Plus descriptors")
+        raise ValueError(
+            "canonical sidecar requires NAGISA, Suisho11Plus, then Soujou TSEC7 descriptors"
+        )
 
     for game_index, game in enumerate(source_games):
         if game.termination is Termination.MAX_PLIES:

@@ -65,6 +65,19 @@ def test_ybb_reader_streams_unique_positions_and_keeps_book_data_out_of_targets(
         positions = tuple(book.iter_position_candidates())
         moves = tuple(book.book_moves_for_audit(index) for index in range(len(book)))
 
+        initial = Board()
+        initial_index = book.find_position_index(initial)
+        initial_moves = book.book_moves_for_position_audit(initial)
+        after_76 = Board()
+        after_76.push_usi("7g7f")
+        after_76_index = book.find_position_index(after_76)
+        different = Board()
+        different.push_usi("2g2f")
+        different_index = book.find_position_index(different)
+        wrong_ply = Board(initial.to_sfen().rsplit(" ", 1)[0] + " 99")
+        wrong_ply_exact = book.find_position_index(wrong_ply)
+        wrong_ply_ignored = book.find_position_index(wrong_ply, exact_ply=False)
+
     assert audit.entries_scanned == 2
     assert audit.move_records_referenced == 3
     assert audit.duplicate_packed_sfens == 0
@@ -72,6 +85,13 @@ def test_ybb_reader_streams_unique_positions_and_keeps_book_data_out_of_targets(
     assert all(position.reanalysis_required for position in positions)
     assert not any(position.book_moves_are_training_targets for position in positions)
     assert {move.move_usi for group in moves for move in group} == {"7g7f", "2g2f", "3c3d"}
+    assert initial_index is not None
+    assert initial_moves is not None
+    assert {move.move_usi for move in initial_moves} == {"7g7f", "2g2f"}
+    assert after_76_index is not None
+    assert different_index is None
+    assert wrong_ply_exact is None
+    assert wrong_ply_ignored == initial_index
 
 
 def test_ybb_plan_covers_every_index_and_receipts_require_every_teacher_shard(

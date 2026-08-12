@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 simajilord-shogi = "simajilord_shogi.cli:main"
+simajilord-nnue = "simajilord_shogi.nnue_runner:main"
 
 [dependency-groups]
 dev = [
@@ -35,7 +36,11 @@ packages = ["src/simajilord_shogi"]
 include = [
   "/LICENSE",
   "/README.md",
+  "/DATASET_AUDIT.md",
   "/MODEL_RIGHTS.md",
+  "/LEARNING_STRATEGY.md",
+  "/NUMERICAL_TRAINING_GUIDE.md",
+  "/TEACHER_LINEAGE.md",
   "/RESEARCH.md",
   "/VALIDATION.md",
   "/FLOODGATE.md",
@@ -74,10 +79,11 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = [
+  "simajilord_shogi.mlx_nnue",
   "simajilord_shogi.model",
   "simajilord_shogi.trainer",
 ]
-disable_error_code = ["attr-defined", "misc", "name-defined"]
+disable_error_code = ["attr-defined", "misc", "name-defined", "no-untyped-call"]
 
 [tool.ruff]
 target-version = "py312"
