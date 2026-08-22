@@ -138,14 +138,10 @@ class SpeechQueueReservation:
         if not self._active:
             item.cleanup()
             raise UserError("speech.reservation_inactive")
-        try:
-            position = await self._session._commit_speech_reservation(
-                self._token,
-                item,
-            )
-        except Exception:
-            item.cleanup()
-            raise
+        position = await self._session._commit_speech_reservation(
+            self._token,
+            item,
+        )
         self._active = False
         return position
 
@@ -205,7 +201,10 @@ class AudioSession:
         self._music: deque[AudioItem] = deque()
         self._autoplay: deque[AudioItem] = deque()
         self._speech: deque[AudioItem] = deque()
-        self._speech_reservations: set[str] = set()
+        # Dict insertion order is the request order. Synthesis may finish out
+        # of order, but commits wait for the reservation ahead of them so a
+        # short later message cannot overtake an earlier long one.
+        self._speech_reservations: dict[str, None] = {}
         self._manual_music_start_reservations: set[str] = set()
         self._history: deque[AudioItem] = deque(maxlen=_MAX_HISTORY_ITEMS)
         self._current: AudioItem | None = None
@@ -228,6 +227,7 @@ class AudioSession:
         self._voice_activation_required = False
         self._closed = False
         self._lock = asyncio.Lock()
+        self._speech_reservation_changed = asyncio.Condition(self._lock)
         self._transport_lock = asyncio.Lock()
         self._started_at: float | None = None
         self._paused_at: float | None = None
@@ -319,13 +319,13 @@ class AudioSession:
     async def reserve_speech(self) -> SpeechQueueReservation:
         """Reserve queue capacity before an expensive speech synthesis starts."""
 
-        async with self._lock:
+        async with self._speech_reservation_changed:
             if self._closed:
                 raise UserError("audio.session_closed")
             if self._speech_load_locked() >= self.max_pending_speech:
                 raise UserError("speech.queue_full")
             token = uuid.uuid4().hex
-            self._speech_reservations.add(token)
+            self._speech_reservations[token] = None
         return SpeechQueueReservation(self, token)
 
     async def reserve_manual_music_start(self) -> ManualMusicStartReservation:
@@ -360,23 +360,38 @@ class AudioSession:
         token: str,
         item: AudioItem,
     ) -> int:
-        if item.kind is not AudioKind.SPEECH:
-            raise ValueError("A speech reservation only accepts speech audio.")
-        async with self._lock:
-            if token not in self._speech_reservations:
-                raise UserError("speech.reservation_cancelled")
-            self._speech_reservations.remove(token)
-            if self._closed:
-                raise UserError("audio.session_closed")
-            position = self._enqueue_speech_locked(item)
-            self._wake.set()
-            self._ensure_worker()
-        await self._state_changed()
-        return position
+        transferred = False
+        try:
+            if item.kind is not AudioKind.SPEECH:
+                raise ValueError("A speech reservation only accepts speech audio.")
+            async with self._speech_reservation_changed:
+                await self._speech_reservation_changed.wait_for(
+                    lambda: token not in self._speech_reservations
+                    or next(iter(self._speech_reservations)) == token
+                )
+                if token not in self._speech_reservations:
+                    raise UserError("speech.reservation_cancelled")
+                self._speech_reservations.pop(token)
+                if self._closed:
+                    self._speech_reservation_changed.notify_all()
+                    raise UserError("audio.session_closed")
+                position = self._enqueue_speech_locked(item)
+                transferred = True
+                self._wake.set()
+                self._ensure_worker()
+                self._speech_reservation_changed.notify_all()
+            await self._state_changed()
+            return position
+        except BaseException:
+            if not transferred:
+                item.cleanup()
+            raise
 
     async def _release_speech_reservation(self, token: str) -> None:
-        async with self._lock:
-            self._speech_reservations.discard(token)
+        async with self._speech_reservation_changed:
+            if token in self._speech_reservations:
+                self._speech_reservations.pop(token)
+                self._speech_reservation_changed.notify_all()
 
     def _speech_load_locked(self) -> int:
         pending = len(self._speech) + len(self._speech_reservations)
@@ -400,14 +415,21 @@ class AudioSession:
             and current.kind is AudioKind.MUSIC
             and self._overlay_task is None
         ):
-            self._speech_active = True
-            self._overlay_task = asyncio.create_task(
-                self._run_speech_overlays(current, item),
-                name=f"simajilord-speech-overlay-{self.workspace_id}",
-            )
+            self._start_speech_overlay_locked(current, item)
         else:
             self._speech.append(item)
         return position
+
+    def _start_speech_overlay_locked(
+        self,
+        music: AudioItem,
+        speech: AudioItem,
+    ) -> None:
+        self._speech_active = True
+        self._overlay_task = asyncio.create_task(
+            self._run_speech_overlays(music, speech),
+            name=f"simajilord-speech-overlay-{self.workspace_id}",
+        )
 
     async def enqueue_many(
         self,
@@ -949,6 +971,7 @@ class AudioSession:
                 item.cleanup()
             self._speech.clear()
             self._speech_reservations.clear()
+            self._speech_reservation_changed.notify_all()
             self._music.clear()
             self._autoplay.clear()
             if self._current is not None:
@@ -1029,6 +1052,9 @@ class AudioSession:
 
         await self._state_changed()
         self._closed = True
+        async with self._speech_reservation_changed:
+            self._speech_reservations.clear()
+            self._speech_reservation_changed.notify_all()
         if self._current is not None:
             self.output.stop()
         if self._worker is not None:
@@ -1043,7 +1069,6 @@ class AudioSession:
         if self._current is not None:
             self._current.cleanup()
         self._speech.clear()
-        self._speech_reservations.clear()
         self._music.clear()
         self._autoplay.clear()
         self._current = None
@@ -1801,6 +1826,7 @@ class AudioSession:
         """Overlay queued speech without ending the Discord music player."""
 
         speech: AudioItem | None = first_speech
+        source_restored = False
         try:
             while speech is not None:
                 if self._current is not music or music.kind is not AudioKind.MUSIC:
@@ -1810,6 +1836,12 @@ class AudioSession:
                         self._wake.set()
                     return
                 speech.volume = self._speech_volume
+                log.info(
+                    "Speech overlay starting workspace=%s request=%s item=%s",
+                    self.workspace_id,
+                    speech.request_id or "untracked",
+                    speech.title,
+                )
                 preparation_started = monotonic()
                 try:
                     overlay_error: Exception | None = None
@@ -1854,7 +1886,14 @@ class AudioSession:
                                 (monotonic() - preparation_started) * 1_000,
                             ),
                             outcome="succeeded",
+                            resource_id=speech.request_id,
                         )
+                    )
+                    log.info(
+                        "Speech overlay completed workspace=%s request=%s item=%s",
+                        self.workspace_id,
+                        speech.request_id or "untracked",
+                        speech.title,
                     )
                 except asyncio.CancelledError:
                     async with self._lock:
@@ -1880,6 +1919,7 @@ class AudioSession:
                                 (monotonic() - preparation_started) * 1_000,
                             ),
                             outcome="fallback_standalone",
+                            resource_id=speech.request_id,
                         )
                     )
                     await self._fallback_to_standalone_speech(music, speech)
@@ -1913,12 +1953,25 @@ class AudioSession:
                 )
                 self._started_at = monotonic()
                 self._paused_seconds = 0.0
+                source_restored = True
         finally:
             if speech is not None and speech.owned_file is not None:
                 speech.cleanup()
-            self._speech_active = False
-            if self._overlay_task is asyncio.current_task():
-                self._overlay_task = None
+            current_task = asyncio.current_task()
+            async with self._lock:
+                if self._overlay_task is current_task:
+                    self._overlay_task = None
+                    self._speech_active = False
+                    if (
+                        source_restored
+                        and self._current is music
+                        and self.output.connected
+                        and self._speech
+                    ):
+                        pending_speech = self._speech.popleft()
+                        self._start_speech_overlay_locked(music, pending_speech)
+                elif self._overlay_task is None:
+                    self._speech_active = False
             await self._state_changed()
 
     async def _fallback_to_standalone_speech(

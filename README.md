@@ -646,6 +646,21 @@ Playback controls such as pause, skip, loop, queue, levels, and leave are kept i
 The configurable prefix remains available as a manual adapter. Its operations and slash
 commands call the same capability APIs.
 
+The running BOT also exposes one deliberately narrow local operator action through
+`.data/operator.sock`. The socket lives inside the mode-`0700` data directory, is mode `0600`,
+accepts only bounded VC speech requests, and never exposes general capability invocation. This
+lets a local Codex task announce maintenance without posting as the signed-in Discord user:
+
+```bash
+uv run simajilord-vc-speak \
+  --guild 1515404362590064781 \
+  "METEOBOTを再起動します。少しだけお待ちください。"
+```
+
+The command fails instead of retaining a delayed announcement when the BOT is stopped or its
+audio session is not connected. Each accepted request is recorded as a `speech.speak`
+capability invocation with transport `local_operator`.
+
 ## Local event journal
 
 `.data/events.sqlite3` records Discord command receipt, capability outcomes, and Discord/agent

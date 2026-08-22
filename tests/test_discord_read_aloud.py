@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -10,7 +11,9 @@ from discord.ext import commands
 
 from simajilord.agent import ReadAloudAudienceMode
 from simajilord.integrations.discord.cogs import (
+    _READ_ALOUD_BURST_BATCH_SIZE,
     _READ_ALOUD_BURST_DELAY_SECONDS,
+    _READ_ALOUD_VOICE_DEBOUNCE_SECONDS,
     ReadAloudCog,
     _read_aloud_audience_allowed,
 )
@@ -416,12 +419,13 @@ async def test_read_aloud_burst_uses_low_latency_debounce(
     runtime.read_aloud = ReadAloudService(tmp_path / "read_aloud.json")
     cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
     key = (1, 2)
-    message = SimpleNamespace(author=SimpleNamespace(id=10))
+    message = SimpleNamespace(id=1, author=SimpleNamespace(id=10))
     prepared = ReadAloudMessageText(
         (SpeechSegment(SpeechSegmentKind.BODY, "すぐに読む"),),
         "Message",
     )
-    cog._message_bursts[key] = [(message, prepared)]
+    cog._message_bursts[key] = [message]
+    cog._message_formatter.format = AsyncMock(return_value=prepared)
     deliver = AsyncMock()
     monkeypatch.setattr(cog, "_deliver_read_aloud", deliver)
 
@@ -430,6 +434,158 @@ async def test_read_aloud_burst_uses_low_latency_debounce(
     assert delays == [_READ_ALOUD_BURST_DELAY_SECONDS]
     assert _READ_ALOUD_BURST_DELAY_SECONDS <= 0.1
     deliver.assert_awaited_once_with(message, prepared)
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_burst_keeps_snowflake_order_and_drains_every_batch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._READ_ALOUD_BURST_DELAY_SECONDS",
+        0.0,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = ReadAloudService(tmp_path / "read_aloud.json")
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    key = (1, 2)
+    messages = [
+        SimpleNamespace(
+            id=index,
+            channel=SimpleNamespace(id=2 + (index % 2)),
+            author=SimpleNamespace(id=10),
+        )
+        for index in range(1, _READ_ALOUD_BURST_BATCH_SIZE + 2)
+    ]
+    cog._message_bursts[key] = [*reversed(messages)]
+
+    async def format_message(message) -> ReadAloudMessageText:
+        if message.id == 1:
+            await asyncio.sleep(0.01)
+        return ReadAloudMessageText(
+            (SpeechSegment(SpeechSegmentKind.BODY, f"message-{message.id}"),),
+            f"Message {message.id}",
+        )
+
+    cog._message_formatter.format = AsyncMock(side_effect=format_message)
+    deliver = AsyncMock()
+    monkeypatch.setattr(cog, "_deliver_read_aloud", deliver)
+
+    await cog._flush_message_burst(key)
+
+    assert deliver.await_count == 2
+    first_message, first_prepared = deliver.await_args_list[0].args
+    second_message, second_prepared = deliver.await_args_list[1].args
+    assert first_message.id == 1
+    assert [segment.text for segment in first_prepared.segments] == [
+        f"message-{index}"
+        for index in range(1, _READ_ALOUD_BURST_BATCH_SIZE + 1)
+    ]
+    assert second_message.id == _READ_ALOUD_BURST_BATCH_SIZE + 1
+    assert [segment.text for segment in second_prepared.segments] == [
+        f"message-{_READ_ALOUD_BURST_BATCH_SIZE + 1}"
+    ]
+    assert cog._message_bursts == {}
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_formats_in_parallel_but_delivers_in_snowflake_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._READ_ALOUD_BURST_DELAY_SECONDS",
+        0.0,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = ReadAloudService(tmp_path / "read_aloud.json")
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    key = (1, 55)
+    messages = [
+        SimpleNamespace(id=index, author=SimpleNamespace(id=10))
+        for index in (2, 1)
+    ]
+    cog._message_bursts[key] = messages
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    started: list[int] = []
+
+    async def format_message(message) -> ReadAloudMessageText:
+        started.append(message.id)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+        return ReadAloudMessageText(
+            (SpeechSegment(SpeechSegmentKind.BODY, f"message-{message.id}"),),
+            f"Message {message.id}",
+        )
+
+    cog._message_formatter.format = AsyncMock(side_effect=format_message)
+    deliver = AsyncMock()
+    monkeypatch.setattr(cog, "_deliver_read_aloud", deliver)
+    flush = asyncio.create_task(cog._flush_message_burst(key))
+
+    await asyncio.wait_for(both_started.wait(), timeout=1)
+    release.set()
+    await flush
+
+    assert started == [1, 2]
+    message, prepared = deliver.await_args.args
+    assert message.id == 1
+    assert [segment.text for segment in prepared.segments] == [
+        "message-1",
+        "message-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multiple_read_aloud_sources_share_one_destination_fifo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure_sources(
+        workspace_id="1",
+        text_channel_ids=("2", "3"),
+        audio_destination_id="55",
+        mode=ReadAloudMode.QUEUE,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = destination
+    author = SimpleNamespace(id=10, bot=False)
+
+    def source_message(message_id: int, channel_id: int) -> discord.Message:
+        return cast(
+            discord.Message,
+            SimpleNamespace(
+                id=message_id,
+                guild=guild,
+                channel=SimpleNamespace(id=channel_id),
+                author=author,
+                webhook_id=None,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._read_aloud_audience_allowed",
+        lambda *_args: True,
+    )
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    first = source_message(100, 2)
+    second = source_message(101, 3)
+
+    await cog.on_message(first)
+    await cog.on_message(second)
+
+    assert tuple(cog._message_bursts) == ((1, 55),)
+    assert cog._message_bursts[(1, 55)] == [first, second]
+    assert len(cog._message_burst_tasks) == 1
+    await cog.cog_unload()
 
 
 @pytest.mark.asyncio
@@ -621,6 +777,37 @@ async def test_join_announcement_uses_shared_speech_api_when_already_connected(
     assert request.text == "アリスさんがボイスチャンネルに参加しました"
     assert request.title == "VCの入退室通知"
     assert context.workspace_id == "1"
+
+
+@pytest.mark.asyncio
+async def test_voice_transition_uses_low_latency_debounce(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs.asyncio.sleep",
+        record_sleep,
+    )
+    cog, _runtime, member, destination = await _announcement_cog(tmp_path)
+    key = (member.guild.id, member.id)
+    cog._voice_transitions[key] = (member, None, destination)
+    announce = AsyncMock()
+    monkeypatch.setattr(cog, "_announce_voice_transition", announce)
+
+    await cog._flush_voice_transition(key)
+
+    assert delays == [_READ_ALOUD_VOICE_DEBOUNCE_SECONDS]
+    assert _READ_ALOUD_VOICE_DEBOUNCE_SECONDS <= 0.15
+    announce.assert_awaited_once_with(
+        member,
+        before_channel=None,
+        after_channel=destination,
+    )
 
 
 @pytest.mark.asyncio

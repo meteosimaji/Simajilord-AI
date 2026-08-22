@@ -33,6 +33,7 @@ simajilord-agent-reference = "simajilord.diagnostics.agent_reference:main"
 simajilord-agent-reset = "simajilord.diagnostics.agent_reset:main"
 simajilord-agent-effects = "simajilord.diagnostics.agent_effects:main"
 simajilord-feedback = "simajilord.diagnostics.feedback:main"
+simajilord-vc-speak = "simajilord.integrations.discord.operator:main"
 
 [dependency-groups]
 dev = [

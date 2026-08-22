@@ -269,6 +269,236 @@ async def test_three_speech_overlays_keep_fifo_order_without_stopping_music() ->
 
 
 @pytest.mark.asyncio
+async def test_speech_enqueued_while_music_source_is_restored_is_not_stranded() -> None:
+    class BlockingRestoreOutput(FakeOutput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_started = asyncio.Event()
+            self.release_restore = asyncio.Event()
+
+        async def update_music(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            self.restore_started.set()
+            await self.release_restore.wait()
+            await super().update_music(music, position_seconds=position_seconds)
+
+    output = BlockingRestoreOutput()
+    session = AudioSession("restore-race", output, max_pending_speech=3)
+    await session.enqueue(AudioItem("music", "music", "music"))
+    await asyncio.sleep(0)
+    await session.enqueue(
+        AudioItem("speech-1", "speech-1", "local://speech-1", kind=AudioKind.SPEECH)
+    )
+
+    await asyncio.wait_for(output.restore_started.wait(), timeout=1)
+    await session.enqueue(
+        AudioItem("speech-2", "speech-2", "local://speech-2", kind=AudioKind.SPEECH)
+    )
+    output.release_restore.set()
+
+    for _ in range(50):
+        if output.overlays == ["speech-1", "speech-2"] and len(output.music_updates) == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert output.overlays == ["speech-1", "speech-2"]
+    assert len(output.music_updates) == 2
+    snapshot = await session.snapshot()
+    assert snapshot.current is not None
+    assert snapshot.current.kind is AudioKind.MUSIC
+    assert snapshot.pending == ()
+    assert snapshot.speech_active is False
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_reservations_commit_in_request_order() -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("reservation-fifo", output, max_pending_speech=3)
+    first = await session.reserve_speech()
+    second = await session.reserve_speech()
+    second_commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                "speech-2",
+                "speech-2",
+                "local://speech-2",
+                kind=AudioKind.SPEECH,
+            )
+        )
+    )
+
+    await asyncio.sleep(0)
+    assert not second_commit.done()
+    first_position = await first.commit(
+        AudioItem(
+            "speech-1",
+            "speech-1",
+            "local://speech-1",
+            kind=AudioKind.SPEECH,
+        )
+    )
+    second_position = await asyncio.wait_for(second_commit, timeout=1)
+
+    assert (first_position, second_position) == (1, 2)
+    snapshot = await session.snapshot()
+    assert [item.title for item in snapshot.pending] == ["speech-1", "speech-2"]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_released_speech_reservation_unblocks_the_next_request() -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("reservation-release", output, max_pending_speech=2)
+    first = await session.reserve_speech()
+    second = await session.reserve_speech()
+    second_commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                "speech-2",
+                "speech-2",
+                "local://speech-2",
+                kind=AudioKind.SPEECH,
+            )
+        )
+    )
+
+    await asyncio.sleep(0)
+    assert not second_commit.done()
+    await first.release()
+
+    assert await asyncio.wait_for(second_commit, timeout=1) == 1
+    snapshot = await session.snapshot()
+    assert [item.title for item in snapshot.pending] == ["speech-2"]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_clearing_speech_reservations_wakes_waiters_and_cleans_audio(
+    tmp_path: Path,
+) -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("reservation-clear", output, max_pending_speech=2)
+    first = await session.reserve_speech()
+    second = await session.reserve_speech()
+    owned_file = tmp_path / "waiting-speech.wav"
+    owned_file.write_bytes(b"speech")
+    second_commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                str(owned_file),
+                "speech-2",
+                "local://speech-2",
+                kind=AudioKind.SPEECH,
+                owned_file=owned_file,
+            )
+        )
+    )
+
+    await asyncio.sleep(0)
+    assert not second_commit.done()
+    assert await session.clear() is True
+
+    with pytest.raises(UserError, match=r"speech\.reservation_cancelled"):
+        await asyncio.wait_for(second_commit, timeout=1)
+    assert not owned_file.exists()
+    await first.release()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_waiting_speech_commit_cleans_its_audio(
+    tmp_path: Path,
+) -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("reservation-cancel-wait", output, max_pending_speech=2)
+    first = await session.reserve_speech()
+    second = await session.reserve_speech()
+    owned_file = tmp_path / "cancelled-waiting-speech.wav"
+    owned_file.write_bytes(b"speech")
+    second_commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                str(owned_file),
+                "speech-2",
+                "local://speech-2",
+                kind=AudioKind.SPEECH,
+                owned_file=owned_file,
+            )
+        )
+    )
+
+    await asyncio.sleep(0)
+    second_commit.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second_commit
+
+    assert not owned_file.exists()
+    await second.release()
+    await first.release()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_speech_commit_keeps_transferred_audio(
+    tmp_path: Path,
+) -> None:
+    state_started = asyncio.Event()
+    release_state = asyncio.Event()
+
+    async def block_first_state_change(_session: AudioSession) -> None:
+        if state_started.is_set():
+            return
+        state_started.set()
+        await release_state.wait()
+
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession(
+        "reservation-cancel-transferred",
+        output,
+        max_pending_speech=1,
+        state_hook=block_first_state_change,
+    )
+    reservation = await session.reserve_speech()
+    owned_file = tmp_path / "transferred-speech.wav"
+    owned_file.write_bytes(b"speech")
+    commit = asyncio.create_task(
+        reservation.commit(
+            AudioItem(
+                str(owned_file),
+                "speech",
+                "local://speech",
+                kind=AudioKind.SPEECH,
+                owned_file=owned_file,
+            )
+        )
+    )
+
+    await asyncio.wait_for(state_started.wait(), timeout=1)
+    commit.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await commit
+
+    snapshot = await session.snapshot()
+    assert [item.title for item in snapshot.pending] == ["speech"]
+    assert owned_file.exists()
+    await reservation.release()
+    release_state.set()
+    assert await session.clear() is True
+    assert not owned_file.exists()
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_speech_overlay_falls_back_then_resumes_music() -> None:
     output = FakeOutput()
     output.overlay_error = RuntimeError("overlay unavailable")

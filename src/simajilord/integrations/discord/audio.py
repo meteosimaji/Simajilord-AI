@@ -32,6 +32,9 @@ class _ManagedFFmpegOpusAudio(discord.FFmpegOpusAudio):
     """Close discord.py's child pipes even when FFmpeg already reached EOF."""
 
     def cleanup(self) -> None:
+        if getattr(self, "_simajilord_cleaned", False):
+            return
+        self._simajilord_cleaned = True
         streams = tuple(
             getattr(self, name, None)
             for name in ("_stdout", "_stdin", "_stderr")

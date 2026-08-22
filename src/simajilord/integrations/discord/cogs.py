@@ -255,6 +255,8 @@ _AUTONOMY_LEASE_SECONDS = 60
 _AUTONOMY_LEASE_HEARTBEAT_SECONDS = 20
 _AUTONOMY_DELIVERY_RECOVERY_LIMIT = 1_000
 _READ_ALOUD_BURST_DELAY_SECONDS = 0.08
+_READ_ALOUD_BURST_BATCH_SIZE = 8
+_READ_ALOUD_VOICE_DEBOUNCE_SECONDS = 0.15
 _AutonomyResultT = TypeVar("_AutonomyResultT")
 
 
@@ -5314,7 +5316,7 @@ class ReadAloudCog(commands.Cog):
         ] = {}
         self._message_bursts: dict[
             tuple[int, int],
-            list[tuple[discord.Message, ReadAloudMessageText]],
+            list[discord.Message],
         ] = {}
         self._message_burst_tasks: dict[
             tuple[int, int],
@@ -6114,13 +6116,13 @@ class ReadAloudCog(commands.Cog):
             or message.author.voice.channel.id != destination.id
         ):
             return
-        prepared = await self._message_formatter.format(message)
-        if prepared is None:
-            return
-        key = (message.guild.id, message.channel.id)
+        # Every configured source feeds one guild-owned voice destination.  A
+        # destination-scoped worker preserves Discord snowflake order across
+        # multiple text/VC-chat sources instead of letting faster formatting
+        # from one source overtake another source.
+        key = (message.guild.id, int(route.audio_destination_id))
         burst = self._message_bursts.setdefault(key, [])
-        if len(burst) < 8:
-            burst.append((message, prepared))
+        burst.append(message)
         if key not in self._message_burst_tasks:
             self._message_burst_tasks[key] = asyncio.create_task(
                 self._flush_message_burst(key),
@@ -6130,16 +6132,37 @@ class ReadAloudCog(commands.Cog):
     async def _flush_message_burst(self, key: tuple[int, int]) -> None:
         try:
             await asyncio.sleep(_READ_ALOUD_BURST_DELAY_SECONDS)
-            burst = tuple(self._message_bursts.pop(key, ()))
-            if not burst:
-                return
-            if self._message_burst_tasks.get(key) is asyncio.current_task():
-                self._message_burst_tasks.pop(key, None)
-            message = burst[0][0]
-            prepared = merge_read_aloud_messages(
-                tuple((str(item.author.id), item_prepared) for item, item_prepared in burst)
-            )
-            await self._deliver_read_aloud(message, prepared)
+            while True:
+                queued = self._message_bursts.get(key)
+                if not queued:
+                    self._message_bursts.pop(key, None)
+                    return
+                ordered = sorted(queued, key=lambda item: item.id)
+                batch = tuple(ordered[:_READ_ALOUD_BURST_BATCH_SIZE])
+                self._message_bursts[key] = ordered[_READ_ALOUD_BURST_BATCH_SIZE:]
+
+                # Reply lookups and other Discord-aware formatting can have
+                # different latencies. Run them together for speed; gather
+                # returns results in input order, so completion timing cannot
+                # reorder the spoken batch.
+                prepared_batch = await asyncio.gather(
+                    *(self._prepare_read_aloud_message(message) for message in batch)
+                )
+                prepared_messages = [
+                    (message, prepared)
+                    for message, prepared in zip(batch, prepared_batch, strict=True)
+                    if prepared is not None
+                ]
+                if not prepared_messages:
+                    continue
+                anchor_message = prepared_messages[0][0]
+                prepared = merge_read_aloud_messages(
+                    tuple(
+                        (str(item.author.id), item_prepared)
+                        for item, item_prepared in prepared_messages
+                    )
+                )
+                await self._deliver_read_aloud(anchor_message, prepared)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6151,6 +6174,28 @@ class ReadAloudCog(commands.Cog):
         finally:
             if self._message_burst_tasks.get(key) is asyncio.current_task():
                 self._message_burst_tasks.pop(key, None)
+                if self._message_bursts.get(key):
+                    self._message_burst_tasks[key] = asyncio.create_task(
+                        self._flush_message_burst(key),
+                        name=f"simajilord-read-aloud-burst-{key[0]}-{key[1]}",
+                    )
+
+    async def _prepare_read_aloud_message(
+        self,
+        message: discord.Message,
+    ) -> ReadAloudMessageText | None:
+        try:
+            return await self._message_formatter.format(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Automatic read-aloud formatting failed guild=%s channel=%s message=%s",
+                getattr(message.guild, "id", "unknown"),
+                message.channel.id,
+                message.id,
+            )
+            return None
 
     async def _deliver_read_aloud(
         self,
@@ -6257,7 +6302,7 @@ class ReadAloudCog(commands.Cog):
 
     async def _flush_voice_transition(self, key: tuple[int, int]) -> None:
         try:
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(_READ_ALOUD_VOICE_DEBOUNCE_SECONDS)
             transition = self._voice_transitions.get(key)
             if transition is None:
                 return

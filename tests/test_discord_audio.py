@@ -6,6 +6,7 @@ import wave
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import discord
 import pytest
 
 from simajilord.core.errors import ProviderError
@@ -41,6 +42,36 @@ def test_discord_source_is_preencoded_opus(tmp_path) -> None:
     finally:
         source.cleanup()
     assert stdout.closed
+
+
+def test_managed_discord_source_cleanup_is_idempotent(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "silence.wav"
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        output.writeframes(b"\0" * (48_000 // 10))
+
+    cleanup_calls = 0
+    original_cleanup = discord.FFmpegOpusAudio.cleanup
+
+    def counted_cleanup(source: discord.FFmpegOpusAudio) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        original_cleanup(source)
+
+    monkeypatch.setattr(discord.FFmpegOpusAudio, "cleanup", counted_cleanup)
+    source = build_discord_audio_source(
+        AudioItem(str(path), "Silence", path.as_uri())
+    )
+
+    source.cleanup()
+    source.cleanup()
+
+    assert cleanup_calls == 1
 
 
 def test_discord_source_uses_bounded_fades(tmp_path) -> None:

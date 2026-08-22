@@ -254,6 +254,10 @@ async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> No
     assert response.title == "Greeting"
     assert response.playback_state == "playing"
     assert response.duration_seconds == pytest.approx(0.1, abs=0.02)
+    snapshot = await sessions.require("1").snapshot()
+    queued_item = snapshot.current or snapshot.pending[0]
+    assert queued_item.request_id == "speak-1"
+    assert queued_item.request_source == "test"
     release.set()
     await sessions.close()
     await speech.close()

@@ -66,6 +66,8 @@ def build_speech_endpoint(
                     before_synthesis=context.dispatch_external_effect,
                 )
             item.requested_by_id = context.actor_id
+            item.request_id = context.request_id
+            item.request_source = context.transport
             if not session.output.connected:
                 await session.wait_for_listener(context.actor_id)
             position = await reservation.commit(item)

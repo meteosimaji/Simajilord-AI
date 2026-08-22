@@ -27,6 +27,7 @@ from .command_sync import (
     local_command_payloads,
     remote_command_payloads,
 )
+from .operator import LocalOperatorServer
 from .presenter import EmbedTone, command_embed
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,7 @@ class SimajilordDiscordBot(commands.Bot):
         )
         self.runtime = runtime
         self.activity_server = ActivityServer(self, runtime)
+        self.operator_server = LocalOperatorServer(runtime)
         self.application_emojis = ApplicationEmojiCatalog.from_settings(
             runtime.settings
         )
@@ -98,6 +100,7 @@ class SimajilordDiscordBot(commands.Bot):
             self.runtime.registry.register(item)
         await setup_cogs(self, self.runtime)
         await self.activity_server.start()
+        await self.operator_server.start()
         report = await self.runtime.maintenance.run()
         log.info(
             "Data maintenance complete: used=%s limit=%s removed=%s over_capacity=%s",
@@ -511,6 +514,9 @@ class SimajilordDiscordBot(commands.Bot):
             if not speech_warmup_task.done():
                 speech_warmup_task.cancel()
             await asyncio.gather(speech_warmup_task, return_exceptions=True)
+        operator_server = getattr(self, "operator_server", None)
+        if operator_server is not None:
+            await operator_server.close()
         dashboard = getattr(self, "_simajilord_music_dashboard", None)
         close_dashboard = getattr(dashboard, "close", None)
         if callable(close_dashboard):
