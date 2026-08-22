@@ -59,7 +59,6 @@ include = [
   "/scripts",
 ]
 exclude = [
-  "/shogi_ai",
   "/.data",
   "/.venv",
   "/.mypy_cache",

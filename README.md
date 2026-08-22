@@ -30,10 +30,6 @@ Discord adapter / local agent / human commands / future transports
   in separate `agent_ui` and `permissions` modules rather than the command Cog.
 - `src/simajilord/agent` holds model-independent event, conversation, context-budget,
   permission-grant, and action contracts.
-- `shogi_ai` is the standalone MLX/USI shogi engine and learning lab named **Meteo**. It has its
-  own dependency environment, tests, human play, parallel self-play, deep reanalysis, and
-  reviewed external-teacher boundary. Discord does not import its internals; a future Discord
-  capability will call its public process/API boundary.
 - `vendor/yt-dlp` is a platform-owned upstream snapshot. Discord never imports it directly.
 
 Conversation text is not hard-coded into capabilities. Only the Discord presenter owns fixed
