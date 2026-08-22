@@ -16,6 +16,7 @@ from simajilord.core.capabilities import (
 )
 from simajilord.core.errors import UserError
 from simajilord.services.read_aloud import (
+    DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT,
     ReadAloudContentMode,
     ReadAloudMode,
     ReadAloudPolicy,
@@ -137,10 +138,29 @@ class ReadAloudSemanticsSetRequest:
             )
         },
     )
+    abbreviate_long_messages: bool | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "When true, replace message content beyond the configured limit "
+                "with an audible omission marker."
+            )
+        },
+    )
+    message_character_limit: int | None = field(
+        default=None,
+        metadata={
+            "description": (
+                "Maximum formatted message characters before abbreviation (20-400)."
+            )
+        },
+    )
     expected_author_names: bool | None = None
     expected_replies: bool | None = None
     expected_attachments: bool | None = None
     expected_vc_members_only: bool | None = None
+    expected_abbreviate_long_messages: bool | None = None
+    expected_message_character_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +213,8 @@ class ReadAloudPolicyResponse:
     read_replies: bool
     read_attachments: bool
     vc_members_only: bool = False
+    abbreviate_long_messages: bool = False
+    message_character_limit: int = DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT
     read_messages: bool = True
     content_mode: str = ReadAloudContentMode.MESSAGES.value
     default_voice_preset: str = ReadAloudVoicePreset.CLEAR.value
@@ -204,6 +226,8 @@ class ReadAloudPolicyResponse:
     previous_read_replies: bool | None = None
     previous_read_attachments: bool | None = None
     previous_vc_members_only: bool | None = None
+    previous_abbreviate_long_messages: bool | None = None
+    previous_message_character_limit: int | None = None
     previous_content_mode: str | None = None
     previous_read_messages: bool | None = None
 
@@ -553,10 +577,18 @@ def build_read_aloud_policy_endpoints(
                 replies=request.replies,
                 attachments=request.attachments,
                 vc_members_only=request.vc_members_only,
+                abbreviate_long_messages=request.abbreviate_long_messages,
+                message_character_limit=request.message_character_limit,
                 expected_author_names=request.expected_author_names,
                 expected_replies=request.expected_replies,
                 expected_attachments=request.expected_attachments,
                 expected_vc_members_only=request.expected_vc_members_only,
+                expected_abbreviate_long_messages=(
+                    request.expected_abbreviate_long_messages
+                ),
+                expected_message_character_limit=(
+                    request.expected_message_character_limit
+                ),
                 before_mutation=context.dispatch_external_effect,
                 on_noop=context.complete_external_effect_without_dispatch,
             )
@@ -764,7 +796,7 @@ def build_read_aloud_policy_endpoints(
             CapabilityDescriptor(
                 name="speech.read_aloud_semantics_set",
                 summary=(
-                    "Configure author, reply, attachment, and voice-member-only narration."
+                    "Configure message narration, filtering, and optional abbreviation."
                 ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
@@ -775,6 +807,8 @@ def build_read_aloud_policy_endpoints(
                     "attachment",
                     "semantic",
                     "voice members",
+                    "abbreviate",
+                    "message length",
                 ),
                 side_effects=("Updates persistent semantic read-aloud settings.",),
                 idempotency="idempotent_write",
@@ -830,6 +864,8 @@ def _policy_response(
         read_replies=policy.read_replies,
         read_attachments=policy.read_attachments,
         vc_members_only=policy.vc_members_only,
+        abbreviate_long_messages=policy.abbreviate_long_messages,
+        message_character_limit=policy.message_character_limit,
         default_voice_preset=policy.default_voice_preset.value,
         user_voice_presets=tuple(
             (user_id, preset.value)
@@ -867,6 +903,16 @@ def _policy_response(
         ),
         previous_vc_members_only=(
             previous_semantics.vc_members_only
+            if previous_semantics is not None
+            else None
+        ),
+        previous_abbreviate_long_messages=(
+            previous_semantics.abbreviate_long_messages
+            if previous_semantics is not None
+            else None
+        ),
+        previous_message_character_limit=(
+            previous_semantics.message_character_limit
             if previous_semantics is not None
             else None
         ),

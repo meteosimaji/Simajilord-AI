@@ -352,6 +352,58 @@ async def test_speech_reservations_commit_in_request_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_partial_speech_reservation_keeps_continuation_ahead_of_next_request(
+) -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("reservation-parts", output, max_pending_speech=3)
+    first = await session.reserve_speech(slots=2)
+    second = await session.reserve_speech()
+    with pytest.raises(UserError, match=r"speech\.queue_full"):
+        await session.reserve_speech()
+
+    assert await first.commit_part(
+        AudioItem(
+            "speech-1a",
+            "speech-1a",
+            "local://speech-1a",
+            kind=AudioKind.SPEECH,
+        ),
+        final=False,
+    ) == 1
+    second_commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                "speech-2",
+                "speech-2",
+                "local://speech-2",
+                kind=AudioKind.SPEECH,
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    assert not second_commit.done()
+
+    assert await first.commit(
+        AudioItem(
+            "speech-1b",
+            "speech-1b",
+            "local://speech-1b",
+            kind=AudioKind.SPEECH,
+        )
+    ) == 2
+    assert await asyncio.wait_for(second_commit, timeout=1) == 3
+
+    snapshot = await session.snapshot()
+    assert [item.title for item in snapshot.pending] == [
+        "speech-1a",
+        "speech-1b",
+        "speech-2",
+    ]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_released_speech_reservation_unblocks_the_next_request() -> None:
     output = FakeOutput()
     output.connected = False

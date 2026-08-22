@@ -135,14 +135,26 @@ class SpeechQueueReservation:
     async def commit(self, item: AudioItem) -> int:
         """Transfer a synthesized speech item into the reserved queue slot."""
 
+        return await self.commit_part(item, final=True)
+
+    async def commit_part(self, item: AudioItem, *, final: bool) -> int:
+        """Queue one ordered part while optionally retaining the reservation.
+
+        A non-final part may start playing while the caller synthesizes the
+        continuation. The reservation remains at the head of the request FIFO,
+        so later speech cannot be committed between parts of the same passage.
+        """
+
         if not self._active:
             item.cleanup()
             raise UserError("speech.reservation_inactive")
         position = await self._session._commit_speech_reservation(
             self._token,
             item,
+            final=final,
         )
-        self._active = False
+        if final:
+            self._active = False
         return position
 
     async def release(self) -> None:
@@ -201,10 +213,11 @@ class AudioSession:
         self._music: deque[AudioItem] = deque()
         self._autoplay: deque[AudioItem] = deque()
         self._speech: deque[AudioItem] = deque()
-        # Dict insertion order is the request order. Synthesis may finish out
-        # of order, but commits wait for the reservation ahead of them so a
-        # short later message cannot overtake an earlier long one.
-        self._speech_reservations: dict[str, None] = {}
+        # Dict insertion order is the request order and each value is the
+        # number of audio parts still reserved by that logical speech request.
+        # Synthesis may finish out of order, but commits wait for the request
+        # ahead of them so a short later message cannot overtake a long one.
+        self._speech_reservations: dict[str, int] = {}
         self._manual_music_start_reservations: set[str] = set()
         self._history: deque[AudioItem] = deque(maxlen=_MAX_HISTORY_ITEMS)
         self._current: AudioItem | None = None
@@ -316,16 +329,18 @@ class AudioSession:
         await self._state_changed()
         return position
 
-    async def reserve_speech(self) -> SpeechQueueReservation:
-        """Reserve queue capacity before an expensive speech synthesis starts."""
+    async def reserve_speech(self, *, slots: int = 1) -> SpeechQueueReservation:
+        """Reserve exact queue capacity before expensive speech synthesis."""
 
+        if slots < 1:
+            raise ValueError("Speech reservation slots must be positive.")
         async with self._speech_reservation_changed:
             if self._closed:
                 raise UserError("audio.session_closed")
-            if self._speech_load_locked() >= self.max_pending_speech:
+            if self._speech_load_locked() + slots > self.max_pending_speech:
                 raise UserError("speech.queue_full")
             token = uuid.uuid4().hex
-            self._speech_reservations[token] = None
+            self._speech_reservations[token] = slots
         return SpeechQueueReservation(self, token)
 
     async def reserve_manual_music_start(self) -> ManualMusicStartReservation:
@@ -359,6 +374,8 @@ class AudioSession:
         self,
         token: str,
         item: AudioItem,
+        *,
+        final: bool,
     ) -> int:
         transferred = False
         try:
@@ -371,15 +388,25 @@ class AudioSession:
                 )
                 if token not in self._speech_reservations:
                     raise UserError("speech.reservation_cancelled")
-                self._speech_reservations.pop(token)
+                remaining_slots = self._speech_reservations[token]
+                if (final and remaining_slots != 1) or (
+                    not final and remaining_slots <= 1
+                ):
+                    raise ValueError("Speech reservation part count mismatch.")
                 if self._closed:
+                    self._speech_reservations.pop(token)
                     self._speech_reservation_changed.notify_all()
                     raise UserError("audio.session_closed")
                 position = self._enqueue_speech_locked(item)
                 transferred = True
+                if final:
+                    self._speech_reservations.pop(token)
+                else:
+                    self._speech_reservations[token] = remaining_slots - 1
                 self._wake.set()
                 self._ensure_worker()
-                self._speech_reservation_changed.notify_all()
+                if final:
+                    self._speech_reservation_changed.notify_all()
             await self._state_changed()
             return position
         except BaseException:
@@ -394,7 +421,7 @@ class AudioSession:
                 self._speech_reservation_changed.notify_all()
 
     def _speech_load_locked(self) -> int:
-        pending = len(self._speech) + len(self._speech_reservations)
+        pending = len(self._speech) + sum(self._speech_reservations.values())
         if self._speech_active or (
             self._current is not None and self._current.kind is AudioKind.SPEECH
         ):

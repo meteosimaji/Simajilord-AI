@@ -146,13 +146,22 @@ async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> N
     assert response.previous_announce_leave is False
     assert response.previous_announce_move is False
     semantics = await endpoints["speech.read_aloud_semantics_set"].invoke(
-        ReadAloudSemanticsSetRequest(author_names=True, vc_members_only=True),
+        ReadAloudSemanticsSetRequest(
+            author_names=True,
+            vc_members_only=True,
+            abbreviate_long_messages=True,
+            message_character_limit=88,
+        ),
         context,
     )
     assert semantics.previous_read_author_names is True
     assert semantics.previous_read_replies is True
     assert semantics.previous_read_attachments is True
     assert semantics.previous_vc_members_only is False
+    assert semantics.abbreviate_long_messages is True
+    assert semantics.message_character_limit == 88
+    assert semantics.previous_abbreviate_long_messages is False
+    assert semantics.previous_message_character_limit == 120
     await endpoints["speech.read_aloud_server_voice_set"].invoke(
         ReadAloudServerVoiceSetRequest(ReadAloudVoicePreset.NARRATOR),
         context,

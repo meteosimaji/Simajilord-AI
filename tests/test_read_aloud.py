@@ -368,6 +368,8 @@ async def test_announcement_and_semantic_options_are_selectively_updated(
         author_names=False,
         attachments=False,
         vc_members_only=True,
+        abbreviate_long_messages=True,
+        message_character_limit=96,
     )
 
     assert announced.announce_join is True
@@ -377,7 +379,27 @@ async def test_announcement_and_semantic_options_are_selectively_updated(
     assert semantic.read_replies is True
     assert semantic.read_attachments is False
     assert semantic.vc_members_only is True
+    assert semantic.abbreviate_long_messages is True
+    assert semantic.message_character_limit == 96
     assert ReadAloudService(path).policy("guild") == semantic
+
+
+@pytest.mark.asyncio
+async def test_message_abbreviation_limit_is_bounded_and_defaults_to_full_text(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+
+    default = service.policy("guild")
+    assert default.abbreviate_long_messages is False
+    assert default.message_character_limit == 120
+
+    for invalid in (19, 401, True):
+        with pytest.raises(ValueError, match="message_character_limit_invalid"):
+            await service.set_semantic_options(
+                workspace_id="guild",
+                message_character_limit=invalid,
+            )
 
 
 @pytest.mark.asyncio

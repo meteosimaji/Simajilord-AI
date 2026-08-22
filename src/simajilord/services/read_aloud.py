@@ -13,6 +13,10 @@ from typing import Any
 
 from simajilord.core.errors import ConfigurationError, UserError
 
+DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 120
+MIN_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 20
+MAX_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 400
+
 
 class ReadAloudMode(StrEnum):
     """How speech behaves while music is already playing."""
@@ -82,6 +86,8 @@ class ReadAloudPolicy:
     read_replies: bool = True
     read_attachments: bool = True
     vc_members_only: bool = False
+    abbreviate_long_messages: bool = False
+    message_character_limit: int = DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT
     default_voice_preset: ReadAloudVoicePreset = ReadAloudVoicePreset.CLEAR
     user_voice_presets: tuple[tuple[str, ReadAloudVoicePreset], ...] = ()
     ignore_bots: bool = True
@@ -713,6 +719,8 @@ class ReadAloudService:
         replies: bool | None = None,
         attachments: bool | None = None,
         vc_members_only: bool | None = None,
+        abbreviate_long_messages: bool | None = None,
+        message_character_limit: int | None = None,
     ) -> ReadAloudPolicy:
         """Update selected semantic speech formatting switches."""
 
@@ -722,6 +730,8 @@ class ReadAloudService:
             replies=replies,
             attachments=attachments,
             vc_members_only=vc_members_only,
+            abbreviate_long_messages=abbreviate_long_messages,
+            message_character_limit=message_character_limit,
         )
         return updated
 
@@ -733,10 +743,14 @@ class ReadAloudService:
         replies: bool | None = None,
         attachments: bool | None = None,
         vc_members_only: bool | None = None,
+        abbreviate_long_messages: bool | None = None,
+        message_character_limit: int | None = None,
         expected_author_names: bool | None = None,
         expected_replies: bool | None = None,
         expected_attachments: bool | None = None,
         expected_vc_members_only: bool | None = None,
+        expected_abbreviate_long_messages: bool | None = None,
+        expected_message_character_limit: int | None = None,
         before_mutation: Callable[[], Awaitable[None]] | None = None,
         on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ReadAloudPolicy, ReadAloudPolicy]:
@@ -747,8 +761,15 @@ class ReadAloudService:
             and replies is None
             and attachments is None
             and vc_members_only is None
+            and abbreviate_long_messages is None
+            and message_character_limit is None
         ):
             raise ValueError("read_aloud.semantic_value_required")
+        normalized_message_character_limit = (
+            None
+            if message_character_limit is None
+            else self._message_character_limit(message_character_limit)
+        )
         async with self._lock:
             current = self.policy(workspace_id)
             updated = replace(
@@ -769,6 +790,16 @@ class ReadAloudService:
                     if vc_members_only is None
                     else vc_members_only
                 ),
+                abbreviate_long_messages=(
+                    current.abbreviate_long_messages
+                    if abbreviate_long_messages is None
+                    else abbreviate_long_messages
+                ),
+                message_character_limit=(
+                    current.message_character_limit
+                    if normalized_message_character_limit is None
+                    else normalized_message_character_limit
+                ),
             )
             if updated == current:
                 if on_noop is not None:
@@ -786,6 +817,14 @@ class ReadAloudService:
             ) or (
                 expected_vc_members_only is not None
                 and current.vc_members_only != expected_vc_members_only
+            ) or (
+                expected_abbreviate_long_messages is not None
+                and current.abbreviate_long_messages
+                != expected_abbreviate_long_messages
+            ) or (
+                expected_message_character_limit is not None
+                and current.message_character_limit
+                != self._message_character_limit(expected_message_character_limit)
             ):
                 raise UserError("action.undo_conflict")
             if before_mutation is not None:
@@ -921,6 +960,18 @@ class ReadAloudService:
         return normalized
 
     @staticmethod
+    def _message_character_limit(value: object) -> int:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not MIN_READ_ALOUD_MESSAGE_CHARACTER_LIMIT
+            <= value
+            <= MAX_READ_ALOUD_MESSAGE_CHARACTER_LIMIT
+        ):
+            raise ValueError("read_aloud.message_character_limit_invalid")
+        return value
+
+    @staticmethod
     def _updated_identifier_set(
         values: tuple[str, ...],
         value: str,
@@ -974,6 +1025,15 @@ class ReadAloudService:
             read_replies=bool(item.get("read_replies", True)),
             read_attachments=bool(item.get("read_attachments", True)),
             vc_members_only=bool(item.get("vc_members_only", False)),
+            abbreviate_long_messages=bool(
+                item.get("abbreviate_long_messages", False)
+            ),
+            message_character_limit=ReadAloudService._message_character_limit(
+                item.get(
+                    "message_character_limit",
+                    DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT,
+                )
+            ),
             default_voice_preset=ReadAloudVoicePreset(
                 str(item.get("default_voice_preset", ReadAloudVoicePreset.CLEAR.value))
             ),
@@ -1010,6 +1070,8 @@ class ReadAloudService:
             "read_replies": policy.read_replies,
             "read_attachments": policy.read_attachments,
             "vc_members_only": policy.vc_members_only,
+            "abbreviate_long_messages": policy.abbreviate_long_messages,
+            "message_character_limit": policy.message_character_limit,
             "default_voice_preset": policy.default_voice_preset.value,
             "user_voice_presets": {
                 user_id: preset.value

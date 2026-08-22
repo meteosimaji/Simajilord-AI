@@ -8192,7 +8192,10 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.read_aloud_semantics_set",
-                summary="Configure semantic reading of authors, replies, and attachments.",
+                summary=(
+                    "Configure message narration, optional long-message abbreviation, "
+                    "and speaker filtering."
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=(
@@ -8204,6 +8207,8 @@ def build_discord_endpoints(
                     "添付を読み上げ",
                     "読み上げ方",
                     "返信元と添付も読み上げる",
+                    "長文は以下略にする",
+                    "読み上げを省略",
                 ),
                 side_effects=("Updates semantic read-aloud settings.",),
                 requires_workspace=True,
@@ -8214,7 +8219,7 @@ def build_discord_endpoints(
                 ),
                 timeout_seconds=15,
                 user_visible_effect=(
-                    "Changes how authors, replies, attachments, and VC membership are narrated."
+                    "Changes narration, long-message abbreviation, and VC-member filtering."
                 ),
             ),
             ReadAloudSemanticsSetRequest,

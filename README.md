@@ -81,8 +81,10 @@ with Discord's generic “interaction failed” banner.
   fails after the route is saved, a requester-only, destination-bound **Reconnect** button remains
   valid for five minutes; passive messages and voice-state changes never authorize a join
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
-  `say` fallback; long messages are sentence-chunked and joined without truncation, while
-  raw URLs and Discord mention markup are normalized before synthesis
+  `say` fallback. Long messages start from a bounded first part while their FIFO-locked
+  continuation is synthesized during playback. Full text remains the default; administrators
+  can opt into a 20-400 character limit that ends with `以下略`. Raw URLs and Discord mention
+  markup are normalized before synthesis
 - Speech-over-music sidechain ducking in the active Discord player, without restarting
   the music stream; standalone speech is used only as an overlay-failure fallback
 - Opt-in VC-member-only read aloud, short-burst merging and spam suppression, plus durable
@@ -631,7 +633,8 @@ for URL Mapping and production-hosting requirements.
 - `/join` selects up to 25 conversations to read in the current VC
 - `/timer` creates a persistent Focus Timer
 - `/system ping`, `/system uptime`, `/system about`, `/system capabilities`
-- `/readaloud ...` manages advanced read-aloud routes, voices, dictionaries, and exclusions
+- `/readaloud ...` manages advanced routes, voices, dictionaries, exclusions, and the optional
+  `/readaloud length abbreviate:<bool> [max_characters]` long-message limit
 - `/web search`, `/web fetch`, `/web find`
 - `/translate` translates supplied text or the latest visible message locally
 - `/media download`, `/media detect-ai`

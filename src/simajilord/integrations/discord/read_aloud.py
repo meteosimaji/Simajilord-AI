@@ -13,7 +13,11 @@ from typing import Any
 import discord
 
 from simajilord.services.read_aloud import ReadAloudService
-from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
+from simajilord.services.speech import (
+    SpeechSegment,
+    SpeechSegmentKind,
+    speech_prefix,
+)
 
 _CUSTOM_EMOJI = re.compile(r"<a?:([^:>]+):\d+>")
 _USER_MENTION = re.compile(r"<@!?(\d+)>")
@@ -22,6 +26,7 @@ _CHANNEL_MENTION = re.compile(r"<#(\d+)>")
 _IMAGE_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_SUFFIXES = {".m4v", ".mov", ".mp4", ".webm"}
 _AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
+_OMISSION_TEXT = "以下略"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +83,49 @@ def merge_read_aloud_messages(
         segments=tuple(segments),
         title=f"{len(messages)}件のメッセージ",
     )
+
+
+def abbreviate_read_aloud_segments(
+    segments: tuple[SpeechSegment, ...],
+    *,
+    maximum: int,
+) -> tuple[SpeechSegment, ...]:
+    """Bound message semantics while retaining the speaker and an audible marker."""
+
+    if maximum < 1:
+        raise ValueError("Read-aloud abbreviation limit must be positive.")
+    semantic_characters = sum(
+        len(segment.text)
+        for segment in segments
+        if segment.kind is not SpeechSegmentKind.AUTHOR
+    )
+    if semantic_characters <= maximum:
+        return segments
+
+    remaining_characters = maximum
+    abbreviated: list[SpeechSegment] = []
+    for segment in segments:
+        if segment.kind is SpeechSegmentKind.AUTHOR:
+            abbreviated.append(segment)
+            continue
+        if remaining_characters == 0:
+            break
+        if len(segment.text) <= remaining_characters:
+            abbreviated.append(segment)
+            remaining_characters -= len(segment.text)
+            continue
+        prefix, _remainder = speech_prefix(segment.text, remaining_characters)
+        abbreviated.append(SpeechSegment(segment.kind, prefix))
+        remaining_characters = 0
+        break
+    abbreviated.append(
+        SpeechSegment(
+            SpeechSegmentKind.EVENT,
+            _OMISSION_TEXT,
+            cache_key="read-aloud:omission",
+        )
+    )
+    return tuple(abbreviated)
 
 
 class ReadAloudMessageFormatter:
@@ -138,15 +186,21 @@ class ReadAloudMessageFormatter:
 
         if not segments:
             return None
+        spoken_segments = tuple(
+            SpeechSegment(
+                segment.kind,
+                self.service.apply_dictionary(workspace_id, segment.text),
+                segment.cache_key,
+            )
+            for segment in segments
+        )
+        if policy.abbreviate_long_messages:
+            spoken_segments = abbreviate_read_aloud_segments(
+                spoken_segments,
+                maximum=policy.message_character_limit,
+            )
         return ReadAloudMessageText(
-            segments=tuple(
-                SpeechSegment(
-                    segment.kind,
-                    self.service.apply_dictionary(workspace_id, segment.text),
-                    segment.cache_key,
-                )
-                for segment in segments
-            ),
+            segments=spoken_segments,
             title=f"{author_name}さんのメッセージ",
         )
 

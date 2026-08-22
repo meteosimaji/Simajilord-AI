@@ -25,6 +25,7 @@ from simajilord.services.speech import (
     SpeechSegmentKind,
     SpeechService,
     normalize_speech,
+    progressive_speech_parts,
     speech_chunks,
 )
 
@@ -263,6 +264,222 @@ async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> No
     await speech.close()
 
 
+@pytest.mark.asyncio
+async def test_blank_speech_releases_fifo_reservation_for_the_next_request(
+    tmp_path: Path,
+) -> None:
+    class ImmediateOutput:
+        connected = True
+        paused = False
+
+        async def connect(self, destination_id: str) -> None:
+            del destination_id
+
+        async def play(self, item: AudioItem) -> None:
+            del item
+
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, speech, position_seconds
+
+        async def update_music(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, position_seconds
+
+        async def fade_out(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+            duration_seconds: float,
+        ) -> None:
+            del music, position_seconds, duration_seconds
+
+        def pause(self) -> None:
+            self.paused = True
+
+        def resume(self) -> None:
+            self.paused = False
+
+        def stop(self) -> None:
+            pass
+
+        async def disconnect(self) -> None:
+            self.connected = False
+
+    speech = SpeechService(
+        WaveSpeechProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+    )
+    sessions = AudioSessionManager(max_active=1, max_pending_speech=2)
+    sessions.get_or_create("guild", ImmediateOutput)
+    endpoint = build_speech_endpoint(speech, sessions)
+
+    with pytest.raises(UserError, match=r"speech\.no_readable_text"):
+        await endpoint.invoke(
+            SpeechSpeakRequest(text="  \n "),
+            InvocationContext("first", "guild", "test", "blank-request"),
+        )
+
+    response = await asyncio.wait_for(
+        endpoint.invoke(
+            SpeechSpeakRequest(text="hello"),
+            InvocationContext("second", "guild", "test", "valid-request"),
+        ),
+        timeout=1,
+    )
+
+    assert response.queue_position == 1
+    await sessions.close()
+    await speech.close()
+
+
+@pytest.mark.asyncio
+async def test_progressive_speech_starts_early_without_allowing_later_overtake(
+    tmp_path: Path,
+) -> None:
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+    first_play_started = asyncio.Event()
+    release_playback = asyncio.Event()
+    long_calls = 0
+
+    def write_wave(destination: Path) -> None:
+        with wave.open(str(destination), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(48_000)
+            output.writeframes(b"\0" * 9_600)
+
+    class ControlledProvider:
+        async def synthesize(self, text: str, destination: Path) -> None:
+            nonlocal long_calls
+            if text == "hello":
+                write_wave(destination)
+                return
+            long_calls += 1
+            if long_calls == 2:
+                continuation_started.set()
+                await release_continuation.wait()
+            write_wave(destination)
+
+        async def close(self) -> None:
+            pass
+
+    class HoldingOutput:
+        connected = True
+        paused = False
+
+        async def connect(self, destination_id: str) -> None:
+            del destination_id
+
+        async def play(self, item: AudioItem) -> None:
+            del item
+            first_play_started.set()
+            await release_playback.wait()
+
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, speech, position_seconds
+
+        async def update_music(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, position_seconds
+
+        async def fade_out(
+            self,
+            music: AudioItem,
+            *,
+            position_seconds: float,
+            duration_seconds: float,
+        ) -> None:
+            del music, position_seconds, duration_seconds
+
+        def pause(self) -> None:
+            self.paused = True
+
+        def resume(self) -> None:
+            self.paused = False
+
+        def stop(self) -> None:
+            release_playback.set()
+
+        async def disconnect(self) -> None:
+            self.connected = False
+            release_playback.set()
+
+    speech = SpeechService(
+        ControlledProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=400,
+        max_concurrent=2,
+        max_provider_calls=2,
+        file_suffix=".wav",
+    )
+    sessions = AudioSessionManager(max_active=1, max_pending_speech=3)
+    sessions.get_or_create("guild", HoldingOutput)
+    endpoint = build_speech_endpoint(speech, sessions)
+    long_text = "長文" * 35
+    long_task = asyncio.create_task(
+        endpoint.invoke(
+            SpeechSpeakRequest(text=long_text, title="Long"),
+            InvocationContext("first", "guild", "test", "long-request"),
+        )
+    )
+
+    await asyncio.wait_for(continuation_started.wait(), timeout=1)
+    await asyncio.wait_for(first_play_started.wait(), timeout=1)
+    later_task = asyncio.create_task(
+        endpoint.invoke(
+            SpeechSpeakRequest(text="hello", title="Later"),
+            InvocationContext("second", "guild", "test", "later-request"),
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not long_task.done()
+    assert not later_task.done()
+    snapshot = await sessions.require("guild").snapshot()
+    assert snapshot.current is not None
+    assert snapshot.current.request_id == "long-request:p1of2"
+    assert snapshot.pending == ()
+
+    release_continuation.set()
+    long_response = await asyncio.wait_for(long_task, timeout=1)
+    later_response = await asyncio.wait_for(later_task, timeout=1)
+
+    assert long_response.queue_position == 1
+    assert later_response.queue_position == 3
+    snapshot = await sessions.require("guild").snapshot()
+    assert [item.request_id for item in snapshot.pending] == [
+        "long-request:p2of2",
+        "later-request",
+    ]
+    release_playback.set()
+    await sessions.close()
+    await speech.close()
+
+
 def test_speech_chunks_preserve_all_text_at_natural_boundaries() -> None:
     chunks = speech_chunks("今日は晴れです。明日も晴れるでしょう。終わり", 10)
 
@@ -288,6 +505,59 @@ def test_speech_normalization_and_chunks_keep_newlines_as_strong_boundaries() ->
         "一行目 です",
         "二行目です",
     )
+
+
+def test_progressive_speech_parts_preserve_text_semantics_and_cache_scope() -> None:
+    author = SpeechSegment(
+        SpeechSegmentKind.AUTHOR,
+        "めておさん",
+        cache_key="author:1:meteo",
+    )
+    body = SpeechSegment(
+        SpeechSegmentKind.BODY,
+        "長文でも最初の音を早く出します。"
+        "残りは再生中に合成し、順番は絶対に入れ替えません。"
+        "これで長い文章の待ち時間を短くします。",
+    )
+
+    parts = progressive_speech_parts((author, body))
+
+    assert len(parts) >= 2
+    assert sum(len(segment.text) for segment in parts[0]) <= 30
+    assert all(
+        sum(len(segment.text) for segment in part) <= 80 for part in parts[1:]
+    )
+    assert "".join(segment.text for part in parts for segment in part) == (
+        normalize_speech(author.text) + normalize_speech(body.text)
+    )
+    assert parts[0][0].cache_key == "author:1:meteo"
+    assert all(
+        segment.cache_key is None
+        for part in parts
+        for segment in part
+        if segment.kind is SpeechSegmentKind.BODY
+    )
+
+
+def test_progressive_speech_parts_leave_short_passage_as_one_item() -> None:
+    segment = SpeechSegment(
+        SpeechSegmentKind.AUTHOR,
+        "めておさん",
+        cache_key="author:1:meteo",
+    )
+
+    assert progressive_speech_parts((segment,)) == ((segment,),)
+
+
+def test_progressive_speech_parts_bound_queue_slots_without_losing_text() -> None:
+    segment = SpeechSegment(SpeechSegmentKind.BODY, "長文" * 300)
+
+    parts = progressive_speech_parts((segment,), maximum_parts=3)
+
+    assert len(parts) == 3
+    assert sum(len(item.text) for item in parts[0]) <= 30
+    assert sum(len(item.text) for item in parts[1]) <= 80
+    assert "".join(item.text for part in parts for item in part) == segment.text
 
 
 @pytest.mark.asyncio

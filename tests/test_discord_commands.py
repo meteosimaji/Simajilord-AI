@@ -60,6 +60,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudPolicyResponse,
     ReadAloudRequest,
     ReadAloudResponse,
+    ReadAloudSemanticsSetRequest,
 )
 from simajilord.capabilities.translation import (
     TranslationDetectResponse,
@@ -3240,6 +3241,49 @@ def test_read_aloud_has_zero_argument_join_entrypoint() -> None:
         "Choose conversation channels to read in your current VC."
     )
     assert commands["join"].parameters == []
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_length_command_persists_optional_abbreviation() -> None:
+    policy = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+        abbreviate_long_messages=True,
+        message_character_limit=80,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(return_value=policy)
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 9
+    interaction.guild_id = 1
+    interaction.channel_id = 2
+    interaction.user = SimpleNamespace(id=3)
+    interaction.response.send_message = AsyncMock()
+    command = next(
+        item for item in ReadAloudCog.readaloud.commands if item.name == "length"
+    )
+
+    await command.callback(cog, interaction, True, 80)
+
+    capability, request, _context = runtime.registry.invoke.await_args.args
+    assert capability == "discord.read_aloud_semantics_set"
+    assert request == ReadAloudSemanticsSetRequest(
+        abbreviate_long_messages=True,
+        message_character_limit=80,
+    )
+    parameters = {parameter.name: parameter for parameter in command.parameters}
+    assert parameters["max_characters"].min_value == 20
+    assert parameters["max_characters"].max_value == 400
+    embed = interaction.response.send_message.await_args.kwargs["embed"]
+    assert any(field.name == "Mode" and "以下略" in field.value for field in embed.fields)
 
 
 def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> None:

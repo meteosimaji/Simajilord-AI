@@ -26,6 +26,7 @@ from simajilord.integrations.discord.permissions import (
 from simajilord.integrations.discord.read_aloud import (
     ReadAloudMessageFormatter,
     ReadAloudMessageText,
+    abbreviate_read_aloud_segments,
     merge_read_aloud_messages,
 )
 from simajilord.runtime import SimajilordRuntime
@@ -334,6 +335,54 @@ async def test_formatter_reads_reply_author_and_uses_dictionary(tmp_path) -> Non
     assert prepared.text == (
         "めておさん。アリスさんへの返信。あいゆーてぃーを確認しました"
     )
+
+
+@pytest.mark.asyncio
+async def test_formatter_can_abbreviate_after_markup_and_dictionary_processing(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.upsert_dictionary_entry(
+        workspace_id="1",
+        surface="AI",
+        reading="人工知能",
+    )
+    await service.set_semantic_options(
+        workspace_id="1",
+        abbreviate_long_messages=True,
+        message_character_limit=20,
+    )
+    formatter = ReadAloudMessageFormatter(service)
+
+    prepared = await formatter.format(_message(content="AI" * 20))
+
+    assert prepared is not None
+    assert prepared.segments[0].kind is SpeechSegmentKind.AUTHOR
+    assert prepared.segments[-1] == SpeechSegment(
+        SpeechSegmentKind.EVENT,
+        "以下略",
+        cache_key="read-aloud:omission",
+    )
+    retained = "".join(
+        segment.text
+        for segment in prepared.segments
+        if segment.kind not in {SpeechSegmentKind.AUTHOR, SpeechSegmentKind.EVENT}
+    )
+    assert len(retained) == 20
+    assert "AI" not in retained
+
+
+def test_abbreviation_leaves_short_text_and_author_cache_unchanged() -> None:
+    segments = (
+        SpeechSegment(
+            SpeechSegmentKind.AUTHOR,
+            "めておさん",
+            cache_key="author:10:めてお",
+        ),
+        SpeechSegment(SpeechSegmentKind.BODY, "短い本文"),
+    )
+
+    assert abbreviate_read_aloud_segments(segments, maximum=20) is segments
 
 
 @pytest.mark.asyncio

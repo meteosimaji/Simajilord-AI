@@ -549,6 +549,136 @@ def normalize_speech(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def progressive_speech_parts(
+    segments: tuple[SpeechSegment, ...],
+    *,
+    threshold_characters: int = 60,
+    first_part_characters: int = 30,
+    continuation_characters: int = 80,
+    maximum_parts: int = 8,
+) -> tuple[tuple[SpeechSegment, ...], ...]:
+    """Plan early-start speech parts without losing semantic segment order.
+
+    Short passages remain one item. Longer passages use a small first part so
+    playback can begin while later parts are synthesized. Callers must retain
+    one queue reservation until the final part is committed; otherwise another
+    request could be inserted between these parts.
+    """
+
+    if threshold_characters < 1:
+        raise ValueError("Progressive speech threshold must be positive.")
+    if not 1 <= first_part_characters <= threshold_characters:
+        raise ValueError(
+            "Progressive first part must be positive and no larger than the threshold."
+        )
+    if continuation_characters < 1:
+        raise ValueError("Progressive continuation size must be positive.")
+    if maximum_parts < 1:
+        raise ValueError("Progressive speech part limit must be positive.")
+
+    normalized: list[SpeechSegment] = []
+    for segment in segments:
+        text = normalize_speech(segment.text)
+        if not text:
+            continue
+        lines = tuple(line for line in text.splitlines() if line)
+        if len(lines) == 1:
+            normalized.append(
+                SpeechSegment(segment.kind, lines[0], cache_key=segment.cache_key)
+            )
+            continue
+        normalized.extend(SpeechSegment(segment.kind, line) for line in lines)
+    if not normalized:
+        raise UserError("speech.no_readable_text")
+    if sum(len(segment.text) for segment in normalized) <= threshold_characters:
+        return (tuple(normalized),)
+
+    parts: list[tuple[SpeechSegment, ...]] = []
+    current: list[SpeechSegment] = []
+    current_characters = 0
+    capacity = first_part_characters
+
+    def finish_part() -> None:
+        nonlocal current, current_characters, capacity
+        if current:
+            parts.append(tuple(current))
+        current = []
+        current_characters = 0
+        capacity = continuation_characters
+
+    for segment in normalized:
+        original_text = segment.text
+        remaining = original_text
+        split_segment = False
+        while remaining:
+            room = capacity - current_characters
+            if room == 0:
+                finish_part()
+                room = capacity
+            if len(remaining) <= room:
+                cache_key = (
+                    segment.cache_key
+                    if not split_segment and remaining == original_text
+                    else None
+                )
+                current.append(
+                    SpeechSegment(segment.kind, remaining, cache_key=cache_key)
+                )
+                current_characters += len(remaining)
+                remaining = ""
+                continue
+            prefix, remaining = speech_prefix(remaining, room)
+            current.append(SpeechSegment(segment.kind, prefix))
+            current_characters += len(prefix)
+            split_segment = True
+            if current_characters == capacity:
+                finish_part()
+    finish_part()
+    if len(parts) > maximum_parts:
+        retained = parts[: maximum_parts - 1]
+        final_part = tuple(
+            segment
+            for part in parts[maximum_parts - 1 :]
+            for segment in part
+        )
+        parts = [*retained, final_part]
+    return tuple(parts)
+
+
+def speech_prefix(text: str, maximum: int) -> tuple[str, str]:
+    """Take one non-empty natural prefix bounded by ``maximum`` characters."""
+
+    if maximum < 1:
+        raise ValueError("Speech prefix size must be positive.")
+    remaining = text.strip()
+    if len(remaining) <= maximum:
+        return remaining, ""
+    window = remaining[:maximum]
+    boundary = max(
+        (
+            window.rfind(separator)
+            for separator in (
+                "。",
+                "\uff01",
+                "\uff1f",
+                "!",
+                "?",
+                "\uff1b",
+                ";",
+                "、",
+                ",",
+                " ",
+            )
+        ),
+        default=-1,
+    )
+    if boundary < max(1, maximum // 3):
+        boundary = maximum
+    else:
+        boundary += 1
+    return remaining[:boundary].strip(), remaining[boundary:].strip()
+
+
 def speech_chunks(text: str, maximum: int) -> tuple[str, ...]:
     """Split without dropping text, preferring natural sentence boundaries."""
 

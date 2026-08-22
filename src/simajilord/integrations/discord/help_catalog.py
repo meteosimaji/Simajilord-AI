@@ -304,6 +304,17 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         ),
     ),
     _entry(
+        "readaloud length",
+        "Read aloud",
+        "Read full messages or shorten long ones and say 「以下略」.",
+        "/readaloud length abbreviate:<bool> [max_characters]",
+        "/readaloud length abbreviate:true max_characters:120",
+        notes=(
+            "Manage Server permission is required.",
+            "The limit is 20-400 formatted characters; disabling keeps the saved limit.",
+        ),
+    ),
+    _entry(
         "readaloud server-voice",
         "Read aloud",
         "Set the default VOICEVOX voice preset for this server.",

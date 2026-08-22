@@ -482,23 +482,39 @@ def _read_aloud_semantics(
     response: object,
 ) -> Mapping[str, object] | None:
     selected: dict[str, object] = {}
-    for argument, response_name in (
-        ("author_names", "previous_read_author_names"),
-        ("replies", "previous_read_replies"),
-        ("attachments", "previous_read_attachments"),
-        ("vc_members_only", "previous_vc_members_only"),
+    for argument, response_name, current_name, value_type in (
+        (
+            "author_names",
+            "previous_read_author_names",
+            "read_author_names",
+            bool,
+        ),
+        ("replies", "previous_read_replies", "read_replies", bool),
+        (
+            "attachments",
+            "previous_read_attachments",
+            "read_attachments",
+            bool,
+        ),
+        ("vc_members_only", "previous_vc_members_only", "vc_members_only", bool),
+        (
+            "abbreviate_long_messages",
+            "previous_abbreviate_long_messages",
+            "abbreviate_long_messages",
+            bool,
+        ),
+        (
+            "message_character_limit",
+            "previous_message_character_limit",
+            "message_character_limit",
+            int,
+        ),
     ):
         if getattr(request, argument, None) is None:
             continue
         previous = getattr(response, response_name, None)
-        current_name = {
-            "author_names": "read_author_names",
-            "replies": "read_replies",
-            "attachments": "read_attachments",
-            "vc_members_only": "vc_members_only",
-        }[argument]
         current = getattr(response, current_name, None)
-        if not isinstance(previous, bool) or not isinstance(current, bool):
+        if type(previous) is not value_type or type(current) is not value_type:
             return None
         if current == previous:
             continue

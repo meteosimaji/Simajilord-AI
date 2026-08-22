@@ -1934,6 +1934,19 @@ async def test_volume_action_undo_restores_previous_level(tmp_path: Path) -> Non
             ReadAloudSemanticsSetRequest(replies=False),
             {"replies": True, "expected_replies": False},
         ),
+        (
+            "speech.read_aloud_semantics_set",
+            ReadAloudSemanticsSetRequest(
+                abbreviate_long_messages=True,
+                message_character_limit=80,
+            ),
+            {
+                "abbreviate_long_messages": False,
+                "expected_abbreviate_long_messages": True,
+                "message_character_limit": 120,
+                "expected_message_character_limit": 80,
+            },
+        ),
     ),
 )
 def test_read_aloud_scalar_setters_have_static_undo(
@@ -1953,6 +1966,8 @@ def test_read_aloud_scalar_setters_have_static_undo(
         read_author_names=True,
         read_replies=False,
         read_attachments=True,
+        abbreviate_long_messages=True,
+        message_character_limit=80,
         previous_announce_join=False,
         previous_announce_leave=True,
         previous_announce_move=False,
@@ -1960,6 +1975,8 @@ def test_read_aloud_scalar_setters_have_static_undo(
         previous_read_replies=True,
         previous_read_attachments=False,
         previous_vc_members_only=True,
+        previous_abbreviate_long_messages=False,
+        previous_message_character_limit=120,
     )
 
     assert policy.classification is ActionClassification.FULLY_REVERSIBLE

@@ -5521,6 +5521,15 @@ class ReadAloudCog(commands.Cog):
                             ),
                         ),
                         EmbedField(
+                            "Long messages",
+                            (
+                                f"Abbreviate after {policy.message_character_limit} "
+                                "characters, then say 「以下略」"
+                                if policy.abbreviate_long_messages
+                                else "Read the full text"
+                            ),
+                        ),
+                        EmbedField(
                             "Pronunciations & exclusions",
                             (
                                 f"{len(policy.dictionary)} pronunciations · "
@@ -5891,6 +5900,56 @@ class ReadAloudCog(commands.Cog):
                                 if policy.vc_members_only
                                 else "Everyone in selected channels"
                             ),
+                        ),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                )
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    @readaloud.command(
+        name="length",
+        description="Choose full reading or abbreviate long messages with an omission marker.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        abbreviate="True shortens long messages; false reads the full text",
+        max_characters="Formatted message characters to keep before the omission marker",
+    )
+    async def message_length(
+        self,
+        interaction: discord.Interaction,
+        abbreviate: bool,
+        max_characters: app_commands.Range[int, 20, 400] | None = None,
+    ) -> None:
+        try:
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_semantics_set",
+                    ReadAloudSemanticsSetRequest(
+                        abbreviate_long_messages=abbreviate,
+                        message_character_limit=max_characters,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            await interaction.response.send_message(
+                embed=command_embed(
+                    "Long-message reading updated",
+                    fields=(
+                        EmbedField(
+                            "Mode",
+                            (
+                                "Abbreviate and say 「以下略」"
+                                if policy.abbreviate_long_messages
+                                else "Read the full text"
+                            ),
+                        ),
+                        EmbedField(
+                            "Character limit",
+                            str(policy.message_character_limit),
                         ),
                     ),
                     tone=EmbedTone.SUCCESS,
