@@ -804,6 +804,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "speech.read_aloud_disable",
         "speech.read_aloud_content_state_restore",
         "speech.read_aloud_user_voice_set",
+        "speech.read_aloud_user_voice_tuning_set",
         "speech.read_aloud_server_voice_set",
         "speech.read_aloud_dictionary_set",
         "speech.read_aloud_dictionary_remove",

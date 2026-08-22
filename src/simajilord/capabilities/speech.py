@@ -23,6 +23,8 @@ class SpeechSpeakRequest:
     title: str | None = None
     segments: tuple[SpeechSegment, ...] = ()
     voice_preset: str | None = None
+    speed_scale: float = 1.0
+    pitch_scale: float = 0.0
     purpose: Literal["progress", "requested_action", "final"] = "requested_action"
 
 
@@ -55,6 +57,8 @@ def build_speech_endpoint(
                     title=title,
                     workspace_id=context.workspace_id,
                     voice_preset=request.voice_preset,
+                    speed_scale=request.speed_scale,
+                    pitch_scale=request.pitch_scale,
                     before_synthesis=context.dispatch_external_effect,
                 )
             else:
@@ -63,6 +67,8 @@ def build_speech_endpoint(
                     title=title,
                     workspace_id=context.workspace_id,
                     voice_preset=request.voice_preset,
+                    speed_scale=request.speed_scale,
+                    pitch_scale=request.pitch_scale,
                     before_synthesis=context.dispatch_external_effect,
                 )
             item.requested_by_id = context.actor_id

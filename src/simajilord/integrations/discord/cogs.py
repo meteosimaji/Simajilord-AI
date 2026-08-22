@@ -18,7 +18,7 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypeAlias, TypeVar, cast
+from typing import ClassVar, Literal, TypeAlias, TypeVar, cast
 from urllib.parse import urlparse
 
 import discord
@@ -132,6 +132,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
     ReadAloudUserVoiceSetRequest,
+    ReadAloudUserVoiceTuningSetRequest,
 )
 from simajilord.capabilities.speech import SpeechSpeakRequest
 from simajilord.capabilities.status import StatusRequest, StatusResponse
@@ -836,10 +837,19 @@ _ERROR_MESSAGES = {
     "read_aloud.exclusion_invalid": "The read-aloud exclusion is invalid.",
     "read_aloud.announcement_value_invalid": "The announcement settings are invalid.",
     "read_aloud.semantic_value_invalid": "The message-reading settings are invalid.",
+    "read_aloud.voice_tuning_invalid": (
+        "Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."
+    ),
     "read_aloud.announcement_value_required": "Choose at least one voice event to update.",
     "read_aloud.semantic_value_required": "Choose at least one message setting to update.",
     "read_aloud.ignore_bot_unnecessary": "BOT messages are already excluded.",
     "read_aloud.role_not_found": "That role was not found in this server.",
+    "speech.voice_tuning_invalid": (
+        "Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."
+    ),
+    "speech.voice_tuning_unavailable": (
+        "Personal speed and pitch require the VOICEVOX speech provider."
+    ),
     "discord.message_channel_unavailable": (
         "You and the BOT must both be able to view every selected channel."
     ),
@@ -5235,6 +5245,195 @@ class ReadAloudLengthSelect(discord.ui.Select[discord.ui.View]):
         await view.set_character_limit(interaction, int(self.values[0]))
 
 
+class ReadAloudVoiceSelect(discord.ui.Select[discord.ui.View]):
+    """Let each member choose their own durable voice without another command."""
+
+    _LABELS: ClassVar[dict[ReadAloudVoicePreset, str]] = {
+        ReadAloudVoicePreset.CLEAR: "Clear — balanced and intelligible",
+        ReadAloudVoicePreset.CALM: "Calm — relaxed delivery",
+        ReadAloudVoicePreset.ENERGETIC: "Energetic — bright delivery",
+        ReadAloudVoicePreset.CUTE: "Cute — friendly delivery",
+        ReadAloudVoicePreset.NARRATOR: "Narrator — low guidance voice",
+    }
+
+    def __init__(self, *, current: ReadAloudVoicePreset | None) -> None:
+        super().__init__(
+            custom_id="simajilord:readaloud:voice",
+            placeholder="Your read-aloud voice",
+            min_values=1,
+            max_values=1,
+            options=self._options(current),
+            row=3,
+        )
+
+    @classmethod
+    def _options(
+        cls,
+        current: ReadAloudVoicePreset | None,
+    ) -> list[discord.SelectOption]:
+        return [
+            discord.SelectOption(
+                label="Server default",
+                value="default",
+                description="Use the server's selected voice",
+                default=current is None,
+            ),
+            *(
+                discord.SelectOption(
+                    label=cls._LABELS[preset],
+                    value=preset.value,
+                    default=current is preset,
+                )
+                for preset in ReadAloudVoicePreset
+            ),
+        ]
+
+    def set_current(self, current: ReadAloudVoicePreset | None) -> None:
+        self.options = self._options(current)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ReadAloudChannelSelectView):
+            raise RuntimeError("Read-aloud voice control lost its parent view.")
+        value = self.values[0]
+        await view.set_personal_voice(
+            interaction,
+            None if value == "default" else ReadAloudVoicePreset(value),
+        )
+
+
+class ReadAloudBehaviorSelect(discord.ui.Select[discord.ui.View]):
+    """Edit common server semantics from the setup surface."""
+
+    _OPTION_DETAILS = (
+        (
+            "author_names",
+            "Read author names",
+            "Say the name when the speaker changes",
+        ),
+        (
+            "replies",
+            "Describe replies",
+            "Say who the message replies to",
+        ),
+        (
+            "attachments",
+            "Describe attachments",
+            "Say image, video, audio, or file counts",
+        ),
+        (
+            "vc_members_only",
+            "Only VC members",
+            "Ignore messages from people outside the output VC",
+        ),
+    )
+
+    def __init__(
+        self,
+        *,
+        selected: frozenset[str],
+        disabled: bool,
+    ) -> None:
+        super().__init__(
+            custom_id="simajilord:readaloud:behavior",
+            placeholder="Message reading options",
+            min_values=0,
+            max_values=len(self._OPTION_DETAILS),
+            options=self._options(selected),
+            row=4,
+            disabled=disabled,
+        )
+
+    @classmethod
+    def _options(cls, selected: frozenset[str]) -> list[discord.SelectOption]:
+        return [
+            discord.SelectOption(
+                label=label,
+                value=value,
+                description=description,
+                default=value in selected,
+            )
+            for value, label, description in cls._OPTION_DETAILS
+        ]
+
+    def set_selected(self, selected: frozenset[str]) -> None:
+        self.options = self._options(selected)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ReadAloudChannelSelectView):
+            raise RuntimeError("Read-aloud behavior control lost its parent view.")
+        await view.set_message_behavior(interaction, frozenset(self.values))
+
+
+class ReadAloudDictionaryModal(SafeModal, title="Add a pronunciation"):
+    word: discord.ui.TextInput[ReadAloudDictionaryModal] = discord.ui.TextInput(
+        label="Written form",
+        placeholder="Discord",
+        min_length=1,
+        max_length=100,
+    )
+    reading: discord.ui.TextInput[ReadAloudDictionaryModal] = discord.ui.TextInput(
+        label="How it should be read",
+        placeholder="ディスコード",
+        min_length=1,
+        max_length=200,
+    )
+
+    def __init__(self, view: ReadAloudChannelSelectView) -> None:
+        super().__init__(timeout=5 * 60)
+        self.setup_view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.setup_view.add_dictionary_entry(
+            interaction,
+            word=str(self.word),
+            reading=str(self.reading),
+        )
+
+
+class ReadAloudVoiceTuningModal(SafeModal, title="Tune your read-aloud voice"):
+    def __init__(self, view: ReadAloudChannelSelectView) -> None:
+        super().__init__(timeout=5 * 60)
+        self.setup_view = view
+        self.speed: discord.ui.TextInput[ReadAloudVoiceTuningModal] = (
+            discord.ui.TextInput(
+                label="Speed (0.5 to 2.0)",
+                placeholder="1.00",
+                default=f"{view.personal_voice_speed:.2f}",
+                min_length=1,
+                max_length=5,
+            )
+        )
+        self.pitch: discord.ui.TextInput[ReadAloudVoiceTuningModal] = (
+            discord.ui.TextInput(
+                label="Pitch (-0.15 to 0.15)",
+                placeholder="0.00",
+                default=f"{view.personal_voice_pitch:.2f}",
+                min_length=1,
+                max_length=5,
+            )
+        )
+        self.add_item(self.speed)
+        self.add_item(self.pitch)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            speed_scale = float(str(self.speed).strip())
+            pitch_scale = float(str(self.pitch).strip())
+        except ValueError:
+            await send_error(
+                interaction,
+                UserError("read_aloud.voice_tuning_invalid"),
+            )
+            return
+        await self.setup_view.set_personal_tuning(
+            interaction,
+            speed_scale=speed_scale,
+            pitch_scale=pitch_scale,
+        )
+
+
 class ReadAloudChannelSelectView(SafeView):
     def __init__(
         self,
@@ -5246,7 +5445,15 @@ class ReadAloudChannelSelectView(SafeView):
         mode: ReadAloudMode = ReadAloudMode.QUEUE,
         source_mention: str = "Current conversation",
         destination_mention: str = "Current voice channel",
-        voice_label: str = "Server default",
+        engine_label: str = "Server default",
+        personal_voice_preset: ReadAloudVoicePreset | None = None,
+        personal_voice_speed: float = 1.0,
+        personal_voice_pitch: float = 0.0,
+        dictionary_size: int = 0,
+        read_author_names: bool = True,
+        read_replies: bool = True,
+        read_attachments: bool = True,
+        vc_members_only: bool = False,
         abbreviate_long_messages: bool = False,
         message_character_limit: int = 120,
         can_manage_semantics: bool = True,
@@ -5256,10 +5463,19 @@ class ReadAloudChannelSelectView(SafeView):
         self.requester_id = requester_id
         self.source_mention = source_mention
         self.destination_mention = destination_mention
-        self.voice_label = voice_label
+        self.engine_label = engine_label
+        self.personal_voice_preset = personal_voice_preset
+        self.personal_voice_speed = personal_voice_speed
+        self.personal_voice_pitch = personal_voice_pitch
+        self.dictionary_size = dictionary_size
+        self.read_author_names = read_author_names
+        self.read_replies = read_replies
+        self.read_attachments = read_attachments
+        self.vc_members_only = vc_members_only
         self.abbreviate_long_messages = abbreviate_long_messages
         self.message_character_limit = message_character_limit
         self.can_manage_semantics = can_manage_semantics
+        self.message: discord.Message | None = None
         self.selector = ReadAloudChannelSelect(
             runtime,
             requester_id=requester_id,
@@ -5273,6 +5489,15 @@ class ReadAloudChannelSelectView(SafeView):
             disabled=not can_manage_semantics,
         )
         self.add_item(self.length_selector)
+        self.voice_selector = ReadAloudVoiceSelect(
+            current=personal_voice_preset,
+        )
+        self.add_item(self.voice_selector)
+        self.behavior_selector = ReadAloudBehaviorSelect(
+            selected=self._selected_behaviors(),
+            disabled=not can_manage_semantics,
+        )
+        self.add_item(self.behavior_selector)
         self._refresh_semantics_controls()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -5285,6 +5510,23 @@ class ReadAloudChannelSelectView(SafeView):
         return False
 
     def setup_embed(self) -> discord.Embed:
+        personal_voice = (
+            "Server default"
+            if self.personal_voice_preset is None
+            else self.personal_voice_preset.value.title()
+        )
+        personal_voice += (
+            f" · {self.personal_voice_speed:.2f}x"
+            f" · pitch {self.personal_voice_pitch:+.2f}"
+        )
+        behavior = " · ".join(
+            (
+                f"Names {_on_off(self.read_author_names)}",
+                f"Replies {_on_off(self.read_replies)}",
+                f"Files {_on_off(self.read_attachments)}",
+                "VC members only" if self.vc_members_only else "Selected channels",
+            )
+        )
         if self.abbreviate_long_messages:
             long_message_mode = (
                 f"After **{self.message_character_limit} characters**, say **以下略**"
@@ -5305,15 +5547,37 @@ class ReadAloudChannelSelectView(SafeView):
             fields=(
                 EmbedField("Current channel", self.source_mention),
                 EmbedField("Speaking in", self.destination_mention),
-                EmbedField("Voice", self.voice_label),
+                EmbedField("Engine", self.engine_label),
+                EmbedField("Your voice", personal_voice),
+                EmbedField("Message details", behavior, inline=False),
+                EmbedField(
+                    "Pronunciation dictionary",
+                    f"{self.dictionary_size} server entries",
+                ),
                 EmbedField("Long messages", long_message_mode, inline=False),
             ),
         )
 
+    def _selected_behaviors(self) -> frozenset[str]:
+        selected: set[str] = set()
+        if self.read_author_names:
+            selected.add("author_names")
+        if self.read_replies:
+            selected.add("replies")
+        if self.read_attachments:
+            selected.add("attachments")
+        if self.vc_members_only:
+            selected.add("vc_members_only")
+        return frozenset(selected)
+
     def _refresh_semantics_controls(self) -> None:
         self.length_selector.set_current_limit(self.message_character_limit)
         self.length_selector.disabled = not self.can_manage_semantics
+        self.voice_selector.set_current(self.personal_voice_preset)
+        self.behavior_selector.set_selected(self._selected_behaviors())
+        self.behavior_selector.disabled = not self.can_manage_semantics
         self.abbreviation_button.disabled = not self.can_manage_semantics
+        self.dictionary_button.disabled = not self.can_manage_semantics
         if self.abbreviate_long_messages:
             self.abbreviation_button.label = "Read full text"
             self.abbreviation_button.style = discord.ButtonStyle.secondary
@@ -5321,12 +5585,22 @@ class ReadAloudChannelSelectView(SafeView):
             self.abbreviation_button.label = "Enable 以下略"
             self.abbreviation_button.style = discord.ButtonStyle.primary
 
+    @staticmethod
+    def _require_current_manager(interaction: discord.Interaction) -> None:
+        member = interaction.user
+        if not isinstance(member, discord.Member) or not (
+            permission_enabled(member.guild_permissions, "administrator")
+            or permission_enabled(member.guild_permissions, "manage_guild")
+        ):
+            raise UserError("discord.manage_guild_required")
+
     async def _set_semantics(
         self,
         interaction: discord.Interaction,
         request: ReadAloudSemanticsSetRequest,
     ) -> None:
         try:
+            self._require_current_manager(interaction)
             await interaction.response.defer()
             policy = cast(
                 ReadAloudPolicyResponse,
@@ -5336,6 +5610,10 @@ class ReadAloudChannelSelectView(SafeView):
                     invocation_context(interaction),
                 ),
             )
+            self.read_author_names = policy.read_author_names
+            self.read_replies = policy.read_replies
+            self.read_attachments = policy.read_attachments
+            self.vc_members_only = policy.vc_members_only
             self.abbreviate_long_messages = policy.abbreviate_long_messages
             self.message_character_limit = policy.message_character_limit
             self._refresh_semantics_controls()
@@ -5345,6 +5623,128 @@ class ReadAloudChannelSelectView(SafeView):
             )
         except Exception as exc:
             await send_error(interaction, exc)
+
+    async def set_personal_voice(
+        self,
+        interaction: discord.Interaction,
+        preset: ReadAloudVoicePreset | None,
+    ) -> None:
+        try:
+            await interaction.response.defer()
+            await self.runtime.registry.invoke(
+                "speech.read_aloud_user_voice_set",
+                ReadAloudUserVoiceSetRequest(preset=preset),
+                invocation_context(interaction),
+            )
+            self.personal_voice_preset = preset
+            self._refresh_semantics_controls()
+            await interaction.edit_original_response(
+                embed=self.setup_embed(),
+                view=self,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    async def set_personal_tuning(
+        self,
+        interaction: discord.Interaction,
+        *,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> None:
+        try:
+            await interaction.response.defer()
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "speech.read_aloud_user_voice_tuning_set",
+                    ReadAloudUserVoiceTuningSetRequest(
+                        speed_scale=speed_scale,
+                        pitch_scale=pitch_scale,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            tuning = next(
+                (
+                    item
+                    for item in policy.user_voice_tunings
+                    if item[0] == str(interaction.user.id)
+                ),
+                (str(interaction.user.id), 1.0, 0.0),
+            )
+            self.personal_voice_speed = tuning[1]
+            self.personal_voice_pitch = tuning[2]
+            await interaction.edit_original_response(
+                embed=self.setup_embed(),
+                view=self,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    async def set_message_behavior(
+        self,
+        interaction: discord.Interaction,
+        selected: frozenset[str],
+    ) -> None:
+        await self._set_semantics(
+            interaction,
+            ReadAloudSemanticsSetRequest(
+                author_names="author_names" in selected,
+                replies="replies" in selected,
+                attachments="attachments" in selected,
+                vc_members_only="vc_members_only" in selected,
+                expected_author_names=self.read_author_names,
+                expected_replies=self.read_replies,
+                expected_attachments=self.read_attachments,
+                expected_vc_members_only=self.vc_members_only,
+            ),
+        )
+
+    async def add_dictionary_entry(
+        self,
+        interaction: discord.Interaction,
+        *,
+        word: str,
+        reading: str,
+    ) -> None:
+        try:
+            self._require_current_manager(interaction)
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_dictionary_set",
+                    ReadAloudDictionarySetRequest(
+                        surface=word,
+                        reading=reading,
+                    ),
+                    invocation_context(interaction),
+                ),
+            )
+            self.dictionary_size = len(policy.dictionary)
+            if self.message is not None:
+                await self.message.edit(
+                    embed=self.setup_embed(),
+                    view=self,
+                )
+            await interaction.edit_original_response(
+                embed=command_embed(
+                    "Pronunciation saved",
+                    fields=(
+                        EmbedField("Written form", word.strip()),
+                        EmbedField("Reading", reading.strip()),
+                        EmbedField("Dictionary", f"{self.dictionary_size} entries"),
+                    ),
+                    tone=EmbedTone.SUCCESS,
+                ),
+                view=None,
+            )
+        except Exception as exc:
+            if interaction.response.is_done():
+                await edit_deferred_error(interaction, exc)
+            else:
+                await send_error(interaction, exc)
 
     async def set_character_limit(
         self,
@@ -5377,6 +5777,36 @@ class ReadAloudChannelSelectView(SafeView):
                 expected_abbreviate_long_messages=self.abbreviate_long_messages,
             ),
         )
+
+    @discord.ui.button(
+        label="Tune voice",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:readaloud:tuning",
+        row=2,
+    )
+    async def tuning_button(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button[ReadAloudChannelSelectView],
+    ) -> None:
+        await interaction.response.send_modal(ReadAloudVoiceTuningModal(self))
+
+    @discord.ui.button(
+        label="Add pronunciation",
+        style=discord.ButtonStyle.secondary,
+        custom_id="simajilord:readaloud:dictionary",
+        row=2,
+    )
+    async def dictionary_button(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button[ReadAloudChannelSelectView],
+    ) -> None:
+        try:
+            self._require_current_manager(interaction)
+            await interaction.response.send_modal(ReadAloudDictionaryModal(self))
+        except Exception as exc:
+            await send_error(interaction, exc)
 
     @discord.ui.button(
         label="Start",
@@ -5427,6 +5857,10 @@ def _read_aloud_setup(
             defaults.append(selected)
 
     policy = runtime.read_aloud.policy(str(member.guild.id))
+    personal_tuning = runtime.read_aloud.voice_tuning_for(
+        workspace_id=str(member.guild.id),
+        user_id=str(member.id),
+    )
     can_manage_semantics = permission_enabled(
         member.guild_permissions,
         "administrator",
@@ -5439,7 +5873,15 @@ def _read_aloud_setup(
         mode=route.mode if route is not None else ReadAloudMode.QUEUE,
         source_mention=source.mention,
         destination_mention=destination.mention,
-        voice_label=_speech_voice_label(runtime),
+        engine_label=_speech_voice_label(runtime),
+        personal_voice_preset=dict(policy.user_voice_presets).get(str(member.id)),
+        personal_voice_speed=personal_tuning.speed_scale,
+        personal_voice_pitch=personal_tuning.pitch_scale,
+        dictionary_size=len(policy.dictionary),
+        read_author_names=policy.read_author_names,
+        read_replies=policy.read_replies,
+        read_attachments=policy.read_attachments,
+        vc_members_only=policy.vc_members_only,
         abbreviate_long_messages=policy.abbreviate_long_messages,
         message_character_limit=policy.message_character_limit,
         can_manage_semantics=can_manage_semantics,
@@ -5458,6 +5900,12 @@ async def _send_read_aloud_setup(
             view=view,
             ephemeral=True,
         )
+        try:
+            response_message = await interaction.original_response()
+        except discord.DiscordException:
+            response_message = None
+        if isinstance(response_message, discord.Message):
+            view.message = response_message
     except Exception as exc:
         await send_error(interaction, exc)
 
@@ -5715,7 +6163,8 @@ class ReadAloudCog(commands.Cog):
                             "Voices",
                             (
                                 f"Server default: {policy.default_voice_preset.title()} · "
-                                f"{len(policy.user_voice_presets)} personal presets"
+                                f"{len(policy.user_voice_presets)} personal presets · "
+                                f"{len(policy.user_voice_tunings)} tuned voices"
                             ),
                         ),
                     ),
@@ -6401,14 +6850,41 @@ class ReadAloudCog(commands.Cog):
                 ]
                 if not prepared_messages:
                     continue
-                anchor_message = prepared_messages[0][0]
-                prepared = merge_read_aloud_messages(
-                    tuple(
-                        (str(item.author.id), item_prepared)
-                        for item, item_prepared in prepared_messages
+                # One synthesis request has one provider voice. Keep adjacent
+                # messages together only while their complete voice profile is
+                # identical; otherwise per-member voice/tuning would silently
+                # use the first author's settings for the whole burst.
+                profile_groups: list[
+                    list[tuple[discord.Message, ReadAloudMessageText]]
+                ] = []
+                previous_profile: tuple[ReadAloudVoicePreset, float, float] | None = None
+                for item, item_prepared in prepared_messages:
+                    tuning = self.runtime.read_aloud.voice_tuning_for(
+                        workspace_id=str(key[0]),
+                        user_id=str(item.author.id),
                     )
-                )
-                await self._deliver_read_aloud(anchor_message, prepared)
+                    profile = (
+                        self.runtime.read_aloud.voice_preset_for(
+                            workspace_id=str(key[0]),
+                            user_id=str(item.author.id),
+                        ),
+                        tuning.speed_scale,
+                        tuning.pitch_scale,
+                    )
+                    if not profile_groups or profile != previous_profile:
+                        profile_groups.append([])
+                    profile_groups[-1].append((item, item_prepared))
+                    previous_profile = profile
+
+                for profile_group in profile_groups:
+                    anchor_message = profile_group[0][0]
+                    prepared = merge_read_aloud_messages(
+                        tuple(
+                            (str(item.author.id), item_prepared)
+                            for item, item_prepared in profile_group
+                        )
+                    )
+                    await self._deliver_read_aloud(anchor_message, prepared)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6489,6 +6965,10 @@ class ReadAloudCog(commands.Cog):
                 and session.current is not None
             ):
                 return
+            voice_tuning = self.runtime.read_aloud.voice_tuning_for(
+                workspace_id=workspace_id,
+                user_id=str(message.author.id),
+            )
             await self.runtime.registry.invoke(
                 "speech.speak",
                 SpeechSpeakRequest(
@@ -6498,6 +6978,8 @@ class ReadAloudCog(commands.Cog):
                         workspace_id=workspace_id,
                         user_id=str(message.author.id),
                     ).value,
+                    speed_scale=voice_tuning.speed_scale,
+                    pitch_scale=voice_tuning.pitch_scale,
                 ),
                 InvocationContext(
                     actor_id=str(message.author.id),

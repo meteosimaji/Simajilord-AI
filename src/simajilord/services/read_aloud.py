@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
@@ -16,6 +17,10 @@ from simajilord.core.errors import ConfigurationError, UserError
 DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 120
 MIN_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 20
 MAX_READ_ALOUD_MESSAGE_CHARACTER_LIMIT = 400
+MIN_READ_ALOUD_SPEED_SCALE = 0.5
+MAX_READ_ALOUD_SPEED_SCALE = 2.0
+MIN_READ_ALOUD_PITCH_SCALE = -0.15
+MAX_READ_ALOUD_PITCH_SCALE = 0.15
 
 
 class ReadAloudMode(StrEnum):
@@ -71,6 +76,15 @@ class ReadAloudDictionaryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadAloudVoiceTuning:
+    """One member's provider-neutral VOICEVOX tuning values."""
+
+    user_id: str
+    speed_scale: float = 1.0
+    pitch_scale: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class ReadAloudPolicy:
     """Durable read-aloud behavior that survives route removal."""
 
@@ -90,6 +104,7 @@ class ReadAloudPolicy:
     message_character_limit: int = DEFAULT_READ_ALOUD_MESSAGE_CHARACTER_LIMIT
     default_voice_preset: ReadAloudVoicePreset = ReadAloudVoicePreset.CLEAR
     user_voice_presets: tuple[tuple[str, ReadAloudVoicePreset], ...] = ()
+    user_voice_tunings: tuple[ReadAloudVoiceTuning, ...] = ()
     ignore_bots: bool = True
     ignore_webhooks: bool = True
 
@@ -697,6 +712,62 @@ class ReadAloudService:
             await asyncio.to_thread(self._save)
             return updated
 
+    async def set_user_voice_tuning(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+        speed_scale: float,
+        pitch_scale: float,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> ReadAloudPolicy:
+        """Set one member's speech speed and pitch without changing their voice."""
+
+        normalized_id = self._required_identifier(user_id, field="user_id")
+        normalized_speed = self._voice_tuning_value(
+            speed_scale,
+            field="speed_scale",
+            minimum=MIN_READ_ALOUD_SPEED_SCALE,
+            maximum=MAX_READ_ALOUD_SPEED_SCALE,
+        )
+        normalized_pitch = self._voice_tuning_value(
+            pitch_scale,
+            field="pitch_scale",
+            minimum=MIN_READ_ALOUD_PITCH_SCALE,
+            maximum=MAX_READ_ALOUD_PITCH_SCALE,
+        )
+        async with self._lock:
+            current = self.policy(workspace_id)
+            tunings = {
+                tuning.user_id: tuning
+                for tuning in current.user_voice_tunings
+            }
+            if normalized_speed == 1.0 and normalized_pitch == 0.0:
+                tunings.pop(normalized_id, None)
+            else:
+                tunings[normalized_id] = ReadAloudVoiceTuning(
+                    user_id=normalized_id,
+                    speed_scale=normalized_speed,
+                    pitch_scale=normalized_pitch,
+                )
+            updated = replace(
+                current,
+                user_voice_tunings=tuple(
+                    tunings[user_id]
+                    for user_id in sorted(tunings)
+                ),
+            )
+            if updated == current:
+                if on_noop is not None:
+                    await on_noop()
+                return current
+            if before_mutation is not None:
+                await before_mutation()
+            self._policies[workspace_id] = updated
+            await asyncio.to_thread(self._save)
+            return updated
+
     def voice_preset_for(
         self,
         *,
@@ -710,6 +781,19 @@ class ReadAloudService:
             user_id,
             policy.default_voice_preset,
         )
+
+    def voice_tuning_for(
+        self,
+        *,
+        workspace_id: str,
+        user_id: str,
+    ) -> ReadAloudVoiceTuning:
+        """Resolve one member's tuning, falling back to the natural defaults."""
+
+        for tuning in self.policy(workspace_id).user_voice_tunings:
+            if tuning.user_id == user_id:
+                return tuning
+        return ReadAloudVoiceTuning(user_id=user_id)
 
     async def set_semantic_options(
         self,
@@ -972,6 +1056,23 @@ class ReadAloudService:
         return value
 
     @staticmethod
+    def _voice_tuning_value(
+        value: object,
+        *,
+        field: str,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not minimum <= float(value) <= maximum
+        ):
+            raise ValueError(f"read_aloud.{field}_invalid")
+        return round(float(value), 3)
+
+    @staticmethod
     def _updated_identifier_set(
         values: tuple[str, ...],
         value: str,
@@ -1005,6 +1106,33 @@ class ReadAloudService:
                         str(entry["reading"]),
                         field="reading",
                         maximum=200,
+                    ),
+                )
+            )
+        voice_tunings_raw = item.get("user_voice_tunings", {})
+        if not isinstance(voice_tunings_raw, dict):
+            raise ValueError("user voice tunings must be an object")
+        voice_tunings: list[ReadAloudVoiceTuning] = []
+        for user_id, tuning in voice_tunings_raw.items():
+            if not isinstance(tuning, dict):
+                raise ValueError("user voice tuning must be an object")
+            voice_tunings.append(
+                ReadAloudVoiceTuning(
+                    user_id=ReadAloudService._required_identifier(
+                        str(user_id),
+                        field="user_id",
+                    ),
+                    speed_scale=ReadAloudService._voice_tuning_value(
+                        tuning.get("speed_scale", 1.0),
+                        field="speed_scale",
+                        minimum=MIN_READ_ALOUD_SPEED_SCALE,
+                        maximum=MAX_READ_ALOUD_SPEED_SCALE,
+                    ),
+                    pitch_scale=ReadAloudService._voice_tuning_value(
+                        tuning.get("pitch_scale", 0.0),
+                        field="pitch_scale",
+                        minimum=MIN_READ_ALOUD_PITCH_SCALE,
+                        maximum=MAX_READ_ALOUD_PITCH_SCALE,
                     ),
                 )
             )
@@ -1051,6 +1179,9 @@ class ReadAloudService:
                     ).items()
                 )
             ),
+            user_voice_tunings=tuple(
+                sorted(voice_tunings, key=lambda tuning: tuning.user_id)
+            ),
             ignore_bots=bool(item.get("ignore_bots", True)),
             ignore_webhooks=bool(item.get("ignore_webhooks", True)),
         )
@@ -1076,6 +1207,13 @@ class ReadAloudService:
             "user_voice_presets": {
                 user_id: preset.value
                 for user_id, preset in policy.user_voice_presets
+            },
+            "user_voice_tunings": {
+                tuning.user_id: {
+                    "speed_scale": tuning.speed_scale,
+                    "pitch_scale": tuning.pitch_scale,
+                }
+                for tuning in policy.user_voice_tunings
             },
             "ignore_bots": policy.ignore_bots,
             "ignore_webhooks": policy.ignore_webhooks,

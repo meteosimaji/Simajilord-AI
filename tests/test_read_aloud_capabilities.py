@@ -16,6 +16,7 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
     ReadAloudUserVoiceSetRequest,
+    ReadAloudUserVoiceTuningSetRequest,
     build_read_aloud_endpoint,
     build_read_aloud_policy_endpoints,
     build_read_aloud_route_endpoints,
@@ -170,8 +171,18 @@ async def test_split_policy_capabilities_share_one_durable_policy(tmp_path) -> N
         ReadAloudUserVoiceSetRequest(ReadAloudVoicePreset.CUTE),
         context,
     )
+    tuning_response = await endpoints[
+        "speech.read_aloud_user_voice_tuning_set"
+    ].invoke(
+        ReadAloudUserVoiceTuningSetRequest(
+            speed_scale=1.2,
+            pitch_scale=0.04,
+        ),
+        context,
+    )
     assert voice_response.default_voice_preset == "narrator"
     assert voice_response.user_voice_presets == (("user", "cute"),)
+    assert tuning_response.user_voice_tunings == (("user", 1.2, 0.04),)
     assert ReadAloudService(service.state_file).policy("guild") == service.policy(
         "guild"
     )

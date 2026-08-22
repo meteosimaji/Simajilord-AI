@@ -20,9 +20,17 @@ from simajilord.services.speech import (
 )
 
 _CUSTOM_EMOJI = re.compile(r"<a?:([^:>]+):\d+>")
+_CUSTOM_EMOJI_RUN = re.compile(
+    r"(?P<emoji><a?:(?P<name>[^:>]+):\d+>)(?:\s*(?P=emoji)){1,}"
+)
 _USER_MENTION = re.compile(r"<@!?(\d+)>")
 _ROLE_MENTION = re.compile(r"<@&(\d+)>")
 _CHANNEL_MENTION = re.compile(r"<#(\d+)>")
+_FENCED_CODE = re.compile(r"```(?:[^\n`]*)\n?.*?```", re.DOTALL)
+_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_MARKDOWN_LINK = re.compile(r"\[([^\]\n]+)]\(https?://[^\s)]+\)")
+_PLAIN_URL = re.compile(r"https?://[^\s<>]+")
+_SPOILER = re.compile(r"\|\|(.+?)\|\|", re.DOTALL)
 _IMAGE_SUFFIXES = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_SUFFIXES = {".m4v", ".mov", ".mp4", ".webm"}
 _AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
@@ -245,9 +253,23 @@ def _resolve_discord_markup(message: discord.Message, content: str) -> str:
         for channel in message.channel_mentions
     }
 
+    value = _FENCED_CODE.sub("コードブロックを送信しました", content)
+    value = _INLINE_CODE.sub(
+        lambda match: f"コード、{' '.join(match.group(1).split())}",
+        value,
+    )
+    value = _MARKDOWN_LINK.sub(
+        lambda match: f"{match.group(1)}のリンク",
+        value,
+    )
+    value = _PLAIN_URL.sub("リンク", value)
+    value = _SPOILER.sub(
+        lambda match: f"スポイラー、{match.group(1)}",
+        value,
+    )
     value = _USER_MENTION.sub(
         lambda match: f"{users.get(match.group(1), 'ユーザー')}さん",
-        content,
+        value,
     )
     value = _ROLE_MENTION.sub(
         lambda match: f"{roles.get(match.group(1), 'ロール')}へのメンション",
@@ -257,14 +279,33 @@ def _resolve_discord_markup(message: discord.Message, content: str) -> str:
         lambda match: f"{channels.get(match.group(1), 'チャンネル')}チャンネル",
         value,
     )
+    value = _CUSTOM_EMOJI_RUN.sub(
+        lambda match: (
+            f"{match.group('name').replace('_', ' ')}の絵文字を"
+            f"{len(_CUSTOM_EMOJI.findall(match.group(0)))}個"
+        ),
+        value,
+    )
     value = _CUSTOM_EMOJI.sub(
         lambda match: f"{match.group(1).replace('_', ' ')}の絵文字",
         value,
     )
     value = value.replace("@everyone", "全員へのメンション")
     value = value.replace("@here", "オンラインの皆さんへのメンション")
-    lines = (" ".join(line.split()).strip() for line in value.splitlines())
-    return "\n".join(line for line in lines if line)
+    lines: list[str] = []
+    for raw_line in value.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        quoted = line.startswith(">")
+        if quoted:
+            line = line.lstrip(">").strip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"^[-+*]\s+", "", line)
+        line = line.replace("**", "").replace("__", "").replace("~~", "")
+        if line:
+            lines.append(f"引用、{line}" if quoted else line)
+    return "\n".join(lines)
 
 
 async def _reply_author_name(message: discord.Message) -> str | None:

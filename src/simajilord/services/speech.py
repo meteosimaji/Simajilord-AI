@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import re
 import shutil
 import struct
@@ -38,6 +39,21 @@ class SelectableSpeechProvider(Protocol):
         text: str,
         destination: Path,
         voice_id: int,
+    ) -> None: ...
+
+
+@runtime_checkable
+class TunableSpeechProvider(Protocol):
+    """Optional provider extension for per-synthesis speed and pitch."""
+
+    async def synthesize_tuned(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
     ) -> None: ...
 
 
@@ -257,6 +273,8 @@ class SpeechService:
         title: str = "Read aloud",
         workspace_id: str = "default",
         voice_preset: str | None = None,
+        speed_scale: float = 1.0,
+        pitch_scale: float = 0.0,
         before_synthesis: Callable[[], Awaitable[None]] | None = None,
     ) -> AudioItem:
         return await self.synthesize_segments(
@@ -264,6 +282,8 @@ class SpeechService:
             title=title,
             workspace_id=workspace_id,
             voice_preset=voice_preset,
+            speed_scale=speed_scale,
+            pitch_scale=pitch_scale,
             before_synthesis=before_synthesis,
         )
 
@@ -274,6 +294,8 @@ class SpeechService:
         title: str = "Read aloud",
         workspace_id: str,
         voice_preset: str | None = None,
+        speed_scale: float = 1.0,
+        pitch_scale: float = 0.0,
         before_synthesis: Callable[[], Awaitable[None]] | None = None,
     ) -> AudioItem:
         normalized_segments: list[SpeechSegment] = []
@@ -291,12 +313,26 @@ class SpeechService:
         if not prepared:
             raise UserError("speech.no_readable_text")
         voice_id = self._resolve_voice_id(voice_preset)
+        speed_scale, pitch_scale = self._validate_tuning(
+            speed_scale,
+            pitch_scale,
+        )
+        if (
+            speed_scale != 1.0 or pitch_scale != 0.0
+        ) and not isinstance(self.provider, TunableSpeechProvider):
+            raise UserError("speech.voice_tuning_unavailable")
         if before_synthesis is not None:
             await before_synthesis()
 
         return await self._scheduler.run(
             workspace_id,
-            lambda: self._synthesize_job(prepared, title=title, voice_id=voice_id),
+            lambda: self._synthesize_job(
+                prepared,
+                title=title,
+                voice_id=voice_id,
+                speed_scale=speed_scale,
+                pitch_scale=pitch_scale,
+            ),
         )
 
     async def _synthesize_job(
@@ -305,6 +341,8 @@ class SpeechService:
         *,
         title: str,
         voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
     ) -> AudioItem:
         destination = self.output_dir / f"speech-{uuid.uuid4().hex}{self.file_suffix}"
         parts: list[Path] = []
@@ -335,6 +373,8 @@ class SpeechService:
                         destination=part,
                         cacheable=cacheable,
                         voice_id=voice_id,
+                        speed_scale=speed_scale,
+                        pitch_scale=pitch_scale,
                     )
 
             tasks = tuple(
@@ -461,9 +501,17 @@ class SpeechService:
         destination: Path,
         cacheable: bool,
         voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
     ) -> None:
         cache_path = (
-            self._cache_path(segment, chunk, voice_id=voice_id)
+            self._cache_path(
+                segment,
+                chunk,
+                voice_id=voice_id,
+                speed_scale=speed_scale,
+                pitch_scale=pitch_scale,
+            )
             if cacheable and segment.cache_key is not None
             else None
         )
@@ -479,6 +527,8 @@ class SpeechService:
                             chunk,
                             temporary,
                             voice_id=voice_id,
+                            speed_scale=speed_scale,
+                            pitch_scale=pitch_scale,
                         )
                         temporary.chmod(0o600)
                         temporary.replace(cache_path)
@@ -487,7 +537,13 @@ class SpeechService:
                 await asyncio.to_thread(shutil.copyfile, cache_path, destination)
                 destination.chmod(0o600)
             return
-        await self._provider_synthesize(chunk, destination, voice_id=voice_id)
+        await self._provider_synthesize(
+            chunk,
+            destination,
+            voice_id=voice_id,
+            speed_scale=speed_scale,
+            pitch_scale=pitch_scale,
+        )
 
     async def _provider_synthesize(
         self,
@@ -495,8 +551,21 @@ class SpeechService:
         destination: Path,
         *,
         voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
     ) -> None:
         async with self._provider_limit:
+            if speed_scale != 1.0 or pitch_scale != 0.0:
+                if not isinstance(self.provider, TunableSpeechProvider):
+                    raise UserError("speech.voice_tuning_unavailable")
+                await self.provider.synthesize_tuned(
+                    text,
+                    destination,
+                    voice_id=voice_id,
+                    speed_scale=speed_scale,
+                    pitch_scale=pitch_scale,
+                )
+                return
             if voice_id is not None and isinstance(self.provider, SelectableSpeechProvider):
                 await self.provider.synthesize_voice(text, destination, voice_id)
                 return
@@ -508,6 +577,8 @@ class SpeechService:
         chunk: str,
         *,
         voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
     ) -> Path:
         identity = str(
             getattr(
@@ -521,6 +592,8 @@ class SpeechService:
                 (
                     identity,
                     "" if voice_id is None else f"voice={voice_id}",
+                    f"speed={speed_scale:.3f}",
+                    f"pitch={pitch_scale:.3f}",
                     segment.kind.value,
                     segment.cache_key or "",
                     chunk,
@@ -536,6 +609,22 @@ class SpeechService:
         if voice_id is None:
             raise UserError("speech.voice_preset_invalid")
         return voice_id
+
+    @staticmethod
+    def _validate_tuning(
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> tuple[float, float]:
+        if (
+            isinstance(speed_scale, bool)
+            or isinstance(pitch_scale, bool)
+            or not math.isfinite(speed_scale)
+            or not math.isfinite(pitch_scale)
+            or not 0.5 <= speed_scale <= 2.0
+            or not -0.15 <= pitch_scale <= 0.15
+        ):
+            raise UserError("speech.voice_tuning_invalid")
+        return round(speed_scale, 3), round(pitch_scale, 3)
 
 
 def normalize_speech(text: str) -> str:

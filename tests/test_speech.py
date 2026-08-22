@@ -56,6 +56,24 @@ class SelectableWaveSpeechProvider(WaveSpeechProvider):
         await self.synthesize(text, destination)
 
 
+class TunableWaveSpeechProvider(SelectableWaveSpeechProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tunings: list[tuple[int | None, float, float]] = []
+
+    async def synthesize_tuned(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> None:
+        self.tunings.append((voice_id, speed_scale, pitch_scale))
+        await self.synthesize(text, destination)
+
+
 @pytest.mark.asyncio
 async def test_speech_service_probes_duration_for_music_ducking(tmp_path: Path) -> None:
     service = SpeechService(
@@ -128,6 +146,48 @@ async def test_speech_service_resolves_named_voice_preset(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_speech_service_applies_tuning_with_voice_and_cache_identity(
+    tmp_path: Path,
+) -> None:
+    provider = TunableWaveSpeechProvider()
+    service = SpeechService(
+        provider,
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+        voice_presets={"cute": 3},
+        file_suffix=".wav",
+    )
+    segment = SpeechSegment(
+        SpeechSegmentKind.AUTHOR,
+        "hello",
+        cache_key="author:1",
+    )
+
+    first = await service.synthesize_segments(
+        (segment,),
+        workspace_id="guild",
+        voice_preset="cute",
+        speed_scale=1.25,
+        pitch_scale=0.05,
+    )
+    second = await service.synthesize_segments(
+        (segment,),
+        workspace_id="guild",
+        voice_preset="cute",
+        speed_scale=1.0,
+        pitch_scale=0.0,
+    )
+
+    assert provider.tunings == [(3, 1.25, 0.05)]
+    assert provider.voice_ids == [3]
+    assert len(tuple((tmp_path / "speech" / "cache").glob("*.wav"))) == 2
+    first.cleanup()
+    second.cleanup()
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_speech_service_rejects_unknown_voice_preset(tmp_path: Path) -> None:
     service = SpeechService(
         WaveSpeechProvider(),
@@ -167,6 +227,18 @@ async def test_speech_validation_happens_before_effect_dispatch(tmp_path: Path) 
         await service.synthesize(
             "hello",
             voice_preset="missing",
+            before_synthesis=before_synthesis,
+        )
+    with pytest.raises(UserError, match=r"speech\.voice_tuning_unavailable"):
+        await service.synthesize(
+            "hello",
+            speed_scale=1.2,
+            before_synthesis=before_synthesis,
+        )
+    with pytest.raises(UserError, match=r"speech\.voice_tuning_invalid"):
+        await service.synthesize(
+            "hello",
+            pitch_scale=float("nan"),
             before_synthesis=before_synthesis,
         )
 
@@ -796,6 +868,7 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
     tmp_path: Path,
 ) -> None:
     calls: list[tuple[str, str]] = []
+    synthesis_payloads: list[dict[str, object]] = []
     version_calls = 0
 
     async def version(_: web.Request) -> web.Response:
@@ -805,12 +878,15 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
 
     async def audio_query(request: web.Request) -> web.Response:
         calls.append(("query", request.query["text"]))
-        assert request.query["speaker"] == "3"
-        return web.json_response({"accent_phrases": [], "speedScale": 1.0})
+        expected_speaker = "8" if request.query["text"] == "調整" else "3"
+        assert request.query["speaker"] == expected_speaker
+        return web.json_response(
+            {"accent_phrases": [], "speedScale": 1.0, "pitchScale": 0.0}
+        )
 
     async def synthesis(request: web.Request) -> web.Response:
         calls.append(("synthesis", request.query["speaker"]))
-        assert await request.json() == {"accent_phrases": [], "speedScale": 1.0}
+        synthesis_payloads.append(await request.json())
         return web.Response(body=_wave_bytes(), content_type="audio/wav")
 
     async def initialize_speaker(request: web.Request) -> web.Response:
@@ -843,6 +919,13 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
         await provider.warm_up()
         await provider.synthesize("こんにちは", destination)
         await provider.synthesize("さようなら", tmp_path / "speech-2.wav")
+        await provider.synthesize_tuned(
+            "調整",
+            tmp_path / "speech-3.wav",
+            voice_id=8,
+            speed_scale=1.3,
+            pitch_scale=0.07,
+        )
     finally:
         await provider.close()
         await runner.cleanup()
@@ -853,6 +936,13 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
         ("synthesis", "3"),
         ("query", "さようなら"),
         ("synthesis", "3"),
+        ("query", "調整"),
+        ("synthesis", "8"),
+    ]
+    assert synthesis_payloads == [
+        {"accent_phrases": [], "speedScale": 1.0, "pitchScale": 0.0},
+        {"accent_phrases": [], "speedScale": 1.0, "pitchScale": 0.0},
+        {"accent_phrases": [], "speedScale": 1.3, "pitchScale": 0.07},
     ]
     assert version_calls == 1
     assert destination.read_bytes() == _wave_bytes()

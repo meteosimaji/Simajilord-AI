@@ -81,14 +81,18 @@ with Discord's generic “interaction failed” banner.
   fails after the route is saved, a requester-only, destination-bound **Reconnect** button remains
   valid for five minutes; passive messages and voice-state changes never authorize a join
 - Local VOICEVOX speech synthesis with BOT-owned engine startup/shutdown and a macOS
-  `say` fallback. Long messages start from a bounded first part while their FIFO-locked
-  continuation is synthesized during playback. Full text remains the default; administrators
-  can opt into a 20-400 character limit that ends with `以下略`. Raw URLs and Discord mention
-  markup are normalized before synthesis
+  `say` fallback. Each message remains one FIFO-locked utterance instead of being split at
+  ordinary newlines. Full text remains the default; administrators can opt into a 20-400
+  character limit that ends with `以下略`. Raw URLs, Discord mentions, Markdown, code blocks,
+  spoilers, quotes, and repeated custom emoji are normalized locally before synthesis
 - Speech-over-music sidechain ducking in the active Discord player, without restarting
   the music stream; standalone speech is used only as an overlay-failure fallback
 - Opt-in VC-member-only read aloud, short-burst merging and spam suppression, plus durable
-  server and user voice presets. Before each queued or delivered utterance, the default
+  server and user voice presets. Each member can also persist VOICEVOX speed (0.5-2.0) and
+  pitch (-0.15 to 0.15); tuned synthesis has a separate cache identity. The ephemeral setup
+  panel combines source selection, long-message behavior, personal voice/tuning, message
+  semantics, and pronunciation entry without changing the persistent music/Queue controls.
+  Before each queued or delivered utterance, the default
   `enforce` policy snapshots the destination's low-level voice-state IDs, resolves only those
   current listeners, verifies source permissions/private-thread membership, and snapshots again.
   Missing listener principals or join/leave races fail closed without requiring a complete guild

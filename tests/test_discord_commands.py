@@ -54,6 +54,7 @@ from simajilord.capabilities.audio import (
 from simajilord.capabilities.file_scope import file_provenance, file_workspace_id
 from simajilord.capabilities.read_aloud import (
     ReadAloudAction,
+    ReadAloudDictionaryItem,
     ReadAloudDictionarySetRequest,
     ReadAloudExclusionSetRequest,
     ReadAloudExclusionTarget,
@@ -61,6 +62,8 @@ from simajilord.capabilities.read_aloud import (
     ReadAloudRequest,
     ReadAloudResponse,
     ReadAloudSemanticsSetRequest,
+    ReadAloudUserVoiceSetRequest,
+    ReadAloudUserVoiceTuningSetRequest,
 )
 from simajilord.capabilities.translation import (
     TranslationDetectResponse,
@@ -170,7 +173,11 @@ from simajilord.integrations.discord.permissions import (
 )
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox
-from simajilord.services.read_aloud import ReadAloudMode, ReadAloudRoute
+from simajilord.services.read_aloud import (
+    ReadAloudMode,
+    ReadAloudRoute,
+    ReadAloudVoicePreset,
+)
 from simajilord.services.translation import TranslationPreference
 
 
@@ -3313,10 +3320,16 @@ def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> No
         "simajilord:readaloud:channels",
         "simajilord:readaloud:length",
         "simajilord:readaloud:abbreviation",
+        "simajilord:readaloud:dictionary",
+        "simajilord:readaloud:tuning",
+        "simajilord:readaloud:voice",
+        "simajilord:readaloud:behavior",
         "simajilord:readaloud:start",
     }
     assert selector.row == 0
     assert view.length_selector.row == 1
+    assert view.voice_selector.row == 3
+    assert view.behavior_selector.row == 4
     assert any(
         isinstance(item, discord.ui.Button)
         and item.label == "Start"
@@ -3374,6 +3387,9 @@ def test_read_aloud_semantics_controls_are_disabled_without_manage_guild() -> No
 
     assert view.length_selector.disabled is True
     assert view.abbreviation_button.disabled is True
+    assert view.dictionary_button.disabled is True
+    assert view.behavior_selector.disabled is True
+    assert view.voice_selector.disabled is False
     assert view.start.disabled is False
     long_messages = next(
         field for field in view.setup_embed().fields if field.name == "Long messages"
@@ -3422,7 +3438,10 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     toggle.id = 90
     toggle.guild_id = 1
     toggle.channel_id = 50
-    toggle.user = SimpleNamespace(id=7)
+    manager = Mock(spec=discord.Member)
+    manager.id = 7
+    manager.guild_permissions = discord.Permissions(manage_guild=True)
+    toggle.user = manager
     toggle.response.defer = AsyncMock()
     toggle.edit_original_response = AsyncMock()
     await view.abbreviation_button.callback(toggle)
@@ -3446,7 +3465,7 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     limit.id = 91
     limit.guild_id = 1
     limit.channel_id = 50
-    limit.user = SimpleNamespace(id=7)
+    limit.user = manager
     limit.response.defer = AsyncMock()
     limit.edit_original_response = AsyncMock()
     view.length_selector._values = ["60"]
@@ -3464,6 +3483,233 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     assert next(
         option for option in view.length_selector.options if option.default
     ).value == "60"
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_persists_the_openers_personal_voice() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(return_value=object())
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 92
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user = SimpleNamespace(id=7)
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    view.voice_selector._values = ["cute"]
+
+    await view.voice_selector.callback(interaction)
+
+    capability, request, _context = runtime.registry.invoke.await_args.args
+    assert capability == "speech.read_aloud_user_voice_set"
+    assert request == ReadAloudUserVoiceSetRequest(
+        preset=ReadAloudVoicePreset.CUTE,
+    )
+    assert view.personal_voice_preset is ReadAloudVoicePreset.CUTE
+    assert next(
+        option for option in view.voice_selector.options if option.default
+    ).value == "cute"
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_persists_personal_speed_and_pitch() -> None:
+    policy = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+        user_voice_tunings=(("7", 1.3, 0.06),),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(return_value=policy)
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 920
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user = SimpleNamespace(id=7)
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await view.set_personal_tuning(
+        interaction,
+        speed_scale=1.3,
+        pitch_scale=0.06,
+    )
+
+    capability, request, _context = runtime.registry.invoke.await_args.args
+    assert capability == "speech.read_aloud_user_voice_tuning_set"
+    assert request == ReadAloudUserVoiceTuningSetRequest(
+        speed_scale=1.3,
+        pitch_scale=0.06,
+    )
+    assert view.personal_voice_speed == 1.3
+    assert view.personal_voice_pitch == 0.06
+    voice = next(
+        field
+        for field in interaction.edit_original_response.await_args.kwargs[
+            "embed"
+        ].fields
+        if field.name == "Your voice"
+    )
+    assert "1.30x" in voice.value
+    assert "pitch +0.06" in voice.value
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_updates_message_behavior_atomically() -> None:
+    policy = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=False,
+        read_replies=True,
+        read_attachments=False,
+        vc_members_only=True,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(return_value=policy)
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    manager = Mock(spec=discord.Member)
+    manager.id = 7
+    manager.guild_permissions = discord.Permissions(manage_guild=True)
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 93
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user = manager
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    view.behavior_selector._values = ["replies", "vc_members_only"]
+
+    await view.behavior_selector.callback(interaction)
+
+    capability, request, _context = runtime.registry.invoke.await_args.args
+    assert capability == "discord.read_aloud_semantics_set"
+    assert request == ReadAloudSemanticsSetRequest(
+        author_names=False,
+        replies=True,
+        attachments=False,
+        vc_members_only=True,
+        expected_author_names=True,
+        expected_replies=True,
+        expected_attachments=True,
+        expected_vc_members_only=False,
+    )
+    assert view._selected_behaviors() == frozenset(
+        {"replies", "vc_members_only"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_rechecks_revoked_manager_permission() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock()
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+        can_manage_semantics=True,
+    )
+    member = Mock(spec=discord.Member)
+    member.id = 7
+    member.guild_permissions = discord.Permissions.none()
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 930
+    interaction.user = member
+    interaction.response.is_done.return_value = False
+    interaction.response.send_message = AsyncMock()
+
+    await view.set_message_behavior(interaction, frozenset({"replies"}))
+
+    runtime.registry.invoke.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+    error_embed = interaction.response.send_message.await_args.kwargs["embed"]
+    assert "Manage Server" in error_embed.description
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_adds_a_server_pronunciation() -> None:
+    policy = ReadAloudPolicyResponse(
+        dictionary=(ReadAloudDictionaryItem("Discord", "ディスコード"),),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(return_value=policy)
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    manager = Mock(spec=discord.Member)
+    manager.id = 7
+    manager.guild_permissions = discord.Permissions(manage_guild=True)
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 94
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.user = manager
+    interaction.response.defer = AsyncMock()
+    interaction.response.is_done.return_value = True
+    interaction.edit_original_response = AsyncMock()
+    setup_message = Mock(spec=discord.InteractionMessage)
+    setup_message.edit = AsyncMock()
+    view.message = setup_message
+
+    await view.add_dictionary_entry(
+        interaction,
+        word="Discord",
+        reading="ディスコード",
+    )
+
+    capability, request, _context = runtime.registry.invoke.await_args.args
+    assert capability == "discord.read_aloud_dictionary_set"
+    assert request == ReadAloudDictionarySetRequest(
+        surface="Discord",
+        reading="ディスコード",
+    )
+    assert view.dictionary_size == 1
+    setup_message.edit.assert_awaited_once()
+    refreshed_embed = setup_message.edit.await_args.kwargs["embed"]
+    assert any(
+        field.name == "Pronunciation dictionary" and "1 server" in field.value
+        for field in refreshed_embed.fields
+    )
+    embed = interaction.edit_original_response.await_args.kwargs["embed"]
+    assert any(field.name == "Dictionary" and field.value == "1 entries" for field in embed.fields)
 
 
 @pytest.mark.asyncio

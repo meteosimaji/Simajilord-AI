@@ -196,6 +196,18 @@ class ReadAloudUserVoiceSetRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class ReadAloudUserVoiceTuningSetRequest:
+    speed_scale: float = field(
+        default=1.0,
+        metadata={"description": "Personal speech speed from 0.5 to 2.0."},
+    )
+    pitch_scale: float = field(
+        default=0.0,
+        metadata={"description": "Personal VOICEVOX pitch from -0.15 to 0.15."},
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ReadAloudDictionaryItem:
     surface: str
     reading: str
@@ -219,6 +231,7 @@ class ReadAloudPolicyResponse:
     content_mode: str = ReadAloudContentMode.MESSAGES.value
     default_voice_preset: str = ReadAloudVoicePreset.CLEAR.value
     user_voice_presets: tuple[tuple[str, str], ...] = ()
+    user_voice_tunings: tuple[tuple[str, float, float], ...] = ()
     previous_announce_join: bool | None = None
     previous_announce_leave: bool | None = None
     previous_announce_move: bool | None = None
@@ -661,6 +674,25 @@ def build_read_aloud_policy_endpoints(
         )
         return _policy_response(policy)
 
+    async def user_voice_tuning_set(
+        request: ReadAloudUserVoiceTuningSetRequest,
+        context: InvocationContext,
+    ) -> ReadAloudPolicyResponse:
+        if context.actor_id is None:
+            raise UserError("actor.required")
+        try:
+            policy = await service.set_user_voice_tuning(
+                workspace_id=_workspace_id(context),
+                user_id=context.actor_id,
+                speed_scale=request.speed_scale,
+                pitch_scale=request.pitch_scale,
+                before_mutation=context.dispatch_external_effect,
+                on_noop=context.complete_external_effect_without_dispatch,
+            )
+        except ValueError as exc:
+            raise UserError("read_aloud.voice_tuning_invalid") from exc
+        return _policy_response(policy)
+
     return (
         endpoint(
             CapabilityDescriptor(
@@ -674,6 +706,20 @@ def build_read_aloud_policy_endpoints(
             ReadAloudUserVoiceSetRequest,
             ReadAloudPolicyResponse,
             user_voice_set,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="speech.read_aloud_user_voice_tuning_set",
+                summary="Set the current actor's read-aloud speed and pitch.",
+                risk=RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                keywords=("read aloud", "voice", "speed", "pitch", "self"),
+                side_effects=("Persists the current actor's voice tuning.",),
+                idempotency="idempotent_write",
+            ),
+            ReadAloudUserVoiceTuningSetRequest,
+            ReadAloudPolicyResponse,
+            user_voice_tuning_set,
         ),
         endpoint(
             CapabilityDescriptor(
@@ -870,6 +916,10 @@ def _policy_response(
         user_voice_presets=tuple(
             (user_id, preset.value)
             for user_id, preset in policy.user_voice_presets
+        ),
+        user_voice_tunings=tuple(
+            (tuning.user_id, tuning.speed_scale, tuning.pitch_scale)
+            for tuning in policy.user_voice_tunings
         ),
         previous_announce_join=(
             previous_announcements.announce_join

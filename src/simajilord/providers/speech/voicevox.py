@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from collections.abc import Mapping
 from contextlib import suppress
@@ -97,11 +98,58 @@ class VoicevoxSpeechProvider:
         destination: Path,
         voice_id: int,
     ) -> None:
+        await self._synthesize_voice(
+            text,
+            destination,
+            voice_id=voice_id,
+            speed_scale=1.0,
+            pitch_scale=0.0,
+        )
+
+    async def synthesize_tuned(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> None:
+        """Apply validated VOICEVOX query tuning for one synthesis."""
+
+        if (
+            isinstance(speed_scale, bool)
+            or isinstance(pitch_scale, bool)
+            or not math.isfinite(speed_scale)
+            or not math.isfinite(pitch_scale)
+            or not 0.5 <= speed_scale <= 2.0
+            or not -0.15 <= pitch_scale <= 0.15
+        ):
+            raise ValueError("VOICEVOX tuning is out of range.")
+        await self._synthesize_voice(
+            text,
+            destination,
+            voice_id=self.speaker_id if voice_id is None else voice_id,
+            speed_scale=round(speed_scale, 3),
+            pitch_scale=round(pitch_scale, 3),
+        )
+
+    async def _synthesize_voice(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        voice_id: int,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> None:
         if not 0 <= voice_id <= 65_535:
             raise ValueError("VOICEVOX speaker ID is out of range.")
         await self._ensure_ready()
         try:
             query = await self._audio_query(text, voice_id=voice_id)
+            query["speedScale"] = speed_scale
+            query["pitchScale"] = pitch_scale
             wave = await self._synthesis(query, voice_id=voice_id)
         except ProviderError:
             self._ready_until = 0.0

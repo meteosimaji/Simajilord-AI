@@ -12,6 +12,7 @@ from simajilord.services.read_aloud import (
     ReadAloudRoute,
     ReadAloudService,
     ReadAloudVoicePreset,
+    ReadAloudVoiceTuning,
 )
 
 
@@ -473,6 +474,57 @@ async def test_voice_presets_are_server_scoped_user_overridable_and_durable(
         workspace_id="guild",
         user_id="42",
     ) is ReadAloudVoicePreset.CALM
+
+
+@pytest.mark.asyncio
+async def test_personal_voice_tuning_is_validated_compact_and_durable(
+    tmp_path,
+) -> None:
+    state_file = tmp_path / "read_aloud.json"
+    service = ReadAloudService(state_file)
+
+    policy = await service.set_user_voice_tuning(
+        workspace_id="guild",
+        user_id="42",
+        speed_scale=1.25,
+        pitch_scale=0.0554,
+    )
+
+    assert policy.user_voice_tunings == (
+        ReadAloudVoiceTuning("42", speed_scale=1.25, pitch_scale=0.055),
+    )
+    restored = ReadAloudService(state_file)
+    assert restored.voice_tuning_for(
+        workspace_id="guild",
+        user_id="42",
+    ) == ReadAloudVoiceTuning("42", speed_scale=1.25, pitch_scale=0.055)
+    assert restored.voice_tuning_for(
+        workspace_id="guild",
+        user_id="other",
+    ) == ReadAloudVoiceTuning("other")
+
+    reset = await restored.set_user_voice_tuning(
+        workspace_id="guild",
+        user_id="42",
+        speed_scale=1.0,
+        pitch_scale=0.0,
+    )
+    assert reset.user_voice_tunings == ()
+
+    with pytest.raises(ValueError, match="speed_scale_invalid"):
+        await restored.set_user_voice_tuning(
+            workspace_id="guild",
+            user_id="42",
+            speed_scale=float("nan"),
+            pitch_scale=0.0,
+        )
+    with pytest.raises(ValueError, match="pitch_scale_invalid"):
+        await restored.set_user_voice_tuning(
+            workspace_id="guild",
+            user_id="42",
+            speed_scale=1.0,
+            pitch_scale=0.16,
+        )
 
 
 @pytest.mark.asyncio

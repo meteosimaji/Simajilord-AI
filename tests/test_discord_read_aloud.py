@@ -34,6 +34,7 @@ from simajilord.services.read_aloud import (
     ReadAloudMode,
     ReadAloudRoute,
     ReadAloudService,
+    ReadAloudVoicePreset,
 )
 from simajilord.services.speech import SpeechSegment, SpeechSegmentKind
 
@@ -284,6 +285,33 @@ async def test_formatter_resolves_discord_markup_before_speech(tmp_path) -> None
         "めておさん。田中さん 管理者へのメンション 雑談チャンネル "
         "party parrotの絵文字 全員へのメンション "
         "オンラインの皆さんへのメンション"
+    )
+
+
+@pytest.mark.asyncio
+async def test_formatter_naturally_compacts_rich_discord_content(tmp_path) -> None:
+    formatter = ReadAloudMessageFormatter(
+        ReadAloudService(tmp_path / "read_aloud.json")
+    )
+    message = _message(
+        content=(
+            "**重要** [資料](https://example.com/report) https://example.com/raw\n"
+            "> 引用文\n"
+            "||秘密||\n"
+            "```python\nprint('noise')\n```\n"
+            "`x = 1` <:party:50> <:party:50> <:party:50>"
+        )
+    )
+
+    prepared = await formatter.format(message)
+
+    assert prepared is not None
+    assert prepared.text == (
+        "めておさん。重要 資料のリンク リンク\n"
+        "引用、引用文\n"
+        "スポイラー、秘密\n"
+        "コードブロックを送信しました\n"
+        "コード、x = 1 partyの絵文字を3個"
     )
 
 
@@ -588,6 +616,56 @@ async def test_read_aloud_formats_in_parallel_but_delivers_in_snowflake_order(
 
 
 @pytest.mark.asyncio
+async def test_read_aloud_burst_splits_when_personal_voice_profile_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._READ_ALOUD_BURST_DELAY_SECONDS",
+        0.0,
+    )
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.set_user_voice_tuning(
+        workspace_id="1",
+        user_id="20",
+        speed_scale=1.3,
+        pitch_scale=0.05,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    key = (1, 55)
+    messages = [
+        SimpleNamespace(id=1, author=SimpleNamespace(id=10)),
+        SimpleNamespace(id=2, author=SimpleNamespace(id=20)),
+    ]
+    cog._message_bursts[key] = messages
+    cog._message_formatter.format = AsyncMock(
+        side_effect=(
+            ReadAloudMessageText(
+                (SpeechSegment(SpeechSegmentKind.BODY, "default"),),
+                "Default",
+            ),
+            ReadAloudMessageText(
+                (SpeechSegment(SpeechSegmentKind.BODY, "tuned"),),
+                "Tuned",
+            ),
+        )
+    )
+    deliver = AsyncMock()
+    monkeypatch.setattr(cog, "_deliver_read_aloud", deliver)
+
+    await cog._flush_message_burst(key)
+
+    assert deliver.await_count == 2
+    assert [call.args[0].id for call in deliver.await_args_list] == [1, 2]
+    assert [call.args[1].text for call in deliver.await_args_list] == [
+        "default",
+        "tuned",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_multiple_read_aloud_sources_share_one_destination_fifo(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -787,6 +865,71 @@ async def test_message_content_does_not_reconnect_with_an_allowed_listener(
     runtime.audio.get_or_create.assert_called_once()
     runtime.audio.connect.assert_not_awaited()
     runtime.registry.invoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_connected_message_uses_authors_personal_voice_tuning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure(ReadAloudRoute("1", "2", "55", ReadAloudMode.QUEUE))
+    await service.set_user_voice_preset(
+        workspace_id="1",
+        user_id="10",
+        preset=ReadAloudVoicePreset.CUTE,
+    )
+    await service.set_user_voice_tuning(
+        workspace_id="1",
+        user_id="10",
+        speed_scale=1.25,
+        pitch_scale=0.05,
+    )
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = destination
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=99,
+            guild=guild,
+            channel=SimpleNamespace(id=2),
+            author=SimpleNamespace(id=10),
+        ),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.audio = Mock()
+    session = Mock()
+    session.voice_activation_required = False
+    session.current = None
+    session.output.connected = True
+    session.output.destination_id = 55
+    runtime.audio.get_or_create.return_value = session
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._read_aloud_audience_allowed",
+        lambda *_args: True,
+    )
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+
+    await cog._deliver_read_aloud(
+        message,
+        ReadAloudMessageText(
+            (SpeechSegment(SpeechSegmentKind.BODY, "調整済み"),),
+            "Message",
+        ),
+    )
+
+    capability, request, context = runtime.registry.invoke.await_args.args
+    assert capability == "speech.speak"
+    assert request.voice_preset == "cute"
+    assert request.speed_scale == 1.25
+    assert request.pitch_scale == 0.05
+    assert context.request_id == "read-aloud:99"
 
 
 async def _announcement_cog(tmp_path) -> tuple[
