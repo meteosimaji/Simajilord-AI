@@ -658,8 +658,10 @@ uv run simajilord-vc-speak \
 ```
 
 The command fails instead of retaining a delayed announcement when the BOT is stopped or its
-audio session is not connected. Each accepted request is recorded as a `speech.speak`
-capability invocation with transport `local_operator`.
+audio session is not connected. After a deliberate restart, add `--connect-if-needed` to
+reconnect only to that guild's saved VC and speak immediately. Without that explicit flag,
+disconnected sessions still fail and retain nothing. Each accepted request is recorded as a
+`speech.speak` capability invocation with transport `local_operator`.
 
 ## Local event journal
 

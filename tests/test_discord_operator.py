@@ -39,7 +39,10 @@ def socket_path() -> Iterator[Path]:
         yield Path(directory) / "operator.sock"
 
 
-def _runtime(*, connected: bool = True) -> tuple[SimajilordRuntime, AsyncMock]:
+def _runtime(
+    *,
+    connected: bool = True,
+) -> tuple[SimajilordRuntime, AsyncMock, AsyncMock]:
     registry = SimpleNamespace(invoke=AsyncMock())
     registry.invoke.return_value = SpeechSpeakResponse(
         title="Local operator announcement",
@@ -52,17 +55,26 @@ def _runtime(*, connected: bool = True) -> tuple[SimajilordRuntime, AsyncMock]:
         destination_id="456",
         output=SimpleNamespace(connected=connected),
     )
+    connect = AsyncMock()
+
+    async def mark_connected(workspace_id: str, destination_id: str) -> None:
+        session.output.connected = True
+
+    connect.side_effect = mark_connected
     runtime = SimpleNamespace(
         settings=SimpleNamespace(data_dir=Path(".data")),
-        audio=SimpleNamespace(find=lambda workspace_id: session),
+        audio=SimpleNamespace(
+            find=lambda workspace_id: session,
+            connect=connect,
+        ),
         registry=registry,
     )
-    return cast(SimajilordRuntime, runtime), registry.invoke
+    return cast(SimajilordRuntime, runtime), registry.invoke, connect
 
 
 @pytest.mark.asyncio
 async def test_local_operator_speaks_through_running_bot(socket_path: Path) -> None:
-    runtime, invoke = _runtime()
+    runtime, invoke, connect = _runtime()
     server = LocalOperatorServer(runtime, socket_path)
     await server.start()
     socket_mode = stat.S_IMODE(socket_path.stat().st_mode)
@@ -93,11 +105,12 @@ async def test_local_operator_speaks_through_running_bot(socket_path: Path) -> N
     assert context.workspace_id == "123"
     assert context.transport == "local_operator"
     assert context.resource_ids == ("456",)
+    connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_local_operator_rejects_disconnected_audio(socket_path: Path) -> None:
-    runtime, invoke = _runtime(connected=False)
+    runtime, invoke, connect = _runtime(connected=False)
     server = LocalOperatorServer(runtime, socket_path)
     await server.start()
     try:
@@ -112,13 +125,37 @@ async def test_local_operator_rejects_disconnected_audio(socket_path: Path) -> N
         await server.close()
 
     invoke.assert_not_awaited()
+    connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_local_operator_explicitly_connects_saved_audio(
+    socket_path: Path,
+) -> None:
+    runtime, invoke, connect = _runtime(connected=False)
+    server = LocalOperatorServer(runtime, socket_path)
+    await server.start()
+    try:
+        response = await request_vc_speech(
+            socket_path=socket_path,
+            workspace_id="123",
+            text="再起動後の直通テスト",
+            request_id="operator:connect",
+            connect_if_needed=True,
+        )
+    finally:
+        await server.close()
+
+    assert response["ok"] is True
+    connect.assert_awaited_once_with("123", "456")
+    invoke.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_local_operator_rejects_unknown_protocol_fields(
     socket_path: Path,
 ) -> None:
-    runtime, invoke = _runtime()
+    runtime, invoke, connect = _runtime()
     server = LocalOperatorServer(runtime, socket_path)
     await server.start()
     try:
@@ -152,3 +189,4 @@ async def test_local_operator_rejects_unknown_protocol_fields(
         "error": "operator.invalid_request",
     }
     invoke.assert_not_awaited()
+    connect.assert_not_awaited()

@@ -42,6 +42,7 @@ _REQUEST_FIELDS = frozenset(
         "workspace_id",
         "text",
         "voice_preset",
+        "connect_if_needed",
     }
 )
 
@@ -144,13 +145,24 @@ class LocalOperatorServer:
         workspace_id = _required_snowflake(payload.get("workspace_id"))
         text = _required_text(payload.get("text"))
         voice_preset = _voice_preset(payload.get("voice_preset"))
+        connect_if_needed = _optional_bool(payload.get("connect_if_needed", False))
 
         session = self.runtime.audio.find(workspace_id)
-        if session is None or not session.output.connected:
+        if session is None:
             raise UserError("operator.voice_not_connected")
         destination_id = session.destination_id
         if destination_id is None:
             raise UserError("operator.voice_not_connected")
+        if not session.output.connected:
+            if not connect_if_needed:
+                raise UserError("operator.voice_not_connected")
+            await self.runtime.audio.connect(workspace_id, destination_id)
+            log.info(
+                "Local operator connected VC request=%s workspace=%s destination=%s",
+                request_id,
+                workspace_id,
+                destination_id,
+            )
 
         result = await self.runtime.registry.invoke(
             "speech.speak",
@@ -198,6 +210,7 @@ async def request_vc_speech(
     text: str,
     voice_preset: str = "clear",
     request_id: str | None = None,
+    connect_if_needed: bool = False,
 ) -> dict[str, object]:
     """Ask the already-running BOT to synthesize one bounded passage."""
 
@@ -208,6 +221,7 @@ async def request_vc_speech(
         "workspace_id": _required_snowflake(workspace_id),
         "text": _required_text(text),
         "voice_preset": _voice_preset(voice_preset),
+        "connect_if_needed": connect_if_needed,
     }
     try:
         reader, writer = await asyncio.wait_for(
@@ -274,6 +288,12 @@ def _voice_preset(value: object) -> str:
     return value
 
 
+def _optional_bool(value: object) -> bool:
+    if not isinstance(value, bool):
+        raise LocalOperatorError("operator.invalid_request")
+    return value
+
+
 def _error_response(code: str) -> dict[str, object]:
     return {
         "ok": False,
@@ -327,6 +347,11 @@ def _parser() -> argparse.ArgumentParser:
         dest="voice_preset",
     )
     parser.add_argument("--socket", type=Path, default=data_dir / "operator.sock")
+    parser.add_argument(
+        "--connect-if-needed",
+        action="store_true",
+        help="Connect to this guild's saved VC before speaking when the BOT is in standby.",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("text", nargs="+")
     return parser
@@ -341,6 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workspace_id=args.workspace_id,
                 text=" ".join(args.text),
                 voice_preset=args.voice_preset,
+                connect_if_needed=args.connect_if_needed,
             )
         )
     except (LocalOperatorError, OSError) as exc:
