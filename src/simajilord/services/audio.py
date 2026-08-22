@@ -2209,6 +2209,20 @@ class AudioSessionManager:
             restored.append(session)
         return tuple(restored)
 
+    async def persist_restored_sessions(
+        self,
+        sessions: tuple[AudioSession, ...],
+    ) -> None:
+        """Durably normalize repaired legacy snapshots before startup completes."""
+
+        if self._state_store is None or not sessions:
+            return
+        for session in sessions:
+            if self._sessions.get(session.workspace_id) is not session:
+                raise ValueError("restored audio session does not belong to this manager")
+        await asyncio.gather(*(self._persist(session) for session in sessions))
+        await self._state_store.flush()
+
     def require(self, workspace_id: str) -> AudioSession:
         try:
             return self._sessions[workspace_id]

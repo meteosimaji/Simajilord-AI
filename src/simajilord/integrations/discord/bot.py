@@ -327,6 +327,7 @@ class SimajilordDiscordBot(commands.Bot):
         sessions = self.runtime.audio.restore(
             lambda workspace_id: DiscordAudioOutput(self, int(workspace_id))
         )
+        await self.runtime.audio.persist_restored_sessions(sessions)
         for session in sessions:
             guild = self.get_guild(int(session.workspace_id))
             if guild is None:
@@ -510,6 +511,10 @@ class SimajilordDiscordBot(commands.Bot):
             if not speech_warmup_task.done():
                 speech_warmup_task.cancel()
             await asyncio.gather(speech_warmup_task, return_exceptions=True)
+        dashboard = getattr(self, "_simajilord_music_dashboard", None)
+        close_dashboard = getattr(dashboard, "close", None)
+        if callable(close_dashboard):
+            await close_dashboard()
         await self.activity_server.close()
         await super().close()
         await self.runtime.close()

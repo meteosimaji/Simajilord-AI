@@ -1917,3 +1917,42 @@ async def test_restore_repairs_disconnected_destination_without_activation_hold(
     assert snapshot.connected is False
     assert snapshot.voice_activation_required is True
     await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_persists_repaired_legacy_activation_hold(tmp_path: Path) -> None:
+    state_path = tmp_path / "audio_sessions.json"
+    legacy_store = AudioStateStore(state_path, debounce_seconds=0)
+    legacy_state = StoredAudioSession(
+        workspace_id="legacy-disconnect",
+        destination_id="voice",
+        waiting_actor_ids=(),
+        loop_mode=LoopMode.NONE,
+        auto_leave=True,
+        speed=1.0,
+        pitch=1.0,
+        items=(),
+        history=(),
+        voice_activation_required=False,
+    )
+    await legacy_store.put(legacy_state)
+    await legacy_store.flush()
+
+    manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(state_path, debounce_seconds=0),
+    )
+
+    def disconnected_output(_workspace_id: str) -> FakeOutput:
+        output = FakeOutput()
+        output.connected = False
+        return output
+
+    restored = manager.restore(disconnected_output)
+    await manager.persist_restored_sessions(restored)
+
+    persisted = AudioStateStore(state_path).all()
+    assert len(persisted) == 1
+    assert persisted[0].voice_activation_required is True
+    await manager.close()

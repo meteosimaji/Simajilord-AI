@@ -4411,6 +4411,9 @@ async def test_bot_unloads_cogs_before_closing_runtime(
     async def close_activity() -> None:
         order.append("activity")
 
+    async def close_dashboard() -> None:
+        order.append("dashboard")
+
     async def close_discord(_bot: commands.Bot) -> None:
         order.append("discord")
 
@@ -4419,12 +4422,13 @@ async def test_bot_unloads_cogs_before_closing_runtime(
 
     bot = object.__new__(SimajilordDiscordBot)
     bot.activity_server = SimpleNamespace(close=close_activity)
+    bot._simajilord_music_dashboard = SimpleNamespace(close=close_dashboard)
     bot.runtime = SimpleNamespace(close=close_runtime)
     monkeypatch.setattr(commands.Bot, "close", close_discord)
 
     await SimajilordDiscordBot.close(bot)
 
-    assert order == ["activity", "discord", "runtime"]
+    assert order == ["dashboard", "activity", "discord", "runtime"]
 
 
 def test_agent_response_chunks_prefer_readable_boundaries() -> None:
