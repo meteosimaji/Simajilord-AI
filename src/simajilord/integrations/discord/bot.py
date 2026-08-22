@@ -78,6 +78,7 @@ class SimajilordDiscordBot(commands.Bot):
         ] = ()
         self._commands_synchronized = False
         self._audio_restored = False
+        self._speech_warmup_task: asyncio.Task[None] | None = None
         self._command_sync_lock = asyncio.Lock()
         self._command_synchronizer = DiscordCommandSynchronizer(
             CommandManifestStore(
@@ -87,6 +88,11 @@ class SimajilordDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await verify_ffmpeg_opus()
+        if self._speech_warmup_task is None:
+            self._speech_warmup_task = asyncio.create_task(
+                self._warm_speech_provider(),
+                name="simajilord-speech-warmup",
+            )
         await self.application_emojis.refresh(self)
         for item in build_discord_endpoints(self, self.runtime):
             self.runtime.registry.register(item)
@@ -102,6 +108,19 @@ class SimajilordDiscordBot(commands.Bot):
         )
         await self.runtime.image.start(self._deliver_image_job)
         self._command_templates = tuple(self.tree.get_commands())
+
+    async def _warm_speech_provider(self) -> None:
+        """Remove VOICEVOX cold-start latency without blocking Discord startup."""
+
+        try:
+            warmed = await self.runtime.speech.warm_up()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Speech provider warm-up failed; first use will retry", exc_info=True)
+            return
+        if warmed:
+            log.info("Speech provider warm-up complete")
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if interaction.type is discord.InteractionType.application_command:
@@ -486,6 +505,11 @@ class SimajilordDiscordBot(commands.Bot):
         return None
 
     async def close(self) -> None:
+        speech_warmup_task = getattr(self, "_speech_warmup_task", None)
+        if speech_warmup_task is not None:
+            if not speech_warmup_task.done():
+                speech_warmup_task.cancel()
+            await asyncio.gather(speech_warmup_task, return_exceptions=True)
         await self.activity_server.close()
         await super().close()
         await self.runtime.close()

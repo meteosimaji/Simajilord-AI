@@ -371,6 +371,62 @@ async def test_disconnected_output_preserves_entire_queue_until_reconnected() ->
 
 
 @pytest.mark.asyncio
+async def test_mid_play_disconnect_holds_current_track_without_retry_penalty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DisconnectingOutput(FakeOutput):
+        async def play(self, item: AudioItem) -> None:
+            self.played.append(item.title)
+            self.played_items.append(item)
+            if len(self.played) == 1:
+                self.connected = False
+                raise EarlyPlaybackEnd(
+                    elapsed_seconds=10.0,
+                    expected_seconds=120.0,
+                )
+            await self.release.wait()
+            self.release.clear()
+
+    monkeypatch.setattr(
+        "simajilord.services.audio._IMMEDIATE_RETRY_DELAYS",
+        (0.0,),
+    )
+    output = DisconnectingOutput()
+    session = AudioSession("dropped-mid-play", output, max_pending_speech=3)
+    await session.connect("voice")
+    await session.enqueue(
+        AudioItem(
+            "stream",
+            "preserve me",
+            "https://example.com/watch",
+            resolver_reference="https://example.com/watch",
+        )
+    )
+
+    for _ in range(50):
+        snapshot = await session.snapshot()
+        if snapshot.voice_activation_required and snapshot.current is None:
+            break
+        await asyncio.sleep(0)
+
+    snapshot = await session.snapshot()
+    assert output.played == ["preserve me"]
+    assert snapshot.connected is False
+    assert snapshot.voice_activation_required is True
+    assert tuple(item.title for item in snapshot.pending) == ("preserve me",)
+    assert snapshot.pending[0].failure_count == 0
+
+    await session.connect("voice")
+    for _ in range(50):
+        if output.played == ["preserve me", "preserve me"]:
+            break
+        await asyncio.sleep(0)
+
+    assert output.played == ["preserve me", "preserve me"]
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_permanent_media_failure_is_not_requeued(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1834,3 +1890,30 @@ async def test_read_aloud_only_resume_hold_survives_manager_restart(
     assert snapshot.destination_id == "voice"
     assert snapshot.voice_activation_required is True
     await restored_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_repairs_disconnected_destination_without_activation_hold() -> None:
+    output = FakeOutput()
+    session = AudioSession("legacy-disconnect", output, max_pending_speech=3)
+    await session.connect("voice")
+    legacy_state = replace(
+        await session.persisted_state(),
+        voice_activation_required=False,
+    )
+    await session.close()
+
+    restored_output = FakeOutput()
+    restored_output.connected = False
+    restored = AudioSession(
+        "legacy-disconnect",
+        restored_output,
+        max_pending_speech=3,
+    )
+    restored.restore(legacy_state)
+
+    snapshot = await restored.snapshot()
+    assert snapshot.destination_id == "voice"
+    assert snapshot.connected is False
+    assert snapshot.voice_activation_required is True
+    await restored.close()

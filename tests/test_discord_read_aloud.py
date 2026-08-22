@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from simajilord.agent import ReadAloudAudienceMode
 from simajilord.integrations.discord.cogs import (
+    _READ_ALOUD_BURST_DELAY_SECONDS,
     ReadAloudCog,
     _read_aloud_audience_allowed,
 )
@@ -395,6 +396,40 @@ def test_short_burst_compacts_exact_consecutive_spam_without_reordering() -> Non
     assert merged.text == (
         "めておさん。こんにちは。同じ内容を2回送信しました。別の内容"
     )
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_burst_uses_low_latency_debounce(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs.asyncio.sleep",
+        record_sleep,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = ReadAloudService(tmp_path / "read_aloud.json")
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+    key = (1, 2)
+    message = SimpleNamespace(author=SimpleNamespace(id=10))
+    prepared = ReadAloudMessageText(
+        (SpeechSegment(SpeechSegmentKind.BODY, "すぐに読む"),),
+        "Message",
+    )
+    cog._message_bursts[key] = [(message, prepared)]
+    deliver = AsyncMock()
+    monkeypatch.setattr(cog, "_deliver_read_aloud", deliver)
+
+    await cog._flush_message_burst(key)
+
+    assert delays == [_READ_ALOUD_BURST_DELAY_SECONDS]
+    assert _READ_ALOUD_BURST_DELAY_SECONDS <= 0.1
+    deliver.assert_awaited_once_with(message, prepared)
 
 
 @pytest.mark.asyncio

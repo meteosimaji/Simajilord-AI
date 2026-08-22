@@ -5498,7 +5498,16 @@ def build_discord_endpoints(
         ) or _permission_enabled(member.guild_permissions, "manage_guild")
         if mutating and not can_manage_guild:
             member_voice = _member_voice_channel(member)
-            if request.action is ReadAloudAction.ADD_SOURCES:
+            if request.action is ReadAloudAction.CONFIGURE_SOURCES:
+                current_route = runtime.read_aloud.get(str(guild.id))
+                self_service_allowed = (
+                    current_route is None
+                    and bool(request.text_channel_ids)
+                    and request.audio_destination_id is not None
+                    and member_voice is not None
+                    and str(member_voice.id) == request.audio_destination_id
+                )
+            elif request.action is ReadAloudAction.ADD_SOURCES:
                 current_route = runtime.read_aloud.get(str(guild.id))
                 self_service_allowed = (
                     bool(request.text_channel_ids)
@@ -5540,7 +5549,10 @@ def build_discord_endpoints(
                 raise UserError("discord.manage_guild_required")
         audience_sources: list[DiscordReadableChannel] = []
         audience_destination: discord.VoiceChannel | discord.StageChannel | None = None
-        if request.action is ReadAloudAction.ADD_SOURCES:
+        if request.action in {
+            ReadAloudAction.CONFIGURE_SOURCES,
+            ReadAloudAction.ADD_SOURCES,
+        }:
             source_ids = tuple(dict.fromkeys(request.text_channel_ids))
             if not 1 <= len(source_ids) <= 25:
                 raise UserError("read_aloud.source_channel_limit")

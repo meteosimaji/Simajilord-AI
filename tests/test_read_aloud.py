@@ -109,6 +109,31 @@ async def test_adding_multiple_sources_is_deduplicated_and_persistent(
 
 
 @pytest.mark.asyncio
+async def test_configuring_multiple_sources_atomically_replaces_route(tmp_path) -> None:
+    path = tmp_path / "read_aloud.json"
+    service = ReadAloudService(path)
+    await service.add_sources(
+        workspace_id="guild",
+        text_channel_ids=("old-one", "old-two"),
+        audio_destination_id="old-voice",
+        mode=ReadAloudMode.SKIP_DURING_MUSIC,
+    )
+
+    route = await service.configure_sources(
+        workspace_id="guild",
+        text_channel_ids=("new-one", "new-two", "new-one"),
+        audio_destination_id="new-voice",
+        mode=ReadAloudMode.QUEUE,
+    )
+
+    assert route.text_channel_ids == ("new-one", "new-two")
+    assert route.audio_destination_id == "new-voice"
+    assert route.mode is ReadAloudMode.QUEUE
+    assert not service.matches("guild", "old-one")
+    assert ReadAloudService(path).get("guild") == route
+
+
+@pytest.mark.asyncio
 async def test_removing_last_conversation_channel_disables_read_aloud(
     tmp_path,
 ) -> None:

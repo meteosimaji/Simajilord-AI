@@ -75,6 +75,40 @@ async def test_speech_service_probes_duration_for_music_ducking(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_speech_service_warms_optional_provider(tmp_path: Path) -> None:
+    warmups = 0
+
+    class WarmableWaveProvider(WaveSpeechProvider):
+        async def warm_up(self) -> None:
+            nonlocal warmups
+            warmups += 1
+
+    service = SpeechService(
+        WarmableWaveProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+    )
+
+    assert await service.warm_up() is True
+    assert warmups == 1
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_service_skips_warmup_for_basic_provider(tmp_path: Path) -> None:
+    service = SpeechService(
+        WaveSpeechProvider(),
+        output_dir=tmp_path / "speech",
+        chunk_characters=100,
+        max_concurrent=1,
+    )
+
+    assert await service.warm_up() is False
+    await service.close()
+
+
+@pytest.mark.asyncio
 async def test_speech_service_resolves_named_voice_preset(tmp_path: Path) -> None:
     provider = SelectableWaveSpeechProvider()
     service = SpeechService(
@@ -565,10 +599,16 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
         assert await request.json() == {"accent_phrases": [], "speedScale": 1.0}
         return web.Response(body=_wave_bytes(), content_type="audio/wav")
 
+    async def initialize_speaker(request: web.Request) -> web.Response:
+        calls.append(("initialize", request.query["speaker"]))
+        assert request.query["skip_reinit"] == "true"
+        return web.Response(status=204)
+
     application = web.Application()
     application.router.add_get("/version", version)
     application.router.add_post("/audio_query", audio_query)
     application.router.add_post("/synthesis", synthesis)
+    application.router.add_post("/initialize_speaker", initialize_speaker)
     runner = web.AppRunner(application)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -582,9 +622,11 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
         timeout_seconds=5.0,
         engine_path=None,
         auto_start=False,
+        preload_voice_ids=(2,),
     )
     destination = tmp_path / "speech.wav"
     try:
+        await provider.warm_up()
         await provider.synthesize("こんにちは", destination)
         await provider.synthesize("さようなら", tmp_path / "speech-2.wav")
     finally:
@@ -592,6 +634,7 @@ async def test_voicevox_provider_uses_two_stage_api_and_writes_valid_wave(
         await runner.cleanup()
 
     assert calls == [
+        ("initialize", "2"),
         ("query", "こんにちは"),
         ("synthesis", "3"),
         ("query", "さようなら"),

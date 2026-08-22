@@ -254,6 +254,7 @@ _FOCUS_TIMER_DELIVERY_RECOVERY_LIMIT = 1_000
 _AUTONOMY_LEASE_SECONDS = 60
 _AUTONOMY_LEASE_HEARTBEAT_SECONDS = 20
 _AUTONOMY_DELIVERY_RECOVERY_LIMIT = 1_000
+_READ_ALOUD_BURST_DELAY_SECONDS = 0.08
 _AutonomyResultT = TypeVar("_AutonomyResultT")
 
 
@@ -4990,10 +4991,12 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
         requester_id: int,
         destination_id: int,
         default_values: tuple[discord.abc.GuildChannel | discord.Thread, ...],
+        mode: ReadAloudMode = ReadAloudMode.QUEUE,
     ) -> None:
         self.runtime = runtime
         self.requester_id = requester_id
         self.destination_id = destination_id
+        self.mode = mode
         self.selected_channel_ids = tuple(str(channel.id) for channel in default_values)
         super().__init__(
             custom_id="simajilord:readaloud:channels",
@@ -5036,9 +5039,11 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
                 raise UserError("discord.voice_channel_unavailable")
             member = interaction.user
+            if not isinstance(member, discord.Member):
+                raise UserError("workspace.required")
             member_destination = (
                 member.voice.channel
-                if isinstance(member, discord.Member) and member.voice is not None
+                if member.voice is not None
                 else None
             )
             if (
@@ -5050,9 +5055,26 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             ):
                 raise UserError("audio.same_voice_required")
             existing_route = _active_read_aloud_route(self.runtime, str(guild.id))
+            can_replace_route = permission_enabled(
+                member.guild_permissions,
+                "administrator",
+            ) or permission_enabled(member.guild_permissions, "manage_guild")
+            if (
+                existing_route is not None
+                and existing_route.audio_destination_id != str(self.destination_id)
+                and not can_replace_route
+            ):
+                raise UserError("discord.manage_guild_required")
+            route_action = (
+                ReadAloudAction.CONFIGURE_SOURCES
+                if can_replace_route
+                else ReadAloudAction.ADD_SOURCES
+            )
             preflight_source_ids = self.selected_channel_ids
-            if existing_route is not None and existing_route.audio_destination_id == str(
-                self.destination_id
+            if (
+                route_action is ReadAloudAction.ADD_SOURCES
+                and existing_route is not None
+                and existing_route.audio_destination_id == str(self.destination_id)
             ):
                 preflight_source_ids = tuple(
                     dict.fromkeys((*existing_route.text_channel_ids, *self.selected_channel_ids))
@@ -5091,9 +5113,10 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 await self.runtime.registry.invoke(
                     "discord.manage_read_aloud",
                     ReadAloudRequest(
-                        action=ReadAloudAction.ADD_SOURCES,
+                        action=route_action,
                         text_channel_ids=self.selected_channel_ids,
                         audio_destination_id=str(self.destination_id),
+                        mode=self.mode,
                     ),
                     invocation_context(interaction),
                 ),
@@ -5171,6 +5194,7 @@ class ReadAloudChannelSelectView(SafeView):
         requester_id: int,
         destination_id: int,
         default_values: tuple[discord.abc.GuildChannel | discord.Thread, ...],
+        mode: ReadAloudMode = ReadAloudMode.QUEUE,
     ) -> None:
         super().__init__(timeout=300)
         self.selector = ReadAloudChannelSelect(
@@ -5178,6 +5202,7 @@ class ReadAloudChannelSelectView(SafeView):
             requester_id=requester_id,
             destination_id=destination_id,
             default_values=default_values,
+            mode=mode,
         )
         self.add_item(self.selector)
 
@@ -5234,6 +5259,7 @@ def _read_aloud_setup(
         requester_id=member.id,
         destination_id=destination.id,
         default_values=tuple(defaults[:25]),
+        mode=route.mode if route is not None else ReadAloudMode.QUEUE,
     )
     embed = command_embed(
         "Audio · Read aloud",
@@ -6103,7 +6129,7 @@ class ReadAloudCog(commands.Cog):
 
     async def _flush_message_burst(self, key: tuple[int, int]) -> None:
         try:
-            await asyncio.sleep(0.65)
+            await asyncio.sleep(_READ_ALOUD_BURST_DELAY_SECONDS)
             burst = tuple(self._message_bursts.pop(key, ()))
             if not burst:
                 return
