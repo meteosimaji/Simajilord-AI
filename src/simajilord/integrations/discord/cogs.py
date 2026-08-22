@@ -13,6 +13,7 @@ import secrets
 import shutil
 import tempfile
 import time
+from collections import deque
 from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -257,6 +258,8 @@ _AUTONOMY_DELIVERY_RECOVERY_LIMIT = 1_000
 _READ_ALOUD_BURST_DELAY_SECONDS = 0.08
 _READ_ALOUD_BURST_BATCH_SIZE = 8
 _READ_ALOUD_VOICE_DEBOUNCE_SECONDS = 0.15
+_READ_ALOUD_LENGTH_PRESETS = (60, 120, 200, 400)
+_READ_ALOUD_RECENT_MESSAGE_LIMIT = 4_096
 _AutonomyResultT = TypeVar("_AutonomyResultT")
 
 
@@ -5188,6 +5191,50 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 )
 
 
+class ReadAloudLengthSelect(discord.ui.Select[discord.ui.View]):
+    """Configure the optional omission threshold without crowding the audio panel."""
+
+    def __init__(
+        self,
+        *,
+        current_limit: int,
+        disabled: bool,
+    ) -> None:
+        super().__init__(
+            custom_id="simajilord:readaloud:length",
+            placeholder="Long-message limit",
+            min_values=1,
+            max_values=1,
+            options=self._options(current_limit),
+            row=1,
+            disabled=disabled,
+        )
+
+    @staticmethod
+    def _options(current_limit: int) -> list[discord.SelectOption]:
+        limits = sorted({*_READ_ALOUD_LENGTH_PRESETS, current_limit})
+        return [
+            discord.SelectOption(
+                label=f"{limit} characters",
+                value=str(limit),
+                description=(
+                    "Say 以下略 after this point when abbreviation is enabled"
+                ),
+                default=limit == current_limit,
+            )
+            for limit in limits
+        ]
+
+    def set_current_limit(self, current_limit: int) -> None:
+        self.options = self._options(current_limit)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, ReadAloudChannelSelectView):
+            raise RuntimeError("Read-aloud length control lost its parent view.")
+        await view.set_character_limit(interaction, int(self.values[0]))
+
+
 class ReadAloudChannelSelectView(SafeView):
     def __init__(
         self,
@@ -5197,8 +5244,22 @@ class ReadAloudChannelSelectView(SafeView):
         destination_id: int,
         default_values: tuple[discord.abc.GuildChannel | discord.Thread, ...],
         mode: ReadAloudMode = ReadAloudMode.QUEUE,
+        source_mention: str = "Current conversation",
+        destination_mention: str = "Current voice channel",
+        voice_label: str = "Server default",
+        abbreviate_long_messages: bool = False,
+        message_character_limit: int = 120,
+        can_manage_semantics: bool = True,
     ) -> None:
         super().__init__(timeout=300)
+        self.runtime = runtime
+        self.requester_id = requester_id
+        self.source_mention = source_mention
+        self.destination_mention = destination_mention
+        self.voice_label = voice_label
+        self.abbreviate_long_messages = abbreviate_long_messages
+        self.message_character_limit = message_character_limit
+        self.can_manage_semantics = can_manage_semantics
         self.selector = ReadAloudChannelSelect(
             runtime,
             requester_id=requester_id,
@@ -5207,12 +5268,121 @@ class ReadAloudChannelSelectView(SafeView):
             mode=mode,
         )
         self.add_item(self.selector)
+        self.length_selector = ReadAloudLengthSelect(
+            current_limit=message_character_limit,
+            disabled=not can_manage_semantics,
+        )
+        self.add_item(self.length_selector)
+        self._refresh_semantics_controls()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the person who opened this setup can change it.",
+            ephemeral=True,
+        )
+        return False
+
+    def setup_embed(self) -> discord.Embed:
+        if self.abbreviate_long_messages:
+            long_message_mode = (
+                f"After **{self.message_character_limit} characters**, say **以下略**"
+            )
+        else:
+            long_message_mode = (
+                "Read the full text (the saved threshold is "
+                f"**{self.message_character_limit} characters**)"
+            )
+        if not self.can_manage_semantics:
+            long_message_mode += "\nServer managers can change this setting."
+        return command_embed(
+            "Audio · Read aloud",
+            description=(
+                "Choose up to 25 text channels, threads, or voice-channel chats, "
+                "then select **Start**."
+            ),
+            fields=(
+                EmbedField("Current channel", self.source_mention),
+                EmbedField("Speaking in", self.destination_mention),
+                EmbedField("Voice", self.voice_label),
+                EmbedField("Long messages", long_message_mode, inline=False),
+            ),
+        )
+
+    def _refresh_semantics_controls(self) -> None:
+        self.length_selector.set_current_limit(self.message_character_limit)
+        self.length_selector.disabled = not self.can_manage_semantics
+        self.abbreviation_button.disabled = not self.can_manage_semantics
+        if self.abbreviate_long_messages:
+            self.abbreviation_button.label = "Read full text"
+            self.abbreviation_button.style = discord.ButtonStyle.secondary
+        else:
+            self.abbreviation_button.label = "Enable 以下略"
+            self.abbreviation_button.style = discord.ButtonStyle.primary
+
+    async def _set_semantics(
+        self,
+        interaction: discord.Interaction,
+        request: ReadAloudSemanticsSetRequest,
+    ) -> None:
+        try:
+            await interaction.response.defer()
+            policy = cast(
+                ReadAloudPolicyResponse,
+                await self.runtime.registry.invoke(
+                    "discord.read_aloud_semantics_set",
+                    request,
+                    invocation_context(interaction),
+                ),
+            )
+            self.abbreviate_long_messages = policy.abbreviate_long_messages
+            self.message_character_limit = policy.message_character_limit
+            self._refresh_semantics_controls()
+            await interaction.edit_original_response(
+                embed=self.setup_embed(),
+                view=self,
+            )
+        except Exception as exc:
+            await send_error(interaction, exc)
+
+    async def set_character_limit(
+        self,
+        interaction: discord.Interaction,
+        message_character_limit: int,
+    ) -> None:
+        await self._set_semantics(
+            interaction,
+            ReadAloudSemanticsSetRequest(
+                message_character_limit=message_character_limit,
+                expected_message_character_limit=self.message_character_limit,
+            ),
+        )
+
+    @discord.ui.button(
+        label="Enable 以下略",
+        style=discord.ButtonStyle.primary,
+        custom_id="simajilord:readaloud:abbreviation",
+        row=2,
+    )
+    async def abbreviation_button(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button[ReadAloudChannelSelectView],
+    ) -> None:
+        await self._set_semantics(
+            interaction,
+            ReadAloudSemanticsSetRequest(
+                abbreviate_long_messages=not self.abbreviate_long_messages,
+                expected_abbreviate_long_messages=self.abbreviate_long_messages,
+            ),
+        )
 
     @discord.ui.button(
         label="Start",
         style=discord.ButtonStyle.success,
         custom_id="simajilord:readaloud:start",
-        row=1,
+        row=2,
     )
     async def start(
         self,
@@ -5256,25 +5426,25 @@ def _read_aloud_setup(
         if selected is not None:
             defaults.append(selected)
 
+    policy = runtime.read_aloud.policy(str(member.guild.id))
+    can_manage_semantics = permission_enabled(
+        member.guild_permissions,
+        "administrator",
+    ) or permission_enabled(member.guild_permissions, "manage_guild")
     view = ReadAloudChannelSelectView(
         runtime,
         requester_id=member.id,
         destination_id=destination.id,
         default_values=tuple(defaults[:25]),
         mode=route.mode if route is not None else ReadAloudMode.QUEUE,
+        source_mention=source.mention,
+        destination_mention=destination.mention,
+        voice_label=_speech_voice_label(runtime),
+        abbreviate_long_messages=policy.abbreviate_long_messages,
+        message_character_limit=policy.message_character_limit,
+        can_manage_semantics=can_manage_semantics,
     )
-    embed = command_embed(
-        "Audio · Read aloud",
-        description=(
-            "Choose up to 25 text channels, threads, or voice-channel chats, then select **Start**."
-        ),
-        fields=(
-            EmbedField("Current channel", source.mention),
-            EmbedField("Speaking in", destination.mention),
-            EmbedField("Voice", _speech_voice_label(runtime)),
-        ),
-    )
-    return embed, view
+    return view.setup_embed(), view
 
 
 async def _send_read_aloud_setup(
@@ -5322,6 +5492,8 @@ class ReadAloudCog(commands.Cog):
             tuple[int, int],
             asyncio.Task[None],
         ] = {}
+        self._recent_message_ids: set[int] = set()
+        self._recent_message_order: deque[int] = deque()
 
     async def cog_unload(self) -> None:
         for task in self._announcement_tasks.values():
@@ -5331,6 +5503,8 @@ class ReadAloudCog(commands.Cog):
         self._announcement_tasks.clear()
         self._message_burst_tasks.clear()
         self._message_bursts.clear()
+        self._recent_message_ids.clear()
+        self._recent_message_order.clear()
         self._voice_transitions.clear()
 
     @app_commands.command(
@@ -6180,6 +6354,19 @@ class ReadAloudCog(commands.Cog):
         # multiple text/VC-chat sources instead of letting faster formatting
         # from one source overtake another source.
         key = (message.guild.id, int(route.audio_destination_id))
+        if message.id in self._recent_message_ids:
+            log.debug(
+                "Ignored duplicate read-aloud event guild=%s channel=%s message=%s",
+                message.guild.id,
+                message.channel.id,
+                message.id,
+            )
+            return
+        if len(self._recent_message_order) >= _READ_ALOUD_RECENT_MESSAGE_LIMIT:
+            expired_message_id = self._recent_message_order.popleft()
+            self._recent_message_ids.discard(expired_message_id)
+        self._recent_message_order.append(message.id)
+        self._recent_message_ids.add(message.id)
         burst = self._message_bursts.setdefault(key, [])
         burst.append(message)
         if key not in self._message_burst_tasks:

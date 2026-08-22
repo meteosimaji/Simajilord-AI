@@ -11,6 +11,7 @@ from pathlib import Path
 from yt_dlp.version import RELEASE_GIT_HEAD  # type: ignore[import-untyped]
 from yt_dlp.version import __version__ as yt_dlp_version
 
+from simajilord.core.errors import MediaError
 from simajilord.integrations.discord.audio import (
     build_discord_audio_source,
     verify_ffmpeg_opus,
@@ -66,8 +67,17 @@ async def run_audio_doctor(
         )
     )
     if "youtube.com/watch?" in item.page_url or "youtu.be/" in item.page_url:
-        mix = await provider.mix_audio((item.page_url,), limit=3)
-        results.append(f"YouTube Mix: OK ({len(mix)} candidates)")
+        try:
+            mix = await provider.mix_audio((item.page_url,), limit=3)
+        except MediaError as exc:
+            if exc.category != "unavailable":
+                raise
+            # A video can have a completely healthy playable stream without a
+            # related-track Mix. Keep the core audio-path result successful and
+            # report the optional recommendation probe separately.
+            results.append("YouTube Mix: unavailable (no new candidates)")
+        else:
+            results.append(f"YouTube Mix: OK ({len(mix)} candidates)")
     else:
         results.append("YouTube Mix: skipped (resolved item is not a YouTube video)")
     return tuple(results)

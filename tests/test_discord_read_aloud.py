@@ -638,6 +638,51 @@ async def test_multiple_read_aloud_sources_share_one_destination_fifo(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_message_event_is_queued_only_once_across_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure_sources(
+        workspace_id="1",
+        text_channel_ids=("2", "3"),
+        audio_destination_id="55",
+        mode=ReadAloudMode.QUEUE,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = destination
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=100,
+            guild=guild,
+            channel=SimpleNamespace(id=2),
+            author=SimpleNamespace(id=10, bot=False),
+            webhook_id=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._read_aloud_audience_allowed",
+        lambda *_args: True,
+    )
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+
+    await cog.on_message(message)
+    await cog.on_message(message)
+
+    assert cog._message_bursts[(1, 55)] == [message]
+    assert cog._recent_message_ids == {100}
+    assert tuple(cog._recent_message_order) == (100,)
+    assert len(cog._message_burst_tasks) == 1
+    await cog.cog_unload()
+
+
+@pytest.mark.asyncio
 async def test_message_does_not_reconnect_read_aloud_to_an_empty_voice_channel(
     tmp_path,
 ) -> None:

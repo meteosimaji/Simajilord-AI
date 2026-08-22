@@ -3301,12 +3301,169 @@ def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> No
     assert discord.ChannelType.text in selector.channel_types
     assert discord.ChannelType.voice in selector.channel_types
     assert discord.ChannelType.public_thread in selector.channel_types
+    component_ids = {
+        item.custom_id
+        for item in view.children
+        if isinstance(
+            item,
+            (discord.ui.Button, discord.ui.Select, discord.ui.ChannelSelect),
+        )
+    }
+    assert component_ids == {
+        "simajilord:readaloud:channels",
+        "simajilord:readaloud:length",
+        "simajilord:readaloud:abbreviation",
+        "simajilord:readaloud:start",
+    }
+    assert selector.row == 0
+    assert view.length_selector.row == 1
     assert any(
         isinstance(item, discord.ui.Button)
         and item.label == "Start"
         and item.style is discord.ButtonStyle.success
+        and item.row == 2
         for item in view.children
     )
+    assert all(
+        item.row == 2
+        for item in view.children
+        if isinstance(item, discord.ui.Button)
+    )
+
+
+def test_read_aloud_setup_controls_do_not_change_the_music_panel() -> None:
+    read_aloud_view = ReadAloudChannelSelectView(
+        cast(SimajilordRuntime, object()),
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+    music_view = MusicControlsView(cast(SimajilordRuntime, object()))
+    read_aloud_ids = {
+        item.custom_id
+        for item in read_aloud_view.children
+        if isinstance(
+            item,
+            (discord.ui.Button, discord.ui.Select, discord.ui.ChannelSelect),
+        )
+    }
+    music_ids = {
+        item.custom_id
+        for item in music_view.children
+        if isinstance(item, (discord.ui.Button, discord.ui.Select))
+    }
+
+    assert read_aloud_ids.isdisjoint(music_ids)
+    more_actions = next(
+        item
+        for item in music_view.children
+        if isinstance(item, discord.ui.Select) and item.placeholder == "More actions"
+    )
+    assert more_actions.row == 1
+    assert [option.value for option in more_actions.options].count("read_aloud") == 1
+
+
+def test_read_aloud_semantics_controls_are_disabled_without_manage_guild() -> None:
+    view = ReadAloudChannelSelectView(
+        cast(SimajilordRuntime, object()),
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+        can_manage_semantics=False,
+    )
+
+    assert view.length_selector.disabled is True
+    assert view.abbreviation_button.disabled is True
+    assert view.start.disabled is False
+    long_messages = next(
+        field for field in view.setup_embed().fields if field.name == "Long messages"
+    )
+    assert "Server managers" in long_messages.value
+
+
+@pytest.mark.asyncio
+async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_guards() -> None:
+    enabled = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+        abbreviate_long_messages=True,
+        message_character_limit=120,
+    )
+    shortened = ReadAloudPolicyResponse(
+        dictionary=(),
+        ignored_user_ids=(),
+        ignored_role_ids=(),
+        announce_join=False,
+        announce_leave=False,
+        announce_move=False,
+        read_author_names=True,
+        read_replies=True,
+        read_attachments=True,
+        abbreviate_long_messages=True,
+        message_character_limit=60,
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry.invoke = AsyncMock(side_effect=(enabled, shortened))
+    view = ReadAloudChannelSelectView(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+    )
+
+    toggle = Mock(spec=discord.Interaction)
+    toggle.id = 90
+    toggle.guild_id = 1
+    toggle.channel_id = 50
+    toggle.user = SimpleNamespace(id=7)
+    toggle.response.defer = AsyncMock()
+    toggle.edit_original_response = AsyncMock()
+    await view.abbreviation_button.callback(toggle)
+
+    first_capability, first_request, _first_context = (
+        runtime.registry.invoke.await_args_list[0].args
+    )
+    assert first_capability == "discord.read_aloud_semantics_set"
+    assert first_request == ReadAloudSemanticsSetRequest(
+        abbreviate_long_messages=True,
+        expected_abbreviate_long_messages=False,
+    )
+    assert view.abbreviation_button.label == "Read full text"
+    assert "以下略" in next(
+        field
+        for field in toggle.edit_original_response.await_args.kwargs["embed"].fields
+        if field.name == "Long messages"
+    ).value
+
+    limit = Mock(spec=discord.Interaction)
+    limit.id = 91
+    limit.guild_id = 1
+    limit.channel_id = 50
+    limit.user = SimpleNamespace(id=7)
+    limit.response.defer = AsyncMock()
+    limit.edit_original_response = AsyncMock()
+    view.length_selector._values = ["60"]
+    await view.length_selector.callback(limit)
+
+    second_capability, second_request, _second_context = (
+        runtime.registry.invoke.await_args_list[1].args
+    )
+    assert second_capability == "discord.read_aloud_semantics_set"
+    assert second_request == ReadAloudSemanticsSetRequest(
+        message_character_limit=60,
+        expected_message_character_limit=120,
+    )
+    assert sum(option.default for option in view.length_selector.options) == 1
+    assert next(
+        option for option in view.length_selector.options if option.default
+    ).value == "60"
 
 
 @pytest.mark.asyncio

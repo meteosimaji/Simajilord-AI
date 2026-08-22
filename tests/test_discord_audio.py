@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import wave
+from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock
+from typing import ClassVar
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
@@ -13,6 +15,10 @@ from simajilord.core.errors import ProviderError
 from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.integrations.discord.audio import (
     DiscordAudioOutput,
+    _ensure_discord_opus_loaded,
+    _LiveSpeechMixer,
+    _mix_stereo_s16le,
+    _PrefetchedAudioSource,
     build_discord_audio_source,
     verify_ffmpeg_opus,
 )
@@ -72,6 +78,246 @@ def test_managed_discord_source_cleanup_is_idempotent(
     source.cleanup()
 
     assert cleanup_calls == 1
+
+
+def test_live_speech_pcm_mix_ducks_music_and_saturates() -> None:
+    music_samples = array("h", [4_000, -4_000] * 960)
+    speech_samples = array("h", [1_000, -1_000] * 960)
+
+    mixed = array(
+        "h",
+        _mix_stereo_s16le(
+            music_samples.tobytes(),
+            speech_samples.tobytes(),
+        ),
+    )
+
+    assert mixed[:4] == array("h", [2_000, -2_000, 2_000, -2_000])
+
+    loud = array("h", [32_000, -32_000] * 960)
+    saturated = array("h", _mix_stereo_s16le(loud.tobytes(), loud.tobytes()))
+    assert saturated[:2] == array("h", [32_767, -32_768])
+
+
+@pytest.mark.asyncio
+async def test_live_speech_mixer_keeps_existing_music_packets(tmp_path) -> None:
+    if not _ensure_discord_opus_loaded():
+        pytest.skip("The host has no loadable system Opus codec.")
+    music_path = tmp_path / "music.wav"
+    speech_path = tmp_path / "speech.wav"
+    for path, frame_count in (
+        (music_path, 48_000),
+        (speech_path, 4_800),
+    ):
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(2)
+            output.setsampwidth(2)
+            output.setframerate(48_000)
+            output.writeframes(b"\0" * (frame_count * 4))
+
+    music_source = build_discord_audio_source(
+        AudioItem(
+            str(music_path),
+            "Music",
+            music_path.as_uri(),
+            kind=AudioKind.MUSIC,
+        )
+    )
+    raw_speech_source = build_discord_audio_source(
+        AudioItem(
+            str(speech_path),
+            "Speech",
+            speech_path.as_uri(),
+            kind=AudioKind.SPEECH,
+        )
+    )
+    first_speech_packet = await asyncio.to_thread(raw_speech_source.read)
+    assert first_speech_packet
+    mixer = _LiveSpeechMixer(
+        music_source,
+        _PrefetchedAudioSource(raw_speech_source, first_speech_packet),
+        loop=asyncio.get_running_loop(),
+    )
+    packets: list[bytes] = []
+    try:
+        for _ in range(8):
+            packet = await asyncio.to_thread(mixer.read)
+            assert packet
+            packets.append(packet)
+            await asyncio.sleep(0)
+        await asyncio.wait_for(mixer.wait_finished(), timeout=1.0)
+        assert len(packets) == 8
+        assert mixer.read()
+    finally:
+        mixer.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_live_overlay_restores_same_music_source_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Source(discord.AudioSource):
+        def __init__(self) -> None:
+            self.cleanup_calls = 0
+
+        def read(self) -> bytes:
+            return b"packet"
+
+        def is_opus(self) -> bool:
+            return True
+
+        def cleanup(self) -> None:
+            self.cleanup_calls += 1
+
+    class Voice:
+        def __init__(self, source: discord.AudioSource) -> None:
+            self._source = source
+            self.assignments: list[discord.AudioSource] = []
+
+        @property
+        def source(self) -> discord.AudioSource:
+            return self._source
+
+        @source.setter
+        def source(self, value: discord.AudioSource) -> None:
+            self._source = value
+            self.assignments.append(value)
+
+        def is_connected(self) -> bool:
+            return True
+
+        def is_playing(self) -> bool:
+            return True
+
+        async def disconnect(self, *, force: bool) -> None:
+            assert force is True
+
+    class Mixer(discord.AudioSource):
+        instances: ClassVar[list[Mixer]] = []
+
+        def __init__(
+            self,
+            music_source: discord.AudioSource,
+            speech_source: discord.AudioSource,
+            *,
+            loop: asyncio.AbstractEventLoop,
+        ) -> None:
+            del loop
+            self.music_source = music_source
+            self.speech_source = speech_source
+            self.detached = False
+            self.cleaned = False
+            self.instances.append(self)
+
+        def read(self) -> bytes:
+            return self.music_source.read()
+
+        def is_opus(self) -> bool:
+            return True
+
+        async def wait_finished(self) -> None:
+            return
+
+        def detach_music(self) -> None:
+            self.detached = True
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+            self.speech_source.cleanup()
+
+    music_source = Source()
+    speech_source = Source()
+    voice = Voice(music_source)
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    output._voice = voice  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._ensure_discord_opus_loaded",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._LiveSpeechMixer",
+        Mixer,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _item: speech_source,
+    )
+
+    await output.overlay_speech(
+        AudioItem(
+            "music",
+            "Music",
+            "https://example.test/music",
+            kind=AudioKind.MUSIC,
+        ),
+        AudioItem(
+            "speech",
+            "Speech",
+            "local://speech",
+            kind=AudioKind.SPEECH,
+            request_id="request:p1of1",
+        ),
+        position_seconds=12.0,
+    )
+    await output.update_music(
+        AudioItem(
+            "music",
+            "Music",
+            "https://example.test/music",
+            kind=AudioKind.MUSIC,
+        ),
+        position_seconds=12.1,
+    )
+
+    assert len(Mixer.instances) == 1
+    assert voice.assignments == [Mixer.instances[0], music_source]
+    assert Mixer.instances[0].detached is True
+    assert Mixer.instances[0].cleaned is True
+    assert music_source.cleanup_calls == 0
+    assert speech_source.cleanup_calls == 1
+    await output.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_live_overlay_keeps_reconnect_compatible_fallback_without_libopus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    compatibility_swap = AsyncMock()
+    output._swap_music_source = compatibility_swap  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._ensure_discord_opus_loaded",
+        lambda: False,
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr("simajilord.integrations.discord.audio.asyncio.sleep", sleep)
+    music = AudioItem(
+        "https://example.test/music",
+        "Music",
+        "https://example.test/music",
+        kind=AudioKind.MUSIC,
+    )
+    speech = AudioItem(
+        "local-speech.wav",
+        "Speech",
+        "local://speech",
+        kind=AudioKind.SPEECH,
+        duration_seconds=1.25,
+        volume=1.1,
+    )
+
+    await output.overlay_speech(music, speech, position_seconds=12.0)
+
+    compatibility_swap.assert_awaited_once()
+    overlay = compatibility_swap.await_args.args[0]
+    assert overlay.source == music.source
+    assert overlay.start_seconds == 12.0
+    assert overlay.speech_overlay_source == speech.source
+    assert overlay.speech_overlay_duration_seconds == 1.25
+    assert overlay.speech_overlay_volume == 1.1
+    sleep.assert_awaited_once_with(1.4)
+    assert output._live_mixing_disabled is True
+    await output.disconnect()
 
 
 def test_discord_source_uses_bounded_fades(tmp_path) -> None:

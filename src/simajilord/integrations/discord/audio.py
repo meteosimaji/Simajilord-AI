@@ -6,9 +6,14 @@ import asyncio
 import logging
 import shlex
 import shutil
+import sys
+from array import array
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from ctypes.util import find_library
 from dataclasses import replace
+from pathlib import Path
+from threading import Lock as ThreadLock
 from time import monotonic
 
 import discord
@@ -26,6 +31,7 @@ _PLAYBACK_MAX_ACTIVE_SECONDS = 6 * 60 * 60
 _EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
 _READ_ALOUD_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 _MUSIC_DUCK_GAIN = 0.25
+_OPUS_LOAD_ATTEMPTED = False
 
 
 class _ManagedFFmpegOpusAudio(discord.FFmpegOpusAudio):
@@ -70,6 +76,196 @@ class _PrefetchedAudioSource(discord.AudioSource):
             return
         self._cleaned = True
         self._source.cleanup()
+
+
+def _read_opus_audio_packet(source: discord.AudioSource) -> bytes:
+    """Skip Ogg metadata packets and return one packet Discord can play/decode."""
+
+    for _ in range(4):
+        packet = source.read()
+        if not packet.startswith((b"OpusHead", b"OpusTags")):
+            return packet
+    return b""
+
+
+def _ensure_discord_opus_loaded() -> bool:
+    """Load the system Opus codec used by the no-reconnect live mixer."""
+
+    global _OPUS_LOAD_ATTEMPTED
+    if discord.opus.is_loaded():
+        return True
+    if _OPUS_LOAD_ATTEMPTED:
+        return False
+    _OPUS_LOAD_ATTEMPTED = True
+
+    candidates: list[str] = []
+    discovered = find_library("opus")
+    if discovered:
+        candidates.append(discovered)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        prefix = Path(ffmpeg).parent.parent
+        candidates.extend(
+            str(prefix / relative)
+            for relative in (
+                "lib/libopus.0.dylib",
+                "lib/libopus.dylib",
+                "lib/libopus.so.0",
+                "lib/libopus.so",
+                "bin/opus.dll",
+                "bin/libopus-0.dll",
+            )
+        )
+    candidates.extend(
+        (
+            "/opt/homebrew/lib/libopus.0.dylib",
+            "/usr/local/lib/libopus.0.dylib",
+            "libopus.so.0",
+            "opus.dll",
+            "libopus-0.dll",
+        )
+    )
+    for candidate in dict.fromkeys(candidates):
+        try:
+            discord.opus.load_opus(candidate)
+        except OSError:
+            continue
+        if discord.opus.is_loaded():
+            log.info("Discord live speech mixer loaded the system Opus codec")
+            return True
+    log.warning(
+        "System Opus codec unavailable; music speech overlays will use the "
+        "reconnect-compatible path"
+    )
+    return False
+
+
+def _mix_stereo_s16le(music_pcm: bytes, speech_pcm: bytes) -> bytes:
+    """Duck and mix one 20 ms Discord PCM frame with saturating arithmetic."""
+
+    expected = discord.opus.Encoder.FRAME_SIZE
+    if len(music_pcm) != expected or len(speech_pcm) != expected:
+        raise ValueError("Live speech mixer received a non-20 ms PCM frame.")
+    music_samples = array("h")
+    music_samples.frombytes(music_pcm)
+    speech_samples = array("h")
+    speech_samples.frombytes(speech_pcm)
+    if sys.byteorder != "little":
+        music_samples.byteswap()
+        speech_samples.byteswap()
+    mixed = array("h", [0]) * len(speech_samples)
+    for index, speech_sample in enumerate(speech_samples):
+        sample = round(music_samples[index] * _MUSIC_DUCK_GAIN) + speech_sample
+        mixed[index] = max(-32_768, min(32_767, sample))
+    if sys.byteorder != "little":
+        mixed.byteswap()
+    return mixed.tobytes()
+
+
+class _LiveSpeechMixer(discord.AudioSource):
+    """Mix local speech into the active Opus stream without reopening music."""
+
+    def __init__(
+        self,
+        music_source: discord.AudioSource,
+        speech_source: discord.AudioSource,
+        *,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if not music_source.is_opus() or not speech_source.is_opus():
+            raise ValueError("Live speech mixing requires Opus inputs.")
+        self._music_source = music_source
+        self._speech_source = speech_source
+        self._loop = loop
+        self._completion: asyncio.Future[None] = loop.create_future()
+        self._music_decoder = discord.opus.Decoder()  # type: ignore[no-untyped-call]
+        self._speech_decoder = discord.opus.Decoder()  # type: ignore[no-untyped-call]
+        self._encoder = discord.opus.Encoder(
+            bitrate=128,
+            fec=True,
+            expected_packet_loss=0.15,
+        )
+        self._speech_finished = False
+        self._completion_signalled = False
+        self._completion_lock = ThreadLock()
+        self._cleanup_lock = ThreadLock()
+        self._owns_music = True
+        self._cleaned = False
+
+    @property
+    def music_source(self) -> discord.AudioSource:
+        return self._music_source
+
+    def read(self) -> bytes:
+        music_packet = _read_opus_audio_packet(self._music_source)
+        if self._speech_finished:
+            return music_packet
+        speech_packet = _read_opus_audio_packet(self._speech_source)
+        if not speech_packet:
+            self._speech_finished = True
+            self._signal_completion(None)
+            return music_packet
+        try:
+            speech_pcm = self._speech_decoder.decode(speech_packet, fec=False)
+            music_pcm = (
+                self._music_decoder.decode(music_packet, fec=False)
+                if music_packet
+                else b"\0" * discord.opus.Encoder.FRAME_SIZE
+            )
+            mixed_pcm = _mix_stereo_s16le(music_pcm, speech_pcm)
+            return self._encoder.encode(
+                mixed_pcm,
+                discord.opus.Encoder.SAMPLES_PER_FRAME,
+            )
+        except Exception as error:
+            # Preserve the music stream even if the optional fast mixer fails.
+            # The awaiting coroutine receives the error and disables this route
+            # before the service retries through the compatibility path.
+            self._speech_finished = True
+            self._signal_completion(error)
+            return music_packet
+
+    def is_opus(self) -> bool:
+        return True
+
+    async def wait_finished(self) -> None:
+        await self._completion
+
+    def detach_music(self) -> None:
+        """Transfer the uninterrupted music source back to Discord's player."""
+
+        with self._cleanup_lock:
+            if self._cleaned:
+                raise ProviderError("The live speech mixer is already closed.")
+            self._owns_music = False
+
+    def cleanup(self) -> None:
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            self._cleaned = True
+            owns_music = self._owns_music
+        try:
+            self._speech_source.cleanup()
+        finally:
+            if owns_music:
+                self._music_source.cleanup()
+
+    def _signal_completion(self, error: Exception | None) -> None:
+        with self._completion_lock:
+            if self._completion_signalled:
+                return
+            self._completion_signalled = True
+        with suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self._settle_completion, error)
+
+    def _settle_completion(self, error: Exception | None) -> None:
+        if self._completion.done():
+            return
+        if error is None:
+            self._completion.set_result(None)
+        else:
+            self._completion.set_exception(error)
 
 
 async def verify_ffmpeg_opus() -> None:
@@ -124,6 +320,8 @@ class DiscordAudioOutput:
             thread_name_prefix=f"simajilord-audio-preflight-{guild_id}",
         )
         self._preflight_poisoned = False
+        self._live_mixing_disabled = False
+        self._music_stream_continuous_after_overlay = False
 
     @property
     def connected(self) -> bool:
@@ -172,6 +370,8 @@ class DiscordAudioOutput:
             raise ProviderError("Discord returned an unsupported voice protocol.")
         self._voice = protocol
         self.destination_id = channel.id
+        self._live_mixing_disabled = False
+        self._music_stream_continuous_after_overlay = False
 
     async def play(self, item: AudioItem) -> None:
         voice = self._adopt_voice_client()
@@ -293,8 +493,12 @@ class DiscordAudioOutput:
         *,
         position_seconds: float,
     ) -> None:
-        """Hot-swap the active source without completing the Discord player."""
+        """Mix speech without ending the active Discord music player."""
 
+        if await self._try_live_speech_overlay(speech):
+            return
+
+        self._music_stream_continuous_after_overlay = False
         overlay = replace(
             music,
             start_seconds=position_seconds,
@@ -314,6 +518,15 @@ class DiscordAudioOutput:
         position_seconds: float,
     ) -> None:
         """Apply a new gain/tuning position while retaining the current stream URL."""
+
+        if self._music_stream_continuous_after_overlay:
+            self._music_stream_continuous_after_overlay = False
+            voice = self._adopt_voice_client()
+            if voice is not None and voice.is_connected() and voice.is_playing():
+                # The live mixer handed the original music source back without
+                # advancing or replacing its remote stream. Nothing needs to be
+                # reopened after the last speech part.
+                return
 
         updated = replace(
             music,
@@ -347,60 +560,139 @@ class DiscordAudioOutput:
         await self._swap_music_source(faded)
         await asyncio.sleep(max(0.0, duration_seconds))
 
+    async def _try_live_speech_overlay(self, speech: AudioItem) -> bool:
+        """Overlay speech on the current packets without reopening remote music."""
+
+        if self._live_mixing_disabled or not _ensure_discord_opus_loaded():
+            self._live_mixing_disabled = True
+            return False
+        preparation_started = monotonic()
+        async with self._source_lock:
+            voice = self._adopt_voice_client()
+            if voice is None or not voice.is_connected() or not voice.is_playing():
+                raise ProviderError("The Discord music source is not active.")
+            previous = voice.source
+            if previous is None or not previous.is_opus():
+                self._live_mixing_disabled = True
+                return False
+
+            speech_source = build_discord_audio_source(speech)
+            prepared_speech = await self._prepare_audio_source(speech_source)
+            try:
+                mixer = _LiveSpeechMixer(
+                    previous,
+                    prepared_speech,
+                    loop=asyncio.get_running_loop(),
+                )
+            except Exception:
+                prepared_speech.cleanup()
+                self._live_mixing_disabled = True
+                log.warning(
+                    "Could not initialize Discord live speech mixing; using the "
+                    "reconnect-compatible path",
+                    exc_info=True,
+                )
+                return False
+
+            try:
+                voice.source = mixer
+            except BaseException:
+                # The player never accepted the wrapper, so ownership of the
+                # still-active music source must remain with Discord.
+                mixer.detach_music()
+                mixer.cleanup()
+                raise
+            log.info(
+                "Live speech overlay source ready guild=%s request=%s "
+                "preparation_ms=%.1f",
+                self.guild_id,
+                speech.request_id or "untracked",
+                max(0.0, (monotonic() - preparation_started) * 1_000),
+            )
+            restored = False
+            try:
+                await mixer.wait_finished()
+            except Exception:
+                self._live_mixing_disabled = True
+                raise
+            finally:
+                try:
+                    if (
+                        voice.is_connected()
+                        and voice.is_playing()
+                        and voice.source is mixer
+                    ):
+                        voice.source = mixer.music_source
+                        mixer.detach_music()
+                        restored = True
+                finally:
+                    mixer.cleanup()
+            if not restored:
+                raise ProviderError(
+                    "Discord music ended before the live speech source was restored."
+                )
+            self._music_stream_continuous_after_overlay = True
+            return True
+
     async def _swap_music_source(self, item: AudioItem) -> None:
         async with self._source_lock:
             voice = self._adopt_voice_client()
             if voice is None or not voice.is_connected() or not voice.is_playing():
                 raise ProviderError("The Discord music source is not active.")
+            self._music_stream_continuous_after_overlay = False
             replacement = build_discord_audio_source(item)
-            prepared: _PrefetchedAudioSource | None = None
+            prepared = await self._prepare_audio_source(replacement)
             previous = voice.source
-            if self._preflight_poisoned:
-                replacement.cleanup()
-                raise ProviderError(
-                    "The Discord audio preflight worker is unavailable until reconnect."
-                )
-            executor = self._preflight_executor
-            if executor is None:
-                executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix=(
-                        f"simajilord-audio-preflight-{self.guild_id}"
-                    ),
-                )
-                self._preflight_executor = executor
-            read_future = asyncio.get_running_loop().run_in_executor(
-                executor,
-                replacement.read,
-            )
             try:
-                async with asyncio.timeout(_SOURCE_PREFLIGHT_TIMEOUT_SECONDS):
-                    first_packet = await asyncio.shield(read_future)
-                if not first_packet:
-                    raise ProviderError(
-                        "The replacement audio source produced no Opus packet."
-                    )
-                prepared = _PrefetchedAudioSource(replacement, first_packet)
                 voice.source = prepared
-            except TimeoutError as exc:
-                await self._abort_preflight_reader(replacement, read_future)
-                raise ProviderError(
-                    "The replacement audio source preflight timed out."
-                ) from exc
-            except asyncio.CancelledError:
-                if prepared is None:
-                    await self._abort_preflight_reader(replacement, read_future)
-                else:
-                    prepared.cleanup()
-                raise
             except BaseException:
-                if prepared is None:
-                    replacement.cleanup()
-                else:
-                    prepared.cleanup()
+                prepared.cleanup()
                 raise
             if previous is not None and previous is not prepared:
                 previous.cleanup()
+
+    async def _prepare_audio_source(
+        self,
+        replacement: discord.AudioSource,
+    ) -> _PrefetchedAudioSource:
+        """Read one packet while the old Discord source continues playing."""
+
+        if self._preflight_poisoned:
+            replacement.cleanup()
+            raise ProviderError(
+                "The Discord audio preflight worker is unavailable until reconnect."
+            )
+        executor = self._preflight_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"simajilord-audio-preflight-{self.guild_id}",
+            )
+            self._preflight_executor = executor
+        read_future = asyncio.get_running_loop().run_in_executor(
+            executor,
+            _read_opus_audio_packet,
+            replacement,
+        )
+        try:
+            async with asyncio.timeout(_SOURCE_PREFLIGHT_TIMEOUT_SECONDS):
+                first_packet = await asyncio.shield(read_future)
+            if not first_packet:
+                raise ProviderError(
+                    "The replacement audio source produced no Opus packet."
+                )
+        except TimeoutError as exc:
+            await self._abort_preflight_reader(replacement, read_future)
+            raise ProviderError(
+                "The replacement audio source preflight timed out."
+            ) from exc
+        except asyncio.CancelledError:
+            await self._abort_preflight_reader(replacement, read_future)
+            raise
+        except BaseException:
+            replacement.cleanup()
+            raise
+        return _PrefetchedAudioSource(replacement, first_packet)
 
     async def _abort_preflight_reader(
         self,
@@ -438,6 +730,7 @@ class DiscordAudioOutput:
 
     def stop(self) -> None:
         self._intentional_stop_generation += 1
+        self._music_stream_continuous_after_overlay = False
         voice = self._adopt_voice_client()
         if voice is not None and (voice.is_playing() or voice.is_paused()):
             voice.stop()
@@ -451,6 +744,8 @@ class DiscordAudioOutput:
         executor = self._preflight_executor
         self._preflight_executor = None
         self._preflight_poisoned = False
+        self._live_mixing_disabled = False
+        self._music_stream_continuous_after_overlay = False
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
 
