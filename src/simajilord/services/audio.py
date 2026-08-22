@@ -1150,7 +1150,11 @@ class AudioSession:
             for item in state.history[-_MAX_HISTORY_ITEMS:]
         )
         self._voice_activation_required = state.voice_activation_required
-        if (self._music or self._autoplay) and not self.output.connected:
+        if self.destination_id is not None and not self.output.connected:
+            # A durable destination without a live transport is a held route,
+            # even when an older snapshot missed the activation flag.  This
+            # repairs mid-play disconnect snapshots and exposes the explicit
+            # Start action instead of leaving the session silently inert.
             self._suspended = True
             self._voice_activation_required = True
         elif self._voice_activation_required and not self.output.connected:
@@ -1501,6 +1505,10 @@ class AudioSession:
                 # A dropped voice transport is a session-level condition, not
                 # one failure per queued track. Preserve the queue unchanged
                 # until ``connect()`` wakes the worker after voice is ready.
+                if self.destination_id is not None:
+                    self._suspended = True
+                    self._voice_activation_required = True
+                    await self._state_changed()
                 self._wake.clear()
                 if not self.output.connected:
                     await self._wake.wait()
@@ -1543,6 +1551,7 @@ class AudioSession:
             completed = False
             playable = item
             playback_error: Exception | None = None
+            output_disconnected = False
             try:
                 if not self.output.connected:
                     raise UserError("audio.output_disconnected")
@@ -1552,13 +1561,29 @@ class AudioSession:
                 raise
             except Exception as exc:
                 playback_error = exc
-                log.exception(
-                    "Audio playback exhausted immediate retries workspace=%s item=%s",
-                    self.workspace_id,
-                    item.title,
+                output_disconnected = (
+                    _is_output_disconnected(exc) or not self.output.connected
                 )
+                if output_disconnected:
+                    log.warning(
+                        "Audio output disconnected; holding current item for explicit "
+                        "resume workspace=%s item=%s",
+                        self.workspace_id,
+                        item.title,
+                    )
+                else:
+                    log.exception(
+                        "Audio playback exhausted immediate retries workspace=%s item=%s",
+                        self.workspace_id,
+                        item.title,
+                    )
             finally:
                 await self._cancel_overlay_for(playable)
+                if output_disconnected:
+                    if playable.kind is AudioKind.MUSIC:
+                        playable.start_seconds = self._position_seconds()
+                    self._suspended = True
+                    self._voice_activation_required = True
                 skipped = self._skip_requested
                 discarded = self._discard_requested
                 suspended = self._suspend_requested
@@ -1574,11 +1599,32 @@ class AudioSession:
                 self._paused_seconds = 0.0
 
             keep_item = False
-            if completed and playable.kind is AudioKind.MUSIC and not (suspended or restarted):
+            if output_disconnected:
+                async with self._lock:
+                    resumed = _resume_copy(playable)
+                    if resumed.kind is AudioKind.SPEECH:
+                        resumed.start_seconds = 0.0
+                        self._speech.appendleft(resumed)
+                    else:
+                        target = (
+                            self._autoplay
+                            if resumed.queue_lane is AudioQueueLane.AUTOPLAY
+                            else self._music
+                        )
+                        target.appendleft(resumed)
+                    self._wake.clear()
+                keep_item = True
+            elif completed and playable.kind is AudioKind.MUSIC and not (
+                suspended or restarted
+            ):
                 history_item = playable.unresolved_copy()
                 history_item.played_at_epoch = int(time())
                 self._history.append(history_item)
-            if (suspended or restarted) and playable.kind is AudioKind.MUSIC:
+            if (
+                not output_disconnected
+                and (suspended or restarted)
+                and playable.kind is AudioKind.MUSIC
+            ):
                 async with self._lock:
                     resumed = _resume_copy(playable)
                     target = (
@@ -1613,7 +1659,11 @@ class AudioSession:
                     self._wake.set()
                 keep_item = True
             elif (
-                not completed and not skipped and not discarded and playable.kind is AudioKind.MUSIC
+                not output_disconnected
+                and not completed
+                and not skipped
+                and not discarded
+                and playable.kind is AudioKind.MUSIC
             ):
                 retry = playable.unresolved_copy(failure_count=playable.failure_count + 1)
                 failure_limit = (
@@ -1700,6 +1750,8 @@ class AudioSession:
             except asyncio.CancelledError:
                 raise
             except EarlyPlaybackEnd as exc:
+                if not self.output.connected:
+                    raise UserError("audio.output_disconnected") from exc
                 await self._record_metric(
                     ServiceOperationMetric(
                         operation="audio.early_eof_count",
@@ -1722,6 +1774,10 @@ class AudioSession:
                 playable = unresolved
                 continue
             except Exception as exc:
+                if _is_output_disconnected(exc) or not self.output.connected:
+                    if _is_output_disconnected(exc):
+                        raise
+                    raise UserError("audio.output_disconnected") from exc
                 last_error = exc
                 log.warning(
                     "Audio attempt %s failed workspace=%s item=%s error=%s",
@@ -2002,6 +2058,10 @@ def _is_permanent_playback_error(error: Exception | None) -> bool:
     return isinstance(error, MediaError) and error.category in _PERMANENT_MEDIA_FAILURES
 
 
+def _is_output_disconnected(error: Exception | None) -> bool:
+    return isinstance(error, UserError) and error.code == "audio.output_disconnected"
+
+
 def _adopt_resolved_stream(destination: AudioItem, resolved: AudioItem) -> None:
     """Refresh only transport fields while preserving the worker's item identity."""
 
@@ -2148,6 +2208,20 @@ class AudioSessionManager:
                 session.restore(state)
             restored.append(session)
         return tuple(restored)
+
+    async def persist_restored_sessions(
+        self,
+        sessions: tuple[AudioSession, ...],
+    ) -> None:
+        """Durably normalize repaired legacy snapshots before startup completes."""
+
+        if self._state_store is None or not sessions:
+            return
+        for session in sessions:
+            if self._sessions.get(session.workspace_id) is not session:
+                raise ValueError("restored audio session does not belong to this manager")
+        await asyncio.gather(*(self._persist(session) for session in sessions))
+        await self._state_store.flush()
 
     def require(self, workspace_id: str) -> AudioSession:
         try:

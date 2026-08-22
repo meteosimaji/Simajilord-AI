@@ -40,9 +40,11 @@ jobs:
           uv build
           python - <<'PY'
           from pathlib import Path
+          import tarfile
           from zipfile import ZipFile
 
           wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
           with ZipFile(wheel) as archive:
               names = set(archive.namelist())
           required = {
@@ -52,6 +54,44 @@ jobs:
           missing = required - names
           if missing:
             raise SystemExit(f"Wheel is missing: {sorted(missing)}")
+
+          with tarfile.open(sdist, "r:gz") as archive:
+              sdist_names = archive.getnames()
+          forbidden_parts = {
+              ".data",
+              ".venv",
+              "artifacts",
+              "datasets",
+              "dist",
+              "sealed-final-test",
+          }
+          forbidden_suffixes = {
+              ".7z",
+              ".bin",
+              ".ckpt",
+              ".hcpe",
+              ".jsonl",
+              ".npz",
+              ".onnx",
+              ".psv",
+              ".pt",
+              ".pth",
+              ".safetensors",
+              ".ybb",
+          }
+          for name in sdist_names:
+              path = Path(name)
+              if forbidden_parts.intersection(path.parts):
+                  raise SystemExit(f"Root sdist contains private/generated scope: {name}")
+              if path.suffix in forbidden_suffixes:
+                  raise SystemExit(f"Root sdist contains model/data artifact: {name}")
+          if not any(Path(name).name == "LICENSE" for name in sdist_names):
+              raise SystemExit("Root sdist does not contain LICENSE")
+          if len(sdist_names) > 1_000 or sdist.stat().st_size > 10_000_000:
+              raise SystemExit(
+                  f"Root sdist scope unexpectedly expanded: {len(sdist_names)} files, "
+                  f"{sdist.stat().st_size} bytes"
+              )
           PY
 
   python-compatibility:
@@ -139,105 +179,6 @@ jobs:
           fi
       - name: Offline Discord preview
         run: uv run simajilord-offline-preview --output-dir .data/ci-preview
-
-  shogi-ai:
-    runs-on: macos-15
-    timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: shogi_ai
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: astral-sh/setup-uv@v9.0.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: shogi_ai/uv.lock
-      - uses: actions/setup-python@v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Install locked Meteo dependencies
-        run: uv sync --locked --all-groups
-      - name: Lint Meteo
-        run: uv run ruff check .
-      - name: Type-check Meteo
-        run: uv run mypy src
-      - name: Test Meteo
-        run: uv run pytest -q
-      - name: Compile Meteo
-        run: uv run python -m compileall -q src
-      - name: Audit Meteo tracked repository boundary
-        run: uv run python -m simajilord_shogi.release_guard repository .
-      - name: Audit Meteo public source
-        run: uv run python -m simajilord_shogi.release_guard source .
-      - name: Build Meteo wheel and sdist
-        run: |
-          rm -rf dist
-          uv build
-          uv run python - <<'PY'
-          from pathlib import Path
-          import tarfile
-          from zipfile import ZipFile
-
-          forbidden_parts = {
-              "artifacts",
-              "datasets",
-              ".venv",
-              ".mypy_cache",
-              ".pytest_cache",
-              ".ruff_cache",
-              "__pycache__",
-              "sealed",
-              "sealed_final_test",
-          }
-          forbidden_suffixes = {
-              ".7z",
-              ".bin",
-              ".ckpt",
-              ".csa",
-              ".engine",
-              ".hcpe",
-              ".jsonl",
-              ".ki2",
-              ".kif",
-              ".nn",
-              ".npz",
-              ".onnx",
-              ".pb",
-              ".psn",
-              ".psv",
-              ".pt",
-              ".pth",
-              ".safetensors",
-              ".tflite",
-              ".ybb",
-          }
-
-          wheel = next(Path("dist").glob("*.whl"))
-          sdist = next(Path("dist").glob("*.tar.gz"))
-          with ZipFile(wheel) as archive:
-              wheel_names = archive.namelist()
-          with tarfile.open(sdist, "r:gz") as archive:
-              sdist_names = archive.getnames()
-
-          for archive_name, names in (("wheel", wheel_names), ("sdist", sdist_names)):
-              for name in names:
-                  path = Path(name)
-                  if forbidden_parts.intersection(path.parts):
-                      raise SystemExit(f"{archive_name} contains generated data: {name}")
-                  if path.suffix in forbidden_suffixes:
-                      raise SystemExit(f"{archive_name} contains checkpoint data: {name}")
-              if not any(Path(name).name == "LICENSE" for name in names):
-                  raise SystemExit(f"{archive_name} does not contain LICENSE")
-
-          if len(sdist_names) > 200 or sdist.stat().st_size > 5_000_000:
-              raise SystemExit(
-                  f"sdist scope unexpectedly expanded: {len(sdist_names)} files, "
-                  f"{sdist.stat().st_size} bytes"
-              )
-          PY
-          uv run python -m simajilord_shogi.release_guard archive dist/*.whl dist/*.tar.gz
-      - name: Smoke-test Meteo CLI
-        run: uv run simajilord-shogi --help
 
   activity:
     runs-on: ubuntu-latest

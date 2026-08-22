@@ -326,6 +326,7 @@ class SimajilordRuntime:
                 engine_path=settings.voicevox_engine_path,
                 auto_start=settings.voicevox_auto_start,
                 readiness_ttl_seconds=settings.voicevox_readiness_ttl_seconds,
+                preload_voice_ids=(settings.voicevox_preset_clear_id,),
             )
             if settings.tts_provider == "voicevox"
             else MacOSSayProvider(settings.tts_voice)

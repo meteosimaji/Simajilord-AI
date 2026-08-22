@@ -179,6 +179,35 @@ class ReadAloudService:
             await asyncio.to_thread(self._save)
             return route
 
+    async def configure_sources(
+        self,
+        *,
+        workspace_id: str,
+        text_channel_ids: tuple[str, ...],
+        audio_destination_id: str,
+        mode: ReadAloudMode,
+        before_mutation: Callable[[], Awaitable[None]] | None = None,
+        on_noop: Callable[[], Awaitable[None]] | None = None,
+    ) -> ReadAloudRoute:
+        """Atomically replace the complete source set and voice destination."""
+
+        channel_ids = tuple(dict.fromkeys(text_channel_ids))
+        if not channel_ids:
+            raise ValueError("read_aloud.source_channels_required")
+        route = ReadAloudRoute(
+            workspace_id=workspace_id,
+            text_channel_id=channel_ids[0],
+            audio_destination_id=audio_destination_id,
+            mode=mode,
+            additional_text_channel_ids=channel_ids[1:],
+        )
+        await self.configure(
+            route,
+            before_mutation=before_mutation,
+            on_noop=on_noop,
+        )
+        return route
+
     async def add_source(
         self,
         *,

@@ -3355,6 +3355,90 @@ async def test_join_selection_is_staged_until_start_is_pressed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_admin_join_selection_atomically_moves_existing_read_aloud_route() -> None:
+    configured = ReadAloudResponse(
+        action=ReadAloudAction.CONFIGURE_SOURCES.value,
+        enabled=True,
+        text_channel_id="50",
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode="skip_during_music",
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(side_effect=(configured, object()))
+    runtime.read_aloud.get.return_value = ReadAloudRoute(
+        "1",
+        "40",
+        "44",
+        ReadAloudMode.SKIP_DURING_MUSIC,
+    )
+    runtime.settings = SimpleNamespace(
+        read_aloud_audience_mode="enforce",
+        tts_provider="say",
+        tts_voice="Kyoko",
+    )
+    selector = ReadAloudChannelSelect(
+        runtime,
+        requester_id=7,
+        destination_id=55,
+        default_values=(),
+        mode=ReadAloudMode.SKIP_DURING_MUSIC,
+    )
+    selector.selected_channel_ids = ("50",)
+    requester = Mock(spec=discord.Member)
+    requester.id = 7
+    requester.bot = False
+    requester.display_name = "Administrator"
+    requester.guild_permissions = discord.Permissions(administrator=True)
+    bot_member = Mock(spec=discord.Member)
+    bot_member.id = 99
+    bot_member.bot = True
+    source = Mock(spec=discord.TextChannel)
+    source.id = 50
+    source.permissions_for.return_value = discord.Permissions(
+        view_channel=True,
+        read_message_history=True,
+    )
+    voice = Mock(spec=discord.VoiceChannel)
+    voice.id = 55
+    voice.voice_states = {7: object(), 99: object()}
+    requester.voice = SimpleNamespace(channel=voice)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.me = bot_member
+    guild.get_member.side_effect = {7: requester, 99: bot_member}.get
+    guild.get_channel.return_value = voice
+    guild.get_channel_or_thread.return_value = source
+    interaction = Mock(spec=discord.Interaction)
+    interaction.id = 91
+    interaction.guild_id = 1
+    interaction.channel_id = 50
+    interaction.guild = guild
+    interaction.user = requester
+    interaction.response.defer = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+
+    await selector.commit(interaction)
+
+    assert [call.args[0] for call in runtime.registry.invoke.await_args_list] == [
+        "discord.manage_read_aloud",
+        "discord.connect_voice",
+    ]
+    route_request = runtime.registry.invoke.await_args_list[0].args[1]
+    assert route_request == ReadAloudRequest(
+        action=ReadAloudAction.CONFIGURE_SOURCES,
+        text_channel_ids=("50",),
+        audio_destination_id="55",
+        mode=ReadAloudMode.SKIP_DURING_MUSIC,
+    )
+    assert "40" not in route_request.text_channel_ids
+    assert interaction.edit_original_response.await_args.kwargs["embed"].title == (
+        "Read aloud is ready"
+    )
+
+
+@pytest.mark.asyncio
 async def test_read_aloud_start_preflight_names_unreadable_listener_before_saving() -> None:
     runtime = Mock(spec=SimajilordRuntime)
     runtime.registry = Mock()
@@ -4327,6 +4411,9 @@ async def test_bot_unloads_cogs_before_closing_runtime(
     async def close_activity() -> None:
         order.append("activity")
 
+    async def close_dashboard() -> None:
+        order.append("dashboard")
+
     async def close_discord(_bot: commands.Bot) -> None:
         order.append("discord")
 
@@ -4335,12 +4422,13 @@ async def test_bot_unloads_cogs_before_closing_runtime(
 
     bot = object.__new__(SimajilordDiscordBot)
     bot.activity_server = SimpleNamespace(close=close_activity)
+    bot._simajilord_music_dashboard = SimpleNamespace(close=close_dashboard)
     bot.runtime = SimpleNamespace(close=close_runtime)
     monkeypatch.setattr(commands.Bot, "close", close_discord)
 
     await SimajilordDiscordBot.close(bot)
 
-    assert order == ["activity", "discord", "runtime"]
+    assert order == ["dashboard", "activity", "discord", "runtime"]
 
 
 def test_agent_response_chunks_prefer_readable_boundaries() -> None:

@@ -41,6 +41,13 @@ class SelectableSpeechProvider(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class WarmableSpeechProvider(Protocol):
+    """Optional provider extension for removing first-use startup latency."""
+
+    async def warm_up(self) -> None: ...
+
+
 class SpeechSegmentKind(StrEnum):
     """Semantic role used for pacing, observability, and safe caching."""
 
@@ -376,6 +383,14 @@ class SpeechService:
     async def close(self) -> None:
         await self._scheduler.close()
         await self.provider.close()
+
+    async def warm_up(self) -> bool:
+        """Prepare an optional provider without requiring a synthesis request."""
+
+        if not isinstance(self.provider, WarmableSpeechProvider):
+            return False
+        await self.provider.warm_up()
+        return True
 
     async def cleanup_orphans(
         self,

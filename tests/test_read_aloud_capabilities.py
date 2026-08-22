@@ -3,17 +3,20 @@ from __future__ import annotations
 import pytest
 
 from simajilord.capabilities.read_aloud import (
+    ReadAloudAction,
     ReadAloudAddSourcesRequest,
     ReadAloudAnnouncementsSetRequest,
     ReadAloudDictionarySetRequest,
     ReadAloudExclusionSetRequest,
     ReadAloudExclusionTarget,
     ReadAloudPolicyResponse,
+    ReadAloudRequest,
     ReadAloudResponse,
     ReadAloudSemanticsSetRequest,
     ReadAloudServerVoiceSetRequest,
     ReadAloudStatusRequest,
     ReadAloudUserVoiceSetRequest,
+    build_read_aloud_endpoint,
     build_read_aloud_policy_endpoints,
     build_read_aloud_route_endpoints,
 )
@@ -70,6 +73,41 @@ async def test_split_route_capabilities_have_one_action_per_schema(tmp_path) -> 
         endpoints["speech.read_aloud_add_sources"].descriptor.approval
         is ApprovalMode.WHEN_REQUESTED
     )
+
+
+@pytest.mark.asyncio
+async def test_generic_route_capability_replaces_multiple_sources_and_destination(
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.add_sources(
+        workspace_id="guild",
+        text_channel_ids=("old-one", "old-two"),
+        audio_destination_id="old-voice",
+        mode=ReadAloudMode.QUEUE,
+    )
+    endpoint = build_read_aloud_endpoint(service)
+
+    response = await endpoint.invoke(
+        ReadAloudRequest(
+            action=ReadAloudAction.CONFIGURE_SOURCES,
+            text_channel_ids=("new-one", "new-two"),
+            audio_destination_id="new-voice",
+            mode=ReadAloudMode.SKIP_DURING_MUSIC,
+        ),
+        _context(),
+    )
+
+    assert response == ReadAloudResponse(
+        action="configure_sources",
+        enabled=True,
+        text_channel_id="new-one",
+        text_channel_ids=("new-one", "new-two"),
+        audio_destination_id="new-voice",
+        mode="skip_during_music",
+    )
+    assert service.get("guild") is not None
+    assert not service.matches("guild", "old-one")
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class VoicevoxSpeechProvider:
         engine_path: Path | None,
         auto_start: bool,
         readiness_ttl_seconds: float = 5.0,
+        preload_voice_ids: tuple[int, ...] = (),
     ) -> None:
         normalized_url = base_url.rstrip("/")
         parsed = urlsplit(normalized_url)
@@ -59,6 +60,8 @@ class VoicevoxSpeechProvider:
             not engine_path.is_file() or not os.access(engine_path, os.X_OK)
         ):
             raise ValueError("VOICEVOX engine path must be an executable file.")
+        if any(not 0 <= voice_id <= 65_535 for voice_id in preload_voice_ids):
+            raise ValueError("VOICEVOX preload voice ID is out of range.")
 
         self.base_url = normalized_url
         self.host = host
@@ -68,6 +71,7 @@ class VoicevoxSpeechProvider:
         self.engine_path = engine_path
         self.auto_start = auto_start
         self.readiness_ttl_seconds = readiness_ttl_seconds
+        self.preload_voice_ids = tuple(dict.fromkeys(preload_voice_ids))
         self._session: aiohttp.ClientSession | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._start_lock = asyncio.Lock()
@@ -79,6 +83,13 @@ class VoicevoxSpeechProvider:
 
     async def synthesize(self, text: str, destination: Path) -> None:
         await self.synthesize_voice(text, destination, self.speaker_id)
+
+    async def warm_up(self) -> None:
+        """Start the engine and preload latency-sensitive voice models."""
+
+        await self._ensure_ready()
+        for voice_id in self.preload_voice_ids:
+            await self._initialize_speaker(voice_id)
 
     async def synthesize_voice(
         self,
@@ -97,6 +108,7 @@ class VoicevoxSpeechProvider:
             raise
         if len(wave) < 44 or not wave.startswith(b"RIFF") or wave[8:12] != b"WAVE":
             raise ProviderError("VOICEVOX returned an invalid WAV file.")
+        self._mark_ready()
 
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.tmp")
@@ -128,6 +140,16 @@ class VoicevoxSpeechProvider:
             await process.wait()
 
     async def _ensure_ready(self) -> None:
+        process = self._process
+        if (
+            self._ready_until > 0.0
+            and process is not None
+            and process.returncode is None
+        ):
+            # A successfully verified engine owned by this provider remains
+            # usable until its child process exits or an HTTP operation fails.
+            # Avoid a /version round trip before ordinary spoken messages.
+            return
         if monotonic() < self._ready_until:
             return
         if await self._version_is_ready():
@@ -216,6 +238,25 @@ class VoicevoxSpeechProvider:
         if not isinstance(payload, Mapping):
             raise ProviderError("VOICEVOX returned an invalid audio query.")
         return {str(key): value for key, value in payload.items()}
+
+    async def _initialize_speaker(self, voice_id: int) -> None:
+        try:
+            async with self._client().post(
+                f"{self.base_url}/initialize_speaker",
+                params={"speaker": str(voice_id), "skip_reinit": "true"},
+            ) as response:
+                body = await _read_bounded(response, maximum=4_096)
+                if response.status not in {200, 204}:
+                    raise ProviderError(
+                        _voicevox_http_error("speaker initialization", response, body)
+                    )
+        except ProviderError:
+            raise
+        except TimeoutError as exc:
+            raise ProviderError("VOICEVOX speaker initialization timed out.") from exc
+        except aiohttp.ClientError as exc:
+            raise ProviderError("VOICEVOX speaker initialization failed.") from exc
+        self._mark_ready()
 
     async def _synthesis(
         self,

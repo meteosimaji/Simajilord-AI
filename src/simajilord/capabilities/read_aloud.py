@@ -27,6 +27,7 @@ from simajilord.services.read_aloud import (
 
 class ReadAloudAction(StrEnum):
     CONFIGURE = "configure"
+    CONFIGURE_SOURCES = "configure_sources"
     ADD_SOURCES = "add_sources"
     ADD_SOURCE = "add_source"
     REMOVE_SOURCE = "remove_source"
@@ -216,7 +217,21 @@ def build_read_aloud_endpoint(service: ReadAloudService) -> CapabilityEndpoint:
             raise UserError("workspace.required")
         workspace_id = context.workspace_id
         route: ReadAloudRoute | None
-        if request.action is ReadAloudAction.ADD_SOURCES:
+        if request.action is ReadAloudAction.CONFIGURE_SOURCES:
+            if not request.text_channel_ids or request.audio_destination_id is None:
+                raise UserError("read_aloud.source_channels_required")
+            try:
+                route = await service.configure_sources(
+                    workspace_id=workspace_id,
+                    text_channel_ids=request.text_channel_ids,
+                    audio_destination_id=request.audio_destination_id,
+                    mode=request.mode,
+                    before_mutation=context.dispatch_external_effect,
+                    on_noop=context.complete_external_effect_without_dispatch,
+                )
+            except ValueError as exc:
+                raise UserError("read_aloud.source_channels_required") from exc
+        elif request.action is ReadAloudAction.ADD_SOURCES:
             if not request.text_channel_ids or request.audio_destination_id is None:
                 raise UserError("read_aloud.source_channels_required")
             try:
