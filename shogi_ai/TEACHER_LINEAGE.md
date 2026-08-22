@@ -134,15 +134,15 @@ held-outには触れません。
 ## 実行確認
 
 ```bash
-uv run --project shogi_ai simajilord-shogi teacher-lineage
-uv run --project shogi_ai simajilord-shogi learning-strategy
-uv run --project shogi_ai simajilord-nnue index-corpus \
+uv run simajilord-shogi teacher-lineage
+uv run simajilord-shogi learning-strategy
+uv run simajilord-nnue index-corpus \
   --allow-user-attested-local-only
-uv run --project shogi_ai simajilord-nnue prepare \
+uv run simajilord-nnue prepare \
   artifacts/runs/meteo-nagisa-nnue-20260812-v1 \
   --nagisa-archive /path/to/NAGISA_V3.1-release.zip \
   --allow-user-attested-local-only
-uv run --project shogi_ai simajilord-shogi fetch-public-psv-seeds \
+uv run simajilord-shogi fetch-public-psv-seeds \
   nodchip-shogi-hao-depth9 artifacts/public-seeds/hao-v1 \
   --file-count 8 --records-per-file 4096 --seed meteo-bootstrap-v1
 ```

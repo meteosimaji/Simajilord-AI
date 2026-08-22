@@ -18,6 +18,10 @@ dependencies = [
   "numpy>=2.1,<3; python_version >= '3.13'",
 ]
 
+[project.urls]
+Repository = "https://github.com/meteosimaji/Meteo-Shogi-AI"
+Issues = "https://github.com/meteosimaji/Meteo-Shogi-AI/issues"
+
 [project.scripts]
 simajilord-shogi = "simajilord_shogi.cli:main"
 simajilord-nnue = "simajilord_shogi.nnue_runner:main"
@@ -39,6 +43,7 @@ packages = ["src/simajilord_shogi"]
 include = [
   "/LICENSE",
   "/README.md",
+  "/THIRD_PARTY_LICENSES.md",
   "/DATASET_AUDIT.md",
   "/MODEL_RIGHTS.md",
   "/LEARNING_STRATEGY.md",

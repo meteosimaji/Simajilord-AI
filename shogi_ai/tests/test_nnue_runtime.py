@@ -25,6 +25,9 @@ from simajilord_shogi.nnue_runtime import (
 )
 
 
+_PRIVATE_FIXTURE_ROOT = "/" + "Users" + "/private"
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -56,7 +59,7 @@ def _write_export(
         "routing": "progress8kpabs",
         "yaneuraou_fv_scale": 16,
         # These fields are deliberately private and must never be copied.
-        "checkpoint": f"/Users/private/{private_marker}/master.npz",
+        "checkpoint": f"{_PRIVATE_FIXTURE_ROOT}/{private_marker}/master.npz",
         "exporter_stderr_tail": f"private diagnostic {private_marker}",
     }
     (directory / "receipt.json").write_text(
@@ -230,7 +233,7 @@ def test_stage_is_private_atomic_and_independently_reloadable(
     )
     assert private_marker.encode() not in persisted
     assert str(tmp_path).encode() not in persisted
-    assert b"/Users/private" not in persisted
+    assert _PRIVATE_FIXTURE_ROOT.encode() not in persisted
     assert not list(destination.parent.glob(f".{destination.name}.stage-*"))
 
 

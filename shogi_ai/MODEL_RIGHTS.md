@@ -159,11 +159,11 @@ sidecarを再検証できない場合は推測で許可済みにせず、旧line
 adjacent receiptを用意します。receiptは元の教師artifactやsidecarを公開してよい許可にはなりません。
 
 ```bash
-uv run --project shogi_ai simajilord-shogi model-rights --public-distillable-only
-uv run --project shogi_ai simajilord-shogi model-rights --local-distillable-only
-uv run --project shogi_ai simajilord-shogi model-rights --not-authorized-only
+uv run simajilord-shogi model-rights --public-distillable-only
+uv run simajilord-shogi model-rights --local-distillable-only
+uv run simajilord-shogi model-rights --not-authorized-only
 
-uv run --project shogi_ai simajilord-shogi reanalyse-usi \
+uv run simajilord-shogi reanalyse-usi \
   artifacts/actor.jsonl artifacts/gikou-tactics.jsonl \
   --engine /path/to/gikou --engine-cwd /path/to/gikou-data \
   --rights-profile gikou2-v2.0.2 \

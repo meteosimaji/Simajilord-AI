@@ -188,7 +188,7 @@ factorizerを別々に見るのではなく、exportが実際に量子化する�
 - 範囲外要素数と、量子化gridまでのmean/p99/max residualを分けて保存。
 
 ```bash
-uv run --project shogi_ai simajilord-nnue audit-mlx-weights CHECKPOINT_DIRECTORY
+uv run simajilord-nnue audit-mlx-weights CHECKPOINT_DIRECTORY
 ```
 
 2026-08-13の実checkpoint監査では、合成weight、FT bias、i32 dense biasを含む75,231,385要素の

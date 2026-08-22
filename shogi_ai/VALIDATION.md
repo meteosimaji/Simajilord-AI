@@ -11,7 +11,7 @@
 次を実行しました。
 
 ```bash
-uv run --project shogi_ai simajilord-shogi verify \
+uv run simajilord-shogi verify \
   <LOCAL_RUN_DIRECTORY> \
   --workers 4 --profile competition_v1
 ```

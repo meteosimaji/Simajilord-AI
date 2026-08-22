@@ -1,4 +1,4 @@
-"""Complete legal-game runner shared by CLI, Discord adapter, and self-play."""
+"""Complete legal-game runner shared by CLI, USI adapters, and self-play."""
 
 from __future__ import annotations
 

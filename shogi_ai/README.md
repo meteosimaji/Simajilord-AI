@@ -1,9 +1,9 @@
-# めてお - Simajilord Shogi AI
+# めてお - Meteo Shogi AI
 
-**めてお**（英字表記: **Meteo**）は、Simajilord-AI リポジトリ内のオリジナル
-将棋AIです。`shogi_ai` は Discord から独立した将棋エンジン・
-自己対局・学習コンポーネントです。CLI と USI で単独利用でき、将来の Discord Bot は
-この公開境界を呼び出します。USI と checkpoint metadata にも公開名「めてお」を
+**めてお**（英字表記: **Meteo**）は、独立して開発・配布するオリジナル将棋AIです。
+このリポジトリだけで将棋エンジン、自己対局、学習、評価を管理し、Discord Botや
+Simajilord-AIへの実行時依存はありません。CLIとUSIで単独利用でき、外部アプリケーションとは
+公開されたプロセス境界を介して接続します。USIとcheckpoint metadataにも公開名「めてお」を
 保存します。
 
 たややん氏／水匠、やねうら王、WCSC公式資料の調査とMeteoへの反映方針は
@@ -18,7 +18,8 @@
 MLXの量子化学習、統合メモリcache、非同期dataset prefetch、transactional checkpointから得た
 CNN/Transformer/LLMにも再利用できる知見は
 [`NUMERICAL_TRAINING_GUIDE.md`](NUMERICAL_TRAINING_GUIDE.md)へ分離しています。
-外部モデルの利用可否は[`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)、実行済みの受入試験と
+外部モデルの利用可否は[`MODEL_RIGHTS.md`](MODEL_RIGHTS.md)、直接依存のライセンスは
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)、実行済みの受入試験と
 4種の実エンジン対局・蒸留は[`VALIDATION.md`](VALIDATION.md)、Floodgate参加前の条件は
 [`FLOODGATE.md`](FLOODGATE.md)に記録します。
 
@@ -359,55 +360,55 @@ unknown profileとしてfail closedします。台帳・文書・releaseへ、�
 ## コマンド
 
 ```bash
-uv sync --project shogi_ai --all-groups
+uv sync --locked --all-groups
 
 # 環境・モデルshape
-uv run --project shogi_ai simajilord-shogi doctor --profile competition_v1
+uv run simajilord-shogi doctor --profile competition_v1
 
 # neural MCTSのnode/time/NPS、1億node所要時間、peak memory、tree上限
-uv run --project shogi_ai simajilord-shogi bench-nps \
+uv run simajilord-shogi bench-nps \
   --profile competition_v1 --parallel-roots 32 --simulations 100
 
 # checkpoint作成
-uv run --project shogi_ai simajilord-shogi init artifacts/initial --profile competition_v2
+uv run simajilord-shogi init artifacts/initial --profile competition_v2
 
 # 複数局をGPU batchで終局まで自己対局
-uv run --project shogi_ai simajilord-shogi selfplay \
+uv run simajilord-shogi selfplay \
   artifacts/initial artifacts/actor.jsonl --games 32 --mode batched --simulations 800
 
 # 同じ局面を深く再解析
-uv run --project shogi_ai simajilord-shogi reanalyse \
+uv run simajilord-shogi reanalyse \
   artifacts/initial artifacts/actor.jsonl artifacts/deep.jsonl \
   --actor-simulations 800 --teacher-simulations 6400 --fraction 0.5
 
 # 深教師＋過去anchorから学習
-uv run --project shogi_ai simajilord-shogi train \
+uv run simajilord-shogi train \
   artifacts/initial artifacts/deep.jsonl artifacts/candidate \
   --anchor-replay artifacts/champion.jsonl --steps 1000 --batch-size 32 \
   --human-play-state-root artifacts/runtime/shogihome
 
 # canonical v2の数学・履歴・独立headはsynthetic fixtureで検証する。
 # 実データのtrain CLIはscore-matrix builder receipt実装まで意図的に拒否する。
-uv run --project shogi_ai pytest -q \
-  shogi_ai/tests/test_distillation_targets_v2.py \
-  shogi_ai/tests/test_trainer_canonical_v2.py \
-  shogi_ai/tests/test_model_contract_v2.py
+uv run pytest -q \
+  tests/test_distillation_targets_v2.py \
+  tests/test_trainer_canonical_v2.py \
+  tests/test_model_contract_v2.py
 
 # value labelだけをC=600 / C=756.086496 / held-out通過teacher-fitで比較
 # p=sigmoid(cp/C)なので、Meteoの符号付きtargetはtanh(cp/(2C))
-uv run --project shogi_ai simajilord-shogi prepare-value-scale-ablation \
+uv run simajilord-shogi prepare-value-scale-ablation \
   artifacts/train-teacher.jsonl artifacts/validation-teacher.jsonl \
   artifacts/value-scale-ablation \
   --parent-checkpoint artifacts/initial --training-seed 0 \
   --minimum-fit-games 30 --minimum-validation-games 10
 
 # 公開checkpointへ使える教師 / 正規承認済みlocal-only教師 / 未承認を分けて表示
-uv run --project shogi_ai simajilord-shogi model-rights --public-distillable-only
-uv run --project shogi_ai simajilord-shogi model-rights --local-distillable-only
-uv run --project shogi_ai simajilord-shogi model-rights --not-authorized-only
+uv run simajilord-shogi model-rights --public-distillable-only
+uv run simajilord-shogi model-rights --local-distillable-only
+uv run simajilord-shogi model-rights --not-authorized-only
 
 # 権利確認済み技巧のMultiPVを同一局面へ付与（binary/parameterはrepo外）
-uv run --project shogi_ai simajilord-shogi reanalyse-usi \
+uv run simajilord-shogi reanalyse-usi \
   artifacts/actor.jsonl artifacts/gikou-tactics.jsonl \
   --engine /path/to/gikou --engine-cwd /path/to/gikou-data \
   --rights-profile gikou2-v2.0.2 --selection tactical \
@@ -416,13 +417,13 @@ uv run --project shogi_ai simajilord-shogi reanalyse-usi \
   --artifact /path/to/params.bin
 
 # YaneuraOu PSVをRAMへ全展開せず学習（教師源名を必須保存）
-uv run --project shogi_ai simajilord-shogi train-psv \
+uv run simajilord-shogi train-psv \
   artifacts/initial teacher.psv artifacts/psv-candidate \
   --source-name reviewed-public-dataset --score-ponanza-coefficient 600 \
   --steps 1000 --batch-size 64
 
 # MIT確認済みHao/tanuki系から、旧labelを捨てて再解析待ちの局面だけRange取得
-uv run --project shogi_ai simajilord-shogi fetch-public-psv-seeds \
+uv run simajilord-shogi fetch-public-psv-seeds \
   nodchip-shogi-hao-depth9 artifacts/public-seeds/hao-v1 \
   --file-count 8 --records-per-file 4096 --seed meteo-bootstrap-v1
 
@@ -439,7 +440,7 @@ DL水匠unique版やAobaZero外部棋譜は、このコマンドの許可リス�
 相互排他で、checkpoint lineage / provenanceには `C` と `2C` を両方保存します。
 
 # actor -> 深再解析 -> 学習 -> 独立openingの色替わりarena -> 昇格/棄却
-uv run --project shogi_ai simajilord-shogi improve \
+uv run simajilord-shogi improve \
   artifacts/champion artifacts/improvement --generations 1 \
   --games 32 --actor-simulations 800 --teacher-simulations 6400 \
   --opening-suite openings.json --arena-simulations 1600 \
@@ -482,7 +483,7 @@ candidate学習前（`initialized`、`actor_saved`、`reanalysed`）に限り、
 独立検証設定を追加して移行できます。それ以降の旧manifestやschema 1はresumeせず拒否します。
 
 # 権利スコープ確認済みのUSIエンジンと直接対局
-uv run --project shogi_ai simajilord-shogi benchmark-usi \
+uv run simajilord-shogi benchmark-usi \
   artifacts/champion artifacts/arena/suisho5 \
   --engine /path/to/YaneuraOu --engine-cwd /path/to/runtime \
   --rights-profile suisho5 --nodes 100000 \
@@ -522,18 +523,18 @@ private bundle、第三者artifact、入手先URLはrepositoryやreleaseへ含�
 必ず先後1組だけで、summaryにdebug blockerを残し、昇格判定にもEloにも使用できません。
 
 # 対局・USI
-uv run --project shogi_ai simajilord-shogi play artifacts/candidate --human black
-uv run --project shogi_ai simajilord-shogi usi artifacts/candidate
+uv run simajilord-shogi play artifacts/candidate --human black
+uv run simajilord-shogi usi artifacts/candidate
 
 # 悪手、相手profile、詰将棋
-uv run --project shogi_ai simajilord-shogi blunders artifacts/deep.jsonl
-uv run --project shogi_ai simajilord-shogi opponent-learn \
+uv run simajilord-shogi blunders artifacts/deep.jsonl
+uv run simajilord-shogi opponent-learn \
   artifacts/deep.jsonl artifacts/opponents/suisho.json --name suisho --color white
-uv run --project shogi_ai simajilord-shogi tsume-mine \
+uv run simajilord-shogi tsume-mine \
   artifacts/deep.jsonl artifacts/tsume.jsonl --plies 5
 
 # 完全受入
-uv run --project shogi_ai simajilord-shogi verify /tmp/simajilord-shogi-verify \
+uv run simajilord-shogi verify /tmp/simajilord-shogi-verify \
   --workers 4 --profile competition_v1
 ```
 
@@ -552,6 +553,6 @@ uv run --project shogi_ai simajilord-shogi verify /tmp/simajilord-shogi-verify \
 
 ## ライセンス境界
 
-本subprojectはApache-2.0です。MITの`rsshogi`を利用します。GPL等の外部エンジンはUSIの
+本リポジトリはApache-2.0です。MITの`rsshogi`を利用します。GPL等の外部エンジンはUSIの
 別process境界に置きます。モデル、教師データ、クラウド解析出力のライセンスはコードとは別に
 確認し、公開可能性をcheckpoint metadataへ記録します。

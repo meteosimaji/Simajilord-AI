@@ -8,7 +8,7 @@
 機械可読契約は次で出力できます。
 
 ```bash
-uv run --project shogi_ai simajilord-shogi post-bootstrap-roadmap
+uv run simajilord-shogi post-bootstrap-roadmap
 ```
 
 「実装済み」「計測済み」「設計契約」「未実装」を混ぜません。現在の1,000億runは広いscalar
@@ -41,7 +41,7 @@ Policy Gradient、PPO、DPOをvalue-only NNUEに無理に当てはめません�
 直近loss約0.05066、残りETA約13.86日でした。これは時点値であり、現在値は次で再読みします。
 
 ```bash
-uv run --project shogi_ai simajilord-nnue status-mlx shogi_ai/artifacts/runs/meteo-nagisa-nnue-20260812-v4
+uv run simajilord-nnue status-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v4
 ```
 
 完走とみなす条件は次のすべてです。
