@@ -62,6 +62,7 @@ def test_progress_snapshot_reports_manifest_disk_and_position_counts(tmp_path: P
         command_sha256="a" * 64,
         bootstrap_position_presentations=64_000,
         target_position_presentations=100_000_000_000,
+        minimum_disk_free_bytes=1,
     )
 
     assert snapshot["completed_generation"] == 2

@@ -45,7 +45,10 @@
    支援者向け頒布です。水匠5は公開再現可能な固定baselineです。一方、ユーザーが正規入手した
    水匠11Plusのexact profileは、元artifactとraw labelsを非公開に保つlocal-only USI教師として
    解析・蒸留・学習へ使用します。派生Meteo checkpointの公開は別の権利gateで拒否します。
-8. [NAGISA V3.1の公式BOOTHページ](https://booth.pm/ja/items/8639574)では本体価格は0円、
+8. [NAGISA V3.1の公式GitHub release](https://github.com/keinoda/YaneuraOu/releases/tag/nagisa-v3.1)は、
+   YaneuraOu 9.60、`HalfKA_hm2 1024x16x64 / LayerStack 9`、`FV_SCALE=28`、
+   `progress8kpabs`、source commitを明示し、v3.1は探索parameterのSPSA再調整だけで評価関数は
+   v3から不変と説明しています。[公式BOOTHページ](https://booth.pm/ja/items/8639574)では本体価格は0円、
    1,000円は同一棋力のDiscordサポートと説明されています。ユーザーが取得した公式ZIPの
    Apple M1版を実行し、終局対局、10,000 node MultiPV蒸留、SHA-256固定まで完了しました。
    評価関数の無断再配布禁止を守り、重みのコピー・形式変換は行いません。

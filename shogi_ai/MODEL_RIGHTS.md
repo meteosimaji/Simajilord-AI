@@ -64,7 +64,8 @@ archiveから`progress.bin`だけを、9個のLayerStackを選ぶ固定routerと
 receiptに残し、runと全exportをlocal-onlyにします。公開・販売・再配布には別の明示許諾、または
 独立に生成して互換性を検証したprogress routerが必要です。
 
-主な一次資料は、[NAGISA V3.1公式BOOTH](https://booth.pm/ja/items/8639574)、
+主な一次資料は、[NAGISA V3.1 GitHub release](https://github.com/keinoda/YaneuraOu/releases/tag/nagisa-v3.1)、
+[NAGISA V3.1公式BOOTH](https://booth.pm/ja/items/8639574)、
 [奏乗TSEC7公式BOOTH](https://booth.pm/ja/items/8606196)、
 [奏乗TSEC7対応ソース](https://github.com/keinoda/YaneuraOu/tree/sojo_tsec7)、
 [AobaNNUE公式](https://github.com/yssaya/AobaNNUE)、
@@ -93,6 +94,14 @@ receiptに残し、runと全exportをlocal-onlyにします。公開・販売・
 | 水匠5 | 公式水匠5 + やねうら王V9.00 Apple M1版 | `6734e3a3d28e67b9206c3442f6d10f16148138327dff811cadedfcf581f79809` | `f4bfaee3f411e9688ebf55a585593463311a18bb2ea01b02eeb5fb0babcacb13` | `768068f0d534a0603a5d38bcd143de6bbca820d5f1c95a14d40863e5b7892d76` |
 | 振電3 | 公式Drive配布ソースを`TARGET_CPU=APPLEM1`で再現buildしUSI実行 | `e5d1db9fae9268791c1dc6a7afab304d2636ee87c69d60edb318766b006c0d87` | `9106675186a699e344e6edf401b714b764007a3a0290114c241b10fc70d9ae7a` | `f6e808025b9ba54eaf73dafc69ce40f0ec442cb476e5b6d3ca6601e53fad4361` |
 | Háo | 公式HalfKP256評価を`FV_SCALE=20`で実行 | 検証記録参照 | `f4bfaee3f411e9688ebf55a585593463311a18bb2ea01b02eeb5fb0babcacb13` | `1141d275bceec911156801f27303dc9ff5beb24f4f59144cc069306c59e80782` |
+
+NAGISA GitHub版Apple Silicon archiveの公式digestは
+`caf11a1ceee41b8fb52c8282419f515865461884089319d467ecb241d1b59280`です。手元のBOOTH ZIPは
+packagingが異なるためarchive hashは一致しませんが、実行ファイル、`nn.bin`、`progress.bin`、
+`eval_options.txt`の4 payloadはGitHub版とbyte単位で一致しました。releaseはv3.1の変更をSPSAによる
+探索parameter再調整のみとし、NNUEはv3から不変、YaneuraOu 9.60、`HalfKA_hm2 1024x16x64 /
+LayerStack 9`、`FV_SCALE=28`、`progress8kpabs`、commit
+`640f46561455436641b2eafb6fb75dfbeaf21f3f`を明示しています。
 
 `reanalyse-usi`は、組み込み台帳の`--rights-profile`が出力蒸留可でなければ起動しません。
 `--artifact`で評価関数やparameter fileを指定すると、絶対path、size、SHA-256を教師replayの

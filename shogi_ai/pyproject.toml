@@ -21,6 +21,9 @@ dependencies = [
 [project.scripts]
 simajilord-shogi = "simajilord_shogi.cli:main"
 simajilord-nnue = "simajilord_shogi.nnue_runner:main"
+simajilord-nnue-games = "simajilord_shogi.nnue_game_runner:main"
+simajilord-score-matrix = "simajilord_shogi.score_matrix_runner:main"
+simajilord-post-bootstrap = "simajilord_shogi.post_bootstrap_runner:main"
 
 [dependency-groups]
 dev = [
@@ -39,6 +42,7 @@ include = [
   "/DATASET_AUDIT.md",
   "/MODEL_RIGHTS.md",
   "/LEARNING_STRATEGY.md",
+  "/POST_100B_ROADMAP.md",
   "/NUMERICAL_TRAINING_GUIDE.md",
   "/TEACHER_LINEAGE.md",
   "/RESEARCH.md",

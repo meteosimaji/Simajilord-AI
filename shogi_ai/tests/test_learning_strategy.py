@@ -113,6 +113,11 @@ def test_learning_strategy_keeps_all_three_primary_scorer_arms() -> None:
     assert diversity["played_move_used_as_best_move_label"] is False
     assert diversity["qpd_historical_repetition_factor_not_unique"] == 20
 
+    post_100b = contract["post_100b"]
+    assert post_100b["entry_gate"]["bootstrap_target_presentations"] == (100_000_000_000)
+    assert post_100b["game_generation"]["latest_previous_weight_artifacts_only"] is True
+    assert post_100b["reinforcement_learning"]["student_policy_head"] is False
+
 
 @pytest.mark.parametrize("scorer_id", CANONICAL_SCORER_IDS)
 def test_teacher_role_contract_has_one_scorer_and_two_challengers(scorer_id: str) -> None:

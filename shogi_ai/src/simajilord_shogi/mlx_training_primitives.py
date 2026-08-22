@@ -97,6 +97,48 @@ def ste_round(values: mx.array) -> mx.array:
     return straight_through(values, mx.round(values))
 
 
+def ste_round_rust_f32_scaled(values: mx.array, *, scale: float) -> mx.array:
+    """Match Rust ``(f32 as f64 * scale).round()`` with an STE gradient.
+
+    MLX's ``round`` uses ties-to-even, whereas Rust's ``f64::round`` uses
+    half-away-from-zero.  There is an additional, less obvious difference for
+    Tatara's QA=127 path: MLX first rounds the f32 multiplication, while the
+    exporter widens the master f32 value to f64 before multiplying.  A product
+    that lands on ``n + 0.5`` in f32 can therefore be just above or below the
+    boundary in the exporter.
+
+    The three production scales have an exact difference-of-powers-of-two
+    decomposition.  FastTwoSum recovers the multiplication residual using
+    only f32 operations, so the deployed branch makes the same rounding
+    decision as the f64 Rust exporter without requiring unsupported f64 Metal
+    arithmetic.  The surrogate branch preserves the original ``scale``
+    gradient.
+    """
+
+    if values.dtype != mx.float32:
+        raise TypeError("Rust-compatible fake quantisation requires float32 master weights")
+    scale_parts = {
+        64.0: (64.0, 0.0),
+        127.0: (128.0, 1.0),
+        8128.0: (8192.0, 64.0),
+    }
+    if scale not in scale_parts:
+        raise ValueError(f"unsupported Rust-compatible quantisation scale: {scale}")
+    high_scale, low_scale = scale_parts[scale]
+    magnitude = mx.abs(values)
+    high = magnitude * high_scale
+    low = magnitude * low_scale
+    product = high - low
+    # |high| >= |low|, so FastTwoSum recovers the exact residual of high-low.
+    residual = (-low) - (product - high)
+    integral = mx.floor(product)
+    fraction = product - integral
+    round_up = (fraction > 0.5) | ((fraction == 0.5) & (residual >= 0.0))
+    rounded_magnitude = integral + round_up.astype(mx.float32)
+    deployed = mx.where(values < 0.0, -rounded_magnitude, rounded_magnitude)
+    return straight_through(values * scale, deployed)
+
+
 def ste_floor(values: mx.array) -> mx.array:
     """Floor in the forward graph while differentiating as the identity."""
 
@@ -124,6 +166,25 @@ def fake_quantise_raw(
     if minimum is not None and maximum is not None and minimum > maximum:
         raise ValueError("fake-quantisation minimum exceeds maximum")
     raw = ste_round(values * scale)
+    if minimum is not None and maximum is not None:
+        raw = mx.clip(raw, minimum, maximum)
+    return raw
+
+
+def fake_quantise_rust_f32_raw(
+    values: mx.array,
+    *,
+    scale: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> mx.array:
+    """Fake-quantise f32 weights with Tatara/Rust export rounding semantics."""
+
+    if (minimum is None) != (maximum is None):
+        raise ValueError("fake-quantisation bounds must be both set or both omitted")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError("fake-quantisation minimum exceeds maximum")
+    raw = ste_round_rust_f32_scaled(values, scale=scale)
     if minimum is not None and maximum is not None:
         raw = mx.clip(raw, minimum, maximum)
     return raw

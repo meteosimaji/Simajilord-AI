@@ -15,8 +15,10 @@ from simajilord_shogi.mlx_training_primitives import (
     DaemonPrefetch,
     QuantisationSchedule,
     fake_quantise_raw,
+    fake_quantise_rust_f32_raw,
     ste_floor,
     ste_round,
+    ste_round_rust_f32_scaled,
 )
 
 
@@ -69,3 +71,52 @@ def test_round_and_floor_forward_values_keep_identity_gradients() -> None:
     np.testing.assert_array_equal(np.asarray(floored), [0.0, 0.0, 1.0])
     np.testing.assert_array_equal(np.asarray(round_gradient), [1.0, 1.0, 1.0])
     np.testing.assert_array_equal(np.asarray(floor_gradient), [1.0, 1.0, 1.0])
+
+
+def test_rust_f32_scaled_round_resolves_qa_half_boundaries_and_keeps_gradient() -> None:
+    # These are real QA=127 boundary values from the stopped production
+    # checkpoint.  f32 multiplication produces an exact x.5, but the widened
+    # Rust product lies on a known side of that boundary.
+    source = mx.array(
+        np.asarray(
+            [
+                0.05118110403418541,
+                -1.618110179901123,
+                -1.169291377067566,
+                -0.4055117964744568,
+                0.027559055015444756,
+            ],
+            dtype=np.float32,
+        )
+    )
+    compiled = mx.compile(lambda values: ste_round_rust_f32_scaled(values, scale=127.0))
+    rounded = compiled(source)
+    gradient = mx.grad(lambda values: mx.sum(ste_round_rust_f32_scaled(values, scale=127.0)))(
+        source
+    )
+    mx.eval(rounded, gradient)
+
+    np.testing.assert_array_equal(np.asarray(rounded), [7.0, -205.0, -149.0, -51.0, 3.0])
+    np.testing.assert_array_equal(np.asarray(gradient), np.full(5, 127.0, dtype=np.float32))
+
+
+def test_rust_f32_fake_quantisation_uses_half_away_and_scale_gradient() -> None:
+    source = mx.array([-2.0, -0.25, 0.25, 2.0], dtype=mx.float32)
+
+    def objective(values: mx.array) -> mx.array:
+        return mx.sum(fake_quantise_rust_f32_raw(values, scale=2.0, minimum=-3.0, maximum=3.0))
+
+    with pytest.raises(ValueError, match="unsupported Rust-compatible"):
+        objective(source)
+
+    source = mx.array([-0.5 / 64.0, 0.5 / 64.0], dtype=mx.float32)
+    quantised = fake_quantise_rust_f32_raw(source, scale=64.0, minimum=-2.0, maximum=2.0)
+    gradient = mx.grad(
+        lambda values: mx.sum(
+            fake_quantise_rust_f32_raw(values, scale=64.0, minimum=-2.0, maximum=2.0)
+        )
+    )(source)
+    mx.eval(quantised, gradient)
+
+    np.testing.assert_array_equal(np.asarray(quantised), [-1.0, 1.0])
+    np.testing.assert_array_equal(np.asarray(gradient), [64.0, 64.0])

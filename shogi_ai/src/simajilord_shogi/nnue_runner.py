@@ -15,6 +15,17 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
+from .incremental_value_replay import (
+    build_incremental_value_replay,
+    load_incremental_value_split,
+    load_scalar_value_labels,
+)
+from .nnue_runtime import (
+    RuntimeProfile,
+    publish_nnue_runtime_registry,
+    stage_nnue_runtime,
+    verify_nnue_runtime,
+)
 from .nnue_training import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_HELDOUT_POSITIONS,
@@ -29,6 +40,7 @@ from .nnue_training import (
     probe_value_only_psv,
     run_nagisa_nnue,
 )
+from .qsearch_leaf import QsearchLeafEngineProfile, convert_qsearch_leaves
 
 
 def _default_tatara_patch() -> Path:
@@ -72,6 +84,26 @@ def _build_tatara(run_directory: Path, *, install_cuda_oxide: bool) -> dict[str,
     return {"commands": commands, "preflight": preflight}
 
 
+def _runtime_extra_options(values: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    options: list[tuple[str, str]] = []
+    normalized_names: set[str] = set()
+    for option in values:
+        if "=" not in option:
+            raise ValueError(f"runtime option must be NAME=VALUE: {option}")
+        raw_name, value = option.split("=", 1)
+        name = raw_name.strip()
+        if not name:
+            raise ValueError("runtime option name must not be empty")
+        normalized = name.casefold()
+        if normalized == "multipv":
+            raise ValueError("MultiPV is reserved; use --multipv")
+        if normalized in normalized_names:
+            raise ValueError(f"duplicate runtime option name: {name}")
+        normalized_names.add(normalized)
+        options.append((name, value))
+    return tuple(options)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="simajilord-nnue",
@@ -89,6 +121,77 @@ def build_parser() -> argparse.ArgumentParser:
     probe = subparsers.add_parser("probe-psv", help="validate Move16=0 scalar-value PSV records")
     probe.add_argument("psv", type=Path)
     probe.add_argument("--board-samples", type=int, default=4_096)
+
+    incremental_psv = subparsers.add_parser(
+        "build-incremental-psv",
+        help=(
+            "convert strict post-bootstrap exact scalar labels into a create-only "
+            "Move16=0 PSV shard"
+        ),
+    )
+    incremental_psv.add_argument("labels", type=Path)
+    incremental_psv.add_argument("split_receipt", type=Path)
+    incremental_psv.add_argument("output", type=Path)
+
+    qsearch_leaf = subparsers.add_parser(
+        "qsearch-leaves",
+        help=(
+            "move value-only PSV records to a qsearch PV leaf; the output remains "
+            "ineligible until every leaf is rescored"
+        ),
+    )
+    qsearch_leaf.add_argument("source_psv", type=Path)
+    qsearch_leaf.add_argument("engine", type=Path)
+    qsearch_leaf.add_argument("working_directory", type=Path)
+    qsearch_leaf.add_argument("output", type=Path)
+    qsearch_leaf.add_argument("--threads", type=int, default=1)
+    qsearch_leaf.add_argument("--hash-mb", type=int, default=64)
+    qsearch_leaf.add_argument("--eval-dir", default="eval")
+    qsearch_leaf.add_argument("--fv-scale", type=int, default=16)
+    qsearch_leaf.add_argument("--ls-bucket-mode", default="progress8kpabs")
+    qsearch_leaf.add_argument("--ls-progress-coeff", default="progress.bin")
+    qsearch_leaf.add_argument("--timeout-seconds", type=float, default=300.0)
+
+    stage_runtime = subparsers.add_parser(
+        "stage-runtime",
+        help="atomically stage a private NNUE export into a verified YaneuraOu runtime",
+    )
+    stage_runtime.add_argument("export_directory", type=Path)
+    stage_runtime.add_argument("engine", type=Path)
+    stage_runtime.add_argument("destination", type=Path)
+    stage_runtime.add_argument("--profile-id", required=True)
+    stage_runtime.add_argument("--threads", type=int, default=1)
+    stage_runtime.add_argument(
+        "--hash-megabytes", "--hash-mb", dest="hash_megabytes", type=int, default=64
+    )
+    stage_runtime.add_argument("--hash-option-name", default="USI_Hash")
+    stage_runtime.add_argument("--multipv", type=int, default=1)
+    stage_runtime.add_argument("--smoke-nodes", type=int, default=2_000)
+    stage_runtime.add_argument("--timeout-seconds", type=float, default=300.0)
+    stage_runtime.add_argument(
+        "--option",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="additional verified USI option; repeatable, with unique names",
+    )
+
+    verify_runtime = subparsers.add_parser(
+        "verify-runtime",
+        help="verify an installed NNUE runtime contract and all content hashes",
+    )
+    verify_runtime.add_argument("runtime_directory", type=Path)
+    verify_runtime.add_argument("--repeat-load-smoke", action="store_true")
+    verify_runtime.add_argument("--timeout-seconds", type=float, default=300.0)
+
+    publish_runtime_registry = subparsers.add_parser(
+        "publish-runtime-registry",
+        help="atomically publish the latest/previous/champion two-weight runtime registry",
+    )
+    publish_runtime_registry.add_argument("registry_path", type=Path)
+    publish_runtime_registry.add_argument("--latest-runtime", type=Path, required=True)
+    publish_runtime_registry.add_argument("--previous-runtime", type=Path)
+    publish_runtime_registry.add_argument("--champion-runtime", type=Path, required=True)
 
     prepare = subparsers.add_parser(
         "prepare", help="create a random-init 100B NAGISA-style production plan"
@@ -169,6 +272,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status_mlx.add_argument("run_directory", type=Path)
 
+    audit_mlx = subparsers.add_parser(
+        "audit-mlx-weights",
+        help="read a complete MLX checkpoint and report deployed integer range/rounding drift",
+    )
+    audit_mlx.add_argument("checkpoint", type=Path)
+
     stop = subparsers.add_parser(
         "request-stop", help="request a safe stop after the active shard/superbatch"
     )
@@ -217,6 +326,73 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "probe-psv":
         _print(probe_value_only_psv(args.psv, board_samples=args.board_samples))
         return 0
+    if args.command == "build-incremental-psv":
+        _print(
+            build_incremental_value_replay(
+                load_scalar_value_labels(args.labels),
+                split=load_incremental_value_split(args.split_receipt),
+                output_directory=args.output,
+            )
+        )
+        return 0
+    if args.command == "qsearch-leaves":
+        _print(
+            convert_qsearch_leaves(
+                args.source_psv,
+                engine=args.engine,
+                working_directory=args.working_directory,
+                output_directory=args.output,
+                profile=QsearchLeafEngineProfile(
+                    threads=args.threads,
+                    hash_mb=args.hash_mb,
+                    eval_dir=args.eval_dir,
+                    fv_scale=args.fv_scale,
+                    ls_bucket_mode=args.ls_bucket_mode,
+                    ls_progress_coeff=args.ls_progress_coeff,
+                ),
+                timeout_seconds=args.timeout_seconds,
+            )
+        )
+        return 0
+    if args.command == "stage-runtime":
+        profile = RuntimeProfile(
+            profile_id=args.profile_id,
+            threads=args.threads,
+            hash_megabytes=args.hash_megabytes,
+            hash_option_name=args.hash_option_name,
+            multipv=args.multipv,
+            smoke_nodes=args.smoke_nodes,
+            timeout_seconds=args.timeout_seconds,
+            extra_options=_runtime_extra_options(args.option),
+        )
+        _print(
+            stage_nnue_runtime(
+                args.export_directory,
+                args.engine,
+                args.destination,
+                profile=profile,
+            ).to_dict()
+        )
+        return 0
+    if args.command == "verify-runtime":
+        _print(
+            verify_nnue_runtime(
+                args.runtime_directory,
+                repeat_load_smoke=args.repeat_load_smoke,
+                timeout_seconds=args.timeout_seconds,
+            ).to_dict()
+        )
+        return 0
+    if args.command == "publish-runtime-registry":
+        _print(
+            publish_nnue_runtime_registry(
+                args.registry_path,
+                latest_runtime=args.latest_runtime,
+                previous_runtime=args.previous_runtime,
+                champion_runtime=args.champion_runtime,
+            ).to_dict()
+        )
+        return 0
     if args.command == "prepare":
         plan = prepare_nagisa_nnue_run(
             args.output,
@@ -262,10 +438,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif not preflight["ready"]:
             try:
-                run_nagisa_nnue(args.run_directory, timeout_seconds=args.timeout_seconds)
+                result = run_nagisa_nnue(
+                    args.run_directory,
+                    timeout_seconds=args.timeout_seconds,
+                )
             except RuntimeError:
                 _print({"preflight": preflight, "status": nagisa_run_status(args.run_directory)})
                 return 2
+            _print(result)
+            return 0
         _print(run_nagisa_nnue(args.run_directory, timeout_seconds=args.timeout_seconds))
         return 0
     if args.command == "status":
@@ -315,6 +496,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .mlx_nnue import mlx_run_status
 
         _print(mlx_run_status(args.run_directory))
+        return 0
+    if args.command == "audit-mlx-weights":
+        from .mlx_nnue import audit_mlx_master_weight_ranges
+
+        _print(audit_mlx_master_weight_ranges(args.checkpoint))
         return 0
     if args.command == "request-stop":
         root = args.run_directory.expanduser().resolve(strict=True)

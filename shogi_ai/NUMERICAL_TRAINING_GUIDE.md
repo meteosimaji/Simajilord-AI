@@ -176,3 +176,23 @@ prefetchへbackpressureを掛けます。
 
 Meteo固有の棋力判断にはこの数値監査だけでは足りません。量子化対応モデルが旧floatモデルより強いかは、
 同一探索、同一開始局面、先後反転、fixed-node/fixed-time対局で別に確認します。
+
+## 10. master weightの範囲と配備出力差を分ける
+
+float masterと配備graphの出力差が大きくても、それだけでclip飽和とは言えません。
+factorizerを別々に見るのではなく、exportが実際に量子化する合成weightを監査します。
+
+- effective FT: `ft_real + tiled(ft_virtual)`をi16範囲で確認。
+- merged L1: bucket weightとshared factorizerを合成後にi8範囲で確認。
+- L2/L3もi8範囲で確認。
+- 範囲外要素数と、量子化gridまでのmean/p99/max residualを分けて保存。
+
+```bash
+uv run --project shogi_ai simajilord-nnue audit-mlx-weights CHECKPOINT_DIRECTORY
+```
+
+2026-08-13の実checkpoint監査では、合成weight、FT bias、i32 dense biasを含む75,231,385要素の
+範囲外が0件でした。当該世代の
+float masterからdeploymentへの勝率差はMAE `0.02853`、p99 `0.13365`、最大 `0.31461`でしたが、
+native exportとQAT forwardのMAEは約`2.6e-9`、最大約`1.3e-8`でした。したがって後者は
+export実装の合否、前者は量子化感度の診断として別々に扱います。

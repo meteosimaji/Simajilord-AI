@@ -104,6 +104,7 @@ from .model_rights import (
 from .opening_suite import OpeningPosition, load_opening_suite
 from .opponent import OpponentProfile
 from .policy_calibration import PolicyCalibrationConfig, calibrate_teacher_policies
+from .post_bootstrap import post_bootstrap_roadmap_contract
 from .public_psv import available_public_psv_corpora, fetch_public_psv_position_seeds
 from .reanalysis import reanalyse_game, reanalyse_game_external
 from .replay import (
@@ -2005,6 +2006,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers.add_parser(
+        "post-bootstrap-roadmap",
+        help=(
+            "print the checked post-100B self-play, three-teacher game, "
+            "reanalysis, value-RL, and promotion roadmap"
+        ),
+    )
+    subparsers.add_parser(
         "teacher-lineage",
         help=(
             "print audited main-teacher ancestry, public corpus identities, "
@@ -3801,6 +3809,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "learning-strategy":
         print(json.dumps(learning_strategy_contract(), indent=2, sort_keys=True))
+        return 0
+    if args.command == "post-bootstrap-roadmap":
+        print(json.dumps(post_bootstrap_roadmap_contract(), indent=2, sort_keys=True))
         return 0
     if args.command == "teacher-lineage":
         print(json.dumps(teacher_lineage_contract(), indent=2, sort_keys=True))

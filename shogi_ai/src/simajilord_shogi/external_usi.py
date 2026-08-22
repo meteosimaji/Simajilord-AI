@@ -467,7 +467,10 @@ class UsiAnalysis:
     time_ms: int | None
     nps: int | None
     depth: int | None
+    seldepth: int | None
     elapsed_seconds: float
+    sent_commands: tuple[str, ...] = ()
+    transcript_lines: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1088,15 +1091,19 @@ class ExternalUsiTeacher:
         search_suffix = (
             "" if not search_moves else f" searchmoves {' '.join(search_moves)}"
         )
-        self._send(f"go nodes {requested_nodes}{search_suffix}")
+        go_command = f"go nodes {requested_nodes}{search_suffix}"
+        self._send(go_command)
+        search_transcript: list[str] = []
         candidates_by_rank: dict[int, TeacherVariation] = {}
         last_nodes: int | None = None
         last_time_ms: int | None = None
         last_nps: int | None = None
         last_depth: int | None = None
+        last_seldepth: int | None = None
         deadline = time.monotonic() + self.timeout_seconds
         while True:
             line = self._read_line(deadline)
+            search_transcript.append(line)
             if line.startswith("info "):
                 try:
                     info = parse_info(line)
@@ -1113,6 +1120,8 @@ class ExternalUsiTeacher:
                     last_nps = info.nps
                 if info.depth is not None:
                     last_depth = info.depth
+                if info.seldepth is not None:
+                    last_seldepth = info.seldepth
             elif line.startswith("bestmove "):
                 best_token = line.split(maxsplit=2)[1]
                 candidates = tuple(
@@ -1126,7 +1135,10 @@ class ExternalUsiTeacher:
                         last_time_ms,
                         last_nps,
                         last_depth,
+                        last_seldepth,
                         time.monotonic() - started,
+                        (position_command, go_command),
+                        tuple(search_transcript),
                     )
                 best = parse_bestmove(line).bestmove.to_usi()
                 return UsiAnalysis(
@@ -1136,7 +1148,10 @@ class ExternalUsiTeacher:
                     last_time_ms,
                     last_nps,
                     last_depth,
+                    last_seldepth,
                     time.monotonic() - started,
+                    (position_command, go_command),
+                    tuple(search_transcript),
                 )
 
     def target_from_analysis(

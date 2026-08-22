@@ -236,9 +236,17 @@ class TrainingSegment:
 
 def _reject_duplicate_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
+    normalized_keys: dict[str, str] = {}
     for key, value in pairs:
         if key in result:
             raise ValueError(f"duplicate JSON key: {key}")
+        normalized = key.casefold()
+        if normalized in normalized_keys:
+            raise ValueError(
+                "case-insensitive JSON key collision: "
+                f"{normalized_keys[normalized]!r} and {key!r}"
+            )
+        normalized_keys[normalized] = key
         result[key] = value
     return result
 

@@ -15,6 +15,7 @@ import pytest
 from rsshogi.core import Board
 from rsshogi.numpy import PackedSfenValue
 
+import simajilord_shogi.nnue_runner as nnue_runner
 import simajilord_shogi.nnue_training as nnue_training
 from simajilord_shogi.nnue_runner import _default_tatara_patch, build_parser
 from simajilord_shogi.nnue_training import (
@@ -106,6 +107,30 @@ def test_default_tatara_patch_is_packaged_with_the_nnue_runner() -> None:
     assert patch.is_file()
     assert "assume_progress8kpabs" in patch.read_text()
     assert nnue_training.TATARA_REPOSITORY_URL == "https://github.com/nodchip/tatara.git"
+
+
+def test_run_command_does_not_repeat_a_successful_run_after_stale_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[Path, float]] = []
+
+    monkeypatch.setattr(
+        nnue_runner,
+        "nagisa_hardware_preflight",
+        lambda _run_directory: {"ready": False, "reason": "stale fixture"},
+    )
+
+    def successful_run(run_directory: Path, *, timeout_seconds: float) -> dict[str, object]:
+        calls.append((run_directory, timeout_seconds))
+        return {"state": "complete", "segments": 1}
+
+    monkeypatch.setattr(nnue_runner, "run_nagisa_nnue", successful_run)
+
+    assert nnue_runner.main(["run", str(tmp_path), "--timeout-seconds", "12.5"]) == 0
+    assert calls == [(tmp_path, 12.5)]
+    assert json.loads(capsys.readouterr().out) == {"segments": 1, "state": "complete"}
 
 
 def test_public_value_index_binds_all_4959_billion_positions(

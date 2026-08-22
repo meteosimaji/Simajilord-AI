@@ -1,6 +1,6 @@
 # Meteo 教師系譜・公開局面再利用台帳
 
-更新: 2026-08-12
+更新: 2026-08-13
 
 この台帳は「公開ページに置かれている」「教師が利用したと書かれている」「Meteoが安全に学習へ
 投入できる」を別々に判定します。機械可読な正本は
@@ -16,6 +16,13 @@
 | NAGISA V3.1 | Tatara。奏乗WCSC36が公開した教師局面集を使用 | 奏乗系の約145億局面を継承した規模 | 奏乗と誤差・データ分布が相関し得る。同じ145億を独立な2票・290億局面とは数えない |
 | 奏乗 WCSC36/TSEC7系 | bullet-shogi。DL水匠で評価値を書換え、静止探索処理、重複除去 | 240億から約145億。公開unique版は正確に14,668,949,437 record | 暫定anchor候補。ただし公開データと手元TSEC7の完全同一性はhashで証明されていない |
 | 水匠11 | SFNNwithoutPSQT、HalfKAv2-1024_8_64。Ryfamate最新、DL水匠、AobaZeroの3モデルによるアンサンブル評価値データ | 公開資料では不明 | 3教師利用の重要な先行例。ただし統合式・重み・校正係数は公開されていない |
+
+NAGISAの[公式GitHub v3.1 release](https://github.com/keinoda/YaneuraOu/releases/tag/nagisa-v3.1)は、
+YaneuraOu 9.60、`HalfKA_hm2 1024x16x64 / LayerStack 9`、`FV_SCALE=28`、
+`progress8kpabs`、source commit `640f46561455436641b2eafb6fb75dfbeaf21f3f`を明示しています。
+v3.1で変わったのはSPSA調整済み探索parameterで、評価関数とNNUE構成はv3から不変です。
+2026-08-13時点で同repositoryにNAGISA v4の公開release・tag・branchは確認できないため、v4は
+教師系譜へ推定登録せず、適法なexact artifact取得後のsealed対戦targetとしてのみ扱います。
 
 水匠11の[公式追加アピール](https://www.apply.computer-shogi.org/wcsc36/appeal/Suisho/appeal2.pdf)は、
 3モデル名、極端な勝率帯が3割以上あること、それを削ると弱くなったこと、Ponanza定数を大きくして

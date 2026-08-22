@@ -98,9 +98,7 @@ class ModelRights:
         )
         return result
 
-    def teacher_policy(
-        self, *, allow_limited_local: bool = False
-    ) -> ExternalTeacherPolicy:
+    def teacher_policy(self, *, allow_limited_local: bool = False) -> ExternalTeacherPolicy:
         """Create a fail-closed USI policy from this reviewed registry row.
 
         A LIMITED source is never enabled implicitly.  The caller must make a
@@ -111,8 +109,7 @@ class ModelRights:
             allow_limited_local and self.analysis == RightsDecision.LIMITED
         )
         training_outputs_allowed = self.output_distillation == RightsDecision.ALLOWED or (
-            allow_limited_local
-            and self.output_distillation == RightsDecision.LIMITED
+            allow_limited_local and self.output_distillation == RightsDecision.LIMITED
         )
         local_only = self.output_distillation == RightsDecision.LIMITED
 
@@ -174,7 +171,11 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         availability="free",
         engine_license="GPL-3.0 engine",
         model_terms="product page prohibits unauthorized redistribution of the evaluation file",
-        sources=("https://booth.pm/ja/items/8639574",),
+        sources=(
+            "https://github.com/keinoda/YaneuraOu/releases/tag/nagisa-v3.1",
+            "https://github.com/keinoda/YaneuraOu/tree/nagisa-v3.1",
+            "https://booth.pm/ja/items/8639574",
+        ),
         analysis=RightsDecision.ALLOWED,
         output_distillation=RightsDecision.ALLOWED,
         hard_game_training=RightsDecision.ALLOWED,
@@ -278,8 +279,7 @@ MODEL_RIGHTS: tuple[ModelRights, ...] = (
         engine_license="GPL-3.0 YaneuraOu/tanuki- engine",
         model_terms="official release archive includes gpl-3.0.txt beside eval/nn.bin",
         sources=(
-            "https://github.com/nodchip/tanuki-/releases/tag/"
-            "tanuki-.halfkp_256x2-32-32.2023-05-08",
+            "https://github.com/nodchip/tanuki-/releases/tag/tanuki-.halfkp_256x2-32-32.2023-05-08",
             "https://huggingface.co/datasets/nodchip/shogi_hao_depth9",
         ),
         analysis=RightsDecision.ALLOWED,
@@ -468,7 +468,5 @@ def analysable_rights_ids() -> tuple[str, ...]:
     """IDs approved for analysis without a local authorization receipt."""
 
     return tuple(
-        record.rights_id
-        for record in MODEL_RIGHTS
-        if record.analysis == RightsDecision.ALLOWED
+        record.rights_id for record in MODEL_RIGHTS if record.analysis == RightsDecision.ALLOWED
     )

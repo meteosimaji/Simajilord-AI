@@ -235,17 +235,37 @@ def test_plan_requires_every_role_flat_start_and_500_unique_heldout_pairs() -> N
         )
 
 
-def test_next_plan_must_schedule_every_model_from_the_append_only_history() -> None:
+def test_next_plan_requires_only_the_retained_previous_weight_not_every_ancestor() -> None:
     flat, evaluation = _openings()
     participants = _participants()
     previous = {
-        "schema": "meteo-continuous-improvement-state-v1",
+        "schema": "meteo-continuous-improvement-state-v2",
         "generation": 1,
+        "champion_after": {
+            "candidate_id": "champion-v3",
+            "artifact_sha256": _digest("champion-v3"),
+        },
         "model_history": [
+            {
+                "candidate_id": "old-pruned-generation",
+                "artifact_sha256": _digest("old-pruned-generation"),
+                "weights_retained": False,
+            },
             {
                 "candidate_id": "meteo-generation-1",
                 "artifact_sha256": _digest("meteo-generation-1"),
-            }
+                "weights_retained": True,
+            },
+        ],
+        "playable_model_window": [
+            {
+                "candidate_id": "champion-v3",
+                "artifact_sha256": _digest("champion-v3"),
+            },
+            {
+                "candidate_id": "meteo-generation-1",
+                "artifact_sha256": _digest("meteo-generation-1"),
+            },
         ],
     }
     arguments = {
@@ -263,7 +283,7 @@ def test_next_plan_must_schedule_every_model_from_the_append_only_history() -> N
         "previous_state": previous,
     }
 
-    with pytest.raises(ValueError, match="every prior Meteo generation"):
+    with pytest.raises(ValueError, match="exactly match the retained playable window"):
         build_generation_plan(**arguments, participants=participants)
 
     historical = Participant(
@@ -273,10 +293,22 @@ def test_next_plan_must_schedule_every_model_from_the_append_only_history() -> N
     )
     plan = build_generation_plan(
         **arguments,
-        participants=(*participants, historical),
+        participants=(participants[0], historical, *participants[2:]),
     )
     assert plan.previous_state_sha256 is not None
     assert plan.required_historical_artifact_sha256 == (_digest("meteo-generation-1"),)
+    assert _digest("old-pruned-generation") not in plan.required_historical_artifact_sha256
+
+    stale_historical = Participant(
+        "old-pruned-generation",
+        OpponentRole.HISTORICAL_METEO,
+        _digest("old-pruned-generation"),
+    )
+    with pytest.raises(ValueError, match="at most one retained previous"):
+        build_generation_plan(
+            **arguments,
+            participants=(participants[0], historical, stale_historical, *participants[2:]),
+        )
 
 
 def test_temperature_can_only_choose_deep_bounded_regret_opening_alternatives() -> None:
@@ -416,6 +448,57 @@ def test_role_gates_require_both_colors_and_do_not_hide_teacher_regression() -> 
     assert "nagisa:black_external_teacher_regression" in regression.blockers
 
 
+def test_external_target_can_require_a_version_specific_confidence_reserve() -> None:
+    base = _plan()
+    reserved_teacher = replace(
+        next(
+            participant
+            for participant in base.participants
+            if participant.participant_id == "nagisa"
+        ),
+        minimum_score_lower_95=0.55,
+    )
+    plan = replace(
+        base,
+        participants=tuple(
+            reserved_teacher if participant.participant_id == "nagisa" else participant
+            for participant in base.participants
+        ),
+    )
+    reports = list(_passing_evidence(plan))
+    teacher_index = next(
+        index for index, report in enumerate(reports) if report.opponent_id == "nagisa"
+    )
+    proxy_score = (1.0,) * 50 + (0.5,) * 450
+    reports[teacher_index] = replace(
+        reports[teacher_index],
+        candidate_black_points=proxy_score,
+        candidate_white_points=proxy_score,
+        reference_black_points=proxy_score,
+        reference_white_points=proxy_score,
+    )
+
+    decision = evaluate_promotion(plan, reports)
+    assert not decision.promoted
+    assert "nagisa:black_external_target_superiority_not_proven" in decision.blockers
+    assert "nagisa:white_external_target_superiority_not_proven" in decision.blockers
+    assert "nagisa:paired_external_target_superiority_not_proven" in decision.blockers
+    manifest_participant = next(
+        participant
+        for participant in plan.to_manifest()["participants"]
+        if participant["participant_id"] == "nagisa"
+    )
+    assert manifest_participant["minimum_score_lower_95"] == 0.55
+
+    with pytest.raises(ValueError, match="valid only for an external teacher"):
+        Participant(
+            "not-external",
+            OpponentRole.CHAMPION,
+            _digest("not-external"),
+            minimum_score_lower_95=0.55,
+        )
+
+
 def test_random_gate_means_every_formal_game_and_game_artifacts_are_unique() -> None:
     plan = _plan()
     reports = list(_passing_evidence(plan))
@@ -513,12 +596,89 @@ def test_rejected_generation_keeps_champion_but_advances_data_and_history(tmp_pa
     assert state["dataset_after_sha256"] != state["dataset_before_sha256"]
     assert state["model_history"][-1]["promotion_status"] == "rejected"
     assert state["model_history"][-1]["eligible_as_historical_opponent"]
+    assert state["model_history"][-1]["weights_retained"]
+    assert len(state["playable_model_window"]) == 2
+    assert state["playable_model_window_limit"] == 2
+    assert state["old_generation_metadata_retained"]
+    assert not state["old_generation_weights_retained"]
     state_digest = append_loop_state(tmp_path, state)
     assert append_loop_state(tmp_path, state) == state_digest
     loaded = load_latest_loop_state(tmp_path)
     assert loaded is not None
     assert loaded[0] == state
     assert loaded[1] == state_digest
+
+
+def test_next_generation_prunes_old_weight_but_keeps_its_metadata() -> None:
+    first_plan = _plan()
+    first_dataset = freeze_dataset_growth(
+        first_plan,
+        _training_entries(first_plan),
+        parent_train_trajectories=(),
+    )
+    first_candidate = CandidateArtifact("meteo-generation-1", _digest("candidate-v1"))
+    first_state = build_loop_state(
+        first_plan,
+        PromotionDecision(
+            plan_sha256=first_plan.sha256,
+            promoted=False,
+            blockers=("candidate:not_good_enough",),
+            opponent_results=(),
+        ),
+        first_dataset,
+        first_candidate,
+        final_receipt_sha256=_digest("generation-1-final-receipt"),
+    )
+
+    flat, evaluation = _openings()
+    participants = _participants()
+    retained_candidate = Participant(
+        first_candidate.candidate_id,
+        OpponentRole.HISTORICAL_METEO,
+        first_candidate.artifact_sha256,
+    )
+    second_plan = build_generation_plan(
+        generation=2,
+        lineage_id="meteo-continuous-test",
+        dataset_parent_sha256=first_dataset.snapshot_sha256,
+        champion=participants[0],
+        participants=(participants[0], retained_candidate, *participants[2:]),
+        teachers=_teachers(),
+        training_opening_sfens=(flat,),
+        evaluation_opening_sfens=evaluation,
+        config=ContinuousLoopConfig(
+            training_games_per_generation=2,
+            bootstrap_iterations=100,
+        ),
+        seed=43,
+        previous_state=first_state,
+    )
+    second_dataset = freeze_dataset_growth(
+        second_plan,
+        _training_entries(second_plan),
+        parent_train_trajectories=(),
+    )
+    second_candidate = CandidateArtifact("meteo-generation-2", _digest("candidate-v2"))
+    second_state = build_loop_state(
+        second_plan,
+        PromotionDecision(
+            plan_sha256=second_plan.sha256,
+            promoted=True,
+            blockers=(),
+            opponent_results=(),
+        ),
+        second_dataset,
+        second_candidate,
+        previous_state=first_state,
+        final_receipt_sha256=_digest("generation-2-final-receipt"),
+    )
+
+    first_history = second_state["model_history"][0]
+    assert first_history["artifact_sha256"] == first_candidate.artifact_sha256
+    assert first_history["weights_retained"] is False
+    assert first_history["eligible_as_historical_opponent"] is False
+    assert len(second_state["model_history"]) == 2
+    assert len(second_state["playable_model_window"]) == 2
 
 
 def test_trajectory_and_retry_identity_are_deterministic_without_counting_duplicates() -> None:

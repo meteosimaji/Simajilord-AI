@@ -42,7 +42,7 @@ from .mlx_training_primitives import (
     DaemonPrefetch,
     NumericPhase,
     QuantisationSchedule,
-    fake_quantise_raw,
+    fake_quantise_rust_f32_raw,
     ste_floor,
 )
 from .nnue_training import (
@@ -72,6 +72,8 @@ LEGACY_MLX_BACKEND_PLAN_SCHEMAS = frozenset({"meteo-nagisa-mlx-backend-plan-v2"}
 MLX_BACKEND_STATE_SCHEMA = "meteo-nagisa-mlx-backend-state-v1"
 MLX_CHECKPOINT_SCHEMA = "meteo-nagisa-mlx-checkpoint-v1"
 MLX_METRIC_SCHEMA = "meteo-nagisa-mlx-metric-v1"
+MLX_NUMERIC_REPAIR_SCHEMA = "meteo-nagisa-mlx-numeric-repair-v1"
+MLX_EXPORT_ROUNDING_REPAIR_SCHEMA = "meteo-nagisa-mlx-export-rounding-repair-v1"
 NATIVE_BUILD_SCHEMA = "meteo-nagisa-mlx-native-build-v1"
 NATIVE_PROTOCOL_MAGIC = b"MTMLX001"
 QUANTIZED_PROTOCOL_MAGIC = b"MTQNT001"
@@ -98,6 +100,12 @@ DEFAULT_VALIDATION_POSITIONS = 262_144
 DEFAULT_SMOKE_POSITIONS = 8_192
 DEFAULT_MLX_CACHE_BYTES = 24 * 1024**3
 SOURCE_PREFETCH_STORAGE_RESERVE_BYTES = 12 * 1024**3
+LEGACY_QAT_FEATURE_ACCUMULATION = "float16_audited_against_float32_reference"
+QAT_FEATURE_ACCUMULATION = (
+    "fused_metal_int32_forward_fp16_scatter_vjp_audited_against_float32_reference"
+)
+LEGACY_EXPORT_ROUNDING = "mlx_float32_product_round_ties_to_even"
+TATARA_EXPORT_ROUNDING = "rust_f32_widen_f64_scale_round_half_away_fast_two_sum_ste"
 MODEL_KEYS = (
     "ft_real",
     "ft_virtual",
@@ -124,6 +132,71 @@ MODEL_SHAPES: dict[str, tuple[int, ...]] = {
     "l3_w": (NUM_BUCKETS, L2_OUT),
     "l3_b": (NUM_BUCKETS,),
 }
+
+_EXACT_SPARSE_FT_ACCUMULATION_KERNEL = mx.fast.metal_kernel(
+    name="meteo_exact_sparse_ft_accumulation",
+    input_names=("ft_raw", "indices", "nnz"),
+    output_names=("accumulated",),
+    source=f"""
+        uint element = thread_position_in_grid.x;
+        uint batch = element / {FT_OUT};
+        uint output = element % {FT_OUT};
+        int total = 0;
+        for (uint slot = 0; slot < {MAX_ACTIVE}; ++slot) {{
+            if (slot < uint(nnz[batch])) {{
+                int feature = indices[batch * {MAX_ACTIVE} + slot];
+                total += int(ft_raw[uint(feature) * {FT_OUT} + output]);
+            }}
+        }}
+        accumulated[element] = float(total);
+    """,
+)
+
+
+@mx.custom_function  # type: ignore[untyped-decorator]
+def _exact_sparse_ft_accumulation(
+    ft_raw: mx.array,
+    indices: mx.array,
+    nnz: mx.array,
+) -> mx.array:
+    """Accumulate quantised sparse FT rows with native int32 semantics."""
+
+    if ft_raw.ndim != 2 or ft_raw.shape[1] != FT_OUT:
+        raise ValueError("quantised FT table must have shape [features, 1024]")
+    if indices.ndim != 2 or indices.shape[1] != MAX_ACTIVE:
+        raise ValueError("sparse FT indices must have shape [batch, 40]")
+    if nnz.ndim != 1 or nnz.shape[0] != indices.shape[0]:
+        raise ValueError("sparse FT NNZ must have one value per batch row")
+    return cast(
+        list[mx.array],
+        _EXACT_SPARSE_FT_ACCUMULATION_KERNEL(
+            inputs=(ft_raw, indices, nnz),
+            grid=(indices.shape[0] * FT_OUT, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=((indices.shape[0], FT_OUT),),
+            output_dtypes=(mx.float32,),
+        ),
+    )[0]
+
+
+@_exact_sparse_ft_accumulation.vjp  # type: ignore[untyped-decorator]
+def _exact_sparse_ft_accumulation_vjp(
+    primals: tuple[mx.array, mx.array, mx.array],
+    cotangent: mx.array,
+    _output: mx.array,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Scatter the exact linear sum gradient back to active FT rows."""
+
+    ft_raw, indices, nnz = primals
+    mask = (mx.arange(MAX_ACTIVE, dtype=mx.int32)[None, :] < nnz[:, None]).astype(cotangent.dtype)
+    safe_indices = mx.maximum(indices, 0)
+    updates = (cotangent[:, None, :] * mask[..., None]).astype(mx.float16)
+    ft_gradient = (mx.zeros(ft_raw.shape, dtype=mx.float16).at[safe_indices].add(updates)).astype(
+        ft_raw.dtype
+    )
+    return ft_gradient, mx.zeros_like(indices), mx.zeros_like(nnz)
+
+
 CLAMPED_MODEL_KEYS = (
     "l1_w",
     "l1_b",
@@ -405,17 +478,15 @@ class MeteoValueNnue(nn.Module):
     ) -> mx.array:
         self._validate_inputs(stm, nstm, nnz, buckets)
         effective_ft = (self.ft_real + mx.tile(self.ft_virtual, (45, 1))).astype(feature_dtype)
-        mask = (mx.arange(MAX_ACTIVE, dtype=mx.int32)[None, :] < nnz[:, None]).astype(
-            feature_dtype
-        )
+        mask = (mx.arange(MAX_ACTIVE, dtype=mx.int32)[None, :] < nnz[:, None]).astype(feature_dtype)
         safe_stm = mx.maximum(stm, 0)
         safe_nstm = mx.maximum(nstm, 0)
         stm_ft = mx.sum(mx.take(effective_ft, safe_stm, axis=0) * mask[..., None], axis=1).astype(
             mx.float32
         )
-        nstm_ft = mx.sum(
-            mx.take(effective_ft, safe_nstm, axis=0) * mask[..., None], axis=1
-        ).astype(mx.float32)
+        nstm_ft = mx.sum(mx.take(effective_ft, safe_nstm, axis=0) * mask[..., None], axis=1).astype(
+            mx.float32
+        )
 
         def post_perspective(values: mx.array) -> mx.array:
             activated = mx.clip(values + self.ft_b, 0.0, 1.0)
@@ -434,9 +505,7 @@ class MeteoValueNnue(nn.Module):
             0.0,
             1.0,
         )
-        l2 = self._bucket_mm(l2_input, self.l2_w, buckets) + mx.take(
-            self.l2_b, buckets, axis=0
-        )
+        l2 = self._bucket_mm(l2_input, self.l2_w, buckets) + mx.take(self.l2_b, buckets, axis=0)
         l2 = mx.clip(l2, 0.0, 1.0)
         l3 = self._bucket_mm(l2, self.l3_w[:, None, :], buckets)[:, 0]
         return l3 + mx.take(self.l3_b, buckets, axis=0) + l1_skip
@@ -459,42 +528,44 @@ class MeteoValueNnue(nn.Module):
         nnz: mx.array,
         buckets: mx.array,
         *,
-        feature_dtype: mx.Dtype,
+        exact_sparse_accumulation: bool,
     ) -> mx.array:
         """Integer-equivalent deployment graph with straight-through gradients.
 
         Forward values reproduce Tatara/YaneuraOu's QA=127, QB=64 network,
         including factorizer folding, right shifts, and saturating casts.  The
-        sparse FT gather may use FP16 during training for memory bandwidth; the
-        reference path keeps it FP32 and is checked against the native Rust
-        evaluator before a generation is accepted.
+        training path uses a fused Metal int32 sparse accumulator with an exact
+        custom scatter VJP.  The independent reference path uses ordinary MLX
+        FP32 operations and is checked against the native Rust evaluator before
+        a generation is accepted.
         """
 
         self._validate_inputs(stm, nstm, nnz, buckets)
         effective_ft = self.ft_real + mx.tile(self.ft_virtual, (45, 1))
-        ft_raw = fake_quantise_raw(
+        exact_ft_raw = fake_quantise_rust_f32_raw(
             effective_ft,
             scale=QUANTISATION_QA,
             minimum=-32_768.0,
             maximum=32_767.0,
-        ).astype(feature_dtype)
-        ft_bias_raw = fake_quantise_raw(
+        )
+        ft_bias_raw = fake_quantise_rust_f32_raw(
             self.ft_b,
             scale=QUANTISATION_QA,
             minimum=-32_768.0,
             maximum=32_767.0,
         )
-        mask = (mx.arange(MAX_ACTIVE, dtype=mx.int32)[None, :] < nnz[:, None]).astype(
-            feature_dtype
-        )
+        mask = (mx.arange(MAX_ACTIVE, dtype=mx.int32)[None, :] < nnz[:, None]).astype(mx.float32)
         safe_stm = mx.maximum(stm, 0)
         safe_nstm = mx.maximum(nstm, 0)
-        stm_raw = mx.sum(mx.take(ft_raw, safe_stm, axis=0) * mask[..., None], axis=1).astype(
-            mx.float32
-        ) + ft_bias_raw
-        nstm_raw = mx.sum(
-            mx.take(ft_raw, safe_nstm, axis=0) * mask[..., None], axis=1
-        ).astype(mx.float32) + ft_bias_raw
+
+        def accumulate(indices: mx.array) -> mx.array:
+            if exact_sparse_accumulation:
+                return _exact_sparse_ft_accumulation(exact_ft_raw, indices, nnz)
+            gathered = mx.take(exact_ft_raw, indices, axis=0) * mask[..., None]
+            return mx.sum(gathered, axis=1)
+
+        stm_raw = accumulate(safe_stm) + ft_bias_raw
+        nstm_raw = accumulate(safe_nstm) + ft_bias_raw
 
         def pairwise_crelu(values: mx.array) -> mx.array:
             activated = mx.clip(values, 0.0, QUANTISATION_QA)
@@ -507,13 +578,13 @@ class MeteoValueNnue(nn.Module):
         # is measurably wrong around half-unit boundaries.
         merged_l1_w = self.l1_w + mx.swapaxes(self.l1f_w, 0, 1)[None, :, :]
         merged_l1_b = self.l1_b + self.l1f_b[None, :]
-        l1_w_raw = fake_quantise_raw(
+        l1_w_raw = fake_quantise_rust_f32_raw(
             merged_l1_w,
             scale=QUANTISATION_QB,
             minimum=-128.0,
             maximum=127.0,
         )
-        l1_b_raw = fake_quantise_raw(merged_l1_b, scale=QUANTISATION_BIAS_SCALE)
+        l1_b_raw = fake_quantise_rust_f32_raw(merged_l1_b, scale=QUANTISATION_BIAS_SCALE)
         l1_total_raw = self._bucket_mm(combined_raw, l1_w_raw, buckets) + mx.take(
             l1_b_raw, buckets, axis=0
         )
@@ -523,25 +594,25 @@ class MeteoValueNnue(nn.Module):
         crelu_raw = mx.clip(ste_floor(l1_main_raw / 64.0), 0.0, 127.0)
         l2_input_raw = mx.concatenate((squared_raw, crelu_raw), axis=1)
 
-        l2_w_raw = fake_quantise_raw(
+        l2_w_raw = fake_quantise_rust_f32_raw(
             self.l2_w,
             scale=QUANTISATION_QB,
             minimum=-128.0,
             maximum=127.0,
         )
-        l2_b_raw = fake_quantise_raw(self.l2_b, scale=QUANTISATION_BIAS_SCALE)
+        l2_b_raw = fake_quantise_rust_f32_raw(self.l2_b, scale=QUANTISATION_BIAS_SCALE)
         l2_dense_raw = self._bucket_mm(l2_input_raw, l2_w_raw, buckets) + mx.take(
             l2_b_raw, buckets, axis=0
         )
         l2_raw = mx.clip(ste_floor(l2_dense_raw / 64.0), 0.0, 127.0)
 
-        l3_w_raw = fake_quantise_raw(
+        l3_w_raw = fake_quantise_rust_f32_raw(
             self.l3_w,
             scale=QUANTISATION_QB,
             minimum=-128.0,
             maximum=127.0,
         )
-        l3_b_raw = fake_quantise_raw(self.l3_b, scale=QUANTISATION_BIAS_SCALE)
+        l3_b_raw = fake_quantise_rust_f32_raw(self.l3_b, scale=QUANTISATION_BIAS_SCALE)
         output_raw = self._bucket_mm(l2_raw, l3_w_raw[:, None, :], buckets)[:, 0]
         output_raw = output_raw + mx.take(l3_b_raw, buckets, axis=0) + l1_skip_raw
         return output_raw / QUANTISATION_BIAS_SCALE
@@ -560,7 +631,7 @@ class MeteoValueNnue(nn.Module):
             nstm,
             nnz,
             buckets,
-            feature_dtype=mx.float16,
+            exact_sparse_accumulation=True,
         )
 
     def quantised_reference_forward(
@@ -577,7 +648,7 @@ class MeteoValueNnue(nn.Module):
             nstm,
             nnz,
             buckets,
-            feature_dtype=mx.float32,
+            exact_sparse_accumulation=False,
         )
 
     def __call__(
@@ -1213,9 +1284,11 @@ def save_mlx_checkpoint(
         numeric_identity = {
             "next_update_phase": numeric_schedule.phase_for_completed_steps(optimizer_step),
             "warmup_optimizer_steps": numeric_schedule.warmup_optimizer_steps,
-            "deployment_graph": cast(dict[str, Any], mlx_plan["numerics"])[
-                "deployment_graph"
-            ],
+            "deployment_graph": cast(dict[str, Any], mlx_plan["numerics"])["deployment_graph"],
+            "feature_accumulation_implementation": (
+                effective_mlx_qat_feature_accumulation(root, mlx_plan)
+            ),
+            "export_rounding_implementation": effective_mlx_export_rounding(root, mlx_plan),
         }
     else:
         numeric_identity = {"next_update_phase": "legacy_float32"}
@@ -1284,8 +1357,11 @@ def load_mlx_checkpoint(
     *,
     learning_rate: float,
 ) -> tuple[MeteoValueNnue, TataraRanger, dict[str, object]]:
-    source = checkpoint.expanduser().resolve(strict=True)
-    if not source.is_dir() or source.is_symlink():
+    requested = checkpoint.expanduser()
+    if requested.is_symlink():
+        raise ValueError("MLX checkpoint must be a regular directory")
+    source = requested.resolve(strict=True)
+    if not source.is_dir():
         raise ValueError("MLX checkpoint must be a regular directory")
     manifest = _strict_json((source / "manifest.json").read_bytes(), label="MLX manifest")
     if manifest.get("schema") != MLX_CHECKPOINT_SCHEMA or manifest.get("complete") is not True:
@@ -1479,6 +1555,273 @@ def load_mlx_plan(run_directory: Path) -> dict[str, Any]:
     return value
 
 
+def _qat_feature_accumulation_contract(plan: Mapping[str, object]) -> str:
+    numerics = plan.get("numerics")
+    if not isinstance(numerics, dict):
+        raise ValueError("QAT MLX plan has no numeric training contract")
+    contract = numerics.get("qat_feature_accumulation")
+    if not isinstance(contract, str):
+        raise ValueError("QAT MLX plan has no feature accumulation contract")
+    return contract
+
+
+def _load_mlx_numeric_repair_receipt(root: Path) -> dict[str, Any]:
+    path = root / "receipts" / "mlx-numeric-repair-v1.json"
+    value = _strict_json(path.read_bytes(), label="MLX numeric repair receipt")
+    if (
+        value.get("schema") != MLX_NUMERIC_REPAIR_SCHEMA
+        or value.get("complete") is not True
+        or value.get("source_mlx_plan_sha256") != _sha256_file(root / "mlx-plan.json")
+        or value.get("from_feature_accumulation") != LEGACY_QAT_FEATURE_ACCUMULATION
+        or value.get("to_feature_accumulation") != QAT_FEATURE_ACCUMULATION
+        or value.get("model_or_optimizer_values_changed") is not False
+    ):
+        raise ValueError("MLX numeric repair receipt does not match the approved migration")
+    source = value.get("source_checkpoint")
+    if not isinstance(source, dict):
+        raise ValueError("MLX numeric repair receipt has no source checkpoint identity")
+    for key in ("manifest_sha256", "model_sha256", "optimizer_sha256"):
+        digest = source.get(key)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("MLX numeric repair checkpoint identity is invalid")
+    return value
+
+
+def effective_mlx_qat_feature_accumulation(
+    root: Path,
+    plan: Mapping[str, object],
+) -> str:
+    """Return the effective QAT accumulator, requiring a receipt for v3 migration."""
+
+    contract = _qat_feature_accumulation_contract(plan)
+    if contract == QAT_FEATURE_ACCUMULATION:
+        return contract
+    if contract != LEGACY_QAT_FEATURE_ACCUMULATION:
+        raise ValueError("QAT feature accumulation contract changed")
+    return cast(str, _load_mlx_numeric_repair_receipt(root)["to_feature_accumulation"])
+
+
+def _export_rounding_contract(plan: Mapping[str, object]) -> str:
+    numerics = plan.get("numerics")
+    if not isinstance(numerics, dict):
+        raise ValueError("QAT MLX plan has no numeric training contract")
+    contract = numerics.get("export_rounding")
+    if contract is None:
+        return LEGACY_EXPORT_ROUNDING
+    if not isinstance(contract, str):
+        raise ValueError("QAT MLX export rounding contract is invalid")
+    return contract
+
+
+def _rounding_repair_source_files() -> dict[str, str]:
+    return {
+        "mlx_nnue.py": _sha256_file(Path(__file__).resolve(strict=True)),
+        "mlx_training_primitives.py": _sha256_file(
+            Path(__file__).with_name("mlx_training_primitives.py").resolve(strict=True)
+        ),
+    }
+
+
+def _load_mlx_export_rounding_repair_receipt(root: Path) -> dict[str, Any]:
+    path = root / "receipts" / "mlx-export-rounding-repair-v1.json"
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("MLX export rounding repair receipt is not a regular file")
+    value = _strict_json(path.read_bytes(), label="MLX export rounding repair receipt")
+    if (
+        value.get("schema") != MLX_EXPORT_ROUNDING_REPAIR_SCHEMA
+        or value.get("complete") is not True
+        or value.get("source_mlx_plan_sha256") != _sha256_file(root / "mlx-plan.json")
+        or value.get("from_export_rounding") != LEGACY_EXPORT_ROUNDING
+        or value.get("to_export_rounding") != TATARA_EXPORT_ROUNDING
+        or value.get("model_or_optimizer_values_changed") is not False
+        or value.get("source_files") != _rounding_repair_source_files()
+    ):
+        raise ValueError("MLX export rounding repair receipt does not match the approved migration")
+    source_checkpoint = value.get("source_checkpoint")
+    source_export = value.get("source_export")
+    if not isinstance(source_checkpoint, dict) or not isinstance(source_export, dict):
+        raise ValueError("MLX export rounding repair identities are incomplete")
+    for identity in (source_checkpoint, source_export):
+        for key, digest in identity.items():
+            if not key.endswith("_sha256"):
+                continue
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError("MLX export rounding repair has an invalid SHA-256")
+    return value
+
+
+def effective_mlx_export_rounding(root: Path, plan: Mapping[str, object]) -> str:
+    """Return the exporter rounding contract, requiring a receipt for old runs."""
+
+    contract = _export_rounding_contract(plan)
+    if contract == TATARA_EXPORT_ROUNDING:
+        return contract
+    if contract != LEGACY_EXPORT_ROUNDING:
+        raise ValueError("QAT export rounding contract changed")
+    return cast(str, _load_mlx_export_rounding_repair_receipt(root)["to_export_rounding"])
+
+
+def _ensure_mlx_export_rounding_repair_receipt(
+    root: Path,
+    *,
+    plan: Mapping[str, object],
+    state: Mapping[str, object],
+    checkpoint: Path,
+) -> dict[str, Any] | None:
+    contract = _export_rounding_contract(plan)
+    if contract == TATARA_EXPORT_ROUNDING:
+        return None
+    if contract != LEGACY_EXPORT_ROUNDING:
+        raise ValueError("QAT export rounding contract changed")
+    path = root / "receipts" / "mlx-export-rounding-repair-v1.json"
+    if path.is_file() and not path.is_symlink():
+        return _load_mlx_export_rounding_repair_receipt(root)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError("partial MLX export rounding repair receipt requires inspection")
+    failure = state.get("failure")
+    if not isinstance(failure, dict) or failure.get("kind") != "ValueError":
+        raise ValueError("legacy rounding run requires its recorded native parity failure")
+    message = failure.get("message")
+    if not isinstance(message, str) or not message.startswith(
+        "MLX integer reference differs from the exported native network:"
+    ):
+        raise ValueError("legacy rounding run did not stop at the approved native parity gate")
+    manifest_path = checkpoint / "manifest.json"
+    manifest = _strict_json(manifest_path.read_bytes(), label="MLX repair checkpoint manifest")
+    model_identity = manifest.get("model_file")
+    optimizer_identity = manifest.get("optimizer_file")
+    if not isinstance(model_identity, dict) or not isinstance(optimizer_identity, dict):
+        raise ValueError("MLX export rounding repair checkpoint identity is incomplete")
+    model_path = checkpoint / cast(str, model_identity["name"])
+    optimizer_path = checkpoint / cast(str, optimizer_identity["name"])
+    if model_identity.get("sha256") != _sha256_file(model_path) or optimizer_identity.get(
+        "sha256"
+    ) != _sha256_file(optimizer_path):
+        raise ValueError("MLX export rounding repair checkpoint artifacts changed")
+    optimizer_step = int(cast(dict[str, Any], manifest["optimizer"])["step"])
+    export = root / "exports" / f"{DEFAULT_NET_ID}-mlx-step-{optimizer_step:08d}"
+    export_receipt_path = export / "receipt.json"
+    export_receipt = _strict_json(
+        export_receipt_path.read_bytes(), label="failed MLX export receipt"
+    )
+    if (
+        export_receipt.get("schema") != "meteo-nagisa-mlx-yaneuraou-export-v1"
+        or export_receipt.get("optimizer_step") != optimizer_step
+        or export_receipt.get("checkpoint_model_sha256") != model_identity.get("sha256")
+    ):
+        raise ValueError("failed MLX export does not match the rounding repair checkpoint")
+    source_export: dict[str, object] = {
+        "receipt_sha256": _sha256_file(export_receipt_path),
+    }
+    for filename in ("network.bin", "nn.bin"):
+        artifact = export / filename
+        if not artifact.is_file() or artifact.is_symlink():
+            raise ValueError(f"failed MLX export artifact is not regular: {artifact}")
+        source_export[f"{filename}_sha256"] = _sha256_file(artifact)
+    receipt: dict[str, Any] = {
+        "schema": MLX_EXPORT_ROUNDING_REPAIR_SCHEMA,
+        "complete": True,
+        "created_unix": time.time(),
+        "source_mlx_plan_sha256": _sha256_file(root / "mlx-plan.json"),
+        "from_export_rounding": LEGACY_EXPORT_ROUNDING,
+        "to_export_rounding": TATARA_EXPORT_ROUNDING,
+        "reason": "qa127_float32_half_boundary_differs_from_rust_f64_export_rounding",
+        "repair": {
+            "forward": "FastTwoSum residual plus Rust half-away-from-zero decision",
+            "backward": "straight-through scale gradient",
+            "approved_scales": [64, 127, 8128],
+        },
+        "source_files": _rounding_repair_source_files(),
+        "source_checkpoint": {
+            "optimizer_step": optimizer_step,
+            "manifest_sha256": _sha256_file(manifest_path),
+            "model_sha256": model_identity["sha256"],
+            "optimizer_sha256": optimizer_identity["sha256"],
+        },
+        "source_export": source_export,
+        "original_failure": dict(failure),
+        "model_or_optimizer_values_changed": False,
+        "local_only": True,
+    }
+    _write_new(path, _json_bytes(receipt), mode=0o600)
+    _fsync_directory(path.parent)
+    return receipt
+
+
+def _ensure_mlx_numeric_repair_receipt(
+    root: Path,
+    *,
+    plan: Mapping[str, object],
+    state: Mapping[str, object],
+    checkpoint: Path,
+) -> dict[str, Any] | None:
+    contract = _qat_feature_accumulation_contract(plan)
+    if contract == QAT_FEATURE_ACCUMULATION:
+        return None
+    if contract != LEGACY_QAT_FEATURE_ACCUMULATION:
+        raise ValueError("QAT feature accumulation contract changed")
+    path = root / "receipts" / "mlx-numeric-repair-v1.json"
+    if path.is_file() and not path.is_symlink():
+        return _load_mlx_numeric_repair_receipt(root)
+    if path.exists() or path.is_symlink():
+        raise FileExistsError("partial MLX numeric repair receipt requires inspection")
+    failure = state.get("failure")
+    if not isinstance(failure, dict) or failure.get("kind") != "ValueError":
+        raise ValueError("legacy FP16 run requires its recorded numeric audit failure")
+    message = failure.get("message")
+    if not isinstance(message, str) or not message.startswith(
+        "FP16 feature accumulation differs from the exported native network:"
+    ):
+        raise ValueError("legacy FP16 run did not stop at the approved numeric repair gate")
+    manifest_path = checkpoint / "manifest.json"
+    manifest = _strict_json(manifest_path.read_bytes(), label="MLX repair checkpoint manifest")
+    model_identity = manifest.get("model_file")
+    optimizer_identity = manifest.get("optimizer_file")
+    if not isinstance(model_identity, dict) or not isinstance(optimizer_identity, dict):
+        raise ValueError("MLX repair checkpoint has no model/optimizer identities")
+    model_path = checkpoint / cast(str, model_identity["name"])
+    optimizer_path = checkpoint / cast(str, optimizer_identity["name"])
+    if model_identity.get("sha256") != _sha256_file(model_path) or optimizer_identity.get(
+        "sha256"
+    ) != _sha256_file(optimizer_path):
+        raise ValueError("MLX repair checkpoint artifacts no longer match their manifest")
+    receipt: dict[str, Any] = {
+        "schema": MLX_NUMERIC_REPAIR_SCHEMA,
+        "complete": True,
+        "created_unix": time.time(),
+        "source_mlx_plan_sha256": _sha256_file(root / "mlx-plan.json"),
+        "from_feature_accumulation": LEGACY_QAT_FEATURE_ACCUMULATION,
+        "to_feature_accumulation": QAT_FEATURE_ACCUMULATION,
+        "reason": "generation_8_fp16_forward_failed_native_probability_parity_gate",
+        "repair": {
+            "forward": "fused Metal int32 sparse FT accumulation",
+            "vjp": "FP16 scatter-add straight-through gradient",
+            "independent_reference": "ordinary MLX float32 sparse FT accumulation",
+        },
+        "source_checkpoint": {
+            "path": str(checkpoint),
+            "optimizer_step": cast(dict[str, Any], manifest["optimizer"])["step"],
+            "manifest_sha256": _sha256_file(manifest_path),
+            "model_sha256": model_identity["sha256"],
+            "optimizer_sha256": optimizer_identity["sha256"],
+        },
+        "original_failure": dict(failure),
+        "model_or_optimizer_values_changed": False,
+        "local_only": True,
+    }
+    _write_new(path, _json_bytes(receipt), mode=0o600)
+    _fsync_directory(path.parent)
+    return receipt
+
+
 def _quantisation_schedule_from_plan(plan: Mapping[str, object]) -> QuantisationSchedule:
     if plan.get("schema") != MLX_BACKEND_PLAN_SCHEMA:
         raise ValueError("legacy float-only MLX plans cannot silently resume under QAT code")
@@ -1489,8 +1832,16 @@ def _quantisation_schedule_from_plan(plan: Mapping[str, object]) -> Quantisation
         raise ValueError("QAT deployment graph contract changed")
     if numerics.get("warmup_forward") != "ft_float16_dense_float32":
         raise ValueError("QAT warm-up precision contract changed")
-    if numerics.get("qat_feature_accumulation") != "float16_audited_against_float32_reference":
+    if numerics.get("qat_feature_accumulation") not in {
+        LEGACY_QAT_FEATURE_ACCUMULATION,
+        QAT_FEATURE_ACCUMULATION,
+    }:
         raise ValueError("QAT feature accumulation contract changed")
+    if _export_rounding_contract(plan) not in {
+        LEGACY_EXPORT_ROUNDING,
+        TATARA_EXPORT_ROUNDING,
+    }:
+        raise ValueError("QAT export rounding contract changed")
     return QuantisationSchedule(
         warmup_optimizer_steps=int(cast(int, numerics["warmup_optimizer_steps"]))
     )
@@ -1675,7 +2026,8 @@ def prepare_mlx_backend(
             "warmup_presentations": DEFAULT_QUANTISATION_WARMUP_STEPS * batch_size,
             "warmup_forward": "ft_float16_dense_float32",
             "deployment_graph": "tatara_yaneuraou_integer_equivalent_ste",
-            "qat_feature_accumulation": "float16_audited_against_float32_reference",
+            "qat_feature_accumulation": QAT_FEATURE_ACCUMULATION,
+            "export_rounding": TATARA_EXPORT_ROUNDING,
             "master_weight_precision": "float32",
             "qa": int(QUANTISATION_QA),
             "qb": int(QUANTISATION_QB),
@@ -2031,6 +2383,143 @@ def _distribution_summary(values: NDArray[np.float64]) -> dict[str, float]:
     }
 
 
+def _rounding_and_range_summary(
+    values: NDArray[np.float64],
+    *,
+    scale: float,
+    minimum_raw: float,
+    maximum_raw: float,
+) -> dict[str, object]:
+    """Describe master-weight distance from one deployed integer tensor."""
+
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("weight audit requires finite non-empty tensors")
+    raw = values * scale
+    rounded = np.rint(raw)
+    below = rounded < minimum_raw
+    above = rounded > maximum_raw
+    out_of_range = below | above
+    clipped = np.clip(rounded, minimum_raw, maximum_raw)
+    residual = np.abs(raw - clipped)
+    count = int(raw.size)
+    return {
+        "elements": count,
+        "scale": scale,
+        "representable_raw": [minimum_raw, maximum_raw],
+        "representable_float": [minimum_raw / scale, maximum_raw / scale],
+        "master_minimum": float(values.min()),
+        "master_maximum": float(values.max()),
+        "below_range_elements": int(below.sum()),
+        "above_range_elements": int(above.sum()),
+        "out_of_range_elements": int(out_of_range.sum()),
+        "out_of_range_fraction": float(out_of_range.mean()),
+        "mean_absolute_raw_rounding_or_clipping_residual": float(residual.mean()),
+        "p99_absolute_raw_rounding_or_clipping_residual": float(np.quantile(residual, 0.99)),
+        "maximum_absolute_raw_rounding_or_clipping_residual": float(residual.max()),
+    }
+
+
+def audit_mlx_master_weight_ranges(checkpoint: Path) -> dict[str, object]:
+    """Audit a checkpoint without changing its weights, optimizer, or run state.
+
+    The effective HalfKA transformer and merged L1 weights are audited because
+    those are the tensors actually quantised by the exporter.  This avoids the
+    false comfort of inspecting factoriser branches independently.
+    """
+
+    requested = checkpoint.expanduser()
+    if requested.is_symlink():
+        raise ValueError("MLX checkpoint must be a regular directory")
+    source = requested.resolve(strict=True)
+    if not source.is_dir():
+        raise ValueError("MLX checkpoint must be a regular directory")
+    manifest = _strict_json((source / "manifest.json").read_bytes(), label="MLX manifest")
+    if manifest.get("schema") != MLX_CHECKPOINT_SCHEMA or manifest.get("complete") is not True:
+        raise ValueError("MLX checkpoint has no valid complete marker")
+    identity = cast(dict[str, Any], manifest["model_file"])
+    model_path = source / cast(str, identity["name"])
+    if (
+        not model_path.is_file()
+        or model_path.is_symlink()
+        or model_path.stat().st_size != int(cast(int, identity["bytes"]))
+        or _sha256_file(model_path) != cast(str, identity["sha256"])
+    ):
+        raise ValueError("MLX checkpoint model identity does not match its manifest")
+    loaded = mx.load(model_path)
+    if not isinstance(loaded, dict):
+        raise TypeError("MLX model safetensors did not load as a tensor mapping")
+    arrays = cast(dict[str, mx.array], loaded)
+    if tuple(sorted(arrays)) != tuple(sorted(MODEL_KEYS)):
+        raise ValueError("MLX model checkpoint parameter names do not match the architecture")
+    numpy_arrays = {key: np.asarray(value, dtype=np.float64) for key, value in arrays.items()}
+    effective_ft = numpy_arrays["ft_real"] + np.tile(numpy_arrays["ft_virtual"], (45, 1))
+    merged_l1_w = numpy_arrays["l1_w"] + np.swapaxes(numpy_arrays["l1f_w"], 0, 1)[None, :, :]
+    merged_l1_b = numpy_arrays["l1_b"] + numpy_arrays["l1f_b"][None, :]
+    audited = {
+        "effective_ft_w": _rounding_and_range_summary(
+            effective_ft,
+            scale=QUANTISATION_QA,
+            minimum_raw=-32_768.0,
+            maximum_raw=32_767.0,
+        ),
+        "ft_b": _rounding_and_range_summary(
+            numpy_arrays["ft_b"],
+            scale=QUANTISATION_QA,
+            minimum_raw=-32_768.0,
+            maximum_raw=32_767.0,
+        ),
+        "merged_l1_w": _rounding_and_range_summary(
+            merged_l1_w,
+            scale=QUANTISATION_QB,
+            minimum_raw=-128.0,
+            maximum_raw=127.0,
+        ),
+        "merged_l1_b": _rounding_and_range_summary(
+            merged_l1_b,
+            scale=QUANTISATION_BIAS_SCALE,
+            minimum_raw=-2_147_483_648.0,
+            maximum_raw=2_147_483_647.0,
+        ),
+        "l2_w": _rounding_and_range_summary(
+            numpy_arrays["l2_w"],
+            scale=QUANTISATION_QB,
+            minimum_raw=-128.0,
+            maximum_raw=127.0,
+        ),
+        "l2_b": _rounding_and_range_summary(
+            numpy_arrays["l2_b"],
+            scale=QUANTISATION_BIAS_SCALE,
+            minimum_raw=-2_147_483_648.0,
+            maximum_raw=2_147_483_647.0,
+        ),
+        "l3_w": _rounding_and_range_summary(
+            numpy_arrays["l3_w"],
+            scale=QUANTISATION_QB,
+            minimum_raw=-128.0,
+            maximum_raw=127.0,
+        ),
+        "l3_b": _rounding_and_range_summary(
+            numpy_arrays["l3_b"],
+            scale=QUANTISATION_BIAS_SCALE,
+            minimum_raw=-2_147_483_648.0,
+            maximum_raw=2_147_483_647.0,
+        ),
+    }
+    out_of_range = sum(cast(int, summary["out_of_range_elements"]) for summary in audited.values())
+    elements = sum(cast(int, summary["elements"]) for summary in audited.values())
+    return {
+        "schema": "meteo-nagisa-mlx-master-range-audit-v1",
+        "checkpoint": str(source),
+        "checkpoint_model_sha256": identity["sha256"],
+        "read_only": True,
+        "factoriser_audit": "effective_ft_and_merged_l1_after_combining_virtual_branches",
+        "out_of_range_elements": out_of_range,
+        "audited_elements": elements,
+        "out_of_range_fraction": out_of_range / elements,
+        "tensors": audited,
+    }
+
+
 def _wrm_probability_numpy(
     centipawns: NDArray[np.float64],
     *,
@@ -2074,8 +2563,8 @@ def audit_quantised_distribution(
     Float-master versus integer output drift remains useful diagnostic data,
     but it is not the acceptance criterion: training optimises the STE
     deployment graph.  Acceptance instead compares (1) the high-fidelity MLX
-    integer reference and (2) the faster FP16-FT QAT graph against the native
-    Rust evaluator that reads the actual exported network.
+    integer reference and (2) the fused int32-forward QAT graph against the
+    native Rust evaluator that reads the actual exported network.
     """
 
     if positions < 1 or batch_size < 1 or positions % batch_size:
@@ -2105,9 +2594,7 @@ def audit_quantised_distribution(
             reference_output = model.quantised_reference_forward(stm, nstm, nnz, buckets)
             training_output = model.quantisation_aware_forward(stm, nstm, nnz, buckets)
             mx.eval(float_output, reference_output, training_output)
-            float_parts.append(
-                np.asarray(float_output, dtype=np.float64) * parameters.nnue2score
-            )
+            float_parts.append(np.asarray(float_output, dtype=np.float64) * parameters.nnue2score)
             reference_parts.append(
                 np.asarray(reference_output, dtype=np.float64) * parameters.nnue2score
             )
@@ -2163,21 +2650,13 @@ def audit_quantised_distribution(
     reference_error = _probability_error_summary(reference_probability, quantised_probability)
     training_error = _probability_error_summary(training_probability, quantised_probability)
     float_drift = _probability_error_summary(float_probability, quantised_probability)
-    if (
-        reference_error["maximum_absolute"] > 3.0e-3
-        or reference_error["p99_absolute"] > 1.0e-4
-    ):
+    if reference_error["maximum_absolute"] > 3.0e-3 or reference_error["p99_absolute"] > 1.0e-4:
         raise ValueError(
-            "MLX integer reference differs from the exported native network: "
-            f"{reference_error}"
+            f"MLX integer reference differs from the exported native network: {reference_error}"
         )
-    if (
-        training_error["maximum_absolute"] > 5.0e-3
-        or training_error["p99_absolute"] > 5.0e-4
-    ):
+    if training_error["maximum_absolute"] > 5.0e-3 or training_error["p99_absolute"] > 5.0e-4:
         raise ValueError(
-            "FP16 feature accumulation differs from the exported native network: "
-            f"{training_error}"
+            f"training QAT accumulation differs from the exported native network: {training_error}"
         )
     residual_cp = quantised_cp - float_cp
     reference_residual_cp = quantised_cp - reference_cp
@@ -2198,9 +2677,7 @@ def audit_quantised_distribution(
     if reference_std > 1e-9 and quantised_std > 1e-9:
         correlation = float(np.corrcoef(reference_cp, quantised_cp)[0, 1])
         regression_slope = float(
-            np.mean(
-                (reference_cp - reference_cp.mean()) * (quantised_cp - quantised_cp.mean())
-            )
+            np.mean((reference_cp - reference_cp.mean()) * (quantised_cp - quantised_cp.mean()))
             / np.var(reference_cp)
         )
     decisive = np.abs(reference_cp) >= 100.0
@@ -2209,6 +2686,9 @@ def audit_quantised_distribution(
     )
     return {
         "schema": "meteo-nagisa-mlx-quantisation-audit-v2",
+        "qat_feature_accumulation_implementation": QAT_FEATURE_ACCUMULATION,
+        "export_rounding_implementation": TATARA_EXPORT_ROUNDING,
+        "qat_gradient_accumulation": "fp16_scatter_add_vjp",
         "positions": positions,
         "quantization_gain": 127 * 64,
         "yaneuraou_fv_scale": fv_scale,
@@ -2680,11 +3160,7 @@ def _download_mlx_source_with_progress(
 
 
 def _cached_source_shard_count(cache: Path) -> int:
-    return sum(
-        1
-        for path in cache.glob("split_*.bin")
-        if path.is_file() and not path.is_symlink()
-    )
+    return sum(1 for path in cache.glob("split_*.bin") if path.is_file() and not path.is_symlink())
 
 
 def _start_source_prefetch(
@@ -2764,6 +3240,43 @@ def _source_probe_receipt(root: Path, shard: PublicPsvShard, cached: Path) -> di
     return source_receipt
 
 
+def _release_consumed_source_cache(root: Path, shard: PublicPsvShard) -> bool:
+    """Delete exactly one receipted shard after its superbatch is durable."""
+
+    cache = (root / "cache").resolve(strict=True)
+    cached = cache / shard.filename
+    if not cached.exists() and not cached.is_symlink():
+        return False
+    if cached.is_symlink() or not cached.is_file() or cached.parent.resolve(strict=True) != cache:
+        raise ValueError(f"consumed source cache target is not a regular child: {cached}")
+    if cached.stat().st_size != shard.byte_size:
+        raise ValueError(f"consumed source cache size changed before release: {cached}")
+    receipt_path = root / "receipts" / f"source-{shard.sha256}.json"
+    if not receipt_path.is_file() or receipt_path.is_symlink():
+        raise ValueError(f"consumed source cache has no regular source receipt: {cached}")
+    receipt = _strict_json(receipt_path.read_bytes(), label="MLX source probe receipt")
+    probe = receipt.get("probe")
+    if (
+        receipt.get("schema") != "meteo-nagisa-source-probe-v1"
+        or receipt.get("source") != shard.to_dict()
+        or not isinstance(probe, dict)
+        or probe.get("bytes") != shard.byte_size
+        or probe.get("records") != shard.records
+        or probe.get("sha256") != shard.sha256
+    ):
+        raise ValueError(f"consumed source cache receipt does not match: {cached}")
+    cached.unlink()
+    _fsync_directory(cache)
+    _log_mlx_event(
+        root,
+        "source_cache_released",
+        source=shard.filename,
+        free_storage_bytes=shutil.disk_usage(root).free,
+        cached_source_shards=_cached_source_shard_count(cache),
+    )
+    return True
+
+
 def _remove_partial_mlx_stages(root: Path) -> list[str]:
     removed: list[str] = []
     token = f".{DEFAULT_NET_ID}-mlx-step-"
@@ -2801,6 +3314,7 @@ def _validate_checkpoint_reload(
 ) -> tuple[MeteoValueNnue, TataraRanger, dict[str, object]]:
     mlx_plan = load_mlx_plan(root)
     modes: tuple[ModelForwardMode, ...]
+    active: NumericPhase | None = None
     if mlx_plan.get("schema") == MLX_BACKEND_PLAN_SCHEMA:
         step = int(
             cast(
@@ -2835,10 +3349,7 @@ def _validate_checkpoint_reload(
         for mode in expected
     }
     differences = {
-        mode: max(
-            abs(a - b)
-            for a, b in zip(expected[mode], observed[mode], strict=True)
-        )
+        mode: max(abs(a - b) for a, b in zip(expected[mode], observed[mode], strict=True))
         for mode in expected
     }
     maximum_difference = max(differences.values())
@@ -2846,6 +3357,19 @@ def _validate_checkpoint_reload(
         raise ValueError(
             f"published MLX checkpoint changed evaluation after reload: {maximum_difference}"
         )
+    qat_reference_max_abs_difference: float | None = None
+    if active == "quantisation_aware":
+        stm, nstm, nnz, buckets, _ = reference_batch.mlx()
+        qat_output = model.quantisation_aware_forward(stm, nstm, nnz, buckets)
+        reference_output = model.quantised_reference_forward(stm, nstm, nnz, buckets)
+        difference = mx.max(mx.abs(qat_output - reference_output))
+        mx.eval(difference)
+        qat_reference_max_abs_difference = float(difference.item())
+        if qat_reference_max_abs_difference > 1.0e-7:
+            raise ValueError(
+                "checkpoint QAT forward differs from its independent float32 reference: "
+                f"{qat_reference_max_abs_difference}"
+            )
     _log_mlx_event(
         root,
         "checkpoint_reload_verified",
@@ -2853,6 +3377,7 @@ def _validate_checkpoint_reload(
         optimizer_step=int(optimizer.state["step"].item()),
         evaluation_max_abs_difference=maximum_difference,
         evaluation_max_abs_difference_by_forward_mode=differences,
+        qat_reference_max_abs_difference=qat_reference_max_abs_difference,
     )
     return model, optimizer, manifest
 
@@ -3105,6 +3630,7 @@ def run_mlx_backend(
     old_sigterm = signal.signal(signal.SIGTERM, request_signal_stop)
     try:
         with _exclusive_run_lock(root):
+            state = load_mlx_state(root)
             removed_stages = _remove_partial_mlx_stages(root)
             if removed_stages:
                 _log_mlx_event(root, "partial_stages_removed", paths=removed_stages)
@@ -3158,6 +3684,34 @@ def run_mlx_backend(
                     teacher_nnue_weights_copied=False,
                 )
             else:
+                repair = _ensure_mlx_numeric_repair_receipt(
+                    root,
+                    plan=mlx_plan,
+                    state=state,
+                    checkpoint=latest,
+                )
+                if repair is not None:
+                    _log_mlx_event(
+                        root,
+                        "numeric_repair_verified",
+                        from_feature_accumulation=repair["from_feature_accumulation"],
+                        to_feature_accumulation=repair["to_feature_accumulation"],
+                        source_checkpoint=repair["source_checkpoint"],
+                    )
+                rounding_repair = _ensure_mlx_export_rounding_repair_receipt(
+                    root,
+                    plan=mlx_plan,
+                    state=state,
+                    checkpoint=latest,
+                )
+                if rounding_repair is not None:
+                    _log_mlx_event(
+                        root,
+                        "export_rounding_repair_verified",
+                        from_export_rounding=rounding_repair["from_export_rounding"],
+                        to_export_rounding=rounding_repair["to_export_rounding"],
+                        source_checkpoint=rounding_repair["source_checkpoint"],
+                    )
                 manifest = _strict_json(
                     (latest / "manifest.json").read_bytes(), label="MLX manifest"
                 )
@@ -3197,9 +3751,9 @@ def run_mlx_backend(
             # receipt/export, finish that transaction before reading new data.
             if completed > 0:
                 previous = schedule[completed - 1]
+                previous_shard = shards[cast(str, previous["filename"])]
                 previous_receipt = root / "receipts" / f"mlx-superbatch-{completed:04d}.json"
                 if not previous_receipt.is_file():
-                    previous_shard = shards[cast(str, previous["filename"])]
                     export, _ = _finalize_mlx_segment(
                         root,
                         common=common,
@@ -3213,6 +3767,7 @@ def run_mlx_backend(
                     )
                     _set_mlx_state(root, state, latest_export=str(export))
                     _prune_mlx_exports(root / "exports", keep=2)
+                _release_consumed_source_cache(root, previous_shard)
             schedule_index, _, batch_offset = _coordinate_for_step(schedule, optimizer_step)
             if schedule_index == len(schedule):
                 _set_mlx_state(root, state, status="complete", pid=None)
@@ -3472,15 +4027,7 @@ def run_mlx_backend(
                     },
                 )
                 _prune_mlx_exports(root / "exports", keep=2)
-                cached.unlink()
-                _fsync_directory(cached.parent)
-                _log_mlx_event(
-                    root,
-                    "source_cache_released",
-                    source=shard.filename,
-                    free_storage_bytes=shutil.disk_usage(root).free,
-                    cached_source_shards=_cached_source_shard_count(cached.parent),
-                )
+                _release_consumed_source_cache(root, shard)
                 schedule_index += 1
                 batch_offset = 0
             _set_mlx_state(root, state, status="complete", pid=None)

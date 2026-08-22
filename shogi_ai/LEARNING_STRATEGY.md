@@ -1,6 +1,6 @@
 # Meteo 学習戦略
 
-更新: 2026-08-12
+更新: 2026-08-13
 
 この文書は、Meteoの主学習経路と比較実験を区別する運用契約です。実装が存在すること、receiptが
 揃うこと、optimizerが実際に動くこと、棋力が改善することを別々に記録します。機械可読な同一契約は
@@ -34,13 +34,17 @@ Move16=0から架空のpolicyを生成しません。公開corpusの旧scalarは
 
 目標は1000億の`cumulative_presentations`です。`datasets_1`の一意source 49,594,855,063局面を
 2周し、残りを3周目から読むので、1000億の一意局面を持つという意味ではありません。source unique、
-学習から除外したheld-out、累計提示数を別々に保存します。1 shardだけをstream cacheに置き、完了後に
-削除し、checkpoint/exportは最新と直前だけ保持します。
+学習から除外したheld-out、累計提示数を別々に保存します。現在shardと次のprefetch shardだけを
+stream cacheに置き、完了後に削除し、checkpoint/exportは最新と直前だけ保持します。
 
 本番optimizerはクラウドGPUを使わず、Apple M4 ProのMLXで実行します。CPUは固定Tatara実装を使って
 PSVをbit-exactにdecodeし、HalfKA_hm2特徴とprogress bucketを生成します。MLXは同じNAGISA互換構造の
 順伝播・WRM loss・Ranger更新だけを担当します。合成probeの速度は実データstream、初回compile、
 checkpoint、量子化exportを含まないため、本番ETAは実測throughputから更新します。
+
+このbootstrap完走後のvalue-only強化学習、Meteo自己対局、3教師との完全対局、共通再解析、
+replay、構造比較、promotion、解析/対人配備の正本は
+[`POST_100B_ROADMAP.md`](POST_100B_ROADMAP.md)です。
 
 ## 旧Policy+Value比較経路
 

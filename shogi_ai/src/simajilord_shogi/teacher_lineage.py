@@ -25,13 +25,9 @@ class CorpusReuseDecision(StrEnum):
     VALUE_ONLY_LOADER_AND_PERMISSION_REQUIRED = "value_only_loader_and_permission_required"
     QSEARCH_RELABEL_AND_STORAGE_REQUIRED = "qsearch_relabel_and_storage_required"
     LOCAL_ONLY_POSITION_RELABEL_REQUIRED = "local_only_position_relabel_required"
-    GATED_ACCESS_PERMISSION_AND_PROBE_REQUIRED = (
-        "gated_access_permission_and_probe_required"
-    )
+    GATED_ACCESS_PERMISSION_AND_PROBE_REQUIRED = "gated_access_permission_and_probe_required"
     GAME_REPLAY_RELABEL_REQUIRED = "game_replay_relabel_required"
-    GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED = (
-        "game_replay_relabel_and_permission_required"
-    )
+    GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED = "game_replay_relabel_and_permission_required"
     SOURCE_DOCUMENTATION_ONLY = "source_documentation_only"
 
 
@@ -193,8 +189,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
             "board_decode": "valid",
             "score_range": [-4858, 32000],
             "conclusion": (
-                "direct local-only scalar target for NAGISA-style value NNUE; "
-                "no policy target"
+                "direct local-only scalar target for NAGISA-style value NNUE; no policy target"
             ),
         },
         seed_sampling_scope=CorpusSeedSamplingScope.USER_ATTESTED_LOCAL_ONLY,
@@ -219,9 +214,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=True,
         license_id=None,
         license_evidence_url=None,
-        reuse_decision=(
-            CorpusReuseDecision.GATED_ACCESS_PERMISSION_AND_PROBE_REQUIRED
-        ),
+        reuse_decision=(CorpusReuseDecision.GATED_ACCESS_PERMISSION_AND_PROBE_REQUIRED),
         required_before_training=(
             "obtain Hugging Face manual-gate access without recording an access token",
             "obtain or record an explicit local-use and derived-checkpoint rights statement",
@@ -347,9 +340,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=False,
         license_id=None,
         license_evidence_url=None,
-        reuse_decision=(
-            CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED
-        ),
+        reuse_decision=(CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED),
         required_before_training=(
             "obtain an explicit reuse statement for the externally hosted game archives",
             "pin every selected archive by URL, byte count, and SHA-256 because the "
@@ -392,9 +383,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=False,
         license_id=None,
         license_evidence_url=None,
-        reuse_decision=(
-            CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED
-        ),
+        reuse_decision=(CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED),
         required_before_training=(
             "keep handicap rule classes separate and use even-game records only for the "
             "current standard-shogi Meteo model",
@@ -432,9 +421,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=False,
         license_id=None,
         license_evidence_url=None,
-        reuse_decision=(
-            CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED
-        ),
+        reuse_decision=(CorpusReuseDecision.GAME_REPLAY_RELABEL_AND_PERMISSION_REQUIRED),
         required_before_training=(
             "exclude games 0 through 100028 from neural-teacher claims",
             "preserve requested and realized rook-file conditioning as group metadata",
@@ -460,8 +447,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         corpus_id="nodchip-tanuki-nnue-pytorch-2024-07-30.1",
         name="tanuki-.nnue-pytorch-2024-07-30.1 training positions",
         repository_url=(
-            "https://huggingface.co/datasets/nodchip/"
-            "tanuki-.nnue-pytorch-2024-07-30.1"
+            "https://huggingface.co/datasets/nodchip/tanuki-.nnue-pytorch-2024-07-30.1"
         ),
         revision="59fd246d3f85d51707a62c89531564a1a8aeb793",
         repository_bytes=320_002_295_568,
@@ -474,8 +460,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=False,
         license_id="MIT",
         license_evidence_url=(
-            "https://huggingface.co/datasets/nodchip/"
-            "tanuki-.nnue-pytorch-2024-07-30.1"
+            "https://huggingface.co/datasets/nodchip/tanuki-.nnue-pytorch-2024-07-30.1"
         ),
         reuse_decision=CorpusReuseDecision.QSEARCH_RELABEL_AND_STORAGE_REQUIRED,
         required_before_training=(
@@ -532,9 +517,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         qsearch_leaf=True,
         deduplicated=False,
         license_id="MIT",
-        license_evidence_url=(
-            "https://huggingface.co/datasets/nodchip/shogi_suisho5_depth9"
-        ),
+        license_evidence_url=("https://huggingface.co/datasets/nodchip/shogi_suisho5_depth9"),
         reuse_decision=CorpusReuseDecision.QSEARCH_RELABEL_AND_STORAGE_REQUIRED,
         required_before_training=(
             "sample the direct shuffled.bin validation file without downloading the 7z set",
@@ -559,8 +542,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         corpus_id="nodchip-shogi-suisho5-depth9-entering-king",
         name="Suisho5 depth-9 entering-king positions",
         repository_url=(
-            "https://huggingface.co/datasets/nodchip/"
-            "shogi_suisho5_depth9_entering_king"
+            "https://huggingface.co/datasets/nodchip/shogi_suisho5_depth9_entering_king"
         ),
         revision="441f149296686876853a355eaeac1b482d3b206e",
         repository_bytes=20_000_245_181,
@@ -573,8 +555,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         deduplicated=False,
         license_id="MIT",
         license_evidence_url=(
-            "https://huggingface.co/datasets/nodchip/"
-            "shogi_suisho5_depth9_entering_king"
+            "https://huggingface.co/datasets/nodchip/shogi_suisho5_depth9_entering_king"
         ),
         reuse_decision=CorpusReuseDecision.QSEARCH_RELABEL_AND_STORAGE_REQUIRED,
         required_before_training=(
@@ -600,9 +581,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
     PublicCorpusLineage(
         corpus_id="suishopsv-150m-public",
         name="Suisho5 2M-nodes-per-move game positions, about 150M PSV",
-        repository_url=(
-            "https://drive.google.com/file/d/1R9kI3xDKeoIjyFPD0RS6K-1wwcko75fr/view"
-        ),
+        repository_url=("https://drive.google.com/file/d/1R9kI3xDKeoIjyFPD0RS6K-1wwcko75fr/view"),
         revision=None,
         repository_bytes=None,
         data_bytes=None,
@@ -628,9 +607,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
     PublicCorpusLineage(
         corpus_id="suisho10mn-100m-public",
         name="Suisho5 10M-nodes-per-position, about 100M PSV",
-        repository_url=(
-            "https://drive.google.com/drive/folders/19Al69YMkJ_cXSBhtn8df9yfxhn8QFCYo"
-        ),
+        repository_url=("https://drive.google.com/drive/folders/19Al69YMkJ_cXSBhtn8df9yfxhn8QFCYo"),
         revision=None,
         repository_bytes=None,
         data_bytes=None,
@@ -663,16 +640,12 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         data_bytes=None,
         position_records=None,
         record_format="HCPE and HCPE3 xz shards with generation-specific contracts",
-        label_capability=(
-            "game outcome, scalar value, and for HCPE3 an MCTS visit distribution"
-        ),
+        label_capability=("game outcome, scalar value, and for HCPE3 an MCTS visit distribution"),
         policy_target_available=True,
         qsearch_leaf=False,
         deduplicated=None,
         license_id="publisher-public-training-use-statement",
-        license_evidence_url=(
-            "https://tadaoyamaoka.hatenablog.com/entry/2021/05/06/223701"
-        ),
+        license_evidence_url=("https://tadaoyamaoka.hatenablog.com/entry/2021/05/06/223701"),
         reuse_decision=CorpusReuseDecision.GAME_REPLAY_RELABEL_REQUIRED,
         required_before_training=(
             "inventory every mutable Drive shard by path, bytes, SHA-256, format, and generation",
@@ -701,9 +674,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         qsearch_leaf=None,
         deduplicated=None,
         license_id="QPD-attribution-terms-2021-11-23",
-        license_evidence_url=(
-            "https://github.com/qhapaq-49/qhapaq-bin/releases/tag/dataset"
-        ),
+        license_evidence_url=("https://github.com/qhapaq-49/qhapaq-bin/releases/tag/dataset"),
         reuse_decision=CorpusReuseDecision.QSEARCH_RELABEL_AND_STORAGE_REQUIRED,
         required_before_training=(
             "record QPD use in any competition PR, published evaluation function, or service",
@@ -740,9 +711,7 @@ PUBLIC_CORPORA: tuple[PublicCorpusLineage, ...] = (
         qsearch_leaf=False,
         deduplicated=False,
         license_id="Denryu-game-record-free-use",
-        license_evidence_url=(
-            "https://denryu-sen.jp/denryusen/dr5_hardware3/dr1_live.php"
-        ),
+        license_evidence_url=("https://denryu-sen.jp/denryusen/dr5_hardware3/dr1_live.php"),
         reuse_decision=CorpusReuseDecision.GAME_REPLAY_RELABEL_REQUIRED,
         required_before_training=(
             "record the exact event page, archive hash, rules, and complete-game identity",
@@ -763,7 +732,7 @@ MAIN_TEACHER_LINEAGES: tuple[TeacherTrainingLineage, ...] = (
         teacher_id="nagisa-v3.1",
         name="NAGISA V3.1",
         learner="Tatara",
-        architecture="SFNN HalfKA_hm2 1024 with 9-layer progress stack (local header)",
+        architecture="SFNN HalfKA_hm2 1024x16x64 with LayerStack 9 (official release)",
         direct_teacher_models=("Soujou WCSC36 published teacher-position corpus",),
         corpus_families=("soujou-dlsuisho-nodchip-family",),
         reported_position_count=14_500_000_000,
@@ -772,6 +741,7 @@ MAIN_TEACHER_LINEAGES: tuple[TeacherTrainingLineage, ...] = (
         exact_training_bytes_public=False,
         ensemble_formula_public=None,
         evidence=(
+            "https://github.com/keinoda/YaneuraOu/releases/tag/nagisa-v3.1",
             "https://ngs436.booth.pm/items/8639574",
             "local NAGISA V3.1 archive/header inspection",
         ),
@@ -792,9 +762,7 @@ MAIN_TEACHER_LINEAGES: tuple[TeacherTrainingLineage, ...] = (
         correlation_family="suisho11-three-dl-model-ensemble",
         exact_training_bytes_public=False,
         ensemble_formula_public=False,
-        evidence=(
-            "https://www.apply.computer-shogi.org/wcsc36/appeal/Suisho/appeal2.pdf",
-        ),
+        evidence=("https://www.apply.computer-shogi.org/wcsc36/appeal/Suisho/appeal2.pdf",),
         caveats=(
             "the appeal discloses the three model names but not weights, calibration, "
             "or averaging space",

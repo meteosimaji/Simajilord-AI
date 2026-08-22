@@ -16,9 +16,10 @@ from .distillation_targets import (
     SOUJOU_TSEC7_SCORER_ID,
     SUISHO11PLUS_SCORER_ID,
 )
+from .post_bootstrap import post_bootstrap_roadmap_contract
 from .teacher_value_ensemble import TeacherValueEnsembleMode
 
-LEARNING_STRATEGY_SCHEMA = "meteo-learning-strategy-v2"
+LEARNING_STRATEGY_SCHEMA = "meteo-learning-strategy-v3"
 LIFETIME_POSITIONS_SEEN_TARGET = 100_000_000_000
 
 
@@ -430,4 +431,5 @@ def learning_strategy_contract() -> dict[str, object]:
             "split_by_book_root": True,
             "prioritize_book_exit_positions": True,
         },
+        "post_100b": post_bootstrap_roadmap_contract(),
     }

@@ -9,6 +9,8 @@
 たややん氏／水匠、やねうら王、WCSC公式資料の調査とMeteoへの反映方針は
 [`RESEARCH.md`](RESEARCH.md) に分離して記録します。現在の学習方式、比較arm、receipt gate、
 1,000億局面の累計提示目標は[`LEARNING_STRATEGY.md`](LEARNING_STRATEGY.md)、
+完走後の自己対局・3教師対局・再解析・昇格・解析/対人配備は
+[`POST_100B_ROADMAP.md`](POST_100B_ROADMAP.md)、
 教師の祖先関係・公開局面の再利用可否・水匠11型アンサンブル比較は
 [`TEACHER_LINEAGE.md`](TEACHER_LINEAGE.md)、Hugging Face同一配布者を含む全公開・
 ローカルcorpusの固定revision、bytes、形式probe、重複系譜、利用順は
@@ -68,10 +70,43 @@ uv run simajilord-nnue prepare-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
 uv run simajilord-nnue smoke-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
 uv run simajilord-nnue run-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
 uv run simajilord-nnue status-mlx artifacts/runs/meteo-nagisa-nnue-20260812-v1
+uv run simajilord-nnue audit-mlx-weights artifacts/runs/meteo-nagisa-nnue-20260812-v1/checkpoints/step-XXXXXXXX
 ```
 
 旧Policy+Valueコードは比較・対局・将来の自己対局研究用の互換経路として残しますが、その重みと
 世代成果物は現Meteoの本学習checkpointではありません。
+現NNUE完走後の主経路は旧Policy+Value checkpointへ戻すのではなく、やねうら王探索で作った
+完全対局と深い子局面valueを現value-only NNUEへ戻す経路です。
+
+## 1,000億bootstrap完走後のNNUE実行経路
+
+完走exportは対応やねうら王と一緒にcontent-addressed runtimeへstageし、別プロセスで3回読み込み
+smokeを行います。対局生成は必ず先後反転ペア、`MultiPV=1`、投了・評価値adjudicationなしで、
+詰み・ルール上の千日手・CSARule27入玉宣言まで進めます。`max_plies`打切りは局面源にはできますが、
+強いWDLラベルにはできません。
+
+```bash
+# exportをprivate runtimeへatomic stageし、hashとUSI optionを含めて検証
+uv run simajilord-nnue stage-runtime /path/to/export /path/to/YaneuraOu \
+  /path/to/runtime --profile-id meteo-candidate --threads 1 --hash-mb 64
+uv run simajilord-nnue verify-runtime /path/to/runtime --repeat-load-smoke
+
+# strict JSON configから完全trajectoryと速度receiptをcreate-only生成
+uv run simajilord-nnue-games /path/to/games-config.json /path/to/game-bundle
+
+# NAGISA・水匠11Plus・奏乗の候補和集を、各単一scorer尺度で個別探索
+uv run simajilord-score-matrix /path/to/matrix-config.json /path/to/matrix-receipt.json
+
+# qsearch leaf変換。この時点では古いscoreなので学習不可
+uv run simajilord-nnue qsearch-leaves SOURCE.psv ENGINE ENGINE_CWD QSEARCH_OUTPUT
+```
+
+qsearch後は`rescore_qsearch_leaves()`で単一の固定anchorを使ってleaf自体を再評価します。exactな
+centipawnだけを`ScalarValueLabel`にし、mate・bound・node不足は未解決queueへ分離します。
+`build-incremental-psv`で`Move16=0`のvalue-only PSVにし、完走1,000億checkpointのmodelとRanger optimizerを
+`prepare_incremental_mlx_run()` / `run_incremental_mlx()`で継続します。追加学習はQATフェーズを解除せず、
+広域anchorとexact hard caseを不変の比率で混合します。これらのraw receiptは絶対パスや限定教師の
+出力証拠を含むため`local_only=true` / `publication_allowed=false`です。
 
 ## 旧Policy+Value互換経路でできること
 

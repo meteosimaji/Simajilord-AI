@@ -27,11 +27,11 @@ from rsshogi.core import Board
 
 from .opening_suite import OpeningPosition
 
-LOOP_PLAN_SCHEMA = "meteo-continuous-improvement-plan-v1"
+LOOP_PLAN_SCHEMA = "meteo-continuous-improvement-plan-v2"
 STAGE_RECEIPT_SCHEMA = "meteo-continuous-improvement-stage-v1"
 DATASET_GROWTH_SCHEMA = "meteo-dataset-growth-v1"
 PROMOTION_DECISION_SCHEMA = "meteo-role-gated-promotion-v1"
-LOOP_STATE_SCHEMA = "meteo-continuous-improvement-state-v1"
+LOOP_STATE_SCHEMA = "meteo-continuous-improvement-state-v2"
 
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 _CANDIDATE_ID = "@candidate"
@@ -201,6 +201,7 @@ class Participant:
     role: OpponentRole
     artifact_sha256: str
     display_name: str | None = None
+    minimum_score_lower_95: float | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.participant_id, label="participant_id")
@@ -209,6 +210,18 @@ class Participant:
             raise ValueError(f"participant_id {self.participant_id!r} is reserved")
         if self.display_name is not None:
             _require_identifier(self.display_name, label="participant display_name")
+        if self.minimum_score_lower_95 is not None:
+            if self.role is not OpponentRole.EXTERNAL_TEACHER:
+                raise ValueError(
+                    "opponent-specific score reserve is valid only for an external teacher"
+                )
+            if (
+                not math.isfinite(self.minimum_score_lower_95)
+                or not 0.5 <= self.minimum_score_lower_95 < 1.0
+            ):
+                raise ValueError(
+                    "external-teacher minimum_score_lower_95 must be finite and in [0.5, 1)"
+                )
 
     def to_manifest(self) -> dict[str, object]:
         return {
@@ -216,6 +229,7 @@ class Participant:
             "role": self.role.value,
             "artifact_sha256": self.artifact_sha256,
             "display_name": self.display_name,
+            "minimum_score_lower_95": self.minimum_score_lower_95,
         }
 
 
@@ -648,7 +662,13 @@ def build_generation_plan(
     previous_state_sha256: str | None = None,
     previous_state: dict[str, Any] | None = None,
 ) -> GenerationPlan:
-    """Build a balanced schedule with flat-start training and 1000-game gates."""
+    """Build a balanced schedule with flat-start training and 1000-game gates.
+
+    The append-only state retains metadata for every generation, but only the
+    current champion and the immediately preceding candidate/champion remain
+    playable weight artifacts.  Requiring every ancestor here would contradict
+    the bounded two-generation storage contract.
+    """
 
     if generation < 1 or seed < 0:
         raise ValueError("generation must be positive and seed must be non-negative")
@@ -670,15 +690,42 @@ def build_generation_plan(
         raw_history = previous_state.get("model_history")
         if not isinstance(raw_history, list):
             raise ValueError("previous loop state model_history must be a list")
-        history_digests: list[str] = []
         for item in raw_history:
             if not isinstance(item, dict):
                 raise ValueError("previous model_history contains a non-object entry")
             digest = item.get("artifact_sha256")
             if not isinstance(digest, str):
                 raise ValueError("previous model_history artifact digest is missing")
-            history_digests.append(_require_sha256(digest, label="historical model"))
-        required_historical_artifacts = tuple(sorted(set(history_digests)))
+            _require_sha256(digest, label="historical model metadata")
+        previous_champion = previous_state.get("champion_after")
+        if not isinstance(previous_champion, dict):
+            raise ValueError("previous loop state champion_after is missing")
+        previous_champion_digest = previous_champion.get("artifact_sha256")
+        if not isinstance(previous_champion_digest, str):
+            raise ValueError("previous loop state champion digest is missing")
+        _require_sha256(previous_champion_digest, label="previous champion")
+        if champion.artifact_sha256 != previous_champion_digest:
+            raise ValueError("generation champion does not match previous state champion_after")
+        raw_window = previous_state.get("playable_model_window")
+        if not isinstance(raw_window, list) or not 1 <= len(raw_window) <= 2:
+            raise ValueError("previous playable model window must contain one or two artifacts")
+        playable_digests: list[str] = []
+        for item in raw_window:
+            if not isinstance(item, dict):
+                raise ValueError("previous playable model window contains a non-object entry")
+            digest = item.get("artifact_sha256")
+            if not isinstance(digest, str):
+                raise ValueError("previous playable model digest is missing")
+            playable_digests.append(_require_sha256(digest, label="playable model"))
+        if len(set(playable_digests)) != len(playable_digests):
+            raise ValueError("previous playable model window contains duplicate artifacts")
+        if previous_champion_digest not in playable_digests:
+            raise ValueError("previous champion is absent from the playable model window")
+        required_historical_artifacts = tuple(
+            digest for digest in playable_digests if digest != previous_champion_digest
+        )
+        if len(required_historical_artifacts) > 1:
+            raise ValueError("at most one previous non-champion weight artifact may be retained")
     elif previous_state_sha256 is not None:
         raise ValueError("previous state payload is required to prove all-generation coverage")
     if champion.role is not OpponentRole.CHAMPION:
@@ -704,6 +751,18 @@ def build_generation_plan(
             "missing required opponent roles: "
             + ", ".join(sorted(role.value for role in missing_roles))
         )
+    historical = tuple(
+        participant
+        for participant in participant_tuple
+        if participant.role is OpponentRole.HISTORICAL_METEO
+    )
+    if len(historical) > 1:
+        raise ValueError("at most one retained previous Meteo weight may be scheduled")
+    historical_digests = {participant.artifact_sha256 for participant in historical}
+    if previous_state is not None and historical_digests != set(required_historical_artifacts):
+        raise ValueError(
+            "historical Meteo participants must exactly match the retained playable window"
+        )
     covered_history = {
         participant.artifact_sha256
         for participant in participant_tuple
@@ -712,7 +771,7 @@ def build_generation_plan(
     missing_history = set(required_historical_artifacts) - covered_history
     if missing_history:
         raise ValueError(
-            "not every prior Meteo generation is scheduled for evaluation: "
+            "the retained previous Meteo weight is not scheduled for evaluation: "
             + ", ".join(sorted(missing_history))
         )
 
@@ -1360,11 +1419,25 @@ def evaluate_promotion(
             ):
                 if metric.lower_95 < allowed_regression:
                     blockers.append(f"{color}_external_teacher_regression")
+            target_threshold = plan.config.superiority_threshold
             external_target_beaten = (
-                black.lower_95 > plan.config.superiority_threshold
-                and white.lower_95 > plan.config.superiority_threshold
-                and paired.lower_95 > plan.config.superiority_threshold
+                black.lower_95 > target_threshold
+                and white.lower_95 > target_threshold
+                and paired.lower_95 > target_threshold
             )
+            if participant.minimum_score_lower_95 is not None:
+                target_threshold = participant.minimum_score_lower_95
+                for color, metric in (
+                    ("black", black),
+                    ("white", white),
+                    ("paired", paired),
+                ):
+                    if metric.lower_95 <= target_threshold:
+                        blockers.append(f"{color}_external_target_superiority_not_proven")
+                external_target_beaten = not any(
+                    blocker.endswith("external_target_superiority_not_proven")
+                    for blocker in blockers
+                )
         elif participant.role is OpponentRole.WEAK:
             for color, metric in (("black", black), ("white", white), ("paired", paired)):
                 if metric.lower_95 < plan.config.weak_score_floor:
@@ -1454,7 +1527,6 @@ def build_loop_state(
             **candidate.to_manifest(),
             "generation": plan.generation,
             "promotion_status": "promoted" if decision.promoted else "rejected",
-            "eligible_as_historical_opponent": True,
         }
     )
     champion_after: dict[str, str]
@@ -1465,6 +1537,21 @@ def build_loop_state(
             "candidate_id": plan.champion.participant_id,
             "artifact_sha256": plan.champion.artifact_sha256,
         }
+    previous_champion = {
+        "candidate_id": plan.champion.participant_id,
+        "artifact_sha256": plan.champion.artifact_sha256,
+    }
+    playable_model_window = [candidate.to_manifest()]
+    if candidate.artifact_sha256 != plan.champion.artifact_sha256:
+        playable_model_window.append(previous_champion)
+    retained_digests = {item["artifact_sha256"] for item in playable_model_window}
+    for item in history:
+        digest = item.get("artifact_sha256")
+        retained = isinstance(digest, str) and digest in retained_digests
+        item["weights_retained"] = retained
+        item["eligible_as_historical_opponent"] = (
+            retained and digest != champion_after["artifact_sha256"]
+        )
     return {
         "schema": LOOP_STATE_SCHEMA,
         "generation": plan.generation,
@@ -1483,6 +1570,10 @@ def build_loop_state(
         "dataset_after_sha256": dataset.snapshot_sha256,
         "dataset_advanced_even_if_candidate_rejected": True,
         "model_history": history,
+        "playable_model_window": playable_model_window,
+        "playable_model_window_limit": 2,
+        "old_generation_metadata_retained": True,
+        "old_generation_weights_retained": False,
     }
 
 
