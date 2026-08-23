@@ -1347,6 +1347,10 @@ class AudioSession:
             return
         generation = self._autoplay_generation
         seeds = self._radio_seed_sample(generation)
+        # The expired deadline has been consumed. Clear it before scheduling
+        # the refill so the playback worker waits for the background task's
+        # wake-up instead of spinning on a permanent zero-second delay.
+        self._autoplay_retry_at = 0.0
         self._autoplay_refill_task = asyncio.create_task(
             self._run_autoplay_refill(generation, seeds),
             name=f"simajilord-audio-autoplay-{self.workspace_id}",

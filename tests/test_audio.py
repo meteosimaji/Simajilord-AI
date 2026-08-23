@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import replace
 from pathlib import Path
+from time import monotonic
 from typing import cast
 
 import pytest
@@ -1957,6 +1958,43 @@ async def test_mix_refills_after_automatic_lane_is_consumed() -> None:
     # Generated Radio tracks must not silently replace the listener's station
     # intent. Every refill remains anchored to the explicit seed.
     assert supplied[1] == (seed,)
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_mix_retry_deadline_is_consumed_before_refill_wait() -> None:
+    refill_started = asyncio.Event()
+    release_refill = asyncio.Event()
+
+    async def supply(
+        seeds: tuple[str, ...],
+        limit: int,
+    ) -> tuple[AudioItem, ...]:
+        assert seeds == ("https://www.youtube.com/watch?v=seed",)
+        assert limit == 30
+        refill_started.set()
+        await release_refill.wait()
+        return ()
+
+    session = AudioSession(
+        "guild",
+        FakeOutput(),
+        max_pending_speech=3,
+        autoplay_supplier=supply,
+    )
+    session._autoplay_enabled = True
+    session._mix_seed_references.append("https://www.youtube.com/watch?v=seed")
+    session._autoplay_retry_at = monotonic() - 1.0
+
+    session._ensure_autoplay_refill()
+
+    refill_task = session._autoplay_refill_task
+    assert refill_task is not None
+    assert session._autoplay_retry_at == 0.0
+    assert await session._next_retry_delay() is None
+    await asyncio.wait_for(refill_started.wait(), timeout=1.0)
+    release_refill.set()
+    await asyncio.wait_for(refill_task, timeout=1.0)
     await session.close()
 
 
