@@ -293,6 +293,19 @@ class AgentToolCatalog:
             return False
         return self._registry.endpoint(capability_name).descriptor.idempotency == "idempotent_write"
 
+    def write_failure_allows_argument_correction(
+        self,
+        capability_name: str,
+        error_code: str,
+    ) -> bool:
+        """Return whether a rejected pre-dispatch write may retry with corrected arguments."""
+
+        return (
+            capability_name in {"discord.send_file", "discord.send_files"}
+            and capability_name in self._write_capabilities
+            and error_code == "files.not_found"
+        )
+
     def validate_planned_write(
         self,
         *,

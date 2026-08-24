@@ -520,6 +520,8 @@ async def test_agent_file_delivery_sends_the_authorized_snapshot(
             runtime,
         )
     }
+    assert "files.not_found" in endpoints["discord.send_file"].descriptor.expected_errors
+    assert "files.not_found" in endpoints["discord.send_files"].descriptor.expected_errors
 
     response = await endpoints["discord.send_file"].invoke(
         DiscordSendFileRequest(channel_id="1", path="result.bin"),

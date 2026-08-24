@@ -6711,6 +6711,103 @@ async def test_provider_does_not_retry_idempotent_stale_undo(
 
 
 @pytest.mark.asyncio
+async def test_provider_allows_one_predispatch_file_path_correction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    registry = CapabilityRegistry()
+
+    async def write(
+        request: WriteRequest,
+        _context: InvocationContext,
+    ) -> WriteResponse:
+        return WriteResponse(job_id=request.subject)
+
+    registry.register(
+        endpoint(
+            CapabilityDescriptor(
+                "discord.send_file",
+                "Send one workspace file.",
+                RiskLevel.WRITE,
+                approval=ApprovalMode.WHEN_REQUESTED,
+                idempotency="non_idempotent_write",
+                expected_errors=("files.not_found",),
+            ),
+            WriteRequest,
+            WriteResponse,
+            write,
+        )
+    )
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="primary-model",
+        escalation_model="escalation-model",
+        workspace_dir=tmp_path / "agent-file-correction",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(
+            registry,
+            ("discord.send_file",),
+            required_grants={"discord.send_file": "file-send"},
+            write_capabilities=("discord.send_file",),
+        ),
+        max_tool_calls=4,
+        max_tool_output_characters=4_000,
+    )
+    monkeypatch.setattr(provider, "_ensure_started", AsyncMock())
+    monkeypatch.setattr(provider, "_ensure_thread", AsyncMock(return_value="thread"))
+    request = AsyncMock(
+        side_effect=[
+            {"turn": {"id": "turn-primary"}},
+            {"turn": {"id": "turn-correction"}},
+        ]
+    )
+    monkeypatch.setattr(provider, "_request", request)
+    await_count = 0
+    correction_calls_remaining: int | None = None
+
+    async def await_turn(
+        _thread_id: str,
+        _turn_id: str,
+        **_kwargs: object,
+    ) -> tuple[str, AgentTokenUsage]:
+        nonlocal await_count, correction_calls_remaining
+        await_count += 1
+        if await_count == 1:
+            provider._active_tool_budgets["thread"].write_failures.append(
+                ("discord.send_file", "files.not_found")
+            )
+            return "The attachment was sent.", AgentTokenUsage(total_tokens=1)
+        correction_calls_remaining = provider._active_tool_budgets["thread"].calls_remaining
+        provider._active_tool_budgets["thread"].write_failures.clear()
+        provider._active_tool_budgets["thread"].write_successes.add("discord.send_file")
+        return "The corrected attachment was sent.", AgentTokenUsage(total_tokens=2)
+
+    monkeypatch.setattr(provider, "_await_turn", await_turn)
+
+    result = await provider.respond(
+        provider_thread_id=None,
+        event_prompt="SIMAJILORD_EVENT_V1\ntrigger=mention\nmessage_id=123",
+        context=InvocationContext(
+            "actor",
+            "workspace",
+            "agent",
+            "discord:message:123",
+            grants=frozenset({"file-send"}),
+            approvals=frozenset({"discord.send_file"}),
+        ),
+    )
+
+    correction_prompt = request.await_args_list[1].args[1]["input"][0]["text"]
+    assert correction_calls_remaining == 2
+    assert "rejected before external dispatch" in correction_prompt
+    assert "copy it verbatim" in correction_prompt
+    assert "Never derive a filename from a job ID" in correction_prompt
+    assert "idempotent" not in correction_prompt
+    assert result.content == "The corrected attachment was sent."
+
+
+@pytest.mark.asyncio
 async def test_provider_returns_structured_tool_budget_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

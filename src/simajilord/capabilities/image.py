@@ -115,7 +115,14 @@ class ImageGenerateRequest:
 class ImageGenerateResponse:
     job_id: str
     status: ImageJobStatus
-    path: str
+    path: str = field(
+        metadata={
+            "description": (
+                "Exact actor-owned workspace path of the generated original. Copy this value "
+                "verbatim into discord.send_file.path; never derive a filename from job_id."
+            )
+        }
+    )
     size_bytes: int
     sha256: str
     kind: str
@@ -145,7 +152,14 @@ class ImageStatusResponse:
     auto_delivery_enabled: bool
     runtime_delivery_completed: bool
     workspace_handoff_completed: bool
-    workspace_path: str | None
+    workspace_path: str | None = field(
+        metadata={
+            "description": (
+                "Exact actor-owned workspace path when handoff succeeded. Copy this value "
+                "verbatim into discord.send_file.path; never derive a filename from job_id."
+            )
+        }
+    )
     error_code: str | None
     terminal: bool
     retryable: bool
@@ -235,8 +249,9 @@ def build_image_endpoints(
             next_action = "Wait for generation completion; do not submit a duplicate."
         elif job.status is ImageJobStatus.COMPLETED and workspace_path is not None:
             next_action = (
-                "Use discord.send_file with workspace_path when the requested image "
-                "should be posted."
+                f"Use discord.send_file with path exactly {workspace_path!r} when the requested "
+                "image should be posted. Copy workspace_path verbatim; never derive or extend "
+                "the filename from job_id."
             )
         elif job.status is ImageJobStatus.COMPLETED:
             next_action = "The result exists but is not available in the agent workspace."
@@ -379,8 +394,10 @@ async def _agent_image_result(
         requested_model=job.prompt.model,
         provider_model=job.provider_model or job.prompt.model.value,
         next_action=(
-            "Inspect the lightweight preview attached to this tool result. The path is "
-            "the full-resolution original. Decide semantically from the exact active "
+            "Inspect the lightweight preview attached to this tool result. The full-resolution "
+            f"original is at {record.path!r}; copy that exact path verbatim into any later "
+            "discord.send_file call and never derive or extend it from job_id. Decide "
+            "semantically from the exact active "
             "request and conversation context whether publishing it in Discord fulfills "
             "the user's intent. A request to create an image in the active public channel "
             "can imply that the result should be shown; no particular delivery verb is "
@@ -441,7 +458,7 @@ def _model_image_preview(content: bytes) -> tuple[bytes, str, int, int]:
 
 
 def _agent_image_path(job_id: str) -> str:
-    return f"generated/simajilord-{job_id[:12]}.png"
+    return f"generated/simajilord-{job_id}.png"
 
 
 def _request_event_id(request_id: str) -> str | None:

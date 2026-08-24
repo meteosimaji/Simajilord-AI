@@ -1163,7 +1163,14 @@ class DiscordViewImageAttachmentResponse:
 @dataclass(frozen=True, slots=True)
 class DiscordSendFileRequest:
     channel_id: str
-    path: str
+    path: str = dataclass_field(
+        metadata={
+            "description": (
+                "Exact actor-owned workspace path returned by the capability that created or "
+                "selected the file. Copy it verbatim; never infer or extend a generated path."
+            )
+        }
+    )
     caption: str = ""
     description: str = ""
     spoiler: bool = False
@@ -1187,7 +1194,14 @@ class DiscordSendFileResponse:
 
 @dataclass(frozen=True, slots=True)
 class DiscordFileAttachmentRequest:
-    path: str
+    path: str = dataclass_field(
+        metadata={
+            "description": (
+                "Exact actor-owned workspace path returned by the capability that created or "
+                "selected the file. Copy it verbatim; never infer or extend a generated path."
+            )
+        }
+    )
     description: str = ""
     spoiler: bool = False
 
@@ -7478,6 +7492,7 @@ def build_discord_endpoints(
                 idempotency="non_idempotent_write",
                 expected_errors=(
                     "files.workspace_required",
+                    "files.not_found",
                     "discord.file_count_invalid",
                     "discord.file_too_large",
                     "discord.file_send_forbidden",
@@ -7520,6 +7535,7 @@ def build_discord_endpoints(
                 idempotency="non_idempotent_write",
                 expected_errors=(
                     "files.workspace_required",
+                    "files.not_found",
                     "discord.file_too_large",
                     "discord.file_send_forbidden",
                 ),

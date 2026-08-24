@@ -650,6 +650,8 @@ _WORKFLOWS = (
                     3,
                     "discord.send_file",
                     (
+                        "Pass the exact path returned by image.generate or image.status "
+                        "verbatim; never construct or extend a filename from the job ID. "
                         "Decide from the exact request's meaning and conversation context "
                         "whether publishing the full original fulfils the user's intent; "
                         "no particular delivery verb is required."

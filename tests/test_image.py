@@ -20,6 +20,8 @@ from simajilord.capabilities.image import (
     _MAX_MODEL_IMAGE_PREVIEW_BYTES,
     ImageGenerateRequest,
     ImageGenerateResponse,
+    ImageStatusRequest,
+    ImageStatusResponse,
     _model_image_preview,
     build_image_endpoints,
 )
@@ -853,11 +855,25 @@ async def test_image_capability_returns_agent_file_without_auto_delivery(
     assert response.image_data_url.startswith("data:image/")
     assert response.preview_size_bytes <= response.size_bytes
     assert (response.preview_width, response.preview_height) == (512, 512)
+    assert response.path == f"generated/simajilord-{response.job_id}.png"
+    assert response.path in response.next_action
+    assert "verbatim" in response.next_action
     assert files.path_for_delivery(file_workspace_id(context), response.path).is_file()
     assert job.auto_deliver is False
     assert job.delivery_message_id is None
     assert job.delivered is False
     assert job.handoff_completed is True
+    status = cast(
+        ImageStatusResponse,
+        await registry.invoke(
+            "image.status",
+            ImageStatusRequest(job_id=response.job_id),
+            context,
+        ),
+    )
+    assert status.workspace_path == response.path
+    assert response.path in status.next_action
+    assert "verbatim" in status.next_action
     delivery.assert_not_awaited()
     await service.close()
 

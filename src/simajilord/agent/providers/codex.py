@@ -1439,9 +1439,18 @@ class CodexAppServerProvider:
                     failed_write = _last_write_failure(budget)
                     if failed_write is not None:
                         failed_capability, failure_code = failed_write
-                        retry_allowed = (
+                        idempotent_retry_allowed = (
                             self.tools.write_is_safe_to_retry(failed_capability)
                             and _error_may_be_retryable(failure_code)
+                        )
+                        argument_correction_allowed = (
+                            self.tools.write_failure_allows_argument_correction(
+                                failed_capability,
+                                failure_code,
+                            )
+                        )
+                        retry_allowed = (
+                            (idempotent_retry_allowed or argument_correction_allowed)
                             and not (
                                 budget is not None
                                 and any(
@@ -1466,11 +1475,18 @@ class CodexAppServerProvider:
                         )
                         correction_instruction = (
                             (
+                                "The previous file send was rejected before external dispatch. "
+                                "Read the exact workspace path already returned by the file- or "
+                                "image-producing capability, copy it verbatim, and retry once "
+                                "with corrected arguments. Never derive a filename from a job ID."
+                            )
+                            if argument_correction_allowed
+                            else (
                                 "Check the arguments and retry now. "
                                 "This capability is idempotent, so the host permits "
                                 "one bounded automatic retry."
                             )
-                            if retry_allowed
+                            if idempotent_retry_allowed
                             else (
                                 "Do not retry it automatically. The host classified "
                                 "this failure as non-retryable; explain its exact "
