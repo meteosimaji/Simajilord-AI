@@ -65,6 +65,22 @@ with Discord's generic “interaction failed” banner.
   result message while the track is being added
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
   queue-preserving auto-leave
+- Restart-safe TempVC rooms with one contextual `/tempvc` command. Administrators create one or
+  more permanent creator lobbies; joining a lobby alone is inert, and the member must explicitly
+  confirm **Create my room** in a requester-only panel before METEOBOT creates or moves anything.
+  Each lobby can copy role/member permission overwrites from itself, its destination category, or
+  another existing voice channel. Missing copy sources and full 50-channel categories fail before
+  creation instead of falling back to unexpectedly broad permissions
+- Empty TempVC rooms have a configurable 1-60 minute recovery window (10 minutes by default),
+  retain the owner's name/limit/lock profile across recreation, and are reconciled from SQLite on
+  startup and every five minutes to catch missed voice-state events. Only channels in the durable
+  BOT-owned registry can be deleted. A returning owner cancels deletion, while a Manage Channels
+  administrator can make an important room permanent
+- TempVC cleanup cooperates with audio's existing 10-second auto-leave. Music queues and
+  read-aloud destinations remain durable; a room that expires forces even auto-leave-disabled
+  audio into explicit-resume standby before deletion, drops only a dashboard still bound to that
+  exact channel, and remaps the saved destination when the owner's room is recreated without
+  connecting or starting playback
 - Globally bounded, priority-aware media work and guild-fair TTS work, with per-guild
   connection reservations, debounced durable audio state, and wait/duration metrics
 - Voice-free queueing: add a track before joining, then start automatically when one of its
@@ -633,6 +649,8 @@ for URL Mapping and production-hosting requirements.
 - `/help`, `/status`
 - `/feedback` opens a private Modal and saves the report locally without asking for a triage kind
 - `/audio` opens the shared music and read-aloud control panel
+- `/tempvc` creates creator lobbies for administrators, explicitly creates a room while the member
+  is in a lobby, or opens owner controls while the member is inside a managed TempVC
 - `/play` adds a track and `/radio` starts or stops continuous related playback
 - `/join` selects up to 25 conversations to read in the current VC
 - `/timer` creates a persistent Focus Timer

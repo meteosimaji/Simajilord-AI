@@ -55,6 +55,25 @@ from .source_inspection import (
     SourceSearchResult,
 )
 from .speech import SpeechProvider, SpeechService
+from .temp_voice import (
+    DEFAULT_TEMP_VOICE_GRACE_SECONDS,
+    DEFAULT_TEMP_VOICE_ROOM_TEMPLATE,
+    MAX_TEMP_VOICE_CREATORS_PER_WORKSPACE,
+    MAX_TEMP_VOICE_GRACE_SECONDS,
+    MAX_TEMP_VOICE_ROOM_NAME_LENGTH,
+    MIN_TEMP_VOICE_GRACE_SECONDS,
+    TempVoiceConfig,
+    TempVoiceCreator,
+    TempVoiceProfile,
+    TempVoiceRoom,
+    TempVoiceRoomEndReason,
+    TempVoiceService,
+    normalize_temp_voice_room_name,
+    render_temp_voice_room_name,
+    validate_temp_voice_grace_seconds,
+    validate_temp_voice_room_template,
+    validate_temp_voice_user_limit,
+)
 from .translation import (
     TranslatedSegment,
     TranslationBatchResult,
@@ -72,7 +91,13 @@ from .translation import (
 from .web import WebService
 
 __all__ = [
+    "DEFAULT_TEMP_VOICE_GRACE_SECONDS",
+    "DEFAULT_TEMP_VOICE_ROOM_TEMPLATE",
     "LOCAL_MEDIA_SCHEME",
+    "MAX_TEMP_VOICE_CREATORS_PER_WORKSPACE",
+    "MAX_TEMP_VOICE_GRACE_SECONDS",
+    "MAX_TEMP_VOICE_ROOM_NAME_LENGTH",
+    "MIN_TEMP_VOICE_GRACE_SECONDS",
     "AgentFileSandbox",
     "AudioOutput",
     "AudioSession",
@@ -120,6 +145,12 @@ __all__ = [
     "SpeechService",
     "StoredAudioItem",
     "StoredAudioSession",
+    "TempVoiceConfig",
+    "TempVoiceCreator",
+    "TempVoiceProfile",
+    "TempVoiceRoom",
+    "TempVoiceRoomEndReason",
+    "TempVoiceService",
     "TranslatedSegment",
     "TranslationBatchResult",
     "TranslationDetection",
@@ -144,4 +175,9 @@ __all__ = [
     "WorkspaceReadResult",
     "WorkspaceVisibility",
     "merge_file_provenances",
+    "normalize_temp_voice_room_name",
+    "render_temp_voice_room_name",
+    "validate_temp_voice_grace_seconds",
+    "validate_temp_voice_room_template",
+    "validate_temp_voice_user_limit",
 ]

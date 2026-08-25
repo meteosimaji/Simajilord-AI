@@ -71,9 +71,7 @@ class SimajilordDiscordBot(commands.Bot):
         self.runtime = runtime
         self.activity_server = ActivityServer(self, runtime)
         self.operator_server = LocalOperatorServer(runtime)
-        self.application_emojis = ApplicationEmojiCatalog.from_settings(
-            runtime.settings
-        )
+        self.application_emojis = ApplicationEmojiCatalog.from_settings(runtime.settings)
         self._command_templates: tuple[
             app_commands.Command[Any, ..., Any] | app_commands.Group | app_commands.ContextMenu,
             ...,
@@ -83,9 +81,7 @@ class SimajilordDiscordBot(commands.Bot):
         self._speech_warmup_task: asyncio.Task[None] | None = None
         self._command_sync_lock = asyncio.Lock()
         self._command_synchronizer = DiscordCommandSynchronizer(
-            CommandManifestStore(
-                runtime.settings.data_dir / "discord_command_manifests.sqlite3"
-            )
+            CommandManifestStore(runtime.settings.data_dir / "discord_command_manifests.sqlite3")
         )
 
     async def setup_hook(self) -> None:
@@ -128,11 +124,7 @@ class SimajilordDiscordBot(commands.Bot):
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         if interaction.type is discord.InteractionType.application_command:
             data: object = interaction.data
-            command_name = (
-                str(data.get("name", "unknown"))
-                if isinstance(data, dict)
-                else "unknown"
-            )
+            command_name = str(data.get("name", "unknown")) if isinstance(data, dict) else "unknown"
             await self.runtime.journal.append(
                 kind="discord.command.received",
                 actor_id=str(interaction.user.id),
@@ -195,12 +187,19 @@ class SimajilordDiscordBot(commands.Bot):
             await self._restore_audio_sessions()
             await self._prepare_read_aloud_presence()
             self._audio_restored = True
+        temp_voice_cog = self.get_cog("TempVoiceCog")
+        restore_temp_voice = getattr(temp_voice_cog, "restore_tracked_rooms", None)
+        if callable(restore_temp_voice):
+            try:
+                await restore_temp_voice()
+            except Exception:
+                log.exception(
+                    "TempVC startup reconciliation failed; the next ready event will retry"
+                )
         dashboard = getattr(self, "_simajilord_music_dashboard", None)
         prune_stale = getattr(dashboard, "prune_stale_records", None)
         if callable(prune_stale):
-            removed = await prune_stale(
-                frozenset(str(guild.id) for guild in self.guilds)
-            )
+            removed = await prune_stale(frozenset(str(guild.id) for guild in self.guilds))
             if removed:
                 log.info("Removed %s stale music dashboard record(s)", removed)
         await self._synchronize_initial_commands()
@@ -260,9 +259,7 @@ class SimajilordDiscordBot(commands.Bot):
                 )
                 self._restore_global_templates()
                 if removed:
-                    log.info(
-                        "Removed stale global commands while using guild command scope"
-                    )
+                    log.info("Removed stale global commands while using guild command scope")
             else:
                 synced = await self._sync_prepared_command_scope(
                     guild=None,
@@ -376,9 +373,7 @@ class SimajilordDiscordBot(commands.Bot):
         try:
             channel_id = int(job.delivery_target_id)
         except ValueError as exc:
-            raise RuntimeError(
-                f"Image job {job.job_id} has an invalid delivery target"
-            ) from exc
+            raise RuntimeError(f"Image job {job.job_id} has an invalid delivery target") from exc
         channel = self.get_channel(channel_id)
         if not isinstance(
             channel,
@@ -389,9 +384,7 @@ class SimajilordDiscordBot(commands.Bot):
                 discord.StageChannel,
             ),
         ):
-            raise RuntimeError(
-                f"Image job {job.job_id} delivery channel is unavailable"
-            )
+            raise RuntimeError(f"Image job {job.job_id} delivery channel is unavailable")
 
         progress_message = await self._image_delivery_message(channel, job)
 
@@ -438,9 +431,7 @@ class SimajilordDiscordBot(commands.Bot):
                 finally:
                     image_file.close()
             if progress_message is None:
-                raise RuntimeError(
-                    f"Completed image job has no Discord message: {job.job_id}"
-                )
+                raise RuntimeError(f"Completed image job has no Discord message: {job.job_id}")
             await self.runtime.image.mark_delivered(
                 job.job_id,
                 message_id=str(progress_message.id),
@@ -567,23 +558,27 @@ def _image_progress_embed(job: ImageGenerationJob) -> discord.Embed:
     complete = job.status is ImageJobStatus.COMPLETED
     step = job.progress_total if complete else job.progress_step
     percentage = round(step / max(1, job.progress_total) * 100)
-    embed = discord.Embed(
-        title="画像が完成しました" if complete else "画像を生成しています",
-        description=(
-            "生成が終わりました。投稿の準備をしています…"
-            if complete
-            else "バックグラウンドで生成中です。そのまま会話を続けられます。"
-        ),
-        colour=discord.Colour.green() if complete else discord.Colour.blurple(),
-        timestamp=datetime.now(UTC),
-    ).add_field(
-        name="進捗",
-        value=f"{step}/{job.progress_total} · {percentage}%",
-        inline=True,
-    ).add_field(
-        name="サイズ",
-        value=f"幅 {job.width}・高さ {job.height}",
-        inline=True,
+    embed = (
+        discord.Embed(
+            title="画像が完成しました" if complete else "画像を生成しています",
+            description=(
+                "生成が終わりました。投稿の準備をしています…"
+                if complete
+                else "バックグラウンドで生成中です。そのまま会話を続けられます。"
+            ),
+            colour=discord.Colour.green() if complete else discord.Colour.blurple(),
+            timestamp=datetime.now(UTC),
+        )
+        .add_field(
+            name="進捗",
+            value=f"{step}/{job.progress_total} · {percentage}%",
+            inline=True,
+        )
+        .add_field(
+            name="サイズ",
+            value=f"幅 {job.width}・高さ {job.height}",
+            inline=True,
+        )
     )
     return embed
 
@@ -593,11 +588,7 @@ def _image_result_embed(
     *,
     filename: str,
 ) -> discord.Embed:
-    duration = (
-        f"{job.generation_seconds:.1f}秒"
-        if job.generation_seconds is not None
-        else "完了"
-    )
+    duration = f"{job.generation_seconds:.1f}秒" if job.generation_seconds is not None else "完了"
     embed = discord.Embed(
         title="生成した画像",
         description=_image_prompt_preview(job),
@@ -634,12 +625,8 @@ def _image_result_already_present(
     *,
     filename: str,
 ) -> bool:
-    has_attachment = any(
-        attachment.filename == filename
-        for attachment in message.attachments
-    )
+    has_attachment = any(attachment.filename == filename for attachment in message.attachments)
     has_result_embed = any(
-        embed.image.url == f"attachment://{filename}"
-        for embed in message.embeds
+        embed.image.url == f"attachment://{filename}" for embed in message.embeds
     )
     return has_attachment and has_result_embed

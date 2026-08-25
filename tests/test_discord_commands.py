@@ -171,6 +171,7 @@ from simajilord.integrations.discord.permissions import (
     readable_for_requester,
     readable_for_service,
 )
+from simajilord.integrations.discord.temp_voice import TempVoiceCog
 from simajilord.runtime import SimajilordRuntime
 from simajilord.services.files import AgentFileSandbox
 from simajilord.services.read_aloud import (
@@ -283,13 +284,11 @@ async def test_agent_imports_pdf_from_canonical_attachment_endpoint(
         context,
     )
 
-    assert response.path == (
-        "attachments/1531959431212961902/"
-        "1531959430940201000-document.pdf"
+    assert response.path == ("attachments/1531959431212961902/1531959430940201000-document.pdf")
+    assert (
+        runtime.files.path_for_delivery(file_workspace_id(context), response.path).read_bytes()
+        == payload
     )
-    assert runtime.files.path_for_delivery(
-        file_workspace_id(context), response.path
-    ).read_bytes() == payload
     assert response.provenance is not None
     assert response.provenance.origin_channel_id == "1373866905357778984"
     dispatch.assert_awaited_once_with()
@@ -802,10 +801,7 @@ def test_unexpected_error_displays_the_logged_reference_id(caplog) -> None:
 
     assert "Reference ID: `interaction-42`" in message
     assert "Share this ID with the administrator." in message
-    assert any(
-        "request_id=interaction-42" in record.getMessage()
-        for record in caplog.records
-    )
+    assert any("request_id=interaction-42" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -895,13 +891,16 @@ def test_autonomous_agent_grants_follow_typed_host_mode() -> None:
         AGENT_SHELL_GRANT,
     } <= requested
     assert not {AGENT_FILE_GRANT, AGENT_IMAGE_GRANT} & assist
-    assert not {
-        AGENT_FILE_GRANT,
-        AGENT_IMAGE_GRANT,
-        AGENT_COMPUTE_GRANT,
-        AGENT_MODERATION_GRANT,
-        AGENT_REPOST_GRANT,
-    } & act
+    assert (
+        not {
+            AGENT_FILE_GRANT,
+            AGENT_IMAGE_GRANT,
+            AGENT_COMPUTE_GRANT,
+            AGENT_MODERATION_GRANT,
+            AGENT_REPOST_GRANT,
+        }
+        & act
+    )
     runtime.settings.agent_autonomy_policy_mode = AgentAutonomyPolicyMode.LEGACY
     legacy_act = _agent_grants(runtime, actor_id="99", autonomous=True)
     assert {
@@ -1008,6 +1007,7 @@ def test_every_public_slash_command_has_exactly_one_help_entry() -> None:
         SystemCog,
         FocusTimerCog,
         MusicCog,
+        TempVoiceCog,
         ReadAloudCog,
         WebCog,
         TranslationCog,
@@ -1055,6 +1055,7 @@ def test_public_command_and_option_descriptions_use_the_official_english_surface
         SystemCog,
         FocusTimerCog,
         MusicCog,
+        TempVoiceCog,
         ReadAloudCog,
         WebCog,
         TranslationCog,
@@ -1095,9 +1096,7 @@ def test_help_categories_fit_discord_select_limits() -> None:
         assert 1 <= len(entries) <= 25
         assert all(len(entry.summary) <= 100 for entry in entries)
         embed = _help_category_embed(category)
-        command_fields = tuple(
-            field for field in embed.fields if field.name.startswith("Commands")
-        )
+        command_fields = tuple(field for field in embed.fields if field.name.startswith("Commands"))
         assert command_fields
         assert all(1 <= len(field.value) <= 1024 for field in command_fields)
         assert sum(field.value.count("\n") + 1 for field in command_fields) == len(entries)
@@ -2663,6 +2662,30 @@ async def test_music_dashboard_edits_existing_panel_without_reposting() -> None:
 
 
 @pytest.mark.asyncio
+async def test_music_dashboard_forgets_only_the_deleted_temp_voice_binding() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.audio.add_state_listener = Mock()
+    runtime.audio.remove_state_listener = Mock()
+    runtime.audio.find.return_value = None
+    bot = Mock(spec=commands.Bot)
+    manager = MusicDashboardManager(bot, runtime)
+    manager.bind(1, 90)
+    panel = Mock(spec=discord.Message)
+    panel.delete = AsyncMock()
+    manager._messages["1"] = panel
+
+    assert await manager.forget_channel("1", 91) is False
+    assert manager._channel_ids["1"] == 90
+    panel.delete.assert_not_awaited()
+
+    assert await manager.forget_channel("1", 90) is True
+    assert "1" not in manager._channel_ids
+    assert "1" not in manager._messages
+    panel.delete.assert_awaited_once_with()
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_music_dashboard_retries_the_same_message_once_after_429() -> None:
     class DashboardError(discord.DiscordException):
         def __init__(self) -> None:
@@ -3139,11 +3162,7 @@ async def test_music_search_selection_updates_the_component_message(
     assert interaction.edit_original_response.await_count == 2
     first_edit = interaction.edit_original_response.await_args_list[0]
     assert first_edit.kwargs["view"] is view
-    assert all(
-        child.disabled
-        for child in view.children
-        if isinstance(child, discord.ui.Button)
-    )
+    assert all(child.disabled for child in view.children if isinstance(child, discord.ui.Button))
     final_edit = interaction.edit_original_response.await_args_list[1]
     assert final_edit.kwargs["view"] is None
 
@@ -3276,9 +3295,7 @@ async def test_read_aloud_length_command_persists_optional_abbreviation() -> Non
     interaction.channel_id = 2
     interaction.user = SimpleNamespace(id=3)
     interaction.response.send_message = AsyncMock()
-    command = next(
-        item for item in ReadAloudCog.readaloud.commands if item.name == "length"
-    )
+    command = next(item for item in ReadAloudCog.readaloud.commands if item.name == "length")
 
     await command.callback(cog, interaction, True, 80)
 
@@ -3339,11 +3356,7 @@ def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> No
         and item.row == 2
         for item in view.children
     )
-    assert all(
-        item.row == 2
-        for item in view.children
-        if isinstance(item, discord.ui.Button)
-    )
+    assert all(item.row == 2 for item in view.children if isinstance(item, discord.ui.Button))
 
 
 def test_read_aloud_setup_controls_do_not_change_the_music_panel() -> None:
@@ -3448,20 +3461,23 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     toggle.edit_original_response = AsyncMock()
     await view.abbreviation_button.callback(toggle)
 
-    first_capability, first_request, _first_context = (
-        runtime.registry.invoke.await_args_list[0].args
-    )
+    first_capability, first_request, _first_context = runtime.registry.invoke.await_args_list[
+        0
+    ].args
     assert first_capability == "discord.read_aloud_semantics_set"
     assert first_request == ReadAloudSemanticsSetRequest(
         abbreviate_long_messages=True,
         expected_abbreviate_long_messages=False,
     )
     assert view.abbreviation_button.label == "Read full text"
-    assert "以下略" in next(
-        field
-        for field in toggle.edit_original_response.await_args.kwargs["embed"].fields
-        if field.name == "Long messages"
-    ).value
+    assert (
+        "以下略"
+        in next(
+            field
+            for field in toggle.edit_original_response.await_args.kwargs["embed"].fields
+            if field.name == "Long messages"
+        ).value
+    )
 
     limit = Mock(spec=discord.Interaction)
     limit.id = 91
@@ -3473,18 +3489,16 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     view.length_selector._values = ["60"]
     await view.length_selector.callback(limit)
 
-    second_capability, second_request, _second_context = (
-        runtime.registry.invoke.await_args_list[1].args
-    )
+    second_capability, second_request, _second_context = runtime.registry.invoke.await_args_list[
+        1
+    ].args
     assert second_capability == "discord.read_aloud_semantics_set"
     assert second_request == ReadAloudSemanticsSetRequest(
         message_character_limit=60,
         expected_message_character_limit=120,
     )
     assert sum(option.default for option in view.length_selector.options) == 1
-    assert next(
-        option for option in view.length_selector.options if option.default
-    ).value == "60"
+    assert next(option for option in view.length_selector.options if option.default).value == "60"
 
 
 @pytest.mark.asyncio
@@ -3514,9 +3528,7 @@ async def test_read_aloud_panel_persists_the_openers_personal_voice() -> None:
         preset=ReadAloudVoicePreset.CUTE,
     )
     assert view.personal_voice_preset is ReadAloudVoicePreset.CUTE
-    assert next(
-        option for option in view.voice_selector.options if option.default
-    ).value == "cute"
+    assert next(option for option in view.voice_selector.options if option.default).value == "cute"
 
 
 @pytest.mark.asyncio
@@ -3565,9 +3577,7 @@ async def test_read_aloud_panel_persists_personal_speed_and_pitch() -> None:
     assert view.personal_voice_pitch == 0.06
     voice = next(
         field
-        for field in interaction.edit_original_response.await_args.kwargs[
-            "embed"
-        ].fields
+        for field in interaction.edit_original_response.await_args.kwargs["embed"].fields
         if field.name == "Your voice"
     )
     assert "1.30x" in voice.value
@@ -3622,9 +3632,7 @@ async def test_read_aloud_panel_updates_message_behavior_atomically() -> None:
         expected_attachments=True,
         expected_vc_members_only=False,
     )
-    assert view._selected_behaviors() == frozenset(
-        {"replies", "vc_members_only"}
-    )
+    assert view._selected_behaviors() == frozenset({"replies", "vc_members_only"})
 
 
 @pytest.mark.asyncio
@@ -4015,15 +4023,10 @@ async def test_read_aloud_start_failure_shows_saved_route_and_explicit_reconnect
     ]
     update = interaction.edit_original_response.await_args.kwargs
     assert update["embed"].title == "Read aloud route saved · voice disconnected"
-    assert "new channel message will not make the bot join" in update[
-        "embed"
-    ].description
+    assert "new channel message will not make the bot join" in update["embed"].description
     assert "retry when the next message" not in update["embed"].description.lower()
     assert isinstance(update["view"], ReadAloudReconnectView)
-    assert any(
-        field.name == "Route" and field.value == "Saved"
-        for field in update["embed"].fields
-    )
+    assert any(field.name == "Route" and field.value == "Saved" for field in update["embed"].fields)
     assert any(
         field.name == "Connection" and field.value.startswith("Disconnected")
         for field in update["embed"].fields
@@ -4104,9 +4107,7 @@ async def test_read_aloud_reconnect_failure_then_success_is_target_bound() -> No
     await button.callback(failed)
 
     failed_update = failed.edit_original_response.await_args.kwargs
-    assert failed_update["embed"].title == (
-        "Read aloud route saved · voice disconnected"
-    )
+    assert failed_update["embed"].title == ("Read aloud route saved · voice disconnected")
     assert failed_update["view"] is view
     assert view.is_finished() is False
 
@@ -4193,9 +4194,7 @@ async def test_read_aloud_reconnect_rejects_wrong_absent_different_and_expired_r
         item for item in different_view.children if isinstance(item, discord.ui.Button)
     )
     await different_button.callback(different)
-    assert "Join the selected voice channel" in (
-        different.response.send_message.await_args.args[0]
-    )
+    assert "Join the selected voice channel" in (different.response.send_message.await_args.args[0])
 
     expired_view = ReadAloudReconnectView(
         runtime,
@@ -4524,9 +4523,7 @@ def test_hive_analysis_is_one_direct_attachment_command() -> None:
         for command in group.commands
     }
     assert set(commands) == {"detect-ai", "download"}
-    assert commands["detect-ai"].description == (
-        "Estimate AI-generation and deepfake likelihood."
-    )
+    assert commands["detect-ai"].description == ("Estimate AI-generation and deepfake likelihood.")
 
 
 def test_web_fetch_continuation_is_one_click_and_uniquely_addressable() -> None:
@@ -4961,10 +4958,13 @@ def test_agent_execution_failure_displays_only_valid_public_reference() -> None:
     )
 
     assert f"Reference ID: `{reference_id}`" in message
-    assert _agent_error_text(
-        RuntimeError("failed"),
-        reference_id="discord:message:secret",
-    ) == "The AI request could not be completed."
+    assert (
+        _agent_error_text(
+            RuntimeError("failed"),
+            reference_id="discord:message:secret",
+        )
+        == "The AI request could not be completed."
+    )
 
 
 def test_agent_admission_rejections_never_display_public_reference() -> None:
@@ -5087,10 +5087,7 @@ def test_voice_chat_requires_message_history_and_connect_permission() -> None:
         read_message_history=True,
         connect=False,
     )
-    assert (
-        readable_for_requester(guild, principal)
-        == ()
-    )
+    assert readable_for_requester(guild, principal) == ()
 
 
 def test_expanded_message_post_to_voice_chat_requires_connect() -> None:

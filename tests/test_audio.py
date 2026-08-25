@@ -157,9 +157,7 @@ async def test_speech_overlays_current_music_before_waiting_music() -> None:
     await session.enqueue(AudioItem("a", "first", "a"))
     await asyncio.sleep(0)
     await session.enqueue(AudioItem("b", "second", "b"))
-    await session.enqueue(
-        AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH)
-    )
+    await session.enqueue(AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH))
     for _ in range(20):
         if output.overlays == ["speech"]:
             break
@@ -353,8 +351,7 @@ async def test_speech_reservations_commit_in_request_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_partial_speech_reservation_keeps_continuation_ahead_of_next_request(
-) -> None:
+async def test_partial_speech_reservation_keeps_continuation_ahead_of_next_request() -> None:
     output = FakeOutput()
     output.connected = False
     session = AudioSession("reservation-parts", output, max_pending_speech=3)
@@ -363,15 +360,18 @@ async def test_partial_speech_reservation_keeps_continuation_ahead_of_next_reque
     with pytest.raises(UserError, match=r"speech\.queue_full"):
         await session.reserve_speech()
 
-    assert await first.commit_part(
-        AudioItem(
-            "speech-1a",
-            "speech-1a",
-            "local://speech-1a",
-            kind=AudioKind.SPEECH,
-        ),
-        final=False,
-    ) == 1
+    assert (
+        await first.commit_part(
+            AudioItem(
+                "speech-1a",
+                "speech-1a",
+                "local://speech-1a",
+                kind=AudioKind.SPEECH,
+            ),
+            final=False,
+        )
+        == 1
+    )
     second_commit = asyncio.create_task(
         second.commit(
             AudioItem(
@@ -385,14 +385,17 @@ async def test_partial_speech_reservation_keeps_continuation_ahead_of_next_reque
     await asyncio.sleep(0)
     assert not second_commit.done()
 
-    assert await first.commit(
-        AudioItem(
-            "speech-1b",
-            "speech-1b",
-            "local://speech-1b",
-            kind=AudioKind.SPEECH,
+    assert (
+        await first.commit(
+            AudioItem(
+                "speech-1b",
+                "speech-1b",
+                "local://speech-1b",
+                kind=AudioKind.SPEECH,
+            )
         )
-    ) == 2
+        == 2
+    )
     assert await asyncio.wait_for(second_commit, timeout=1) == 3
 
     snapshot = await session.snapshot()
@@ -558,9 +561,7 @@ async def test_failed_speech_overlay_falls_back_then_resumes_music() -> None:
     session = AudioSession("one", output, max_pending_speech=3)
     await session.enqueue(AudioItem("music", "music", "music"))
     await asyncio.sleep(0)
-    await session.enqueue(
-        AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH)
-    )
+    await session.enqueue(AudioItem("speech", "speech", "local://speech", kind=AudioKind.SPEECH))
 
     for _ in range(50):
         if output.played == ["music", "speech"]:
@@ -1114,8 +1115,7 @@ def test_audio_exact_write_endpoints_have_small_typed_requests() -> None:
     }
     assert exact_names <= endpoints.keys()
     assert all(
-        endpoints[name].descriptor.approval is ApprovalMode.WHEN_REQUESTED
-        for name in exact_names
+        endpoints[name].descriptor.approval is ApprovalMode.WHEN_REQUESTED for name in exact_names
     )
     assert endpoints["audio.pause"].request_type is AudioNoArgsRequest
     assert endpoints["audio.move"].request_type is AudioMoveRequest
@@ -1131,9 +1131,7 @@ async def test_queue_capability_returns_transport_neutral_state() -> None:
     await asyncio.sleep(0)
     await session.enqueue(AudioItem("two", "Next track", "https://example.com/two"))
     endpoints = build_audio_endpoints(cast(MediaService, object()), manager)
-    queue_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.queue"
-    )
+    queue_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.queue")
     response = await queue_endpoint.invoke(
         AudioQueueRequest(),
         InvocationContext("actor", "guild", "test", "request"),
@@ -1180,12 +1178,8 @@ async def test_play_api_queues_without_voice_then_starts_and_records_history(
     )
     manager.get_or_create("guild", lambda: output)
     endpoints = build_audio_endpoints(cast(MediaService, FakeMedia()), manager)
-    play_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.play"
-    )
-    history_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.history"
-    )
+    play_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.play")
+    history_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.history")
     context = InvocationContext("requester-id", "guild", "test", "request")
 
     response = await play_endpoint.invoke(
@@ -1258,9 +1252,7 @@ async def test_search_requires_one_click_for_same_title_from_different_artists()
 
     manager = AudioSessionManager(max_active=2, max_pending_speech=3)
     endpoints = build_audio_endpoints(cast(MediaService, FakeMedia()), manager)
-    search_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.search"
-    )
+    search_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.search")
     response = await search_endpoint.invoke(
         AudioSearchRequest(query="Hello"),
         InvocationContext("actor", "guild", "test", "request"),
@@ -1301,9 +1293,7 @@ async def test_search_uses_explicit_artist_without_an_extra_click() -> None:
 
     manager = AudioSessionManager(max_active=2, max_pending_speech=3)
     endpoints = build_audio_endpoints(cast(MediaService, FakeMedia()), manager)
-    search_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.search"
-    )
+    search_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.search")
     response = await search_endpoint.invoke(
         AudioSearchRequest(query="Adele Hello"),
         InvocationContext("actor", "guild", "test", "request"),
@@ -1359,9 +1349,7 @@ async def test_search_reuses_requesters_durable_choice_without_an_extra_click() 
         )
     )
     endpoints = build_audio_endpoints(cast(MediaService, FakeMedia()), manager)
-    search_endpoint = next(
-        item for item in endpoints if item.descriptor.name == "audio.search"
-    )
+    search_endpoint = next(item for item in endpoints if item.descriptor.name == "audio.search")
     response = await search_endpoint.invoke(
         AudioSearchRequest(query="Same"),
         InvocationContext("actor", "guild", "test", "request"),
@@ -2106,8 +2094,7 @@ async def test_audio_mix_capability_reports_station_state() -> None:
     manager.get_or_create("guild", lambda: output)
     media = cast(MediaService, object())
     endpoints = {
-        endpoint.descriptor.name: endpoint
-        for endpoint in build_audio_endpoints(media, manager)
+        endpoint.descriptor.name: endpoint for endpoint in build_audio_endpoints(media, manager)
     }
     context = InvocationContext(
         actor_id="listener",
@@ -2158,6 +2145,50 @@ async def test_auto_leave_suspends_voice_without_losing_current_track(tmp_path) 
     assert snapshot.pending[0].start_seconds > 0
     assert snapshot.destination_id == "voice"
     assert snapshot.voice_activation_required is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_recreated_temp_voice_destination_remaps_only_while_suspended(
+    tmp_path: Path,
+) -> None:
+    output = FakeOutput()
+    output.connected = False
+    manager = AudioSessionManager(
+        max_active=2,
+        max_pending_speech=3,
+        state_store=AudioStateStore(tmp_path / "audio_sessions.json"),
+    )
+    session = manager.get_or_create("guild", lambda: output)
+    await session.connect("old-temp-room")
+    output.connected = False
+    assert (
+        await session.remap_suspended_destination(
+            expected_destination_id="old-temp-room",
+            replacement_destination_id="must-not-remap",
+        )
+        is False
+    )
+    output.connected = True
+    await session.suspend()
+
+    remapped = await session.remap_suspended_destination(
+        expected_destination_id="old-temp-room",
+        replacement_destination_id="new-temp-room",
+    )
+
+    snapshot = await session.snapshot()
+    assert remapped is True
+    assert snapshot.destination_id == "new-temp-room"
+    assert snapshot.voice_activation_required is True
+    assert output.connected is False
+    assert (
+        await session.remap_suspended_destination(
+            expected_destination_id="wrong-room",
+            replacement_destination_id="another-room",
+        )
+        is False
+    )
     await manager.close()
 
 

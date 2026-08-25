@@ -383,15 +383,15 @@ class AudioSession:
                 raise ValueError("A speech reservation only accepts speech audio.")
             async with self._speech_reservation_changed:
                 await self._speech_reservation_changed.wait_for(
-                    lambda: token not in self._speech_reservations
-                    or next(iter(self._speech_reservations)) == token
+                    lambda: (
+                        token not in self._speech_reservations
+                        or next(iter(self._speech_reservations)) == token
+                    )
                 )
                 if token not in self._speech_reservations:
                     raise UserError("speech.reservation_cancelled")
                 remaining_slots = self._speech_reservations[token]
-                if (final and remaining_slots != 1) or (
-                    not final and remaining_slots <= 1
-                ):
+                if (final and remaining_slots != 1) or (not final and remaining_slots <= 1):
                     raise ValueError("Speech reservation part count mismatch.")
                 if self._closed:
                     self._speech_reservations.pop(token)
@@ -437,11 +437,7 @@ class AudioSession:
             pending += 1
         position = pending + 1
         current = self._current
-        if (
-            current is not None
-            and current.kind is AudioKind.MUSIC
-            and self._overlay_task is None
-        ):
+        if current is not None and current.kind is AudioKind.MUSIC and self._overlay_task is None:
             self._start_speech_overlay_locked(current, item)
         else:
             self._speech.append(item)
@@ -564,15 +560,9 @@ class AudioSession:
     ) -> None:
         autoplay_task: asyncio.Task[None] | None = None
         async with self._lock:
-            if (
-                mode is not LoopMode.NONE
-                and self._autoplay_enabled
-                and not replace_autoplay
-            ):
+            if mode is not LoopMode.NONE and self._autoplay_enabled and not replace_autoplay:
                 raise UserError("audio.loop_mix_conflict")
-            disables_autoplay = (
-                mode is not LoopMode.NONE and self._autoplay_enabled
-            )
+            disables_autoplay = mode is not LoopMode.NONE and self._autoplay_enabled
             if self._loop_mode is mode and not disables_autoplay:
                 if on_noop is not None:
                     await on_noop()
@@ -1074,6 +1064,32 @@ class AudioSession:
             await self.output.disconnect()
         await self._state_changed()
 
+    async def remap_suspended_destination(
+        self,
+        *,
+        expected_destination_id: str,
+        replacement_destination_id: str,
+    ) -> bool:
+        """Move a held route to a recreated VC without joining or starting playback."""
+
+        expected = expected_destination_id.strip()
+        replacement = replacement_destination_id.strip()
+        if not expected or not replacement:
+            raise ValueError("audio destination IDs must be non-empty")
+        async with self._transport_lock:
+            if (
+                not self._suspended
+                or self.output.connected
+                or self.destination_id != expected
+                or expected == replacement
+            ):
+                return False
+            self.destination_id = replacement
+            self._suspended = True
+            self._voice_activation_required = True
+        await self._state_changed()
+        return True
+
     async def shutdown(self) -> None:
         """Stop the process without deleting the last durable queue snapshot."""
 
@@ -1151,9 +1167,7 @@ class AudioSession:
         # Older state may contain the invalid combination that used to let a
         # loop starve Mix forever. Preserve the explicit loop and require the
         # user to confirm a switch to Mix after restart.
-        self._autoplay_enabled = (
-            state.autoplay_enabled and state.loop_mode is LoopMode.NONE
-        )
+        self._autoplay_enabled = state.autoplay_enabled and state.loop_mode is LoopMode.NONE
         self._mix_seed_references.extend(state.mix_seed_references[-_MAX_MIX_SEEDS:])
         restored_items = tuple(
             AudioItem(
@@ -1310,10 +1324,7 @@ class AudioSession:
             )
 
     def _remember_mix_seed(self, item: AudioItem) -> None:
-        if (
-            item.kind is not AudioKind.MUSIC
-            or item.queue_lane is AudioQueueLane.AUTOPLAY
-        ):
+        if item.kind is not AudioKind.MUSIC or item.queue_lane is AudioQueueLane.AUTOPLAY:
             return
         self._remember_mix_seed_reference(item.resolver_reference or item.page_url)
 
@@ -1472,19 +1483,11 @@ class AudioSession:
         """Score a bounded reservoir and queue only the next three radio items."""
 
         recent_items = tuple(self._history)[-25:]
-        recent_titles = {
-            _normalize_radio_title(item.title)
-            for item in recent_items
-            if item.title
-        }
+        recent_titles = {_normalize_radio_title(item.title) for item in recent_items if item.title}
         recent_artists = {
-            _normalize_radio_text(item.uploader)
-            for item in recent_items[-5:]
-            if item.uploader
+            _normalize_radio_text(item.uploader) for item in recent_items[-5:] if item.uploader
         }
-        randomizer = random.Random(
-            _stable_radio_seed(self.workspace_id, generation, "candidates")
-        )
+        randomizer = random.Random(_stable_radio_seed(self.workspace_id, generation, "candidates"))
         ranked: list[tuple[float, int, AudioItem]] = []
         seen_references: set[str] = set()
         seen_titles: set[str] = set()
@@ -1617,9 +1620,7 @@ class AudioSession:
                 raise
             except Exception as exc:
                 playback_error = exc
-                output_disconnected = (
-                    _is_output_disconnected(exc) or not self.output.connected
-                )
+                output_disconnected = _is_output_disconnected(exc) or not self.output.connected
                 if output_disconnected:
                     log.warning(
                         "Audio output disconnected; holding current item for explicit "
@@ -1670,9 +1671,7 @@ class AudioSession:
                         target.appendleft(resumed)
                     self._wake.clear()
                 keep_item = True
-            elif completed and playable.kind is AudioKind.MUSIC and not (
-                suspended or restarted
-            ):
+            elif completed and playable.kind is AudioKind.MUSIC and not (suspended or restarted):
                 history_item = playable.unresolved_copy()
                 history_item.played_at_epoch = int(time())
                 self._history.append(history_item)
@@ -1740,8 +1739,7 @@ class AudioSession:
                         target.append(retry)
                     keep_item = True
                     log.warning(
-                        "Keeping failed track queued for retry %s/%s in %.0fs "
-                        "workspace=%s item=%s",
+                        "Keeping failed track queued for retry %s/%s in %.0fs workspace=%s item=%s",
                         retry.failure_count,
                         failure_limit,
                         delay,
@@ -1822,9 +1820,7 @@ class AudioSession:
                 early_eof_retried = True
                 retry_early_eof_now = True
                 last_error = exc
-                unresolved = playable.unresolved_copy(
-                    failure_count=playable.failure_count
-                )
+                unresolved = playable.unresolved_copy(failure_count=playable.failure_count)
                 unresolved.start_seconds = self._position_seconds()
                 _move_speech_overlay(playable, unresolved)
                 playable = unresolved
@@ -1894,8 +1890,7 @@ class AudioSession:
                         except Exception as exc:
                             overlay_error = exc
                             log.warning(
-                                "Speech overlay attempt %s/%s failed workspace=%s "
-                                "item=%s error=%s",
+                                "Speech overlay attempt %s/%s failed workspace=%s item=%s error=%s",
                                 attempt,
                                 _OVERLAY_ATTEMPTS,
                                 self.workspace_id,
@@ -2112,9 +2107,7 @@ class AudioSession:
 
 
 def _stable_radio_seed(workspace_id: str, generation: int, purpose: str) -> int:
-    digest = hashlib.sha256(
-        f"{workspace_id}\0{generation}\0{purpose}".encode()
-    ).digest()
+    digest = hashlib.sha256(f"{workspace_id}\0{generation}\0{purpose}".encode()).digest()
     return int.from_bytes(digest[:8], "big")
 
 
@@ -2154,9 +2147,7 @@ def _adopt_resolved_stream(destination: AudioItem, resolved: AudioItem) -> None:
     destination.resolved_at = resolved.resolved_at
     destination.duration_seconds = resolved.duration_seconds or destination.duration_seconds
     destination.page_url = resolved.page_url or destination.page_url
-    destination.resolver_reference = (
-        resolved.resolver_reference or destination.resolver_reference
-    )
+    destination.resolver_reference = resolved.resolver_reference or destination.resolver_reference
     destination.uploader = resolved.uploader or destination.uploader
     destination.thumbnail_url = resolved.thumbnail_url or destination.thumbnail_url
 

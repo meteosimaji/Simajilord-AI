@@ -130,6 +130,7 @@ from simajilord.services import (
     ServiceOperationMetric,
     SourceInspectionService,
     SpeechService,
+    TempVoiceService,
     TranslationService,
     TranslationStore,
     WebService,
@@ -148,6 +149,7 @@ class SimajilordRuntime:
     audio: AudioSessionManager
     focus_timer: FocusTimerService
     speech: SpeechService
+    temp_voice: TempVoiceService
     read_aloud: ReadAloudService
     web: WebService
     moderation: ModerationService
@@ -348,6 +350,7 @@ class SimajilordRuntime:
             file_suffix=".wav" if settings.tts_provider == "voicevox" else ".aiff",
         )
         focus_timer = FocusTimerService(settings.data_dir / "focus_timers.sqlite3")
+        temp_voice = TempVoiceService(settings.data_dir / "temp_voice.sqlite3")
         read_aloud = ReadAloudService(settings.data_dir / "read_aloud.json")
         web = WebService(
             search_provider=SearxngSearchProvider(
@@ -917,6 +920,7 @@ class SimajilordRuntime:
             audio=audio,
             focus_timer=focus_timer,
             speech=speech,
+            temp_voice=temp_voice,
             read_aloud=read_aloud,
             web=web,
             moderation=moderation,

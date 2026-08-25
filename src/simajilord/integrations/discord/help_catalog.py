@@ -27,14 +27,10 @@ def _entry(
     summary: str,
     usage: str,
     *examples: str,
-    permissions: tuple[str, ...] = (
-        "View the current channel and use application commands.",
-    ),
+    permissions: tuple[str, ...] = ("View the current channel and use application commands.",),
     side_effects: tuple[str, ...] = (),
     notes: tuple[str, ...] = (),
-    common_errors: tuple[str, ...] = (
-        "The BOT cannot view or respond in the current channel.",
-    ),
+    common_errors: tuple[str, ...] = ("The BOT cannot view or respond in the current channel.",),
     prefix_name: str | None = None,
 ) -> PublicCommandSpec:
     return PublicCommandSpec(
@@ -54,6 +50,7 @@ def _entry(
 HELP_CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "Getting started": "Find commands and check whether the platform is healthy.",
     "Audio": "Play music, run Radio, manage the shared audio panel, and set timers.",
+    "Voice rooms": "Create, recover, and privately control temporary voice rooms.",
     "Read aloud": "Read several conversation channels into one voice channel.",
     "Web & media": "Search the web, inspect pages, save public media, and analyse uploads.",
     "Discord": "Inspect public server/member data and create native Discord content.",
@@ -161,6 +158,32 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         ),
     ),
     _entry(
+        "tempvc",
+        "Voice rooms",
+        "Set up a creator lobby or create and control a recoverable temporary VC.",
+        "/tempvc",
+        "/tempvc",
+        notes=(
+            "Administrators first create a permanent lobby from the private setup panel.",
+            "Join the lobby, run /tempvc, then press Create my room; joining alone does nothing.",
+            "Inside your room, the same command opens rename, limit, lock, invite, remove, and "
+            "ownership controls.",
+            "Empty rooms wait 10 minutes by default and retain your saved room preferences.",
+            "Manage Channels administrators can copy permissions from an existing VC and keep "
+            "an important room permanently.",
+        ),
+        side_effects=(
+            "May create a BOT-owned category, permanent creator lobby, or temporary voice room.",
+            "May move you from the creator lobby only after your explicit button confirmation.",
+            "Deletes only tracked empty rooms after the configured recovery window.",
+        ),
+        common_errors=(
+            "You are not inside a configured creator lobby or managed TempVC.",
+            "METEOBOT lacks Manage Channels or Move Members in the configured category.",
+            "The configured permission-copy channel was deleted or the category is full.",
+        ),
+    ),
+    _entry(
         "radio",
         "Audio",
         "Keep adding related tracks while manual requests always play first.",
@@ -186,9 +209,7 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
             "A private channel picker appears after the command.",
             "The selected sources are read into the VC you currently occupy.",
         ),
-        side_effects=(
-            "Creates or updates the server read-aloud route and activates voice.",
-        ),
+        side_effects=("Creates or updates the server read-aloud route and activates voice.",),
     ),
     _entry(
         "timer",
@@ -290,10 +311,7 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         "readaloud message-style",
         "Read aloud",
         "Configure author names, replies, attachments, and VC membership filtering.",
-        (
-            "/readaloud message-style [author_names] [replies] "
-            "[attachments] [vc_members_only]"
-        ),
+        ("/readaloud message-style [author_names] [replies] [attachments] [vc_members_only]"),
         (
             "/readaloud message-style author_names:true replies:true "
             "attachments:true vc_members_only:true"

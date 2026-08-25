@@ -684,6 +684,55 @@ _ERROR_MESSAGES = {
     "audio.volume_range_invalid": "Volume must be between 0% and 200%.",
     "audio.volume_number_invalid": "Volume must be a number from 0 to 200.",
     "audio.volume_value_required": "Provide music or read-aloud volume.",
+    "temp_voice.bot_member_missing": "METEOBOT is not available as a member of this server.",
+    "temp_voice.bot_permissions_missing": (
+        "METEOBOT is missing a required voice/category permission. "
+        "An administrator can open `/tempvc` to inspect the setup."
+    ),
+    "temp_voice.category_full": (
+        "This TempVC category already has Discord's maximum of 50 channels. "
+        "An administrator can add another hub with `/tempvc`."
+    ),
+    "temp_voice.category_missing": (
+        "The configured TempVC category no longer exists. No room was created."
+    ),
+    "temp_voice.creation_paused": (
+        "New TempVC rooms are paused. Existing rooms and saved settings are unchanged."
+    ),
+    "temp_voice.creator_conflict": "That creator lobby belongs to another server setup.",
+    "temp_voice.creator_join_required": (
+        "Join the configured creator lobby, run `/tempvc`, and confirm creation there."
+    ),
+    "temp_voice.creator_limit": "This server already has the maximum of 20 creator lobbies.",
+    "temp_voice.creator_missing": (
+        "That TempVC creator lobby is no longer registered. Open `/tempvc` to refresh setup."
+    ),
+    "temp_voice.grace_invalid": "Empty-room recovery must be between 1 and 60 minutes.",
+    "temp_voice.manager_required": "Manage Channels permission is required for this action.",
+    "temp_voice.member_invalid": "Choose a non-BOT member from this server.",
+    "temp_voice.member_not_present": "That member is no longer in this TempVC.",
+    "temp_voice.name_exhausted": "Could not find an unused channel name in this category.",
+    "temp_voice.not_configured": "TempVC has not been set up in this server.",
+    "temp_voice.owner_removal_forbidden": "Transfer ownership before removing the room owner.",
+    "temp_voice.owner_required": "Only this TempVC's owner or a channel manager can do that.",
+    "temp_voice.permission_source_missing": (
+        "The configured permission-copy voice channel no longer exists or is inaccessible. "
+        "No room was created; an administrator can choose another source with `/tempvc`."
+    ),
+    "temp_voice.room_already_owned": (
+        "You already own an occupied TempVC. Return to it or transfer ownership before "
+        "creating another."
+    ),
+    "temp_voice.room_conflict": "That Discord channel is already tracked as a TempVC.",
+    "temp_voice.room_join_required": "Join that TempVC before opening or using its controls.",
+    "temp_voice.room_missing": "That TempVC no longer exists or is no longer BOT-managed.",
+    "temp_voice.room_name_invalid": (
+        "Use a visible channel name between 1 and 100 characters without control characters."
+    ),
+    "temp_voice.template_invalid": (
+        "Use a 1-100 character template with only `{display_name}` or `{username}` variables."
+    ),
+    "temp_voice.user_limit_invalid": "The TempVC user limit must be between 0 and 99.",
     "media.reference_required": "Provide a media URL or search query.",
     "media.reference_too_long": "The URL or search query is too long.",
     "media.query_url_not_allowed": "A search query cannot contain a URL.",
@@ -837,16 +886,12 @@ _ERROR_MESSAGES = {
     "read_aloud.exclusion_invalid": "The read-aloud exclusion is invalid.",
     "read_aloud.announcement_value_invalid": "The announcement settings are invalid.",
     "read_aloud.semantic_value_invalid": "The message-reading settings are invalid.",
-    "read_aloud.voice_tuning_invalid": (
-        "Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."
-    ),
+    "read_aloud.voice_tuning_invalid": ("Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."),
     "read_aloud.announcement_value_required": "Choose at least one voice event to update.",
     "read_aloud.semantic_value_required": "Choose at least one message setting to update.",
     "read_aloud.ignore_bot_unnecessary": "BOT messages are already excluded.",
     "read_aloud.role_not_found": "That role was not found in this server.",
-    "speech.voice_tuning_invalid": (
-        "Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."
-    ),
+    "speech.voice_tuning_invalid": ("Speed must be 0.5-2.0 and pitch must be -0.15 to 0.15."),
     "speech.voice_tuning_unavailable": (
         "Personal speed and pitch require the VOICEVOX speech provider."
     ),
@@ -1568,6 +1613,19 @@ class MusicDashboardManager:
             self._fingerprints.pop(workspace_id, None)
             if self._stored_messages.pop(workspace_id, None) is not None:
                 await self._persist_stored_messages()
+
+    async def forget_channel(
+        self,
+        workspace_id: str,
+        expected_channel_id: int,
+    ) -> bool:
+        """Forget a dashboard only when it is still bound to a deleted channel."""
+
+        if self._channel_ids.get(workspace_id) != expected_channel_id:
+            return False
+        self._channel_ids.pop(workspace_id, None)
+        await self.dismiss(workspace_id)
+        return True
 
     async def prune_stale_records(self, valid_workspace_ids: frozenset[str]) -> int:
         """Drop dashboard pointers for guilds the BOT no longer belongs to."""
@@ -5056,11 +5114,7 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             member = interaction.user
             if not isinstance(member, discord.Member):
                 raise UserError("workspace.required")
-            member_destination = (
-                member.voice.channel
-                if member.voice is not None
-                else None
-            )
+            member_destination = member.voice.channel if member.voice is not None else None
             if (
                 not isinstance(
                     member_destination,
@@ -5227,9 +5281,7 @@ class ReadAloudLengthSelect(discord.ui.Select[discord.ui.View]):
             discord.SelectOption(
                 label=f"{limit} characters",
                 value=str(limit),
-                description=(
-                    "Say 以下略 after this point when abbreviation is enabled"
-                ),
+                description=("Say 以下略 after this point when abbreviation is enabled"),
                 default=limit == current_limit,
             )
             for limit in limits
@@ -5396,23 +5448,19 @@ class ReadAloudVoiceTuningModal(SafeModal, title="Tune your read-aloud voice"):
     def __init__(self, view: ReadAloudChannelSelectView) -> None:
         super().__init__(timeout=5 * 60)
         self.setup_view = view
-        self.speed: discord.ui.TextInput[ReadAloudVoiceTuningModal] = (
-            discord.ui.TextInput(
-                label="Speed (0.5 to 2.0)",
-                placeholder="1.00",
-                default=f"{view.personal_voice_speed:.2f}",
-                min_length=1,
-                max_length=5,
-            )
+        self.speed: discord.ui.TextInput[ReadAloudVoiceTuningModal] = discord.ui.TextInput(
+            label="Speed (0.5 to 2.0)",
+            placeholder="1.00",
+            default=f"{view.personal_voice_speed:.2f}",
+            min_length=1,
+            max_length=5,
         )
-        self.pitch: discord.ui.TextInput[ReadAloudVoiceTuningModal] = (
-            discord.ui.TextInput(
-                label="Pitch (-0.15 to 0.15)",
-                placeholder="0.00",
-                default=f"{view.personal_voice_pitch:.2f}",
-                min_length=1,
-                max_length=5,
-            )
+        self.pitch: discord.ui.TextInput[ReadAloudVoiceTuningModal] = discord.ui.TextInput(
+            label="Pitch (-0.15 to 0.15)",
+            placeholder="0.00",
+            default=f"{view.personal_voice_pitch:.2f}",
+            min_length=1,
+            max_length=5,
         )
         self.add_item(self.speed)
         self.add_item(self.pitch)
@@ -5516,8 +5564,7 @@ class ReadAloudChannelSelectView(SafeView):
             else self.personal_voice_preset.value.title()
         )
         personal_voice += (
-            f" · {self.personal_voice_speed:.2f}x"
-            f" · pitch {self.personal_voice_pitch:+.2f}"
+            f" · {self.personal_voice_speed:.2f}x · pitch {self.personal_voice_pitch:+.2f}"
         )
         behavior = " · ".join(
             (
@@ -5666,11 +5713,7 @@ class ReadAloudChannelSelectView(SafeView):
                 ),
             )
             tuning = next(
-                (
-                    item
-                    for item in policy.user_voice_tunings
-                    if item[0] == str(interaction.user.id)
-                ),
+                (item for item in policy.user_voice_tunings if item[0] == str(interaction.user.id)),
                 (str(interaction.user.id), 1.0, 0.0),
             )
             self.personal_voice_speed = tuning[1]
@@ -6854,9 +6897,7 @@ class ReadAloudCog(commands.Cog):
                 # messages together only while their complete voice profile is
                 # identical; otherwise per-member voice/tuning would silently
                 # use the first author's settings for the whole burst.
-                profile_groups: list[
-                    list[tuple[discord.Message, ReadAloudMessageText]]
-                ] = []
+                profile_groups: list[list[tuple[discord.Message, ReadAloudMessageText]]] = []
                 previous_profile: tuple[ReadAloudVoicePreset, float, float] | None = None
                 for item, item_prepared in prepared_messages:
                     tuning = self.runtime.read_aloud.voice_tuning_for(
@@ -12930,6 +12971,7 @@ class PrefixCog(commands.Cog):
 
 async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     from .feedback import FeedbackCog
+    from .temp_voice import TempVoiceCog
 
     dashboard = MusicDashboardManager(bot, runtime)
     setattr(bot, _MUSIC_DASHBOARD_ATTRIBUTE, dashboard)
@@ -12948,6 +12990,7 @@ async def setup_cogs(bot: commands.Bot, runtime: SimajilordRuntime) -> None:
     )
     await bot.add_cog(ReadAloudCog(bot, runtime))
     await bot.add_cog(VoiceLifecycleCog(bot, runtime))
+    await bot.add_cog(TempVoiceCog(bot, runtime))
     await bot.add_cog(WebCog(runtime))
     translation_cog = TranslationCog(runtime)
     await bot.add_cog(translation_cog)
