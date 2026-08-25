@@ -60,7 +60,9 @@ from METEOBOT's implementation decisions.
 1. A Manage Channels member runs `/tempvc` and creates a permanent category plus creator lobby,
    or adds a creator to an existing category.
 2. The administrator may select a different existing voice channel whose role/member permission
-   overwrites each creator copies. New creators copy their own lobby by default.
+   overwrites each creator copies. New creators copy their own lobby by default. Locking overlays
+   the copied `@everyone` Connect value; unlocking restores that exact tri-state value instead of
+   silently widening a source VC that was already private.
 3. Joining the lobby does nothing by itself. The member runs `/tempvc` and presses the private
    **Create my room** button. The BOT verifies the exact lobby, creator record, category capacity,
    copy source, and BOT permissions before creating anything.

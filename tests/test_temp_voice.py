@@ -58,8 +58,10 @@ async def test_temp_voice_state_survives_restart_and_preserves_owner_profile(
         name="Owner room",
         user_limit=4,
         locked=False,
+        base_everyone_connect=False,
     )
     assert room.empty_since is None
+    assert room.base_everyone_connect is False
     marked = await service.mark_room_empty(
         room.channel_id,
         empty_since=created_at,
@@ -134,15 +136,58 @@ def test_temp_voice_store_migrates_legacy_creator_rows(tmp_path) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE temp_voice_rooms (
+                channel_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                creator_channel_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                user_limit INTEGER NOT NULL,
+                locked INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                empty_since TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE temp_voice_room_history (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                creator_channel_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                user_limit INTEGER NOT NULL,
+                locked INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                empty_since TEXT,
+                ended_at TEXT NOT NULL,
+                end_reason TEXT NOT NULL
+            )
+            """
+        )
 
     TempVoiceService(path)
 
     with sqlite3.connect(path) as connection:
-        columns = {
+        creator_columns = {
             str(row[1])
             for row in connection.execute("PRAGMA table_info(temp_voice_creators)").fetchall()
         }
-    assert "permission_source_channel_id" in columns
+        room_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(temp_voice_rooms)").fetchall()
+        }
+        history_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(temp_voice_room_history)").fetchall()
+        }
+    assert "permission_source_channel_id" in creator_columns
+    assert "base_everyone_connect" in room_columns
+    assert "base_everyone_connect" in history_columns
 
 
 def test_temp_voice_names_reject_invisible_control_characters() -> None:
@@ -383,7 +428,10 @@ async def test_room_creation_copies_selected_voice_permissions(tmp_path) -> None
     copied = discord.PermissionOverwrite(view_channel=True, connect=True)
     source = Mock(spec=discord.VoiceChannel)
     source.id = 25
-    source.overwrites = {copied_role: copied}
+    source.overwrites = {
+        copied_role: copied,
+        guild.default_role: discord.PermissionOverwrite(connect=False),
+    }
     source.permissions_for.return_value = discord.Permissions.all()
     category = Mock(spec=discord.CategoryChannel)
     category.id = 30
@@ -427,7 +475,49 @@ async def test_room_creation_copies_selected_voice_permissions(tmp_path) -> None
         created,
         reason="Simajilord TempVC join-to-create",
     )
-    assert await service.room("90") is not None
+    tracked = await service.room("90")
+    assert tracked is not None
+    assert tracked.base_everyone_connect is False
+
+
+@pytest.mark.asyncio
+async def test_unlock_restores_permission_source_everyone_connect_value(tmp_path) -> None:
+    service = TempVoiceService(tmp_path / "temp_voice.sqlite3")
+    await service.add_creator(
+        workspace_id="10",
+        channel_id="20",
+        category_id="30",
+    )
+    room = await service.register_room(
+        workspace_id="10",
+        channel_id="90",
+        creator_channel_id="20",
+        owner_id="40",
+        name="Private room",
+        user_limit=0,
+        locked=True,
+        base_everyone_connect=False,
+    )
+    runtime = cast(SimajilordRuntime, SimpleNamespace(temp_voice=service))
+    cog = TempVoiceCog(Mock(spec=commands.Bot), runtime)
+    guild = Mock(spec=discord.Guild)
+    guild.default_role = Mock(spec=discord.Role)
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.guild = guild
+    channel.overwrites_for.return_value = discord.PermissionOverwrite(connect=False)
+    channel.set_permissions = AsyncMock()
+    member = Mock(spec=discord.Member)
+    interaction = Mock(spec=discord.Interaction)
+    cog.require_room_controller = AsyncMock(  # type: ignore[method-assign]
+        return_value=(room, channel, member)
+    )
+
+    updated = await cog.set_room_lock(interaction, 90, False)
+
+    applied = channel.set_permissions.await_args.kwargs["overwrite"]
+    assert applied.connect is False
+    assert updated.locked is False
+    assert updated.base_everyone_connect is False
 
 
 @pytest.mark.asyncio

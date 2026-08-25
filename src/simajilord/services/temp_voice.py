@@ -59,6 +59,7 @@ class TempVoiceRoom:
     name: str
     user_limit: int
     locked: bool
+    base_everyone_connect: bool | None
     created_at: datetime
     empty_since: datetime | None = None
 
@@ -219,6 +220,7 @@ class TempVoiceService:
         name: str,
         user_limit: int,
         locked: bool,
+        base_everyone_connect: bool | None = None,
     ) -> TempVoiceRoom:
         normalized_workspace_id = _bounded_identifier(workspace_id, "workspace_id")
         normalized_channel_id = _bounded_identifier(channel_id, "channel_id")
@@ -229,6 +231,11 @@ class TempVoiceService:
         normalized_owner_id = _bounded_identifier(owner_id, "owner_id")
         normalized_name = normalize_temp_voice_room_name(name)
         normalized_limit = validate_temp_voice_user_limit(user_limit)
+        if base_everyone_connect is not None and not isinstance(
+            base_everyone_connect,
+            bool,
+        ):
+            raise ValueError("base_everyone_connect must be bool or None")
         async with self._lock:
             return await asyncio.to_thread(
                 self._register_room,
@@ -239,6 +246,7 @@ class TempVoiceService:
                 normalized_name,
                 normalized_limit,
                 locked,
+                base_everyone_connect,
             )
 
     async def room(self, channel_id: str) -> TempVoiceRoom | None:
@@ -400,6 +408,8 @@ class TempVoiceService:
                     name TEXT NOT NULL,
                     user_limit INTEGER NOT NULL,
                     locked INTEGER NOT NULL CHECK (locked IN (0, 1)),
+                    base_everyone_connect INTEGER
+                        CHECK (base_everyone_connect IN (0, 1) OR base_everyone_connect IS NULL),
                     created_at TEXT NOT NULL,
                     empty_since TEXT,
                     FOREIGN KEY(workspace_id)
@@ -434,6 +444,7 @@ class TempVoiceService:
                     name TEXT NOT NULL,
                     user_limit INTEGER NOT NULL,
                     locked INTEGER NOT NULL,
+                    base_everyone_connect INTEGER,
                     created_at TEXT NOT NULL,
                     empty_since TEXT,
                     ended_at TEXT NOT NULL,
@@ -452,6 +463,30 @@ class TempVoiceService:
                     """
                     ALTER TABLE temp_voice_creators
                     ADD COLUMN permission_source_channel_id TEXT
+                    """
+                )
+            room_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(temp_voice_rooms)").fetchall()
+            }
+            if "base_everyone_connect" not in room_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE temp_voice_rooms
+                    ADD COLUMN base_everyone_connect INTEGER
+                    """
+                )
+            history_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(temp_voice_room_history)"
+                ).fetchall()
+            }
+            if "base_everyone_connect" not in history_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE temp_voice_room_history
+                    ADD COLUMN base_everyone_connect INTEGER
                     """
                 )
         os.chmod(self.path, 0o600)
@@ -693,6 +728,7 @@ class TempVoiceService:
         name: str,
         user_limit: int,
         locked: bool,
+        base_everyone_connect: bool | None,
     ) -> TempVoiceRoom:
         self._ensure_config(workspace_id)
         now = datetime.now(UTC).isoformat()
@@ -718,9 +754,10 @@ class TempVoiceService:
                         name,
                         user_limit,
                         locked,
+                        base_everyone_connect,
                         created_at,
                         empty_since
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (
                         channel_id,
@@ -730,6 +767,7 @@ class TempVoiceService:
                         name,
                         user_limit,
                         int(locked),
+                        (int(base_everyone_connect) if base_everyone_connect is not None else None),
                         now,
                     ),
                 )
@@ -923,11 +961,12 @@ class TempVoiceService:
                     name,
                     user_limit,
                     locked,
+                    base_everyone_connect,
                     created_at,
                     empty_since,
                     ended_at,
                     end_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     room.workspace_id,
@@ -937,6 +976,11 @@ class TempVoiceService:
                     room.name,
                     room.user_limit,
                     int(room.locked),
+                    (
+                        int(room.base_everyone_connect)
+                        if room.base_everyone_connect is not None
+                        else None
+                    ),
                     room.created_at.isoformat(),
                     room.empty_since.isoformat() if room.empty_since is not None else None,
                     ended_at,
@@ -1091,6 +1135,7 @@ def _room_from_row(row: sqlite3.Row) -> TempVoiceRoom:
         name=str(row["name"]),
         user_limit=int(row["user_limit"]),
         locked=bool(row["locked"]),
+        base_everyone_connect=_optional_bool(row["base_everyone_connect"]),
         created_at=_row_datetime(row["created_at"]),
         empty_since=(_row_datetime(raw_empty_since) if raw_empty_since is not None else None),
     )
@@ -1109,6 +1154,10 @@ def _profile_from_row(row: sqlite3.Row) -> TempVoiceProfile:
         ),
         updated_at=_row_datetime(row["updated_at"]),
     )
+
+
+def _optional_bool(value: object) -> bool | None:
+    return bool(value) if value is not None else None
 
 
 def _required_room_row(connection: sqlite3.Connection, channel_id: str) -> sqlite3.Row:

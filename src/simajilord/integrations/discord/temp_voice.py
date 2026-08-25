@@ -1492,11 +1492,12 @@ class TempVoiceCog(commands.Cog):
             move_members=True,
         )
         overwrites[bot_member] = bot_overwrite
+        everyone_overwrite = overwrites.get(
+            member.guild.default_role,
+            discord.PermissionOverwrite(),
+        )
+        base_everyone_connect = everyone_overwrite.connect
         if locked:
-            everyone_overwrite = overwrites.get(
-                member.guild.default_role,
-                discord.PermissionOverwrite(),
-            )
             everyone_overwrite.update(connect=False)
             overwrites[member.guild.default_role] = everyone_overwrite
         channel = await member.guild.create_voice_channel(
@@ -1516,6 +1517,7 @@ class TempVoiceCog(commands.Cog):
                 name=room_name,
                 user_limit=user_limit,
                 locked=locked,
+                base_everyone_connect=base_everyone_connect,
             )
             registered = True
             await member.move_to(
@@ -1839,7 +1841,9 @@ class TempVoiceCog(commands.Cog):
         target = channel.guild.default_role
         original = channel.overwrites_for(target)
         changed = discord.PermissionOverwrite.from_pair(*original.pair())
-        changed.update(connect=False if locked else None)
+        changed.update(
+            connect=False if locked else room.base_everyone_connect,
+        )
         async with self._room_locks.hold(room.channel_id):
             await channel.set_permissions(
                 target,
