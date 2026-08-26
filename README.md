@@ -66,8 +66,9 @@ with Discord's generic “interaction failed” banner.
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
   queue-preserving auto-leave
 - Restart-safe TempVC rooms with one contextual `/tempvc` command. Administrators create one or
-  more permanent creator lobbies; joining a lobby alone is inert, and the member must explicitly
-  confirm **Create my room** in a requester-only panel before METEOBOT creates or moves anything.
+  more permanent creator lobbies; joining one creates a room and moves the member automatically.
+  New hubs use the explicit `Join to create` label, while `/tempvc` in a creator lobby provides a
+  requester-only retry panel if the automatic voice event does not complete.
   Each lobby can copy role/member permission overwrites from itself, its destination category, or
   another existing voice channel. Missing copy sources and full 50-channel categories fail before
   creation instead of falling back to unexpectedly broad permissions
@@ -649,8 +650,8 @@ for URL Mapping and production-hosting requirements.
 - `/help`, `/status`
 - `/feedback` opens a private Modal and saves the report locally without asking for a triage kind
 - `/audio` opens the shared music and read-aloud control panel
-- `/tempvc` creates creator lobbies for administrators, explicitly creates a room while the member
-  is in a lobby, or opens owner controls while the member is inside a managed TempVC
+- `/tempvc` creates creator lobbies for administrators, retries automatic room creation while the
+  member remains in a lobby, or opens owner controls inside a managed TempVC
 - `/play` adds a track and `/radio` starts or stops continuous related playback
 - `/join` selects up to 25 conversations to read in the current VC
 - `/timer` creates a persistent Focus Timer

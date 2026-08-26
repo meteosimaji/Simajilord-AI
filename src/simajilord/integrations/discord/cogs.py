@@ -701,7 +701,8 @@ _ERROR_MESSAGES = {
     ),
     "temp_voice.creator_conflict": "That creator lobby belongs to another server setup.",
     "temp_voice.creator_join_required": (
-        "Join the configured creator lobby, run `/tempvc`, and confirm creation there."
+        "Join the configured creator lobby; room creation starts automatically. "
+        "If you remain there, run `/tempvc` and retry creation."
     ),
     "temp_voice.creator_limit": "This server already has the maximum of 20 creator lobbies.",
     "temp_voice.creator_missing": (

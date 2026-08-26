@@ -1,4 +1,4 @@
-"""Restart-safe, explicitly created temporary voice rooms and private controls."""
+"""Restart-safe, join-created temporary voice rooms and private controls."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from .presenter import EmbedField, EmbedTone, command_embed
 log = logging.getLogger(__name__)
 
 _TEMP_VOICE_CATEGORY_NAME = "TEMP VC"
-_TEMP_VOICE_CREATOR_NAME = "Create a room"
+_TEMP_VOICE_CREATOR_NAME = "Join to create"
 _TEMP_VOICE_DELETE_RETRY_SECONDS = 60
 _TEMP_VOICE_RECONCILE_SECONDS = 5 * 60
 _TEMP_VOICE_VIEW_TIMEOUT_SECONDS = 10 * 60
@@ -137,7 +137,7 @@ class TempVoiceCategorySelect(discord.ui.ChannelSelect[discord.ui.View]):
 
 
 class TempVoiceCreateView(TempVoiceSafeView):
-    """Explicit creation confirmation for a member sitting in a creator lobby."""
+    """Requester-only retry panel for a member still sitting in a creator lobby."""
 
     def __init__(
         self,
@@ -169,7 +169,7 @@ class TempVoiceCreateView(TempVoiceSafeView):
         return isinstance(member, discord.Member) and member.guild.id == self.guild_id
 
     @discord.ui.button(
-        label="Create my room",
+        label="Retry room creation",
         style=discord.ButtonStyle.primary,
         custom_id="simajilord:tempvc:create-room",
         row=0,
@@ -1081,8 +1081,9 @@ class TempVoiceCog(commands.Cog):
                 tone = EmbedTone.WARNING
             else:
                 description = (
-                    "Join one of these permanent creator lobbies, then run `/tempvc` and "
-                    "confirm **Create my room**:\n"
+                    "Join one of these permanent creator lobbies. METEOBOT creates your room "
+                    "and moves you automatically. If you remain in the lobby after a temporary "
+                    "failure, run `/tempvc` and press **Retry room creation**:\n"
                     + "\n".join(f"• <#{creator.channel_id}>" for creator in creators)
                 )
                 tone = EmbedTone.SUCCESS
@@ -1122,6 +1123,38 @@ class TempVoiceCog(commands.Cog):
                 joined_room = await self.runtime.temp_voice.room(str(after.channel.id))
                 if joined_room is not None:
                     await self._handle_room_join(member, after.channel, joined_room)
+                else:
+                    creator = await self.runtime.temp_voice.creator(str(after.channel.id))
+                    if (
+                        creator is not None
+                        and creator.workspace_id == str(member.guild.id)
+                    ):
+                        request_id = f"voice:{member.id}:{after.channel.id}"
+                        try:
+                            await self._create_or_recover_room_from_creator(
+                                member,
+                                after.channel.id,
+                                request_id=request_id,
+                            )
+                        except UserError as exc:
+                            log.warning(
+                                "TempVC automatic creation rejected guild=%s member=%s "
+                                "creator=%s error=%s",
+                                member.guild.id,
+                                member.id,
+                                after.channel.id,
+                                exc.code,
+                            )
+                            await self.record_event(
+                                "temp_voice.auto_create_rejected",
+                                workspace_id=str(member.guild.id),
+                                actor_id=str(member.id),
+                                request_id=request_id,
+                                payload={
+                                    "creator_channel_id": str(after.channel.id),
+                                    "error": exc.code,
+                                },
+                            )
             if isinstance(before.channel, discord.VoiceChannel):
                 left_room = await self.runtime.temp_voice.room(str(before.channel.id))
                 if left_room is not None:
@@ -1336,6 +1369,19 @@ class TempVoiceCog(commands.Cog):
         member = interaction.user
         if not isinstance(member, discord.Member):
             raise UserError("workspace.required")
+        return await self._create_or_recover_room_from_creator(
+            member,
+            creator_channel_id,
+            request_id=str(interaction.id),
+        )
+
+    async def _create_or_recover_room_from_creator(
+        self,
+        member: discord.Member,
+        creator_channel_id: int,
+        *,
+        request_id: str,
+    ) -> tuple[discord.VoiceChannel, bool]:
         member_key = f"{member.guild.id}:{member.id}"
         async with self._member_locks.hold(member_key):
             current_voice = member.voice.channel if member.voice is not None else None
@@ -1392,7 +1438,7 @@ class TempVoiceCog(commands.Cog):
                     "temp_voice.room_recovered",
                     workspace_id=str(member.guild.id),
                     actor_id=str(member.id),
-                    request_id=str(interaction.id),
+                    request_id=request_id,
                     payload={"channel_id": str(recovered.id)},
                 )
                 return recovered, True
@@ -2170,20 +2216,21 @@ class TempVoiceCog(commands.Cog):
                 inline=False,
             ),
             EmbedField(
-                "No automatic creation",
+                "Automatic creation",
                 (
-                    "Joining this lobby never creates a channel by itself. The button is the "
-                    "explicit confirmation and its response is visible only to you."
+                    "Joining this lobby normally creates and moves you immediately. If an event "
+                    "was missed or a temporary failure left you here, this private button retries "
+                    "the same validated operation."
                 ),
                 inline=False,
             ),
         )
         return (
             command_embed(
-                "Create a TempVC",
+                "TempVC creation retry",
                 description=(
-                    f"You are in {creator_channel.mention}. Press the button once when you are "
-                    "ready; METEOBOT will create a room and move you there."
+                    f"You are still in {creator_channel.mention}. METEOBOT normally creates a "
+                    "room on join; press the retry button to create and move there."
                     if creation_available
                     else "Room creation is unavailable until an administrator fixes or resumes "
                     "this creator lobby. No channel was created."
@@ -2223,9 +2270,10 @@ class TempVoiceCog(commands.Cog):
             "\n".join(creator_lines_list) if creator_lines_list else "No creator channels yet."
         )
         description = (
-            "Create a permanent lobby first. Members join it, run `/tempvc`, and confirm with "
-            "a private button; joining alone never creates a room. Pausing only stops new "
-            "rooms and never removes lobbies, settings, or active rooms."
+            "Create a permanent lobby first. Joining it creates and moves the member into a "
+            "private room automatically; `/tempvc` in the lobby remains a requester-only "
+            "retry panel. Pausing only stops new rooms and never removes lobbies, settings, "
+            "or active rooms."
         )
         fields: tuple[EmbedField, ...] = (
             EmbedField("Creator channels", creator_lines, inline=False),

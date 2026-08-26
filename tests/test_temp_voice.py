@@ -218,7 +218,7 @@ def test_unique_temp_voice_names_are_bounded_and_do_not_shadow_existing_names() 
     assert len(duplicate) <= 100
 
 
-def test_creation_view_requires_explicit_button_and_can_hide_setup() -> None:
+def test_creation_retry_view_can_disable_retry_and_hide_setup() -> None:
     view = TempVoiceCreateView(
         cast(TempVoiceCog, Mock()),
         requester_id=1,
@@ -230,6 +230,7 @@ def test_creation_view_requires_explicit_button_and_can_hide_setup() -> None:
     children = {item.custom_id: item for item in view.children}
     create = children["simajilord:tempvc:create-room"]
     assert isinstance(create, discord.ui.Button)
+    assert create.label == "Retry room creation"
     assert create.disabled is True
     assert "simajilord:tempvc:creator-setup" not in children
 
@@ -253,7 +254,37 @@ async def test_full_category_blocks_creator_before_discord_mutation(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_joining_creator_lobby_alone_does_not_create_room(tmp_path) -> None:
+async def test_new_creator_channel_uses_join_to_create_label(tmp_path) -> None:
+    service = TempVoiceService(tmp_path / "temp_voice.sqlite3")
+    runtime = cast(SimajilordRuntime, SimpleNamespace(temp_voice=service))
+    cog = TempVoiceCog(Mock(spec=commands.Bot), runtime)
+
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    guild.me = Mock(spec=discord.Member)
+    created_channel = Mock(spec=discord.VoiceChannel)
+    created_channel.id = 20
+    guild.create_voice_channel = AsyncMock(return_value=created_channel)
+    member = Mock(spec=discord.Member)
+    member.guild = guild
+    category = Mock(spec=discord.CategoryChannel)
+    category.id = 30
+    category.guild = guild
+    category.channels = []
+    category.voice_channels = []
+    category.permissions_for.return_value = discord.Permissions.all()
+
+    creator = await cog._create_creator_channel(member, category)
+
+    create_call = guild.create_voice_channel.await_args
+    assert create_call.args[0] == "Join to create"
+    assert create_call.kwargs["category"] is category
+    assert creator.channel_id == "20"
+    assert creator.permission_source_channel_id == "20"
+
+
+@pytest.mark.asyncio
+async def test_joining_creator_lobby_starts_automatic_room_creation(tmp_path) -> None:
     service = TempVoiceService(tmp_path / "temp_voice.sqlite3")
     await service.add_creator(
         workspace_id="10",
@@ -264,7 +295,61 @@ async def test_joining_creator_lobby_alone_does_not_create_room(tmp_path) -> Non
     runtime = cast(SimajilordRuntime, SimpleNamespace(temp_voice=service))
     bot = Mock(spec=commands.Bot)
     cog = TempVoiceCog(bot, runtime)
-    cog._create_room_for_member = AsyncMock()  # type: ignore[method-assign]
+    created_channel = Mock(spec=discord.VoiceChannel)
+    cog._create_room_for_member = AsyncMock(  # type: ignore[method-assign]
+        return_value=created_channel
+    )
+
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    guild.me = Mock(spec=discord.Member)
+    category = Mock(spec=discord.CategoryChannel)
+    category.id = 30
+    category.guild = guild
+    category.channels = []
+    category.permissions_for.return_value = discord.Permissions.all()
+    member = Mock(spec=discord.Member)
+    member.id = 40
+    member.bot = False
+    member.guild = guild
+    creator_channel = Mock(spec=discord.VoiceChannel)
+    creator_channel.id = 20
+    creator_channel.guild = guild
+    creator_channel.permissions_for.return_value = discord.Permissions.all()
+    guild.get_channel.side_effect = lambda channel_id: {
+        20: creator_channel,
+        30: category,
+    }.get(channel_id)
+    member.voice = SimpleNamespace(channel=creator_channel)
+    before = Mock(spec=discord.VoiceState)
+    before.channel = None
+    after = Mock(spec=discord.VoiceState)
+    after.channel = creator_channel
+
+    await cog.on_voice_state_update(member, before, after)
+
+    creation_call = cog._create_room_for_member.await_args
+    assert creation_call.args[0] is member
+    assert creation_call.args[1] is creator_channel
+    assert creation_call.args[2].channel_id == "20"
+    assert creation_call.args[3] is category
+
+
+@pytest.mark.asyncio
+async def test_automatic_creation_rejection_is_journaled_for_private_retry(tmp_path) -> None:
+    service = TempVoiceService(tmp_path / "temp_voice.sqlite3")
+    await service.add_creator(
+        workspace_id="10",
+        channel_id="20",
+        category_id="30",
+        permission_source_channel_id="20",
+    )
+    runtime = cast(SimajilordRuntime, SimpleNamespace(temp_voice=service))
+    cog = TempVoiceCog(Mock(spec=commands.Bot), runtime)
+    cog._create_or_recover_room_from_creator = AsyncMock(  # type: ignore[method-assign]
+        side_effect=UserError("temp_voice.creation_paused")
+    )
+    cog.record_event = AsyncMock()  # type: ignore[method-assign]
 
     guild = Mock(spec=discord.Guild)
     guild.id = 10
@@ -281,11 +366,20 @@ async def test_joining_creator_lobby_alone_does_not_create_room(tmp_path) -> Non
 
     await cog.on_voice_state_update(member, before, after)
 
-    cog._create_room_for_member.assert_not_awaited()
+    cog.record_event.assert_awaited_once_with(
+        "temp_voice.auto_create_rejected",
+        workspace_id="10",
+        actor_id="40",
+        request_id="voice:40:20",
+        payload={
+            "creator_channel_id": "20",
+            "error": "temp_voice.creation_paused",
+        },
+    )
 
 
 @pytest.mark.asyncio
-async def test_explicit_creation_checks_lobby_and_invokes_room_creation(tmp_path) -> None:
+async def test_creation_retry_checks_lobby_and_invokes_room_creation(tmp_path) -> None:
     service = TempVoiceService(tmp_path / "temp_voice.sqlite3")
     await service.add_creator(
         workspace_id="10",
@@ -438,7 +532,7 @@ async def test_room_creation_copies_selected_voice_permissions(tmp_path) -> None
     category.overwrites = {category_only_role: discord.PermissionOverwrite(view_channel=False)}
     creator_channel = Mock(spec=discord.VoiceChannel)
     creator_channel.id = 20
-    creator_channel.name = "Create a room"
+    creator_channel.name = "Join to create"
     creator_channel.user_limit = 0
     category.voice_channels = [creator_channel]
     created = Mock(spec=discord.VoiceChannel)

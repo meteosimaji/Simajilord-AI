@@ -726,7 +726,7 @@ class AudioSession:
             current.start_seconds = bounded
             self._restart_requested = True
             self.output.stop()
-            await self._wait_for_current()
+            await self._wait_for_current(current)
         return bounded
 
     async def tune(
@@ -751,14 +751,17 @@ class AudioSession:
                 return
             if before_mutation is not None:
                 await before_mutation()
-            if current is not None and current.kind is AudioKind.MUSIC:
-                current.start_seconds = self._position_seconds()
+            restart_item = (
+                current if current is not None and current.kind is AudioKind.MUSIC else None
+            )
+            if restart_item is not None:
+                restart_item.start_seconds = self._position_seconds()
                 self._restart_requested = True
             self._speed = speed
             self._pitch = pitch
-            if self._restart_requested:
+            if restart_item is not None:
                 self.output.stop()
-                await self._wait_for_current()
+                await self._wait_for_current(restart_item)
         await self._state_changed()
 
     async def set_volume(
@@ -842,23 +845,24 @@ class AudioSession:
                 raise UserError("action.undo_conflict")
             if before_mutation is not None:
                 await before_mutation()
+            current = self._current
             restart_music = (
                 music is not None
-                and self._current is not None
-                and self._current.kind is AudioKind.MUSIC
+                and current is not None
+                and current.kind is AudioKind.MUSIC
             )
-            if restart_music and self._current is not None:
-                self._current.start_seconds = self._position_seconds()
+            if restart_music and current is not None:
+                current.start_seconds = self._position_seconds()
                 self._restart_requested = True
             if music is not None:
                 self._music_volume = music
-                if restart_music and self._current is not None:
-                    self._current.volume = music
+                if restart_music and current is not None:
+                    current.volume = music
             if speech is not None:
                 self._speech_volume = speech
-            if restart_music:
+            if restart_music and current is not None:
                 self.output.stop()
-                await self._wait_for_current()
+                await self._wait_for_current(current)
         await self._state_changed()
         return (
             self._music_volume,
@@ -959,6 +963,7 @@ class AudioSession:
         on_noop: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         autoplay_task: asyncio.Task[None] | None
+        stopped_item: AudioItem | None = None
         async with self._transport_lock, self._lock:
             changed = bool(
                 self._current is not None
@@ -992,11 +997,13 @@ class AudioSession:
             self._music.clear()
             self._autoplay.clear()
             if self._current is not None:
+                stopped_item = self._current
                 self.output.stop()
         if autoplay_task is not None:
             autoplay_task.cancel()
             await asyncio.gather(autoplay_task, return_exceptions=True)
-        await self._wait_for_current()
+        if stopped_item is not None:
+            await self._wait_for_current(stopped_item)
         await self._state_changed()
         return True
 
@@ -1056,11 +1063,12 @@ class AudioSession:
             self._suspended = True
             self._voice_activation_required = True
             self._suspend_requested = True
-            if self._current is not None:
-                if self._current.kind is AudioKind.MUSIC:
-                    self._current.start_seconds = self._position_seconds()
+            current = self._current
+            if current is not None:
+                if current.kind is AudioKind.MUSIC:
+                    current.start_seconds = self._position_seconds()
                 self.output.stop()
-                await self._wait_for_current()
+                await self._wait_for_current(current)
             await self.output.disconnect()
         await self._state_changed()
 
@@ -2077,13 +2085,18 @@ class AudioSession:
             return min(position, current.duration_seconds)
         return position
 
-    async def _wait_for_current(self) -> None:
+    async def _wait_for_current(self, stopped_item: AudioItem) -> None:
+        """Wait until the stopped item is retired, even if its replacement starts immediately."""
+
         try:
             async with asyncio.timeout(2.0):
-                while self._current is not None:
+                while self._current is stopped_item:
                     await asyncio.sleep(0)
         except TimeoutError:
-            log.warning("Timed out waiting for audio playback callback in %s", self.workspace_id)
+            log.warning(
+                "Timed out waiting for stopped audio item in %s",
+                self.workspace_id,
+            )
 
     async def _state_changed(self) -> None:
         if self._state_hook is None:

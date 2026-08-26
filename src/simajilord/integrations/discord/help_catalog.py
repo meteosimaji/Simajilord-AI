@@ -165,7 +165,8 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         "/tempvc",
         notes=(
             "Administrators first create a permanent lobby from the private setup panel.",
-            "Join the lobby, run /tempvc, then press Create my room; joining alone does nothing.",
+            "Join the lobby to create and enter your room automatically; /tempvc there opens "
+            "a private retry panel if creation does not complete.",
             "Inside your room, the same command opens rename, limit, lock, invite, remove, and "
             "ownership controls.",
             "Empty rooms wait 10 minutes by default and retain your saved room preferences.",
@@ -174,7 +175,7 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
         ),
         side_effects=(
             "May create a BOT-owned category, permanent creator lobby, or temporary voice room.",
-            "May move you from the creator lobby only after your explicit button confirmation.",
+            "Joining a configured creator lobby may create a room and move you into it.",
             "Deletes only tracked empty rooms after the configured recovery window.",
         ),
         common_errors=(

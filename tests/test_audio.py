@@ -151,6 +151,31 @@ async def test_audio_effect_hook_follows_state_validation_and_noop_detection() -
 
 
 @pytest.mark.asyncio
+async def test_volume_restart_waits_for_stopped_item_not_its_replacement() -> None:
+    output = FakeOutput()
+    session = AudioSession("one", output, max_pending_speech=3)
+    await session.enqueue(AudioItem("stream", "Track", "https://example.com/watch"))
+    for _ in range(20):
+        if len(output.played_items) == 1:
+            break
+        await asyncio.sleep(0)
+    assert len(output.played_items) == 1
+    first_item = output.played_items[0]
+
+    await asyncio.wait_for(session.set_volume(music=0.5), timeout=0.5)
+    for _ in range(20):
+        if len(output.played_items) == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert len(output.played_items) == 2
+    assert output.played_items[1] is not first_item
+    assert output.played_items[1].volume == pytest.approx(0.5)
+    assert output.stop_calls == 1
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_speech_overlays_current_music_before_waiting_music() -> None:
     output = FakeOutput()
     session = AudioSession("one", output, max_pending_speech=3)
