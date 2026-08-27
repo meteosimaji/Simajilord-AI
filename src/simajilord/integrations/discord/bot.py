@@ -78,6 +78,7 @@ class SimajilordDiscordBot(commands.Bot):
         ] = ()
         self._commands_synchronized = False
         self._audio_restored = False
+        self._agent_warmup_task: asyncio.Task[None] | None = None
         self._speech_warmup_task: asyncio.Task[None] | None = None
         self._command_sync_lock = asyncio.Lock()
         self._command_synchronizer = DiscordCommandSynchronizer(
@@ -86,6 +87,11 @@ class SimajilordDiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await verify_ffmpeg_opus()
+        if self.runtime.agent is not None and self._agent_warmup_task is None:
+            self._agent_warmup_task = asyncio.create_task(
+                self._warm_agent_provider(),
+                name="simajilord-agent-warmup",
+            )
         if self._speech_warmup_task is None:
             self._speech_warmup_task = asyncio.create_task(
                 self._warm_speech_provider(),
@@ -107,6 +113,22 @@ class SimajilordDiscordBot(commands.Bot):
         )
         await self.runtime.image.start(self._deliver_image_job)
         self._command_templates = tuple(self.tree.get_commands())
+
+    async def _warm_agent_provider(self) -> None:
+        """Start the app-server host without waiting for a Discord mention."""
+
+        agent = self.runtime.agent
+        if agent is None:
+            return
+        try:
+            started = await agent.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Agent provider warm-up failed; first use will retry", exc_info=True)
+            return
+        if started:
+            log.info("Agent provider host warm-up complete")
 
     async def _warm_speech_provider(self) -> None:
         """Remove VOICEVOX cold-start latency without blocking Discord startup."""
@@ -500,11 +522,18 @@ class SimajilordDiscordBot(commands.Bot):
         return None
 
     async def close(self) -> None:
-        speech_warmup_task = getattr(self, "_speech_warmup_task", None)
-        if speech_warmup_task is not None:
-            if not speech_warmup_task.done():
-                speech_warmup_task.cancel()
-            await asyncio.gather(speech_warmup_task, return_exceptions=True)
+        warmup_tasks = tuple(
+            task
+            for task in (
+                getattr(self, "_agent_warmup_task", None),
+                getattr(self, "_speech_warmup_task", None),
+            )
+            if task is not None
+        )
+        for task in warmup_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*warmup_tasks, return_exceptions=True)
         operator_server = getattr(self, "operator_server", None)
         if operator_server is not None:
             await operator_server.close()

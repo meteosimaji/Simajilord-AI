@@ -575,6 +575,12 @@ uv run simajilord-discord
 The real `.env`, local databases, generated speech, downloads, cookies, and `notes/` are
 ignored by Git.
 
+`CODEX_EXPECTED_VERSION_PREFIX=auto` follows the Codex CLI selected by `CODEX_EXECUTABLE` after
+each app-server start. Before accepting a newly installed CLI, Simajilord generates its protocol
+schemas and verifies every request, notification, response, dynamic-tool, and approval shape that
+the host uses; an incompatible update fails closed while the Discord capability platform remains
+available. Set an explicit prefix such as `0.150.` only when an operator needs a temporary pin.
+
 For private development, `COMMAND_SCOPE=guild` synchronizes commands to each connected server.
 It also removes stale global commands for the same application so users do not see old and new
 commands together. Each scope has a durable canonical manifest hash: an unchanged restart makes

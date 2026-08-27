@@ -4849,6 +4849,17 @@ def test_trigger_message_id_comes_only_from_typed_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bot_prewarms_agent_provider_before_first_mention() -> None:
+    start_agent = AsyncMock(return_value=True)
+    bot = object.__new__(SimajilordDiscordBot)
+    bot.runtime = SimpleNamespace(agent=SimpleNamespace(start=start_agent))
+
+    await SimajilordDiscordBot._warm_agent_provider(bot)
+
+    start_agent.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_bot_unloads_cogs_before_closing_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -42,6 +42,7 @@ from .providers import (
     AgentProvider,
     ProviderTurnResult,
     SemanticRoutingAgentProvider,
+    StartableAgentProvider,
 )
 from .store import AgentConversationStore, AgentTaskRouteUnavailableError
 
@@ -129,6 +130,14 @@ class AgentService:
     @property
     def model(self) -> str:
         return self.provider.model
+
+    async def start(self) -> bool:
+        """Preflight a provider host when its implementation exposes a lifecycle hook."""
+
+        if not isinstance(self.provider, StartableAgentProvider):
+            return False
+        await self.provider.start()
+        return True
 
     async def _provider_turn(
         self,

@@ -241,6 +241,57 @@ class FakeProvider:
         return True
 
 
+class StartableFakeProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = False
+
+    async def start(self) -> None:
+        self.started = True
+
+
+@pytest.mark.asyncio
+async def test_agent_service_prewarms_only_startable_provider(tmp_path: Path) -> None:
+    startable_provider = StartableFakeProvider()
+    startable_service = AgentService(
+        provider=startable_provider,
+        store=AgentConversationStore(tmp_path / "startable-agent.sqlite3"),
+        journal=EventJournal(tmp_path / "startable-events.sqlite3"),
+        limits=_limits(),
+    )
+    passive_service = AgentService(
+        provider=FakeProvider(),
+        store=AgentConversationStore(tmp_path / "passive-agent.sqlite3"),
+        journal=EventJournal(tmp_path / "passive-events.sqlite3"),
+        limits=_limits(),
+    )
+
+    assert await startable_service.start() is True
+    assert startable_provider.started is True
+    assert await passive_service.start() is False
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_public_start_initializes_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "agent",
+        idle_timeout_seconds=10,
+        reasoning_effort="medium",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+    )
+    ensure_started = AsyncMock()
+    monkeypatch.setattr(provider, "_ensure_started", ensure_started)
+
+    await provider.start()
+
+    ensure_started.assert_awaited_once_with()
+
+
 @pytest.mark.asyncio
 async def test_provider_starts_new_threads_with_stable_history_mode(
     monkeypatch: pytest.MonkeyPatch,

@@ -9,6 +9,7 @@ from .base import (
     AgentToolTraceSink,
     ProviderTurnResult,
     SemanticRoutingAgentProvider,
+    StartableAgentProvider,
 )
 from .codex import CodexAppServerProvider
 
@@ -22,4 +23,5 @@ __all__ = [
     "CodexAppServerProvider",
     "ProviderTurnResult",
     "SemanticRoutingAgentProvider",
+    "StartableAgentProvider",
 ]

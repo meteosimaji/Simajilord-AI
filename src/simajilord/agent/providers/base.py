@@ -51,6 +51,13 @@ class AgentProvider(Protocol):
 
 
 @runtime_checkable
+class StartableAgentProvider(Protocol):
+    """Optional provider lifecycle used to preflight a host before the first turn."""
+
+    async def start(self) -> None: ...
+
+
+@runtime_checkable
 class SemanticRoutingAgentProvider(Protocol):
     """Optional provider extension for typed same-turn task routing."""
 

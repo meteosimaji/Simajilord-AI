@@ -9,9 +9,13 @@ import pytest
 
 from simajilord.agent import AgentProviderError, AgentUnavailableError
 from simajilord.agent.providers.codex import (
+    _CODEX_PROTOCOL_ENVELOPE_CONTRACTS,
+    _CODEX_PROTOCOL_METHOD_CONTRACTS,
+    _CODEX_PROTOCOL_RESPONSE_CONTRACTS,
     CodexAppServerProvider,
     _codex_app_server_environment,
     _ToolTurnBudget,
+    _validate_codex_protocol_schema,
     _verify_codex_version,
 )
 from simajilord.agent.tools import AgentToolCatalog
@@ -51,6 +55,113 @@ def _config_overrides(arguments: tuple[str, ...]) -> dict[str, str]:
     settings = tuple(setting.split("=", 1) for _flag, setting in pairs)
     assert len(settings) == len({key for key, _value in settings})
     return dict(settings)
+
+
+def _write_minimal_codex_protocol_schema(schema_dir: Path) -> None:
+    string_parameter_values = {
+        ("thread/start", "approvalPolicy"): ["never"],
+        ("thread/start", "sandbox"): ["read-only"],
+        ("thread/start", "historyMode"): ["legacy"],
+        ("thread/start", "sessionStartSource"): ["startup"],
+        ("thread/resume", "approvalPolicy"): ["never"],
+        ("turn/start", "approvalPolicy"): ["never"],
+        ("turn/start", "effort"): ["high", "low"],
+        ("mcpServerStatus/list", "detail"): ["full"],
+    }
+    for schema_file, (envelope_fields, _sent_envelope_fields) in (
+        _CODEX_PROTOCOL_ENVELOPE_CONTRACTS.items()
+    ):
+        branches: list[dict[str, object]] = []
+        for contract in _CODEX_PROTOCOL_METHOD_CONTRACTS:
+            if contract.schema_file != schema_file:
+                continue
+            properties: dict[str, object] = {field: {} for field in envelope_fields}
+            properties["method"] = {"enum": [contract.method]}
+            if "params" in envelope_fields:
+                parameter_properties: dict[str, object] = {
+                    field: {} for field in contract.parameter_fields
+                }
+                for (method, parameter), values in string_parameter_values.items():
+                    if method == contract.method and parameter in parameter_properties:
+                        parameter_properties[parameter] = {"enum": values}
+                if contract.method == "turn/start" and "sandboxPolicy" in parameter_properties:
+                    parameter_properties["sandboxPolicy"] = {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {"type": {"enum": ["readOnly"]}},
+                                "required": ["type"],
+                            }
+                        ]
+                    }
+                properties["params"] = {
+                    "type": "object",
+                    "properties": parameter_properties,
+                    "required": [],
+                }
+            branches.append(
+                {
+                    "type": "object",
+                    "properties": properties,
+                    "required": sorted(envelope_fields),
+                }
+            )
+        (schema_dir / schema_file).write_text(
+            json.dumps({"oneOf": branches}),
+            encoding="utf-8",
+        )
+
+    for contract in _CODEX_PROTOCOL_RESPONSE_CONTRACTS:
+        path = schema_dir / contract.schema_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        properties: dict[str, object] = {field: {} for field in contract.property_fields}
+        if contract.nested_property is not None:
+            properties[contract.nested_property] = {
+                "type": "object",
+                "properties": {
+                    field: {} for field in contract.nested_property_fields
+                },
+                "required": sorted(contract.nested_required_fields),
+            }
+        if contract.schema_file == "DynamicToolCallResponse.json":
+            properties["contentItems"] = {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "type": {"enum": ["inputText"]},
+                            },
+                            "required": ["text", "type"],
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "imageUrl": {"type": "string"},
+                                "type": {"enum": ["inputImage"]},
+                            },
+                            "required": ["imageUrl", "type"],
+                        },
+                    ]
+                },
+            }
+        if contract.schema_file in {
+            "CommandExecutionRequestApprovalResponse.json",
+            "FileChangeRequestApprovalResponse.json",
+        }:
+            properties["decision"] = {"enum": ["decline"]}
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "object",
+                    "properties": properties,
+                    "required": sorted(contract.required_fields),
+                }
+            ),
+            encoding="utf-8",
+        )
 
 
 def test_discord_app_and_plugin_policy_has_no_collisions() -> None:
@@ -296,7 +407,7 @@ async def test_codex_version_guard_accepts_only_configured_line(
         returncode = 0
 
         async def communicate(self) -> tuple[bytes, bytes]:
-            return b"codex-cli 0.149.0-alpha.4.1\n", b""
+            return b"codex-cli 0.150.0-alpha.8\n", b""
 
     async def create_process(*args: object, **kwargs: object) -> Process:
         del args, kwargs
@@ -307,15 +418,109 @@ async def test_codex_version_guard_accepts_only_configured_line(
 
     assert await _verify_codex_version(
         "/resolved/codex",
-        expected_prefix="0.149.",
+        expected_prefix="0.150.",
         environment=environment,
-    ) == "0.149.0-alpha.4.1"
+    ) == "0.150.0-alpha.8"
     with pytest.raises(AgentUnavailableError, match="supported prefix"):
         await _verify_codex_version(
             "/resolved/codex",
             expected_prefix="0.148.",
             environment=environment,
         )
+
+
+@pytest.mark.asyncio
+async def test_codex_auto_version_policy_requires_protocol_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"codex-cli 0.151.0\n", b""
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    schema_check = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._verify_codex_protocol_schema",
+        schema_check,
+    )
+    environment = {"PATH": "/usr/bin:/bin"}
+
+    assert await _verify_codex_version(
+        "/resolved/codex",
+        expected_prefix="auto",
+        environment=environment,
+    ) == "0.151.0"
+    schema_check.assert_awaited_once_with(
+        "/resolved/codex",
+        environment=environment,
+    )
+
+
+def test_codex_protocol_schema_contract_accepts_complete_surface(tmp_path: Path) -> None:
+    _write_minimal_codex_protocol_schema(tmp_path)
+
+    _validate_codex_protocol_schema(tmp_path)
+
+
+def test_codex_protocol_schema_contract_rejects_missing_method(tmp_path: Path) -> None:
+    _write_minimal_codex_protocol_schema(tmp_path)
+    path = tmp_path / "ClientRequest.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["oneOf"] = [
+        branch
+        for branch in document["oneOf"]
+        if branch["properties"]["method"]["enum"] != ["turn/steer"]
+    ]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(AgentUnavailableError, match="protocol schema is incompatible"):
+        _validate_codex_protocol_schema(tmp_path)
+
+
+def test_codex_protocol_schema_contract_rejects_new_required_parameter(
+    tmp_path: Path,
+) -> None:
+    _write_minimal_codex_protocol_schema(tmp_path)
+    path = tmp_path / "ClientRequest.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    initialize = next(
+        branch
+        for branch in document["oneOf"]
+        if branch["properties"]["method"]["enum"] == ["initialize"]
+    )
+    params = initialize["properties"]["params"]
+    params["properties"]["futureRequired"] = {}
+    params["required"] = ["clientInfo", "futureRequired"]
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(AgentUnavailableError, match="protocol schema is incompatible"):
+        _validate_codex_protocol_schema(tmp_path)
+
+
+def test_codex_protocol_schema_contract_rejects_removed_runtime_value(
+    tmp_path: Path,
+) -> None:
+    _write_minimal_codex_protocol_schema(tmp_path)
+    path = tmp_path / "ClientRequest.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    thread_start = next(
+        branch
+        for branch in document["oneOf"]
+        if branch["properties"]["method"]["enum"] == ["thread/start"]
+    )
+    thread_start["properties"]["params"]["properties"]["sandbox"] = {
+        "enum": ["workspace-write"]
+    }
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(AgentUnavailableError, match="protocol schema is incompatible"):
+        _validate_codex_protocol_schema(tmp_path)
 
 
 @pytest.mark.asyncio

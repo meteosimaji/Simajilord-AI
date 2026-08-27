@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager, suppress
@@ -115,6 +116,8 @@ _APP_SERVER_INPUT_LINE_LIMIT_BYTES = 4_000_000
 _APP_SERVER_STDOUT_LIMIT_BYTES = 80_000_000
 _APP_SERVER_LARGE_LINE_LOG_BYTES = 500_000
 _APP_SERVER_FAILURE_NOTIFICATION = "__simajilord_app_server_failed__"
+_CODEX_AUTO_VERSION_POLICY = "auto"
+_CODEX_PROTOCOL_SCHEMA_MAX_BYTES = 2_000_000
 _SIMAJILORD_SOURCE_REPOSITORY = "https://github.com/meteosimaji/Simajilord-AI"
 _CAPABILITY_BROKER_TOOLS = frozenset(
     {
@@ -595,6 +598,311 @@ class _AppServerTransportError(AgentProviderError):
     """The app-server JSONL transport stopped independently of the model turn."""
 
 
+@dataclass(frozen=True, slots=True)
+class _CodexProtocolMethodContract:
+    schema_file: str
+    method: str
+    parameter_fields: frozenset[str]
+    sent_parameter_fields: frozenset[str] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CodexProtocolResponseContract:
+    schema_file: str
+    property_fields: frozenset[str]
+    required_fields: frozenset[str]
+    nested_property: str | None = None
+    nested_property_fields: frozenset[str] = frozenset()
+    nested_required_fields: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True, slots=True)
+class _CodexSchemaMethodShape:
+    envelope_properties: frozenset[str]
+    envelope_required: frozenset[str]
+    parameter_properties: frozenset[str]
+    parameter_required: frozenset[str]
+
+
+_CODEX_PROTOCOL_ENVELOPE_CONTRACTS: dict[
+    str,
+    tuple[frozenset[str], frozenset[str] | None],
+] = {
+    "ClientRequest.json": (
+        frozenset({"id", "method", "params"}),
+        frozenset({"id", "method", "params"}),
+    ),
+    "ClientNotification.json": (
+        frozenset({"method"}),
+        frozenset({"method"}),
+    ),
+    "ServerRequest.json": (
+        frozenset({"id", "method", "params"}),
+        None,
+    ),
+    "ServerNotification.json": (
+        frozenset({"method", "params"}),
+        None,
+    ),
+}
+
+_CODEX_PROTOCOL_METHOD_CONTRACTS = (
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "initialize",
+        frozenset({"capabilities", "clientInfo"}),
+        frozenset({"capabilities", "clientInfo"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "thread/start",
+        frozenset(
+            {
+                "allowProviderModelFallback",
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "developerInstructions",
+                "dynamicTools",
+                "environments",
+                "ephemeral",
+                "historyMode",
+                "model",
+                "permissions",
+                "runtimeWorkspaceRoots",
+                "sandbox",
+                "selectedCapabilityRoots",
+                "sessionStartSource",
+            }
+        ),
+        frozenset(
+            {
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "developerInstructions",
+                "dynamicTools",
+                "environments",
+                "ephemeral",
+                "historyMode",
+                "model",
+                "runtimeWorkspaceRoots",
+                "selectedCapabilityRoots",
+                "sessionStartSource",
+            }
+        ),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "thread/resume",
+        frozenset(
+            {
+                "approvalPolicy",
+                "baseInstructions",
+                "cwd",
+                "developerInstructions",
+                "model",
+                "permissions",
+                "runtimeWorkspaceRoots",
+                "threadId",
+            }
+        ),
+        frozenset(
+            {
+                "approvalPolicy",
+                "baseInstructions",
+                "config",
+                "cwd",
+                "developerInstructions",
+                "dynamicTools",
+                "environments",
+                "model",
+                "permissions",
+                "runtimeWorkspaceRoots",
+                "selectedCapabilityRoots",
+                "threadId",
+            }
+        ),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "turn/start",
+        frozenset(
+            {
+                "approvalPolicy",
+                "clientUserMessageId",
+                "effort",
+                "input",
+                "model",
+                "permissions",
+                "sandboxPolicy",
+                "threadId",
+            }
+        ),
+        frozenset({"approvalPolicy", "effort", "input", "model", "threadId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "turn/steer",
+        frozenset({"clientUserMessageId", "expectedTurnId", "input", "threadId"}),
+        frozenset({"clientUserMessageId", "expectedTurnId", "input", "threadId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "turn/interrupt",
+        frozenset({"threadId", "turnId"}),
+        frozenset({"threadId", "turnId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "mcpServerStatus/list",
+        frozenset({"cursor", "detail", "limit", "threadId"}),
+        frozenset({"detail", "limit", "threadId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientRequest.json",
+        "mcpServer/tool/call",
+        frozenset({"arguments", "server", "threadId", "tool"}),
+        frozenset({"arguments", "server", "threadId", "tool"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ClientNotification.json",
+        "initialized",
+        frozenset(),
+        frozenset(),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerRequest.json",
+        "item/tool/call",
+        frozenset({"arguments", "callId", "namespace", "threadId", "tool", "turnId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerRequest.json",
+        "item/commandExecution/requestApproval",
+        frozenset(),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerRequest.json",
+        "item/fileChange/requestApproval",
+        frozenset(),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerRequest.json",
+        "item/permissions/requestApproval",
+        frozenset(),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerNotification.json",
+        "item/started",
+        frozenset({"item", "threadId", "turnId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerNotification.json",
+        "item/completed",
+        frozenset({"item", "threadId", "turnId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerNotification.json",
+        "turn/completed",
+        frozenset({"threadId", "turn"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerNotification.json",
+        "thread/tokenUsage/updated",
+        frozenset({"threadId", "tokenUsage", "turnId"}),
+    ),
+    _CodexProtocolMethodContract(
+        "ServerNotification.json",
+        "thread/compacted",
+        frozenset({"threadId", "turnId"}),
+    ),
+)
+
+_CODEX_PROTOCOL_RESPONSE_CONTRACTS = (
+    _CodexProtocolResponseContract(
+        "v2/ThreadStartResponse.json",
+        frozenset({"thread"}),
+        frozenset({"thread"}),
+        nested_property="thread",
+        nested_property_fields=frozenset({"id"}),
+        nested_required_fields=frozenset({"id"}),
+    ),
+    _CodexProtocolResponseContract(
+        "v2/ThreadResumeResponse.json",
+        frozenset({"thread"}),
+        frozenset({"thread"}),
+        nested_property="thread",
+        nested_property_fields=frozenset({"id"}),
+        nested_required_fields=frozenset({"id"}),
+    ),
+    _CodexProtocolResponseContract(
+        "v2/TurnStartResponse.json",
+        frozenset({"turn"}),
+        frozenset({"turn"}),
+        nested_property="turn",
+        nested_property_fields=frozenset({"id", "items", "status"}),
+        nested_required_fields=frozenset({"id", "items", "status"}),
+    ),
+    _CodexProtocolResponseContract(
+        "v2/TurnSteerResponse.json",
+        frozenset({"turnId"}),
+        frozenset({"turnId"}),
+    ),
+    _CodexProtocolResponseContract(
+        "v2/ListMcpServerStatusResponse.json",
+        frozenset({"data", "nextCursor"}),
+        frozenset({"data"}),
+    ),
+    _CodexProtocolResponseContract(
+        "v2/McpServerToolCallResponse.json",
+        frozenset({"content", "isError"}),
+        frozenset({"content"}),
+    ),
+    _CodexProtocolResponseContract(
+        "DynamicToolCallResponse.json",
+        frozenset({"contentItems", "success"}),
+        frozenset({"contentItems", "success"}),
+    ),
+    _CodexProtocolResponseContract(
+        "CommandExecutionRequestApprovalResponse.json",
+        frozenset({"decision"}),
+        frozenset({"decision"}),
+    ),
+    _CodexProtocolResponseContract(
+        "FileChangeRequestApprovalResponse.json",
+        frozenset({"decision"}),
+        frozenset({"decision"}),
+    ),
+    _CodexProtocolResponseContract(
+        "PermissionsRequestApprovalResponse.json",
+        frozenset({"permissions"}),
+        frozenset({"permissions"}),
+    ),
+)
+
+_CODEX_PROTOCOL_STRING_PARAMETER_VALUES = (
+    ("thread/start", "approvalPolicy", frozenset({"never"})),
+    ("thread/start", "sandbox", frozenset({"read-only"})),
+    ("thread/start", "historyMode", frozenset({CODEX_THREAD_HISTORY_MODE})),
+    ("thread/start", "sessionStartSource", frozenset({"startup"})),
+    ("thread/resume", "approvalPolicy", frozenset({"never"})),
+    ("turn/start", "approvalPolicy", frozenset({"never"})),
+    ("turn/start", "effort", frozenset({"high", "low"})),
+    ("mcpServerStatus/list", "detail", frozenset({"full"})),
+)
+
+_CODEX_PROTOCOL_OBJECT_DISCRIMINATOR_VALUES = (
+    ("turn/start", "sandboxPolicy", "type", frozenset({"readOnly"})),
+)
+
+_CODEX_PROTOCOL_RESPONSE_STRING_VALUES = (
+    ("CommandExecutionRequestApprovalResponse.json", "decision", frozenset({"decline"})),
+    ("FileChangeRequestApprovalResponse.json", "decision", frozenset({"decline"})),
+)
+
+
 @dataclass(slots=True)
 class _TurnAttemptState:
     process: asyncio.subprocess.Process | None = None
@@ -719,6 +1027,11 @@ class CodexAppServerProvider:
             tuple[str | None, str | None],
             tuple[str, str, str],
         ] = {}
+
+    async def start(self) -> None:
+        """Start and initialize the shared app-server before its first model turn."""
+
+        await self._ensure_started()
 
     async def generate_image(
         self,
@@ -1955,10 +2268,15 @@ class CodexAppServerProvider:
             environment.setdefault("RUST_LOG", "info")
             self._stderr_tail.clear()
             try:
-                await _verify_codex_version(
+                version = await _verify_codex_version(
                     executable,
                     expected_prefix=self.expected_version_prefix,
                     environment=environment,
+                )
+                log.info(
+                    "Codex app-server compatibility verified version=%s policy=%s",
+                    version,
+                    self.expected_version_prefix or "unchecked",
                 )
                 process = await asyncio.create_subprocess_exec(
                     executable,
@@ -6979,13 +7297,634 @@ def _codex_app_server_environment() -> dict[str, str]:
     return environment
 
 
+def _codex_protocol_schema_error(reason: str) -> AgentUnavailableError:
+    log.warning("Codex app-server protocol schema rejected reason=%s", reason)
+    return AgentUnavailableError(
+        "Codex app-server protocol schema is incompatible with this Simajilord host."
+    )
+
+
+def _codex_schema_mapping(value: object, *, label: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise _codex_protocol_schema_error(f"{label} is not an object")
+    return cast(dict[str, object], value)
+
+
+def _codex_schema_string_set(value: object, *, label: str) -> frozenset[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise _codex_protocol_schema_error(f"{label} is not a string array")
+    return frozenset(cast(list[str], value))
+
+
+def _load_codex_protocol_schema(path: Path) -> dict[str, object]:
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > _CODEX_PROTOCOL_SCHEMA_MAX_BYTES:
+            raise _codex_protocol_schema_error(f"{path.name} has an invalid size")
+        value: object = json.loads(path.read_text(encoding="utf-8"))
+    except AgentUnavailableError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _codex_protocol_schema_error(f"{path.name} could not be read") from exc
+    return _codex_schema_mapping(value, label=path.name)
+
+
+def _resolve_codex_schema_node(
+    document: dict[str, object],
+    value: object,
+    *,
+    label: str,
+) -> dict[str, object]:
+    node = _codex_schema_mapping(value, label=label)
+    seen: set[str] = set()
+    while "$ref" in node:
+        reference = node.get("$ref")
+        if (
+            not isinstance(reference, str)
+            or not reference.startswith("#/definitions/")
+            or reference in seen
+        ):
+            raise _codex_protocol_schema_error(f"{label} has an invalid reference")
+        seen.add(reference)
+        definitions = _codex_schema_mapping(
+            document.get("definitions"),
+            label=f"{label} definitions",
+        )
+        definition_name = (
+            reference.removeprefix("#/definitions/").replace("~1", "/").replace("~0", "~")
+        )
+        if definition_name not in definitions:
+            raise _codex_protocol_schema_error(f"{label} reference is missing")
+        node = _codex_schema_mapping(
+            definitions[definition_name],
+            label=f"{label} definition",
+        )
+    return node
+
+
+def _codex_schema_object_shape(
+    document: dict[str, object],
+    value: object,
+    *,
+    label: str,
+) -> tuple[dict[str, object], frozenset[str]]:
+    node = _resolve_codex_schema_node(document, value, label=label)
+    properties = _codex_schema_mapping(
+        node.get("properties"),
+        label=f"{label} properties",
+    )
+    required = _codex_schema_string_set(
+        node.get("required", []),
+        label=f"{label} required fields",
+    )
+    return properties, required
+
+
+def _codex_schema_method_name(
+    document: dict[str, object],
+    value: object,
+    *,
+    label: str,
+) -> str | None:
+    node = _resolve_codex_schema_node(document, value, label=label)
+    constant = node.get("const")
+    if isinstance(constant, str):
+        return constant
+    enum = node.get("enum")
+    if isinstance(enum, list) and len(enum) == 1 and isinstance(enum[0], str):
+        return enum[0]
+    return None
+
+
+def _codex_schema_method_shapes(
+    schema_path: Path,
+    *,
+    wanted_methods: frozenset[str],
+) -> dict[str, _CodexSchemaMethodShape]:
+    document = _load_codex_protocol_schema(schema_path)
+    branches = document.get("oneOf")
+    if not isinstance(branches, list):
+        raise _codex_protocol_schema_error(f"{schema_path.name} has no method union")
+    result: dict[str, _CodexSchemaMethodShape] = {}
+    for index, raw_branch in enumerate(branches):
+        branch_label = f"{schema_path.name} branch {index}"
+        envelope_properties, envelope_required = _codex_schema_object_shape(
+            document,
+            raw_branch,
+            label=branch_label,
+        )
+        raw_method = envelope_properties.get("method")
+        if raw_method is None:
+            continue
+        method = _codex_schema_method_name(
+            document,
+            raw_method,
+            label=f"{branch_label} method",
+        )
+        if method not in wanted_methods:
+            continue
+        if method in result:
+            raise _codex_protocol_schema_error(
+                f"{schema_path.name} defines {method} more than once"
+            )
+        raw_params = envelope_properties.get("params")
+        if raw_params is None:
+            parameter_properties: frozenset[str] = frozenset()
+            parameter_required: frozenset[str] = frozenset()
+        else:
+            raw_parameter_properties, parameter_required = _codex_schema_object_shape(
+                document,
+                raw_params,
+                label=f"{branch_label} params",
+            )
+            parameter_properties = frozenset(raw_parameter_properties)
+        result[method] = _CodexSchemaMethodShape(
+            envelope_properties=frozenset(envelope_properties),
+            envelope_required=envelope_required,
+            parameter_properties=parameter_properties,
+            parameter_required=parameter_required,
+        )
+    return result
+
+
+def _codex_schema_method_parameter(
+    document: dict[str, object],
+    *,
+    method: str,
+    parameter: str,
+    label: str,
+) -> object:
+    branches = document.get("oneOf")
+    if not isinstance(branches, list):
+        raise _codex_protocol_schema_error(f"{label} has no method union")
+    for index, raw_branch in enumerate(branches):
+        branch_label = f"{label} branch {index}"
+        envelope_properties, _envelope_required = _codex_schema_object_shape(
+            document,
+            raw_branch,
+            label=branch_label,
+        )
+        raw_method = envelope_properties.get("method")
+        if raw_method is None:
+            continue
+        branch_method = _codex_schema_method_name(
+            document,
+            raw_method,
+            label=f"{branch_label} method",
+        )
+        if branch_method != method:
+            continue
+        raw_params = envelope_properties.get("params")
+        if raw_params is None:
+            break
+        parameter_properties, _parameter_required = _codex_schema_object_shape(
+            document,
+            raw_params,
+            label=f"{branch_label} params",
+        )
+        if parameter in parameter_properties:
+            return parameter_properties[parameter]
+        break
+    raise _codex_protocol_schema_error(f"{label} {method} is missing parameter {parameter}")
+
+
+def _validate_codex_response_schema(
+    schema_dir: Path,
+    contract: _CodexProtocolResponseContract,
+) -> None:
+    path = schema_dir / contract.schema_file
+    document = _load_codex_protocol_schema(path)
+    properties, required = _codex_schema_object_shape(
+        document,
+        document,
+        label=contract.schema_file,
+    )
+    if not contract.property_fields.issubset(properties):
+        missing = sorted(contract.property_fields - properties.keys())
+        raise _codex_protocol_schema_error(
+            f"{contract.schema_file} is missing properties {missing}"
+        )
+    if not contract.required_fields.issubset(required):
+        missing = sorted(contract.required_fields - required)
+        raise _codex_protocol_schema_error(
+            f"{contract.schema_file} made required fields optional {missing}"
+        )
+    if contract.nested_property is None:
+        return
+    nested_properties, nested_required = _codex_schema_object_shape(
+        document,
+        properties[contract.nested_property],
+        label=f"{contract.schema_file} {contract.nested_property}",
+    )
+    if not contract.nested_property_fields.issubset(nested_properties):
+        missing = sorted(contract.nested_property_fields - nested_properties.keys())
+        raise _codex_protocol_schema_error(
+            f"{contract.schema_file} nested object is missing properties {missing}"
+        )
+    if not contract.nested_required_fields.issubset(nested_required):
+        missing = sorted(contract.nested_required_fields - nested_required)
+        raise _codex_protocol_schema_error(
+            f"{contract.schema_file} made nested required fields optional {missing}"
+        )
+
+
+def _codex_schema_string_values(
+    document: dict[str, object],
+    value: object,
+    *,
+    label: str,
+    depth: int = 0,
+) -> frozenset[str]:
+    if depth > 32:
+        raise _codex_protocol_schema_error(f"{label} is nested too deeply")
+    node = _resolve_codex_schema_node(document, value, label=label)
+    values: set[str] = set()
+    constant = node.get("const")
+    if isinstance(constant, str):
+        values.add(constant)
+    enum = node.get("enum")
+    if isinstance(enum, list):
+        values.update(item for item in enum if isinstance(item, str))
+    for union_name in ("oneOf", "anyOf", "allOf"):
+        raw_variants = node.get(union_name)
+        if raw_variants is None:
+            continue
+        if not isinstance(raw_variants, list):
+            raise _codex_protocol_schema_error(f"{label} has an invalid {union_name}")
+        for index, raw_variant in enumerate(raw_variants):
+            values.update(
+                _codex_schema_string_values(
+                    document,
+                    raw_variant,
+                    label=f"{label} {union_name} {index}",
+                    depth=depth + 1,
+                )
+            )
+    return frozenset(values)
+
+
+def _codex_schema_accepts_string(
+    document: dict[str, object],
+    value: object,
+    candidate: str,
+    *,
+    label: str,
+    depth: int = 0,
+) -> bool:
+    if depth > 32:
+        raise _codex_protocol_schema_error(f"{label} is nested too deeply")
+    node = _resolve_codex_schema_node(document, value, label=label)
+    constant = node.get("const")
+    if constant is not None and constant != candidate:
+        return False
+    enum = node.get("enum")
+    if isinstance(enum, list) and candidate not in enum:
+        return False
+    raw_type = node.get("type")
+    if isinstance(raw_type, str) and raw_type != "string":
+        return False
+    if isinstance(raw_type, list) and "string" not in raw_type:
+        return False
+    minimum_length = node.get("minLength")
+    if isinstance(minimum_length, int) and len(candidate) < minimum_length:
+        return False
+    maximum_length = node.get("maxLength")
+    if isinstance(maximum_length, int) and len(candidate) > maximum_length:
+        return False
+    pattern = node.get("pattern")
+    if isinstance(pattern, str):
+        try:
+            if re.search(pattern, candidate) is None:
+                return False
+        except re.error as exc:
+            raise _codex_protocol_schema_error(f"{label} has an invalid pattern") from exc
+    for union_name in ("anyOf", "oneOf"):
+        raw_variants = node.get(union_name)
+        if raw_variants is None:
+            continue
+        if not isinstance(raw_variants, list):
+            raise _codex_protocol_schema_error(f"{label} has an invalid {union_name}")
+        matches = sum(
+            _codex_schema_accepts_string(
+                document,
+                raw_variant,
+                candidate,
+                label=f"{label} {union_name} {index}",
+                depth=depth + 1,
+            )
+            for index, raw_variant in enumerate(raw_variants)
+        )
+        if matches == 0 or (union_name == "oneOf" and matches != 1):
+            return False
+    raw_all_of = node.get("allOf")
+    if raw_all_of is not None:
+        if not isinstance(raw_all_of, list):
+            raise _codex_protocol_schema_error(f"{label} has an invalid allOf")
+        if not all(
+            _codex_schema_accepts_string(
+                document,
+                raw_variant,
+                candidate,
+                label=f"{label} allOf {index}",
+                depth=depth + 1,
+            )
+            for index, raw_variant in enumerate(raw_all_of)
+        ):
+            return False
+    raw_not = node.get("not")
+    if raw_not is None:
+        return True
+    return not _codex_schema_accepts_string(
+        document,
+        raw_not,
+        candidate,
+        label=f"{label} not",
+        depth=depth + 1,
+    )
+
+
+def _codex_schema_discriminator_values(
+    document: dict[str, object],
+    value: object,
+    *,
+    label: str,
+    discriminator_field: str = "type",
+    depth: int = 0,
+) -> frozenset[str]:
+    if depth > 32:
+        raise _codex_protocol_schema_error(f"{label} is nested too deeply")
+    node = _resolve_codex_schema_node(document, value, label=label)
+    values: set[str] = set()
+    raw_properties = node.get("properties")
+    if isinstance(raw_properties, dict):
+        properties = _codex_schema_mapping(
+            raw_properties,
+            label=f"{label} properties",
+        )
+        raw_discriminator = properties.get(discriminator_field)
+        if raw_discriminator is not None:
+            values.update(
+                _codex_schema_string_values(
+                    document,
+                    raw_discriminator,
+                    label=f"{label} {discriminator_field}",
+                    depth=depth + 1,
+                )
+            )
+    for union_name in ("oneOf", "anyOf", "allOf"):
+        raw_variants = node.get(union_name)
+        if raw_variants is None:
+            continue
+        if not isinstance(raw_variants, list):
+            raise _codex_protocol_schema_error(f"{label} has an invalid {union_name}")
+        for index, raw_variant in enumerate(raw_variants):
+            values.update(
+                _codex_schema_discriminator_values(
+                    document,
+                    raw_variant,
+                    label=f"{label} {union_name} {index}",
+                    discriminator_field=discriminator_field,
+                    depth=depth + 1,
+                )
+            )
+    return frozenset(values)
+
+
+def _validate_codex_protocol_literal_values(schema_dir: Path) -> None:
+    client_path = schema_dir / "ClientRequest.json"
+    client_document = _load_codex_protocol_schema(client_path)
+    for method, parameter, expected_values in _CODEX_PROTOCOL_STRING_PARAMETER_VALUES:
+        raw_parameter = _codex_schema_method_parameter(
+            client_document,
+            method=method,
+            parameter=parameter,
+            label=client_path.name,
+        )
+        label = f"{client_path.name} {method} {parameter}"
+        missing = sorted(
+            candidate
+            for candidate in expected_values
+            if not _codex_schema_accepts_string(
+                client_document,
+                raw_parameter,
+                candidate,
+                label=label,
+            )
+        )
+        if missing:
+            raise _codex_protocol_schema_error(
+                f"{client_path.name} {method} {parameter} rejects values {missing}"
+            )
+
+    for (
+        method,
+        parameter,
+        discriminator,
+        expected_values,
+    ) in _CODEX_PROTOCOL_OBJECT_DISCRIMINATOR_VALUES:
+        raw_parameter = _codex_schema_method_parameter(
+            client_document,
+            method=method,
+            parameter=parameter,
+            label=client_path.name,
+        )
+        accepted_values = _codex_schema_discriminator_values(
+            client_document,
+            raw_parameter,
+            label=f"{client_path.name} {method} {parameter}",
+            discriminator_field=discriminator,
+        )
+        if not expected_values.issubset(accepted_values):
+            missing = sorted(expected_values - accepted_values)
+            raise _codex_protocol_schema_error(
+                f"{client_path.name} {method} {parameter} rejects variants {missing}"
+            )
+
+    for schema_file, property_name, expected_values in (
+        _CODEX_PROTOCOL_RESPONSE_STRING_VALUES
+    ):
+        path = schema_dir / schema_file
+        document = _load_codex_protocol_schema(path)
+        properties, _required = _codex_schema_object_shape(
+            document,
+            document,
+            label=schema_file,
+        )
+        label = f"{schema_file} {property_name}"
+        missing = sorted(
+            candidate
+            for candidate in expected_values
+            if not _codex_schema_accepts_string(
+                document,
+                properties[property_name],
+                candidate,
+                label=label,
+            )
+        )
+        if missing:
+            raise _codex_protocol_schema_error(
+                f"{schema_file} {property_name} rejects values {missing}"
+            )
+
+
+def _validate_codex_dynamic_tool_content(schema_dir: Path) -> None:
+    path = schema_dir / "DynamicToolCallResponse.json"
+    document = _load_codex_protocol_schema(path)
+    properties, _required = _codex_schema_object_shape(
+        document,
+        document,
+        label=path.name,
+    )
+    content_items = _resolve_codex_schema_node(
+        document,
+        properties["contentItems"],
+        label=f"{path.name} contentItems",
+    )
+    raw_items = content_items.get("items")
+    if raw_items is None:
+        raise _codex_protocol_schema_error(f"{path.name} has no content item schema")
+    values = _codex_schema_discriminator_values(
+        document,
+        raw_items,
+        label=f"{path.name} content item",
+    )
+    required_values = frozenset({"inputImage", "inputText"})
+    if not required_values.issubset(values):
+        missing = sorted(required_values - values)
+        raise _codex_protocol_schema_error(
+            f"{path.name} is missing content item variants {missing}"
+        )
+
+
+def _validate_codex_protocol_schema(schema_dir: Path) -> None:
+    """Validate the generated protocol surface used by every Simajilord call site."""
+
+    method_keys = tuple(
+        (method_contract.schema_file, method_contract.method)
+        for method_contract in _CODEX_PROTOCOL_METHOD_CONTRACTS
+    )
+    if len(method_keys) != len(set(method_keys)):
+        raise _codex_protocol_schema_error("host method contracts contain a duplicate")
+    response_files = tuple(
+        response_contract.schema_file
+        for response_contract in _CODEX_PROTOCOL_RESPONSE_CONTRACTS
+    )
+    if len(response_files) != len(set(response_files)):
+        raise _codex_protocol_schema_error("host response contracts contain a duplicate")
+
+    for schema_file, (envelope_fields, sent_envelope_fields) in (
+        _CODEX_PROTOCOL_ENVELOPE_CONTRACTS.items()
+    ):
+        contracts = tuple(
+            method_contract
+            for method_contract in _CODEX_PROTOCOL_METHOD_CONTRACTS
+            if method_contract.schema_file == schema_file
+        )
+        wanted_methods = frozenset(method_contract.method for method_contract in contracts)
+        shapes = _codex_schema_method_shapes(
+            schema_dir / schema_file,
+            wanted_methods=wanted_methods,
+        )
+        for method_contract in contracts:
+            shape = shapes.get(method_contract.method)
+            if shape is None:
+                raise _codex_protocol_schema_error(
+                    f"{schema_file} is missing method {method_contract.method}"
+                )
+            if not envelope_fields.issubset(shape.envelope_properties):
+                missing = sorted(envelope_fields - shape.envelope_properties)
+                raise _codex_protocol_schema_error(
+                    f"{schema_file} {method_contract.method} is missing envelope fields {missing}"
+                )
+            if sent_envelope_fields is not None and not shape.envelope_required.issubset(
+                sent_envelope_fields
+            ):
+                unsupported = sorted(shape.envelope_required - sent_envelope_fields)
+                raise _codex_protocol_schema_error(
+                    f"{schema_file} {method_contract.method} "
+                    f"requires new envelope fields {unsupported}"
+                )
+            if not method_contract.parameter_fields.issubset(shape.parameter_properties):
+                missing = sorted(
+                    method_contract.parameter_fields - shape.parameter_properties
+                )
+                raise _codex_protocol_schema_error(
+                    f"{schema_file} {method_contract.method} "
+                    f"is missing parameter fields {missing}"
+                )
+            sent_parameter_fields = method_contract.sent_parameter_fields
+            if sent_parameter_fields is not None and not shape.parameter_required.issubset(
+                sent_parameter_fields
+            ):
+                unsupported = sorted(shape.parameter_required - sent_parameter_fields)
+                raise _codex_protocol_schema_error(
+                    f"{schema_file} {method_contract.method} "
+                    f"requires new parameters {unsupported}"
+                )
+
+    for response_contract in _CODEX_PROTOCOL_RESPONSE_CONTRACTS:
+        _validate_codex_response_schema(schema_dir, response_contract)
+    _validate_codex_protocol_literal_values(schema_dir)
+    _validate_codex_dynamic_tool_content(schema_dir)
+
+
+async def _verify_codex_protocol_schema(
+    executable: str,
+    *,
+    environment: Mapping[str, str],
+) -> None:
+    try:
+        with tempfile.TemporaryDirectory(prefix="simajilord-codex-schema-") as raw_schema_dir:
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                "app-server",
+                "generate-json-schema",
+                "--experimental",
+                "--out",
+                raw_schema_dir,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(environment),
+            )
+            try:
+                async with asyncio.timeout(15.0):
+                    _stdout, stderr = await process.communicate()
+            except TimeoutError as exc:
+                process.kill()
+                await process.wait()
+                raise AgentUnavailableError(
+                    "Codex app-server protocol compatibility check timed out."
+                ) from exc
+            if process.returncode != 0:
+                detail = stderr.decode("utf-8", errors="replace").strip()[-2_000:]
+                log.warning(
+                    "Codex app-server schema generation failed returncode=%s detail=%s",
+                    process.returncode,
+                    detail or "none",
+                )
+                raise AgentUnavailableError(
+                    "Codex app-server protocol compatibility could not be checked."
+                )
+            await asyncio.to_thread(
+                _validate_codex_protocol_schema,
+                Path(raw_schema_dir),
+            )
+    except AgentUnavailableError:
+        raise
+    except OSError as exc:
+        raise AgentUnavailableError(
+            "Codex app-server protocol compatibility could not be checked."
+        ) from exc
+
+
 async def _verify_codex_version(
     executable: str,
     *,
     expected_prefix: str | None,
     environment: Mapping[str, str],
 ) -> str:
-    """Fail closed before speaking an experimental protocol outside its pinned line."""
+    """Check a manual pin or auto-gate the installed experimental protocol schema."""
 
     if expected_prefix is None:
         return "unchecked"
@@ -7012,6 +7951,12 @@ async def _verify_codex_version(
     if process.returncode != 0 or match is None:
         raise AgentUnavailableError("Codex returned an invalid version response.")
     version = match.group(1)
+    if expected_prefix.casefold() == _CODEX_AUTO_VERSION_POLICY:
+        await _verify_codex_protocol_schema(
+            executable,
+            environment=environment,
+        )
+        return version
     if not version.startswith(expected_prefix):
         raise AgentUnavailableError(
             "Codex app-server version is outside the configured supported prefix."
