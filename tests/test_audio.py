@@ -203,7 +203,7 @@ async def test_speech_overlays_current_music_before_waiting_music() -> None:
 
 
 @pytest.mark.asyncio
-async def test_speech_ducks_current_music_without_restarting_the_player(
+async def test_speech_ducks_current_stale_music_without_resolving_or_restarting_player(
     tmp_path: Path,
 ) -> None:
     resolved: list[str] = []
@@ -224,15 +224,18 @@ async def test_speech_ducks_current_music_without_restarting_the_player(
         max_pending_speech=3,
         resolver=resolve,
     )
-    await session.enqueue(
-        AudioItem(
-            "music-stream",
-            "music",
-            "https://example.com/music",
-            resolver_reference="https://example.com/music",
-        )
+    music = AudioItem(
+        "music-stream",
+        "music",
+        "https://example.com/music",
+        resolver_reference="https://example.com/music",
     )
-    await asyncio.sleep(0)
+    await session.enqueue(music)
+    for _ in range(20):
+        if output.played == ["music"]:
+            break
+        await asyncio.sleep(0)
+    music.resolved_at = 0.0
     speech_file = tmp_path / "speech.wav"
     speech_file.write_bytes(b"speech")
     await session.enqueue(
@@ -262,6 +265,84 @@ async def test_speech_ducks_current_music_without_restarting_the_player(
     assert snapshot.speech_active is False
     assert snapshot.position_seconds >= 0
     assert snapshot.history == ()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_speech_overlay_refreshes_stale_music_before_retry(
+    tmp_path: Path,
+) -> None:
+    class RetryOutput(FakeOutput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.overlay_sources: list[str] = []
+
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del position_seconds
+            self.overlay_attempts += 1
+            self.overlay_sources.append(music.source)
+            if self.overlay_attempts == 1:
+                raise RuntimeError("reopen required")
+            self.overlays.append(speech.source)
+
+    resolved: list[str] = []
+
+    async def resolve(reference: str) -> AudioItem:
+        resolved.append(reference)
+        return AudioItem(
+            "fresh-music-stream",
+            "music",
+            reference,
+            resolver_reference=reference,
+        )
+
+    output = RetryOutput()
+    session = AudioSession(
+        "overlay-retry",
+        output,
+        max_pending_speech=3,
+        resolver=resolve,
+    )
+    music = AudioItem(
+        "stale-music-stream",
+        "music",
+        "https://example.com/music",
+        resolver_reference="https://example.com/music",
+    )
+    await session.enqueue(music)
+    for _ in range(20):
+        if output.played == ["music"]:
+            break
+        await asyncio.sleep(0)
+    music.resolved_at = 0.0
+    speech_file = tmp_path / "speech.wav"
+    speech_file.write_bytes(b"speech")
+    await session.enqueue(
+        AudioItem(
+            str(speech_file),
+            "speech",
+            "local://speech",
+            duration_seconds=0.01,
+            kind=AudioKind.SPEECH,
+            owned_file=speech_file,
+        )
+    )
+
+    for _ in range(50):
+        if output.overlays == [str(speech_file)] and output.music_updates:
+            break
+        await asyncio.sleep(0)
+
+    assert output.overlay_sources == ["stale-music-stream", "fresh-music-stream"]
+    assert resolved == ["https://example.com/music"]
+    assert output.stop_calls == 0
+    assert not speech_file.exists()
     await session.close()
 
 

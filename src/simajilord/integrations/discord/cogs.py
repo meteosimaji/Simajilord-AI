@@ -7004,7 +7004,6 @@ class ReadAloudCog(commands.Cog):
             if (
                 output.connected
                 and output.destination_id != int(route.audio_destination_id)
-                and session.current is not None
             ):
                 return
             voice_tuning = self.runtime.read_aloud.voice_tuning_for(

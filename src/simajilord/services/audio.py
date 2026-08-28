@@ -1881,9 +1881,12 @@ class AudioSession:
                 try:
                     overlay_error: Exception | None = None
                     for attempt in range(1, _OVERLAY_ATTEMPTS + 1):
-                        if self._resolver is not None and (
-                            self._must_resolve(music, 1) or attempt > 1
-                        ):
+                        # The active transport already owns a playable music
+                        # source.  A live speech mixer can wrap that source
+                        # directly, so refreshing an aged signed URL before
+                        # the first attempt only delays speech.  Resolve on a
+                        # retry for transports that need to reopen the stream.
+                        if self._resolver is not None and attempt > 1:
                             resolved = await self._resolve(music.unresolved_copy())
                             _adopt_resolved_stream(music, resolved)
                         try:

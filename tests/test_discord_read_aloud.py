@@ -932,6 +932,55 @@ async def test_connected_message_uses_authors_personal_voice_tuning(
     assert context.request_id == "read-aloud:99"
 
 
+@pytest.mark.asyncio
+async def test_connected_idle_read_aloud_rejects_a_different_voice_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    service = ReadAloudService(tmp_path / "read_aloud.json")
+    await service.configure(ReadAloudRoute("1", "2", "55", ReadAloudMode.QUEUE))
+    destination = Mock(spec=discord.VoiceChannel)
+    destination.id = 55
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    guild.get_channel.return_value = destination
+    message = cast(
+        discord.Message,
+        SimpleNamespace(
+            id=99,
+            guild=guild,
+            channel=SimpleNamespace(id=2),
+            author=SimpleNamespace(id=10),
+        ),
+    )
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.read_aloud = service
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock()
+    runtime.audio = Mock()
+    session = Mock()
+    session.voice_activation_required = False
+    session.current = None
+    session.output.connected = True
+    session.output.destination_id = 66
+    runtime.audio.get_or_create.return_value = session
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.cogs._read_aloud_audience_allowed",
+        lambda *_args: True,
+    )
+    cog = ReadAloudCog(cast(commands.Bot, object()), runtime)
+
+    await cog._deliver_read_aloud(
+        message,
+        ReadAloudMessageText(
+            (SpeechSegment(SpeechSegmentKind.BODY, "別のVCには読み上げない"),),
+            "Message",
+        ),
+    )
+
+    runtime.registry.invoke.assert_not_awaited()
+
+
 async def _announcement_cog(tmp_path) -> tuple[
     ReadAloudCog,
     SimajilordRuntime,
