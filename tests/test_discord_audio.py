@@ -80,6 +80,68 @@ def test_managed_discord_source_cleanup_is_idempotent(
     assert cleanup_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_discord_output_reports_playback_after_voice_accepts_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Source(discord.AudioSource):
+        def read(self) -> bytes:
+            return b"packet"
+
+        def is_opus(self) -> bool:
+            return True
+
+        def cleanup(self) -> None:
+            events.append("cleanup")
+
+    class Voice:
+        def __init__(self) -> None:
+            self.playing = False
+
+        def is_connected(self) -> bool:
+            return True
+
+        def is_playing(self) -> bool:
+            return self.playing
+
+        def is_paused(self) -> bool:
+            return False
+
+        def play(self, source: discord.AudioSource, *, after) -> None:
+            assert source.is_opus()
+            events.append("voice.play")
+            self.playing = True
+            after(None)
+
+        def stop(self) -> None:
+            self.playing = False
+
+        async def disconnect(self, *, force: bool) -> None:
+            assert force is True
+
+    source = Source()
+    voice = Voice()
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _guild: None), 1)
+    output._voice = voice  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _item: source,
+    )
+
+    async def on_started() -> None:
+        events.append("started")
+
+    await output.play(
+        AudioItem("music", "Music", "https://example.test/music"),
+        on_started=on_started,
+    )
+
+    assert events == ["voice.play", "started", "cleanup"]
+    await output.disconnect()
+
+
 def test_live_speech_pcm_mix_ducks_music_and_saturates() -> None:
     music_samples = array("h", [4_000, -4_000] * 960)
     speech_samples = array("h", [1_000, -1_000] * 960)

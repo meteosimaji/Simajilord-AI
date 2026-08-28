@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import wave
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -255,8 +256,15 @@ async def test_speech_capability_uses_shared_audio_session(tmp_path: Path) -> No
         async def connect(self, destination_id: str) -> None:
             del destination_id
 
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             del item
+            if on_started is not None:
+                await on_started()
             await release.wait()
 
         async def overlay_speech(
@@ -346,8 +354,15 @@ async def test_blank_speech_releases_fifo_reservation_for_the_next_request(
         async def connect(self, destination_id: str) -> None:
             del destination_id
 
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             del item
+            if on_started is not None:
+                await on_started()
 
         async def overlay_speech(
             self,
@@ -453,9 +468,16 @@ async def test_single_speech_item_keeps_fifo_while_synthesis_runs(
         async def connect(self, destination_id: str) -> None:
             del destination_id
 
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             del item
             first_play_started.set()
+            if on_started is not None:
+                await on_started()
             await release_playback.wait()
 
         async def overlay_speech(
@@ -709,8 +731,15 @@ async def test_speech_queue_is_reserved_before_provider_work_starts(
             del destination_id
             self.connected = True
 
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             del item
+            if on_started is not None:
+                await on_started()
 
         async def overlay_speech(
             self,

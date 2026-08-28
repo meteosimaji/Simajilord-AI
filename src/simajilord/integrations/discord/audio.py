@@ -8,6 +8,7 @@ import shlex
 import shutil
 import sys
 from array import array
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from ctypes.util import find_library
@@ -373,7 +374,12 @@ class DiscordAudioOutput:
         self._live_mixing_disabled = False
         self._music_stream_continuous_after_overlay = False
 
-    async def play(self, item: AudioItem) -> None:
+    async def play(
+        self,
+        item: AudioItem,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         voice = self._adopt_voice_client()
         if voice is None or not voice.is_connected():
             raise UserError("audio.output_disconnected")
@@ -401,6 +407,8 @@ class DiscordAudioOutput:
             # FFmpegOpusAudio reports is_opus=True, so discord.py sends the packets
             # directly instead of constructing its native libopus PCM encoder.
             voice.play(source, after=after)
+            if on_started is not None:
+                await on_started()
             expected = max(
                 0.0,
                 (item.duration_seconds - item.start_seconds)

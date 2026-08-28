@@ -67,7 +67,12 @@ class AudioOutput(Protocol):
 
     async def connect(self, destination_id: str) -> None: ...
 
-    async def play(self, item: AudioItem) -> None: ...
+    async def play(
+        self,
+        item: AudioItem,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> None: ...
 
     async def overlay_speech(
         self,
@@ -221,6 +226,7 @@ class AudioSession:
         self._manual_music_start_reservations: set[str] = set()
         self._history: deque[AudioItem] = deque(maxlen=_MAX_HISTORY_ITEMS)
         self._current: AudioItem | None = None
+        self._current_playback_started = False
         self._waiting_actor_ids: set[str] = set()
         self._loop_mode = LoopMode.NONE
         self._wake = asyncio.Event()
@@ -437,7 +443,12 @@ class AudioSession:
             pending += 1
         position = pending + 1
         current = self._current
-        if current is not None and current.kind is AudioKind.MUSIC and self._overlay_task is None:
+        if (
+            current is not None
+            and current.kind is AudioKind.MUSIC
+            and self._current_playback_started
+            and self._overlay_task is None
+        ):
             self._start_speech_overlay_locked(current, item)
         else:
             self._speech.append(item)
@@ -453,6 +464,21 @@ class AudioSession:
             self._run_speech_overlays(music, speech),
             name=f"simajilord-speech-overlay-{self.workspace_id}",
         )
+
+    async def _mark_playback_started(self, item: AudioItem) -> None:
+        """Release speech only after the current music source is truly active."""
+
+        async with self._lock:
+            if self._current is not item or self._closed:
+                return
+            self._current_playback_started = True
+            if (
+                item.kind is AudioKind.MUSIC
+                and self._overlay_task is None
+                and self._speech
+            ):
+                speech = self._speech.popleft()
+                self._start_speech_overlay_locked(item, speech)
 
     async def enqueue_many(
         self,
@@ -1597,6 +1623,7 @@ class AudioSession:
                 continue
 
             self._current = item
+            self._current_playback_started = False
             self._speech_active = item.kind is AudioKind.SPEECH
             if item.kind is AudioKind.MUSIC:
                 self._remember_mix_seed(item)
@@ -1654,6 +1681,7 @@ class AudioSession:
                 suspended = self._suspend_requested
                 restarted = self._restart_requested
                 self._current = None
+                self._current_playback_started = False
                 self._skip_requested = False
                 self._discard_requested = False
                 self._suspend_requested = False
@@ -1807,7 +1835,17 @@ class AudioSession:
                     playable = await self._resolve(playable)
                     self._current = playable
                     await self._state_changed()
-                await self.output.play(playable)
+                self._current_playback_started = False
+
+                async def mark_playback_started(
+                    started_item: AudioItem = playable,
+                ) -> None:
+                    await self._mark_playback_started(started_item)
+
+                await self.output.play(
+                    playable,
+                    on_started=mark_playback_started,
+                )
                 return playable
             except asyncio.CancelledError:
                 raise

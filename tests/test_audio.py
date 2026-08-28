@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic
@@ -54,9 +55,16 @@ class FakeOutput:
     async def connect(self, destination_id: str) -> None:
         self.connected = True
 
-    async def play(self, item: AudioItem) -> None:
+    async def play(
+        self,
+        item: AudioItem,
+        *,
+        on_started: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         self.played.append(item.title)
         self.played_items.append(item)
+        if on_started is not None:
+            await on_started()
         await self.release.wait()
         self.release.clear()
 
@@ -344,6 +352,95 @@ async def test_failed_speech_overlay_refreshes_stale_music_before_retry(
     assert output.stop_calls == 0
     assert not speech_file.exists()
     await session.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_waits_for_resolved_music_playback_before_overlay() -> None:
+    class StartAwareOutput(FakeOutput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.playback_started = False
+
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
+            self.playback_started = True
+            await super().play(item, on_started=on_started)
+
+        async def overlay_speech(
+            self,
+            music: AudioItem,
+            speech: AudioItem,
+            *,
+            position_seconds: float,
+        ) -> None:
+            del music, position_seconds
+            self.overlay_attempts += 1
+            if not self.playback_started:
+                raise RuntimeError("music source is not active")
+            self.overlays.append(speech.source)
+
+    resolve_started = asyncio.Event()
+    release_resolve = asyncio.Event()
+    resolve_calls = 0
+
+    async def resolve(reference: str) -> AudioItem:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        assert reference == "https://example.com/music"
+        resolve_started.set()
+        await release_resolve.wait()
+        return AudioItem(
+            "fresh-music-stream",
+            "music",
+            reference,
+            resolver_reference=reference,
+        )
+
+    output = StartAwareOutput()
+    session = AudioSession(
+        "overlay-start-race",
+        output,
+        max_pending_speech=3,
+        resolver=resolve,
+    )
+    try:
+        await session.enqueue(
+            AudioItem(
+                "",
+                "music",
+                "https://example.com/music",
+                resolver_reference="https://example.com/music",
+            )
+        )
+        await asyncio.wait_for(resolve_started.wait(), timeout=1)
+        await session.enqueue(
+            AudioItem(
+                "speech",
+                "speech",
+                "local://speech",
+                kind=AudioKind.SPEECH,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert output.overlay_attempts == 0
+
+        release_resolve.set()
+        for _ in range(50):
+            if output.overlays == ["speech"]:
+                break
+            await asyncio.sleep(0)
+
+        assert output.overlays == ["speech"]
+        assert output.overlay_attempts == 1
+        assert resolve_calls == 1
+    finally:
+        release_resolve.set()
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -701,7 +798,13 @@ async def test_failed_music_is_dropped_at_lane_retry_cap(
     initial_failures: int,
 ) -> None:
     class FailedOutput(FakeOutput):
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
+            del on_started
             self.played.append(item.title)
             raise RuntimeError("transport failed")
 
@@ -765,9 +868,16 @@ async def test_mid_play_disconnect_holds_current_track_without_retry_penalty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class DisconnectingOutput(FakeOutput):
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             self.played.append(item.title)
             self.played_items.append(item)
+            if on_started is not None:
+                await on_started()
             if len(self.played) == 1:
                 self.connected = False
                 raise EarlyPlaybackEnd(
@@ -821,7 +931,13 @@ async def test_permanent_media_failure_is_not_requeued(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class UnavailableOutput(FakeOutput):
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
+            del on_started
             self.played.append(item.title)
             raise MediaError("unavailable", "private or deleted")
 
@@ -857,8 +973,15 @@ async def test_early_playback_end_reresolves_once_and_resumes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class EarlyEndOutput(FakeOutput):
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             self.played.append(item.source)
+            if on_started is not None:
+                await on_started()
             if len(self.played) == 1:
                 raise EarlyPlaybackEnd(
                     elapsed_seconds=10.0,
@@ -1746,10 +1869,17 @@ async def test_failed_stream_is_reresolved_without_another_command(monkeypatch) 
             super().__init__()
             self.sources: list[str] = []
 
-        async def play(self, item: AudioItem) -> None:
+        async def play(
+            self,
+            item: AudioItem,
+            *,
+            on_started: Callable[[], Awaitable[None]] | None = None,
+        ) -> None:
             self.sources.append(item.source)
             if len(self.sources) == 1:
                 raise RuntimeError("expired stream")
+            if on_started is not None:
+                await on_started()
 
     async def resolve(reference: str) -> AudioItem:
         assert reference == "https://example.com/watch"
