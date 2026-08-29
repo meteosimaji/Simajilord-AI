@@ -104,6 +104,7 @@ from simajilord.core import (
 )
 from simajilord.core.errors import UserError
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.audio import AudioSession
 from simajilord.services.files import (
     WorkspaceFileAction,
     WorkspaceFileProvenance,
@@ -5414,8 +5415,27 @@ def build_discord_endpoints(
         request: AudioMixRequest,
         context: InvocationContext,
     ) -> AudioMixResponse:
-        await _assert_audio_control_access(context)
+        session: AudioSession | None = None
+        if request.enabled:
+            guild = _guild(client, context)
+            member = await _actor_member(guild, context)
+            await _prepare_actor_audio(
+                client,
+                runtime,
+                guild,
+                member,
+                before_connect=context.dispatch_external_effect,
+            )
+            session = runtime.audio.require(str(guild.id))
+        else:
+            await _assert_audio_control_access(context)
         response = await runtime.registry.invoke("audio.mix", request, context)
+        if session is not None and not session.output.connected:
+            # Radio has no manual request to register through ``audio.play``.
+            # Keep a disconnected station activatable by its requester so the
+            # shared panel exposes Start instead of reporting Radio on while
+            # leaving the session permanently dormant.
+            await session.wait_for_listener(context.actor_id)
         return cast(AudioMixResponse, response)
 
     async def move_audio(
@@ -7861,7 +7881,10 @@ def build_discord_endpoints(
                     "ラジオ",
                     "関連曲",
                 ),
-                side_effects=("Changes the server's persistent automatic selection settings.",),
+                side_effects=(
+                    "May join the requester's voice channel when Radio is enabled.",
+                    "Changes the server's persistent automatic selection settings.",
+                ),
                 audit_payload="metadata",
                 egress=EgressDescriptor(
                     provider="public_media",

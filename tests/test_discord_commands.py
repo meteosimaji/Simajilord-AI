@@ -42,6 +42,8 @@ from simajilord.agent import (
 from simajilord.capabilities.audio import (
     AudioAction,
     AudioControlResponse,
+    AudioMixRequest,
+    AudioMixResponse,
     AudioNoArgsRequest,
     AudioPlayRequest,
     AudioPlayResponse,
@@ -1858,6 +1860,144 @@ async def test_agent_audio_adapter_rebinds_requester_identity(
 
 
 @pytest.mark.asyncio
+async def test_radio_enable_connects_to_requesters_current_voice_before_starting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+
+    async def invoke_audio_mix(
+        capability_name: str,
+        request: AudioMixRequest,
+        context: InvocationContext,
+    ) -> AudioMixResponse:
+        del request, context
+        events.append(capability_name)
+        return AudioMixResponse(
+            enabled=True,
+            seed_references=("https://example.com/seed",),
+            next_item=None,
+        )
+
+    runtime.registry.invoke = AsyncMock(side_effect=invoke_audio_mix)
+    session = Mock()
+    session.output.connected = False
+    session.wait_for_listener = AsyncMock()
+    runtime.audio.get_or_create.return_value = session
+    runtime.audio.require.return_value = session
+
+    async def connect_audio(workspace_id: str, destination_id: str) -> None:
+        assert workspace_id == "1"
+        assert destination_id == "55"
+        events.append("voice.connect")
+        session.output.connected = True
+
+    runtime.audio.connect = AsyncMock(side_effect=connect_audio)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    member = Mock(spec=discord.Member)
+    voice_channel = Mock(spec=discord.VoiceChannel)
+    voice_channel.id = 55
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._member_voice_channel",
+        lambda selected_member: voice_channel,
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="discord",
+        request_id="radio",
+    )
+    request = AudioMixRequest(enabled=True)
+
+    response = await endpoint_by_name["discord.set_audio_radio"].invoke(
+        request,
+        context,
+    )
+
+    assert response.enabled is True
+    assert events == ["voice.connect", "audio.mix"]
+    runtime.registry.invoke.assert_awaited_once_with("audio.mix", request, context)
+    session.wait_for_listener.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_radio_enable_without_voice_exposes_requester_start_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.registry = Mock()
+    runtime.registry.invoke = AsyncMock(
+        return_value=AudioMixResponse(
+            enabled=True,
+            seed_references=("https://example.com/seed",),
+            next_item=None,
+        )
+    )
+    session = Mock()
+    session.output.connected = False
+    session.wait_for_listener = AsyncMock()
+    runtime.audio.get_or_create.return_value = session
+    runtime.audio.require.return_value = session
+    runtime.audio.connect = AsyncMock()
+    guild = Mock(spec=discord.Guild)
+    guild.id = 1
+    member = Mock(spec=discord.Member)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._guild",
+        lambda client, context: guild,
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._actor_member",
+        AsyncMock(return_value=member),
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.capabilities._member_voice_channel",
+        lambda selected_member: None,
+    )
+    endpoint_by_name = {
+        item.descriptor.name: item
+        for item in build_discord_endpoints(
+            cast(discord.Client, object()),
+            runtime,
+        )
+    }
+    context = InvocationContext(
+        actor_id="7",
+        workspace_id="1",
+        transport="discord",
+        request_id="radio",
+    )
+    request = AudioMixRequest(enabled=True)
+
+    response = await endpoint_by_name["discord.set_audio_radio"].invoke(
+        request,
+        context,
+    )
+
+    assert response.enabled is True
+    runtime.audio.connect.assert_not_awaited()
+    session.wait_for_listener.assert_awaited_once_with("7")
+    runtime.registry.invoke.assert_awaited_once_with("audio.mix", request, context)
+
+
+@pytest.mark.asyncio
 async def test_agent_pause_adapter_invokes_exact_audio_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2605,6 +2745,31 @@ async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() 
         isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
     )
+
+
+def test_disconnected_requester_radio_panel_exposes_start() -> None:
+    response = AudioQueueResponse(
+        current=None,
+        pending=(),
+        paused=False,
+        loop_mode="none",
+        destination_id=None,
+        auto_leave=True,
+        position_seconds=0,
+        speed=1,
+        pitch=1,
+        waiting_for_voice=True,
+        autoplay_enabled=True,
+        connected=False,
+    )
+
+    view = MusicControlsView(
+        cast(SimajilordRuntime, object()),
+        response=response,
+    )
+    labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+
+    assert labels == ["Start", "Add music"]
 
 
 @pytest.mark.asyncio
