@@ -24,6 +24,7 @@ from simajilord.core import (
     endpoint,
 )
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 from .contracts import expand_agent_grants
 
@@ -659,7 +660,7 @@ class CapabilityLeaseStore:
         self.path.chmod(0o600)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10.0)
+        connection = closing_connect(self.path, timeout=10.0)
         connection.execute("PRAGMA busy_timeout=10000")
         return connection
 

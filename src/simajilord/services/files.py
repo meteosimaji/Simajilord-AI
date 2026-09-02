@@ -23,6 +23,7 @@ from typing import Literal, TypeAlias, cast
 from pypdf import PdfReader
 
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 log = logging.getLogger(__name__)
 
@@ -369,7 +370,7 @@ class AgentFileSandbox:
         publication_rows: list[sqlite3.Row]
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -524,7 +525,7 @@ class AgentFileSandbox:
         _validate_managed_identity(guild_id, actor_id)
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -702,7 +703,7 @@ class AgentFileSandbox:
             try:
                 with (
                     self._provenance_lock,
-                    sqlite3.connect(
+                    closing_connect(
                         self._provenance_path,
                         timeout=5.0,
                     ) as connection,
@@ -760,7 +761,7 @@ class AgentFileSandbox:
             raise UserError("files.file_ref_not_found")
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -813,7 +814,7 @@ class AgentFileSandbox:
                 raise UserError("files.publication_not_found")
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -844,7 +845,7 @@ class AgentFileSandbox:
         cursor_pair: tuple[str, str] | None = None
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -970,7 +971,7 @@ class AgentFileSandbox:
     ) -> WorkspaceManagedFileShareState:
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -1731,7 +1732,7 @@ class AgentFileSandbox:
         try:
             with (
                 self._provenance_lock,
-                sqlite3.connect(
+                closing_connect(
                     self._provenance_path,
                     timeout=5.0,
                 ) as connection,
@@ -1827,7 +1828,7 @@ class AgentFileSandbox:
             raise UserError("files.publication_revision_conflict")
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2011,7 +2012,7 @@ class AgentFileSandbox:
     def _initialize_provenance(self) -> None:
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2246,7 +2247,7 @@ class AgentFileSandbox:
     ) -> tuple[str | None, str | None, str | None]:
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2273,7 +2274,7 @@ class AgentFileSandbox:
     ) -> WorkspaceFileProvenance | None:
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2342,7 +2343,7 @@ class AgentFileSandbox:
         file_ref = f"fil_{uuid.uuid4().hex}"
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2417,7 +2418,7 @@ class AgentFileSandbox:
         _validate_private_file_ref(source_file_ref)
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2513,7 +2514,7 @@ class AgentFileSandbox:
             raise UserError("files.publication_not_found")
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,
@@ -2537,7 +2538,7 @@ class AgentFileSandbox:
     ) -> None:
         with (
             self._provenance_lock,
-            sqlite3.connect(
+            closing_connect(
                 self._provenance_path,
                 timeout=5.0,
             ) as connection,

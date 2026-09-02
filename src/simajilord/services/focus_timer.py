@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 
 class FocusTimerStatus(StrEnum):
@@ -585,7 +586,7 @@ class FocusTimerService:
         return _row_to_timer(row)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = closing_connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")

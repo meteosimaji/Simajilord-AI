@@ -509,7 +509,9 @@ with Discord's generic “interaction failed” banner.
 - An optional read-only Now Playing Activity built with Discord's official Embedded App SDK.
   OAuth identity and same-VC membership are checked by the backend; the browser receives no
   stream URLs, authorization headers, local paths, or playback controls
-- Structured, append-only local command/capability/message events in SQLite
+- Structured, append-only local command/capability/message events in SQLite. Transaction-scoped
+  connections commit or roll back and then close their file handles; a source-level regression
+  check rejects raw SQLite connection contexts that could silently exhaust the service limit
 
 One independent audio session is created per Discord server. Different servers may use voice
 concurrently up to the configured process limit; one server never owns multiple Discord voice
@@ -579,7 +581,11 @@ ignored by Git.
 each app-server start. Before accepting a newly installed CLI, Simajilord generates its protocol
 schemas and verifies every request, notification, response, dynamic-tool, and approval shape that
 the host uses; an incompatible update fails closed while the Discord capability platform remains
-available. Set an explicit prefix such as `0.150.` only when an operator needs a temporary pin.
+available. It also starts a disposable strict-config app-server with the exact runtime arguments
+before serving a turn. Disabled MCP definitions carry an inert, self-contained transport rather
+than depending on mutable global config, and an idle long-lived app-server is replaced when those
+arguments change. Set an explicit prefix such as `0.150.` only when an operator needs a temporary
+pin.
 
 For private development, `COMMAND_SCOPE=guild` synchronizes commands to each connected server.
 It also removes stale global commands for the same application so users do not see old and new

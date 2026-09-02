@@ -27,6 +27,7 @@ from simajilord.core import (
     endpoint,
 )
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 from .contracts import AGENT_MEMORY_CURATOR_GRANT
 
@@ -1799,7 +1800,7 @@ class AgentMemoryStore:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = closing_connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")

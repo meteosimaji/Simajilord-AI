@@ -118,6 +118,7 @@ _APP_SERVER_LARGE_LINE_LOG_BYTES = 500_000
 _APP_SERVER_FAILURE_NOTIFICATION = "__simajilord_app_server_failed__"
 _CODEX_AUTO_VERSION_POLICY = "auto"
 _CODEX_PROTOCOL_SCHEMA_MAX_BYTES = 2_000_000
+_CODEX_RUNTIME_CONFIG_PROBE_SECONDS = 1.5
 _SIMAJILORD_SOURCE_REPOSITORY = "https://github.com/meteosimaji/Simajilord-AI"
 _CAPABILITY_BROKER_TOOLS = frozenset(
     {
@@ -996,6 +997,7 @@ class CodexAppServerProvider:
             self.workspace_dir.chmod(0o700)
 
         self._process: asyncio.subprocess.Process | None = None
+        self._runtime_arguments: tuple[str, ...] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._server_tasks: set[asyncio.Task[None]] = set()
@@ -2201,6 +2203,7 @@ class CodexAppServerProvider:
     async def _close_unlocked(self) -> None:
         process = self._process
         self._process = None
+        self._runtime_arguments = None
         process_key = id(process) if process is not None else None
         if process_key is not None:
             self._expected_process_exits.add(process_key)
@@ -2255,13 +2258,51 @@ class CodexAppServerProvider:
             self._expected_process_exits.discard(process_key)
 
     async def _ensure_started(self) -> None:
-        if self._process is not None and self._process.returncode is None:
+        environment = _codex_app_server_environment()
+        try:
+            runtime_arguments = _codex_runtime_arguments(
+                codex_home=Path(
+                    environment.get("CODEX_HOME", str(Path.home() / ".codex"))
+                ).resolve(),
+                allow_image_generation=self.allow_image_generation,
+            )
+        except (OSError, RuntimeError) as exc:
+            raise AgentUnavailableError(
+                "Codex app-server runtime policy could not be validated."
+            ) from exc
+        if (
+            self._process is not None
+            and self._process.returncode is None
+            and runtime_arguments == self._runtime_arguments
+        ):
             return
         async with self._start_lock:
-            if self._process is not None and self._process.returncode is None:
-                return
-            executable = _resolve_executable(self.executable)
             environment = _codex_app_server_environment()
+            try:
+                runtime_arguments = _codex_runtime_arguments(
+                    codex_home=Path(
+                        environment.get("CODEX_HOME", str(Path.home() / ".codex"))
+                    ).resolve(),
+                    allow_image_generation=self.allow_image_generation,
+                )
+            except (OSError, RuntimeError) as exc:
+                raise AgentUnavailableError(
+                    "Codex app-server runtime policy could not be validated."
+                ) from exc
+            if (
+                self._process is not None
+                and self._process.returncode is None
+                and runtime_arguments == self._runtime_arguments
+            ):
+                return
+            if self._process is not None and self._process.returncode is None:
+                if self._thread_by_turn:
+                    raise AgentUnavailableError(
+                        "Codex runtime configuration changed while turns are active."
+                    )
+                log.info("Codex runtime configuration changed; restarting app-server")
+                await self._close_unlocked()
+            executable = _resolve_executable(self.executable)
             # Retain enough app-server detail to diagnose a later idle failure.
             # The parent keeps only a bounded, sanitized tail and emits it at
             # warning level when the process or turn fails.
@@ -2278,21 +2319,18 @@ class CodexAppServerProvider:
                     version,
                     self.expected_version_prefix or "unchecked",
                 )
+                await _verify_codex_runtime_configuration(
+                    executable,
+                    environment=environment,
+                    runtime_arguments=runtime_arguments,
+                )
                 process = await asyncio.create_subprocess_exec(
                     executable,
                     "app-server",
                     "--strict-config",
                     "--listen",
                     "stdio://",
-                    *codex_feature_arguments(
-                        allow_image_generation=self.allow_image_generation,
-                        allow_discord_extensions=True,
-                    ),
-                    *discord_codex_policy_arguments(
-                        codex_home=Path(
-                            environment.get("CODEX_HOME", str(Path.home() / ".codex"))
-                        ).resolve(),
-                    ),
+                    *runtime_arguments,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -2303,6 +2341,7 @@ class CodexAppServerProvider:
             except OSError as exc:
                 raise AgentUnavailableError("Codex app-server could not be started.") from exc
             self._process = process
+            self._runtime_arguments = runtime_arguments
             log.info(
                 "Codex app-server started pid=%s model=%s effort=%s",
                 process.pid,
@@ -7916,6 +7955,85 @@ async def _verify_codex_protocol_schema(
         raise AgentUnavailableError(
             "Codex app-server protocol compatibility could not be checked."
         ) from exc
+
+
+def _codex_runtime_arguments(
+    *,
+    codex_home: Path,
+    allow_image_generation: bool,
+) -> tuple[str, ...]:
+    """Build the complete process-local config so global config drift is detectable."""
+
+    return (
+        *codex_feature_arguments(
+            allow_image_generation=allow_image_generation,
+            allow_discord_extensions=True,
+        ),
+        *discord_codex_policy_arguments(codex_home=codex_home),
+    )
+
+
+async def _verify_codex_runtime_configuration(
+    executable: str,
+    *,
+    environment: Mapping[str, str],
+    runtime_arguments: tuple[str, ...],
+) -> None:
+    """Prove the exact app-server CLI configuration can start before serving turns."""
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            executable,
+            "app-server",
+            "--strict-config",
+            "--listen",
+            "stdio://",
+            *runtime_arguments,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=dict(environment),
+        )
+    except OSError as exc:
+        raise AgentUnavailableError(
+            "Codex app-server runtime configuration could not be checked."
+        ) from exc
+    stderr_task = asyncio.create_task(
+        process.stderr.read() if process.stderr is not None else asyncio.sleep(0, result=b"")
+    )
+    try:
+        try:
+            async with asyncio.timeout(_CODEX_RUNTIME_CONFIG_PROBE_SECONDS):
+                await process.wait()
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                async with asyncio.timeout(2.0):
+                    await process.wait()
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+            await stderr_task
+            log.info("Codex app-server runtime configuration verified")
+            return
+        stderr = await stderr_task
+        detail = stderr.decode("utf-8", errors="replace").strip()[-2_000:]
+        log.warning(
+            "Codex app-server runtime configuration rejected returncode=%s detail=%s",
+            process.returncode,
+            detail or "none",
+        )
+        raise AgentUnavailableError(
+            "Codex app-server runtime configuration is incompatible."
+        )
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        if not stderr_task.done():
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
 
 
 async def _verify_codex_version(

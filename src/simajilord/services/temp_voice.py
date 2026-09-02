@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import cast
 
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 DEFAULT_TEMP_VOICE_GRACE_SECONDS = 10 * 60
 MIN_TEMP_VOICE_GRACE_SECONDS = 60
@@ -1007,7 +1008,7 @@ class TempVoiceService:
         return room
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = closing_connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys=ON")

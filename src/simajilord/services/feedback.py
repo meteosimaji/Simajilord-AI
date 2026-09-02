@@ -15,6 +15,7 @@ from pathlib import Path
 
 from simajilord.agent import is_agent_public_reference_id
 from simajilord.core.errors import UserError
+from simajilord.sqlite import closing_connect
 
 _MAX_TITLE_CHARACTERS = 160
 _MAX_DETAILS_CHARACTERS = 4_000
@@ -271,7 +272,7 @@ class FeedbackService:
         os.chmod(self.path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = closing_connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")

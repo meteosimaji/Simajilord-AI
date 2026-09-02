@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from discord import app_commands
 
+from simajilord.sqlite import closing_connect
+
 CommandPayload = Mapping[str, object]
 CommandPayloadFetcher = Callable[[], Awaitable[Sequence[CommandPayload]]]
 
@@ -132,7 +134,7 @@ class CommandManifestStore:
             return cursor.rowcount
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = closing_connect(self.path, timeout=10)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")
         return connection

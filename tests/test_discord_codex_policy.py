@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -14,8 +15,10 @@ from simajilord.agent.providers.codex import (
     _CODEX_PROTOCOL_RESPONSE_CONTRACTS,
     CodexAppServerProvider,
     _codex_app_server_environment,
+    _codex_runtime_arguments,
     _ToolTurnBudget,
     _validate_codex_protocol_schema,
+    _verify_codex_runtime_configuration,
     _verify_codex_version,
 )
 from simajilord.agent.tools import AgentToolCatalog
@@ -190,7 +193,10 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     (codex_home / "config.toml").write_text(
-        '[mcp_servers.personal_gateway]\nurl = "https://example.invalid/mcp"\n',
+        (
+            '[mcp_servers.personal_gateway]\nurl = "https://example.invalid/mcp"\n'
+            '[mcp_servers.cua_repl]\ncommand = "/configured/cua-repl"\n'
+        ),
         encoding="utf-8",
     )
     disabled_skill = codex_home / "skills" / "playwright" / "SKILL.md"
@@ -235,8 +241,11 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
     assert overrides["apps._default.destructive_enabled"] == "false"
     assert overrides["apps._default.open_world_enabled"] == "false"
     assert overrides["mcp_servers.node_repl.enabled"] == "false"
+    assert overrides["mcp_servers.node_repl.command"] == '"/usr/bin/false"'
     assert overrides["mcp_servers.playwright.enabled"] == "false"
+    assert overrides["mcp_servers.playwright.command"] == '"/usr/bin/false"'
     assert overrides["mcp_servers.computer-use.enabled"] == "false"
+    assert overrides["mcp_servers.computer-use.command"] == '"/usr/bin/false"'
     for server in (
         "creative_production_mcp",
         "dataAnalyticsWidgets",
@@ -246,10 +255,16 @@ def test_discord_policy_is_fail_closed_and_process_local(tmp_path: Path) -> None
         assert overrides[f"mcp_servers.{server}.command"] == '"/usr/bin/false"'
         assert overrides[f"mcp_servers.{server}.enabled"] == "false"
     assert overrides["mcp_servers.openaiDeveloperDocs.enabled"] == "false"
+    assert overrides["mcp_servers.openaiDeveloperDocs.command"] == '"/usr/bin/false"'
     assert overrides["mcp_servers.design_plugin_server.command"] == '"/usr/bin/false"'
     assert overrides["mcp_servers.design_plugin_server.enabled"] == "false"
     assert overrides["mcp_servers.personal_gateway.enabled"] == "false"
     assert "mcp_servers.personal_gateway.command" not in overrides
+    assert overrides["mcp_servers.personal_gateway.url"] == '"http://127.0.0.1:9"'
+    assert overrides["mcp_servers.cua_repl.enabled"] == "false"
+    assert overrides["mcp_servers.cua_repl.command"] == '"/usr/bin/false"'
+    assert "example.invalid" not in " ".join(overrides.values())
+    assert "/configured/cua-repl" not in " ".join(overrides.values())
     assert overrides["shell_environment_policy.inherit"] == '"none"'
     assert overrides["shell_environment_policy.set.HOME"] == '"/nonexistent"'
     assert (
@@ -292,6 +307,16 @@ def test_discord_policy_rejects_an_uninspectable_plugin_mcp_manifest(
     manifest.write_text("not json", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="Plugin MCP manifest is invalid"):
+        discord_codex_policy_arguments(codex_home=tmp_path)
+
+
+def test_discord_policy_rejects_configured_mcp_without_transport(tmp_path: Path) -> None:
+    (tmp_path / "config.toml").write_text(
+        "[mcp_servers.cua_repl]\nenabled = false\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid transport"):
         discord_codex_policy_arguments(codex_home=tmp_path)
 
 
@@ -460,6 +485,163 @@ async def test_codex_auto_version_policy_requires_protocol_schema(
         "/resolved/codex",
         environment=environment,
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_configuration_probe_uses_exact_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class Process:
+        returncode: int | None = None
+        stderr = SimpleNamespace(read=AsyncMock(return_value=b""))
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                await asyncio.Future()
+            assert self.returncode is not None
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        created.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._CODEX_RUNTIME_CONFIG_PROBE_SECONDS",
+        0.01,
+    )
+    runtime_arguments = ("-c", "mcp_servers.cua_repl.enabled=false")
+
+    await _verify_codex_runtime_configuration(
+        "/resolved/codex",
+        environment={"PATH": "/usr/bin:/bin"},
+        runtime_arguments=runtime_arguments,
+    )
+
+    assert created[0][0] == (
+        "/resolved/codex",
+        "app-server",
+        "--strict-config",
+        "--listen",
+        "stdio://",
+        *runtime_arguments,
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_runtime_configuration_probe_rejects_invalid_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process:
+        returncode = 1
+        stderr = SimpleNamespace(read=AsyncMock(return_value=b"invalid transport"))
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    async def create_process(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    with pytest.raises(AgentUnavailableError, match="configuration is incompatible"):
+        await _verify_codex_runtime_configuration(
+            "/resolved/codex",
+            environment={"PATH": "/usr/bin:/bin"},
+            runtime_arguments=("-c", "mcp_servers.cua_repl.enabled=false"),
+        )
+
+
+def test_codex_runtime_arguments_have_no_duplicate_overrides(tmp_path: Path) -> None:
+    arguments = _codex_runtime_arguments(
+        codex_home=tmp_path,
+        allow_image_generation=False,
+    )
+    config_arguments = arguments[arguments.index("-c") :]
+
+    _config_overrides(config_arguments)
+
+
+@pytest.mark.asyncio
+async def test_provider_restarts_idle_app_server_after_runtime_config_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = _provider(tmp_path)
+    old_process = SimpleNamespace(returncode=None, pid=10)
+    new_process = SimpleNamespace(
+        returncode=None,
+        pid=20,
+        stdin=None,
+        stdout=None,
+        stderr=None,
+    )
+    provider._process = old_process
+    provider._runtime_arguments = ("old",)
+
+    async def close_unlocked() -> None:
+        provider._process = None
+        provider._runtime_arguments = None
+
+    close = AsyncMock(side_effect=close_unlocked)
+    verify_version = AsyncMock(return_value="0.152.1")
+    verify_runtime = AsyncMock()
+    request = AsyncMock(return_value={})
+    notify = AsyncMock()
+    create_process = AsyncMock(return_value=new_process)
+    monkeypatch.setattr(provider, "_close_unlocked", close)
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(provider, "_notify", notify)
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._codex_app_server_environment",
+        lambda: {"PATH": "/usr/bin:/bin", "CODEX_HOME": str(tmp_path)},
+    )
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._codex_runtime_arguments",
+        lambda **_kwargs: ("new",),
+    )
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._resolve_executable",
+        lambda _value: "/resolved/codex",
+    )
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._verify_codex_version",
+        verify_version,
+    )
+    monkeypatch.setattr(
+        "simajilord.agent.providers.codex._verify_codex_runtime_configuration",
+        verify_runtime,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    await provider._ensure_started()
+
+    close.assert_awaited_once()
+    verify_runtime.assert_awaited_once_with(
+        "/resolved/codex",
+        environment={
+            "PATH": "/usr/bin:/bin",
+            "CODEX_HOME": str(tmp_path),
+            "RUST_LOG": "info",
+        },
+        runtime_arguments=("new",),
+    )
+    assert provider._process is new_process
+    assert provider._runtime_arguments == ("new",)
+    request.assert_awaited_once()
+    notify.assert_awaited_once_with("initialized")
 
 
 def test_codex_protocol_schema_contract_accepts_complete_surface(tmp_path: Path) -> None:

@@ -432,19 +432,23 @@ def discord_codex_policy_arguments(*, codex_home: Path) -> tuple[str, ...]:
             "}",
         ),
     ]
-    configured_mcp_servers = _configured_mcp_server_names(codex_home)
+    configured_mcp_servers = _configured_mcp_server_transports(codex_home)
     plugin_mcp_servers = _plugin_mcp_server_names(codex_home)
     disabled_mcp_servers = (
-        configured_mcp_servers
+        set(configured_mcp_servers)
         | plugin_mcp_servers
         | _DISCORD_CODEX_ALWAYS_DISABLED_MCP_SERVERS
     )
     for server in sorted(disabled_mcp_servers):
         settings.append((f"mcp_servers.{server}.enabled", "false"))
-    for server in sorted(plugin_mcp_servers - configured_mcp_servers):
-        settings.extend(
+        transport_field = configured_mcp_servers.get(server, "command")
+        transport_value = (
+            "http://127.0.0.1:9" if transport_field == "url" else "/usr/bin/false"
+        )
+        settings.append(
             (
-                (f"mcp_servers.{server}.command", _toml_string("/usr/bin/false")),
+                f"mcp_servers.{server}.{transport_field}",
+                _toml_string(transport_value),
             )
         )
     for policy in DISCORD_CODEX_APP_POLICIES:
@@ -519,12 +523,14 @@ def _disabled_skill_paths(codex_home: Path) -> tuple[Path, ...]:
 _MCP_SERVER_NAME = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 
 
-def _configured_mcp_server_names(codex_home: Path) -> set[str]:
-    """Discover every user-configured MCP so the Discord process can disable it."""
+def _configured_mcp_server_transports(
+    codex_home: Path,
+) -> dict[str, str]:
+    """Identify each configured MCP transport without copying credentials or commands."""
 
     config = codex_home / "config.toml"
     if not config.is_file():
-        return set()
+        return {}
     try:
         if config.stat().st_size > 2_000_000:
             raise RuntimeError("Codex config is too large to validate safely")
@@ -533,10 +539,24 @@ def _configured_mcp_server_names(codex_home: Path) -> set[str]:
         raise RuntimeError("Codex MCP configuration could not be validated") from exc
     servers = raw.get("mcp_servers")
     if servers is None:
-        return set()
+        return {}
     if not isinstance(servers, dict):
         raise RuntimeError("Codex mcp_servers configuration is invalid")
-    return _validated_mcp_server_names(servers, source="Codex config")
+    names = _validated_mcp_server_names(servers, source="Codex config")
+    transports: dict[str, str] = {}
+    for name in names:
+        raw_server = servers[name]
+        if not isinstance(raw_server, dict):
+            raise RuntimeError(f"Codex MCP server {name} configuration is invalid")
+        command = raw_server.get("command")
+        url = raw_server.get("url")
+        if isinstance(command, str) and command and url is None:
+            transports[name] = "command"
+        elif isinstance(url, str) and url and command is None:
+            transports[name] = "url"
+        else:
+            raise RuntimeError(f"Codex MCP server {name} has an invalid transport")
+    return transports
 
 
 def _plugin_mcp_server_names(codex_home: Path) -> set[str]:

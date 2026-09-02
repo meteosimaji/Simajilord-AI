@@ -5,7 +5,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import discord
 import pytest
@@ -75,6 +75,39 @@ def test_focus_timer_is_claimed_once_and_survives_restart(tmp_path: Path) -> Non
         assert await restarted.active(workspace_id="guild") == ()
 
     asyncio.run(run())
+
+
+def test_focus_timer_connection_context_closes_file_handle(tmp_path: Path) -> None:
+    service = FocusTimerService(tmp_path / "timers.sqlite3")
+    connection = service._connect()
+
+    with connection:
+        connection.execute("SELECT 1").fetchone()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connection.execute("SELECT 1")
+
+
+@pytest.mark.asyncio
+async def test_focus_timer_scan_uses_bounded_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cog = object.__new__(FocusTimerCog)
+    cog.bot = SimpleNamespace(
+        wait_until_ready=AsyncMock(),
+        is_closed=Mock(side_effect=(False, False, True)),
+    )
+    cog.runtime = SimpleNamespace(
+        focus_timer=SimpleNamespace(
+            claim_due=AsyncMock(side_effect=(RuntimeError("database unavailable"), ())),
+        )
+    )
+    sleep = AsyncMock()
+    monkeypatch.setattr(discord_cogs.asyncio, "sleep", sleep)
+
+    await cog._run()
+
+    assert sleep.await_args_list == [call(2.0), call(1.0)]
 
 
 def test_focus_timer_migrates_delivery_message_column(tmp_path: Path) -> None:

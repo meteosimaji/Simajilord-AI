@@ -28,6 +28,7 @@ from simajilord.core import (
     endpoint,
 )
 from simajilord.core.errors import CapabilityError, UserError
+from simajilord.sqlite import closing_connect
 
 log = logging.getLogger(__name__)
 
@@ -1905,7 +1906,7 @@ class ActionReceiptStore:
         return int(row[0]) if row is not None else 0
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = closing_connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")

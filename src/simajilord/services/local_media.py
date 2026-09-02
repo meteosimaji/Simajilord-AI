@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from simajilord.core.errors import MediaError, UserError
 from simajilord.domain.audio import AudioItem
+from simajilord.sqlite import closing_connect
 
 LOCAL_MEDIA_SCHEME = "local-media"
 _ALLOWED_CONTENT_PREFIXES = ("audio/", "video/")
@@ -175,7 +176,7 @@ class LocalMediaStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection = closing_connect(self.database_path, timeout=10)
         connection.row_factory = sqlite3.Row
         return connection
 

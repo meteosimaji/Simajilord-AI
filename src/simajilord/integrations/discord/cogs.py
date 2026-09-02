@@ -3547,15 +3547,18 @@ class FocusTimerCog(commands.Cog):
 
     async def _run(self) -> None:
         await self.bot.wait_until_ready()
+        retry_delay = 1.0
         while not self.bot.is_closed():
             try:
                 for timer in await self.runtime.focus_timer.claim_due():
                     await self._deliver(timer)
+                retry_delay = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Focus timer delivery scan failed")
-            await asyncio.sleep(1)
+                retry_delay = min(60.0, retry_delay * 2)
+            await asyncio.sleep(retry_delay)
 
     async def _deliver(self, timer: FocusTimer) -> None:
         async with self.runtime.focus_timer.delivery_lock(timer.timer_id):
