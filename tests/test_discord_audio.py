@@ -685,7 +685,8 @@ async def test_streaming_opus_starts_before_tail_without_changing_audio(tmp_path
         return packets
 
     try:
-        first = await asyncio.wait_for(asyncio.to_thread(_read_opus_audio_packet, source), 2)
+        # This asserts output before the withheld tail, not a CI CPU-speed SLA.
+        first = await asyncio.wait_for(asyncio.to_thread(_read_opus_audio_packet, source), 10)
         assert first  # Four seconds are available, but the eight-second tail is not.
         assert stream.path.stat().st_size < len(data)
         stream.append(data[split:])
