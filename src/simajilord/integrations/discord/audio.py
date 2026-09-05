@@ -6,6 +6,7 @@ import asyncio
 import logging
 import shlex
 import shutil
+import subprocess
 import sys
 from array import array
 from collections.abc import Awaitable, Callable
@@ -16,6 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Lock as ThreadLock
 from time import monotonic
+from typing import Any
 
 import discord
 
@@ -39,9 +41,21 @@ _OPUS_LOAD_ATTEMPTED = False
 class _ManagedFFmpegOpusAudio(discord.FFmpegOpusAudio):
     """Close discord.py's child pipes even when FFmpeg already reached EOF."""
 
+    # discord.py otherwise inherits io.DEFAULT_BUFFER_SIZE (128 KiB on 3.14).
+    BLOCKSIZE = 8 * 1_024
     stream_reader: SpeechStreamReader | None = None
     stream_reference: str | None = None
     _stream_first_packet = False
+
+    def _spawn_process(
+        self, args: Any, **subprocess_kwargs: Any
+    ) -> subprocess.Popen[bytes]:
+        if subprocess_kwargs.get("stdin") == subprocess.PIPE:
+            # discord.py writes BLOCKSIZE bytes without flushing. Python 3.14's
+            # 128 KiB default can hold seconds of audio before FFmpeg sees it.
+            # Keep stdout buffered too: the Ogg reader expects complete reads.
+            subprocess_kwargs["bufsize"] = self.BLOCKSIZE
+        return super()._spawn_process(args, **subprocess_kwargs)
 
     def read(self) -> bytes:
         packet = super().read()
@@ -179,6 +193,25 @@ def _mix_stereo_s16le(music_pcm: bytes, speech_pcm: bytes) -> bytes:
     return mixed.tobytes()
 
 
+class _FinishedMusicSource(discord.AudioSource):
+    """Hold music EOF until the queued speech finishes, then allow a track change."""
+
+    def __init__(self, source: discord.AudioSource) -> None:
+        self._source = source
+        self._cleaned = False
+
+    def read(self) -> bytes:
+        return discord.opus.OPUS_SILENCE
+
+    def is_opus(self) -> bool:
+        return True
+
+    def cleanup(self) -> None:
+        if not self._cleaned:
+            self._cleaned = True
+            self._source.cleanup()
+
+
 class _LiveSpeechMixer(discord.AudioSource):
     """Mix local speech into the active Opus stream without reopening music."""
 
@@ -203,6 +236,7 @@ class _LiveSpeechMixer(discord.AudioSource):
             expected_packet_loss=0.15,
         )
         self._speech_finished = False
+        self._music_finished = False
         self._speech_packet_count = 0
         self._speech_max_read_ms = 0.0
         self._speech_slow_reads = 0
@@ -216,10 +250,16 @@ class _LiveSpeechMixer(discord.AudioSource):
     def music_source(self) -> discord.AudioSource:
         return self._music_source
 
+    @property
+    def music_finished(self) -> bool:
+        return self._music_finished
+
     def read(self) -> bytes:
         music_packet = _read_opus_audio_packet(self._music_source)
+        if not music_packet:
+            self._music_finished = True
         if self._speech_finished:
-            return music_packet
+            return music_packet or discord.opus.OPUS_SILENCE
         speech_read_started = monotonic()
         speech_packet = _read_opus_audio_packet(self._speech_source)
         speech_read_ms = (monotonic() - speech_read_started) * 1_000
@@ -234,7 +274,9 @@ class _LiveSpeechMixer(discord.AudioSource):
             )
             self._speech_finished = True
             self._signal_completion(None)
-            return music_packet
+            # Keep the voice player alive while its event loop transfers source
+            # ownership. Returning EOF here can cancel/requeue completed speech.
+            return music_packet or discord.opus.OPUS_SILENCE
         self._speech_packet_count += 1
         try:
             speech_pcm = self._speech_decoder.decode(speech_packet, fec=False)
@@ -569,6 +611,11 @@ class DiscordAudioOutput:
             self._music_stream_continuous_after_overlay = False
             voice = self._adopt_voice_client()
             if voice is not None and voice.is_connected() and voice.is_playing():
+                if isinstance(voice.source, _FinishedMusicSource):
+                    # Speech is fully drained. Let the normal music worker
+                    # finish this track and select the next one, without replay.
+                    log.info("Speech queue drained; releasing music EOF guild=%s", self.guild_id)
+                    voice.stop()
                 # The live mixer handed the original music source back without
                 # advancing or replacing its remote stream. Nothing needs to be
                 # reopened after the last speech part.
@@ -663,7 +710,17 @@ class DiscordAudioOutput:
             finally:
                 try:
                     if voice.is_connected() and voice.is_playing() and voice.source is mixer:
-                        voice.source = mixer.music_source
+                        if mixer.music_finished:
+                            log.info(
+                                "Music EOF deferred until speech queue drains guild=%s request=%s",
+                                self.guild_id,
+                                speech.request_id or "untracked",
+                            )
+                        voice.source = (
+                            _FinishedMusicSource(mixer.music_source)
+                            if mixer.music_finished
+                            else mixer.music_source
+                        )
                         mixer.detach_music()
                         restored = True
                 finally:

@@ -11,6 +11,8 @@ punctuation and author/body order. It does not perform sentence-by-sentence
 synthesis. Engine waveform frames share the full utterance's intermediate features.
 FFmpeg emits Ogg pages every 20 ms instead of collecting a full second; regression
 coverage compares every encoded packet with the ordinary complete-file path.
+Piped subprocess buffers are explicitly 8 KiB: Python 3.14 otherwise increases the
+standard buffer to 128 KiB and delays discord.py's unflushed input writes.
 A bounded private disk spool supplies a blocking FFmpeg input: temporary exhaustion
 is not EOF, cancellation releases the reader, and incomplete/failed responses are
 reported as playback errors. PCM format and declared length are checked. A measured
@@ -90,3 +92,26 @@ media references again. Paused, manually held, and legacy unmarked sessions rema
 held; failed reconnects retain recovery intent. Transient speech spools are not
 replayed after restart. Existing durable image/focus jobs retain their own recovery
 mechanisms.
+
+## Production Python
+
+The BOT production checkout now selects Python 3.14 via `.python-version`.
+`uv sync --locked --all-groups` provisions that runtime. The tested local patch
+version is 3.14.7; its interpreter is separate from the engine's virtual environment.
+The declared package range remains Python 3.11 through 3.14, and compatibility CI
+covers 3.11/3.12/3.13 while primary Linux and macOS checks run on 3.14.
+
+When replacing a running environment, stop the service gracefully before replacing
+`.venv`, retain the previous environment for rollback, provision locked dependencies,
+and restart. The September 5 migration retained the Python 3.12 environment in
+`.data/runtime-backups/python312-before-20260905`. To roll back locally, stop the
+service, retain the current environment, restore that directory to `.venv`, restore
+the Python selection to 3.12, and then restart. Do not move an active interpreter's
+environment while the BOT is running.
+
+
+Music that reaches EOF during speech is held until all queued utterances complete,
+then the normal music worker advances. This avoids treating an already completed
+utterance as failed and replaying it at a track boundary. The read-aloud length
+policy remains upstream of synthesis: enabling abbreviation still adds `以下略`
+above the selected limit; streaming does not override that policy.

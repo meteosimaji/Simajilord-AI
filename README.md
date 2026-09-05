@@ -602,6 +602,10 @@ intent is not enabled or approved. Presence/activity and complete cached member 
 the corresponding opt-ins; normal non-privileged guild, channel, message, reaction, and VC events
 remain enabled.
 
+The production checkout selects Python 3.14 through `.python-version`. Run
+`uv sync --locked --all-groups` to provision it. Python 3.11–3.13 remain covered
+by the compatibility matrix; Linux and macOS primary CI use Python 3.14.
+
 Set `TTS_PROVIDER=voicevox`, `VOICEVOX_SPEAKER_ID` to a VOICEVOX style ID, and
 `VOICEVOX_ENGINE_PATH` to the local engine executable. The provider only accepts a loopback
 HTTP endpoint. With `VOICEVOX_AUTO_START=true`, the BOT starts the engine on first speech and

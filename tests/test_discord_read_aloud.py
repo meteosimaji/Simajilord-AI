@@ -1129,3 +1129,34 @@ async def test_move_announcement_names_both_channels(tmp_path) -> None:
 
     request = runtime.registry.invoke.await_args.args[1]
     assert request.text == "アリスさんが、ゲームから一般へ移動しました"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("abbreviate,characters", [(True, 19), (True, 20), (True, 21), (False, 21)])
+async def test_saved_abbreviation_policy_reaches_single_stream_synthesis(
+    tmp_path, abbreviate, characters,
+) -> None:
+    from test_speech_stream import ControlledStreamingProvider
+
+    from simajilord.services.speech import SpeechService
+
+    settings_path = tmp_path / "read_aloud.json"
+    settings = ReadAloudService(settings_path)
+    await settings.set_semantic_options(
+        workspace_id="1", abbreviate_long_messages=abbreviate, message_character_limit=20,
+    )
+    # Reload persisted policy just as a new production process does.
+    formatter = ReadAloudMessageFormatter(ReadAloudService(settings_path))
+    body = "あ" * characters
+    prepared = await formatter.format(_message(content=body))
+    assert prepared is not None
+    provider = ControlledStreamingProvider()
+    provider.release.set()
+    speech = SpeechService(provider, output_dir=tmp_path, chunk_characters=8, max_concurrent=1)
+    item = await speech.synthesize_segments(prepared.segments, workspace_id="1")
+    expected = "めておさん。" + (body[:20] + "。以下略" if abbreviate and characters > 20 else body)
+    assert provider.texts == [expected]
+    assert item.speech_stream is not None
+    await asyncio.to_thread(item.speech_stream.wait_finished)
+    item.cleanup()
+    await speech.close()

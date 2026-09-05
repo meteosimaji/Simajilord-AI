@@ -17,6 +17,7 @@ from simajilord.domain.audio import AudioItem, AudioKind
 from simajilord.integrations.discord.audio import (
     DiscordAudioOutput,
     _ensure_discord_opus_loaded,
+    _FinishedMusicSource,
     _LiveSpeechMixer,
     _mix_stereo_s16le,
     _PrefetchedAudioSource,
@@ -253,6 +254,7 @@ async def test_live_overlay_restores_same_music_source_without_reconnect(
 
     class Mixer(discord.AudioSource):
         instances: ClassVar[list[Mixer]] = []
+        music_finished = False
 
         def __init__(
             self,
@@ -705,3 +707,76 @@ async def test_streaming_opus_starts_before_tail_without_changing_audio(tmp_path
         assert len(streamed_packets) == 401
     finally:
         ordinary.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_music_eof_waits_for_all_queued_speech_before_stopping(monkeypatch) -> None:
+    if not _ensure_discord_opus_loaded():
+        pytest.skip("The host has no loadable system Opus codec.")
+
+    class Packets(discord.AudioSource):
+        def __init__(self, count):
+            self.remaining = count
+            self.consumed = 0
+            self.cleaned = 0
+
+        def read(self):
+            if not self.remaining:
+                return b""
+            self.remaining -= 1
+            self.consumed += 1
+            return discord.opus.OPUS_SILENCE
+
+        def is_opus(self):
+            return True
+
+        def cleanup(self):
+            self.cleaned += 1
+
+    class PlayingVoice:
+        def __init__(self, source):
+            self.source = source
+            self.playing = True
+            self.stops = 0
+
+        def is_connected(self):
+            return True
+
+        def is_playing(self):
+            return self.playing
+
+        def stop(self):
+            self.stops += 1
+            self.playing = False
+            self.source.cleanup()
+
+    music_source = Packets(1)
+    voice = PlayingVoice(music_source)
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _: None), 1)
+    output._voice = voice
+    speech_sources = [Packets(5), Packets(3)]
+    pending_sources = iter(speech_sources)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.build_discord_audio_source",
+        lambda _: next(pending_sources),
+    )
+    music = AudioItem("music", "Music", "local://music", kind=AudioKind.MUSIC)
+    for index in range(2):
+        speech = AudioItem("speech", "Speech", "local://speech", kind=AudioKind.SPEECH)
+        overlay = asyncio.create_task(output.overlay_speech(music, speech, position_seconds=0))
+        for _ in range(200):
+            if overlay.done():
+                break
+            # The actual Opus mixer must never expose music EOF to the player.
+            assert await asyncio.to_thread(voice.source.read)
+            await asyncio.sleep(0.001)
+        await asyncio.wait_for(overlay, 1)
+        assert voice.is_playing()
+        assert isinstance(voice.source, _FinishedMusicSource)
+        assert speech_sources[index].remaining == 0
+    assert [source.consumed for source in speech_sources] == [5, 3]
+    assert music_source.cleaned == 0
+    await output.update_music(music, position_seconds=1)
+    assert voice.stops == 1
+    assert music_source.cleaned == 1
+    assert [source.cleaned for source in speech_sources] == [1, 1]
