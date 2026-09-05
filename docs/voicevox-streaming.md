@@ -115,3 +115,8 @@ then the normal music worker advances. This avoids treating an already completed
 utterance as failed and replaying it at a track boundary. The read-aloud length
 policy remains upstream of synthesis: enabling abbreviation still adds `以下略`
 above the selected limit; streaming does not override that policy.
+The playback watchdog allows an active speech overlay its declared duration plus
+the existing completion grace, even after the music's completion window expires.
+Expired speech allowances, missing callbacks, disconnections, and the overall
+active-playback cap still terminate stuck playback. Completion or cancellation
+clears the overlay allowance before subsequent playback.

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import discord
+
 from simajilord.diagnostics.offline_discord import (
     _discord_markdown,
+    _render_component,
     _sample_panels,
     render_preview_html,
+    serialize_view,
 )
 
 
@@ -22,17 +26,20 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
     ]
     idle_labels = tuple(
         str(component.get("label"))
-        for component in panels[0].components
+        for row in panels[0].components
+        for component in row["components"]
         if component.get("type") == 2
     )
     waiting_labels = tuple(
         str(component.get("label"))
-        for component in panels[1].components
+        for row in panels[1].components
+        for component in row["components"]
         if component.get("type") == 2
     )
     active_labels = tuple(
         str(component.get("label"))
-        for component in panels[2].components
+        for row in panels[2].components
+        for component in row["components"]
         if component.get("type") == 2
     )
     assert idle_labels == ("Add music",)
@@ -47,7 +54,8 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
     assert panels[0].embed["title"] == "Audio"
     assert tuple(
         str(component.get("label"))
-        for component in panels[3].components
+        for row in panels[3].components
+        for component in row["components"]
         if component.get("type") == 2
     ) == (
         "Layout · Landscape",
@@ -107,3 +115,33 @@ def test_markdown_heading_matches_discord_block_flow_without_extra_break() -> No
     output = _discord_markdown("### Track\n`1:05 / 4:09`\nArtist")
 
     assert output == "<h3>Track</h3><code>1:05 / 4:09</code><br>Artist"
+
+
+def test_preview_preserves_discord_action_rows_and_order() -> None:
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Second row", row=1))
+    view.add_item(discord.ui.Button(label="First row", row=0))
+    assert serialize_view(view) == tuple(view.to_components())
+    assert serialize_view(view)[0]["components"][0]["label"] == "First row"
+
+
+def test_preview_select_preserves_disabled_options_and_defaults() -> None:
+    control = discord.ui.Select(
+        placeholder="Choose a command",
+        disabled=True,
+        options=[discord.SelectOption(label="Play <music>", value="play", default=True)],
+    )
+    rendered = _render_component(control.to_component_dict())
+    assert '<select ' in rendered
+    assert ' disabled' in rendered
+    assert '<option value="play" selected>Play &lt;music&gt;</option>' in rendered
+    assert 'aria-label="Choose a command"' in rendered
+
+
+def test_preview_preserves_button_and_option_emoji_text() -> None:
+    labelled = discord.ui.Button(label="Play", emoji="▶️")
+    icon_only = discord.ui.Button(emoji="▶️")
+    control = discord.ui.Select(options=[discord.SelectOption(label="Radio", emoji="📻")])
+    assert "▶️ Play</button>" in _render_component(labelled.to_component_dict())
+    assert ">▶️</button>" in _render_component(icon_only.to_component_dict())
+    assert "📻 Radio</option>" in _render_component(control.to_component_dict())

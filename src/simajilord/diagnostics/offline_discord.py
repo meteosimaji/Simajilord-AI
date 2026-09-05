@@ -57,7 +57,7 @@ class PreviewPanel:
 def serialize_view(view: discord.ui.View) -> tuple[dict[str, Any], ...]:
     """Serialize the same component objects Discord.py would send."""
 
-    return tuple(dict(child.to_component_dict()) for child in view.children)
+    return tuple(dict(row) for row in view.to_components())
 
 
 def render_preview_html(
@@ -66,7 +66,7 @@ def render_preview_html(
     speech_filename: str,
     mixed_audio_filename: str,
 ) -> str:
-    """Return an offline simulator calibrated against the current Discord Web UI."""
+    """Return an approximate offline renderer using measured Discord layout values."""
 
     panel_markup = "\n".join(_render_panel(panel) for panel in panels)
     case_buttons = "\n".join(
@@ -144,6 +144,8 @@ body {{
   display: grid;
   gap: 6px;
   margin-top: 18px;
+  max-height: 40vh;
+  overflow-y: auto;
 }}
 .case-button {{
   width: 100%;
@@ -385,11 +387,16 @@ audio {{ width: 100%; height: 28px; }}
   line-height: 16px;
 }}
 .controls {{
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   gap: 8px;
   max-width: 516px;
   margin-top: 4px;
+}}
+.component-row {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }}
 .component-button, .select {{
   position: relative;
@@ -424,13 +431,16 @@ audio {{ width: 100%; height: 28px; }}
   border-color: var(--discord-control-border);
   background: var(--discord-control-critical);
 }}
-.component-button:disabled {{ opacity: .45; }}
+.component-button:disabled, .select:disabled {{ opacity: .45; }}
 .select {{
   justify-content: space-between;
   width: min(100%, 516px);
   min-height: 40px;
   height: 40px;
-  padding: 8px 12px;
+  padding: 8px 8px 8px 12px;
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
 }}
 .interaction-log {{
   min-height: 18px;
@@ -454,8 +464,10 @@ audio {{ width: 100%; height: 28px; }}
 <main class="simulator">
   <aside class="simulator-sidebar">
     <h1>Discord UI simulator</h1>
-    <p>Measured from the current Web client. No Discord gateway, webhook,
+    <p>Style reference: Discord Web, 2026-07-28. No Discord gateway, webhook,
        token, or server send is used.</p>
+    <p>Layout approximation: native menus, system fonts/emoji, and placeholder media.
+       Not a pixel-identical Discord client.</p>
     <nav class="case-switcher" aria-label="Audio panel states">
       {case_buttons}
     </nav>
@@ -494,6 +506,14 @@ audio {{ width: 100%; height: 28px; }}
     button.addEventListener("click", () => {{
       const log = button.closest(".message")?.querySelector(".interaction-log");
       if (log) log.textContent = `${{button.textContent.trim()}} · simulated locally`;
+    }});
+  }});
+  document.querySelectorAll("select.select").forEach((select) => {{
+    select.addEventListener("change", () => {{
+      const log = select.closest(".message")?.querySelector(".interaction-log");
+      if (log) log.textContent = [...select.selectedOptions]
+        .map((option) => option.textContent).join(", ")
+        + " · selected locally (no command executed)";
     }});
   }});
   const updateRelativeTimes = () => {{
@@ -547,6 +567,14 @@ async def build_offline_preview(
         "offline": True,
         "discord_send_count": 0,
         "discord_client_code_copied": False,
+        "pixel_identical": False,
+        "rendering_limitations": [
+            "System font fallback; Discord web fonts are not bundled.",
+            "Native select menus; Discord icons and popup rendering are not reproduced.",
+            "System Unicode emoji and named custom-emoji placeholders, not Discord assets.",
+            "Placeholder avatars/thumbnails and partial Markdown/mention rendering.",
+            "Control feedback is local; Discord callbacks are not executed by this HTML.",
+        ],
         "discord_client_reason": (
             "The installed bootstrapper and desktop core packages are UNLICENSED "
             "and do not contain a reusable embed renderer."
@@ -563,6 +591,7 @@ async def build_offline_preview(
             "button_height_px": 32,
             "button_radius_px": 8,
             "button_padding_px": [3, 11],
+            "select_padding_px": [8, 8, 8, 12],
             "message_padding_px": [2, 24, 2, 72],
             "avatar_size_px": 40,
         },
@@ -967,7 +996,7 @@ def _render_panel(panel: PreviewPanel) -> str:
     <div class="avatar">S</div>
     <div class="message-body">
       <div class="message-header">
-        <span class="author">SIMAJILORD</span><span class="bot">APP</span>
+        <span class="author">METEOBOT</span><span class="bot">APP</span>
         <span class="message-time">13:47</span>
       </div>
       <div class="embed-container">
@@ -988,15 +1017,33 @@ def _render_panel(panel: PreviewPanel) -> str:
 </section>"""
 
 
+def _component_emoji_text(component: dict[str, Any]) -> str:
+    emoji = component.get("emoji")
+    if not isinstance(emoji, dict):
+        return ""
+    name = str(emoji.get("name") or "emoji")
+    # Custom image assets are intentionally not fetched by the offline renderer.
+    return f":{name}:" if emoji.get("id") is not None else name
+
+
 def _render_component(component: dict[str, Any]) -> str:
     component_type = int(component.get("type", 0))
+    if component_type == int(discord.ComponentType.action_row.value):
+        children = "".join(_render_component(child) for child in component.get("components", ()))
+        return f'<div class="component-row">{children}</div>'
     if component_type == int(discord.ComponentType.button.value):
         style = {
             int(discord.ButtonStyle.primary.value): "primary",
             int(discord.ButtonStyle.success.value): "success",
             int(discord.ButtonStyle.danger.value): "danger",
         }.get(int(component.get("style", 0)), "")
-        label = html.escape(str(component.get("label") or component.get("emoji") or "Button"))
+        label = html.escape(
+            " ".join(
+                part for part in (
+                    _component_emoji_text(component), str(component.get("label") or "")
+                ) if part
+            ) or "Button"
+        )
         disabled = " disabled" if component.get("disabled") else ""
         return (
             f'<button class="component-button {style}" type="button"{disabled}>'
@@ -1010,7 +1057,28 @@ def _render_component(component: dict[str, Any]) -> str:
         int(discord.ComponentType.channel_select.value),
     }:
         placeholder = html.escape(str(component.get("placeholder") or "Select"))
-        return f'<div class="select">{placeholder}⌄</div>'
+        options = component.get("options", ())
+        selected_placeholder = (
+            "" if any(option.get("default") for option in options) else " selected"
+        )
+        option_markup = f'<option value="" disabled{selected_placeholder}>{placeholder}</option>'
+        for option in options:
+            value = html.escape(str(option.get("value", "")), quote=True)
+            label = html.escape(
+                " ".join(
+                    part for part in (
+                        _component_emoji_text(option), str(option.get("label", ""))
+                    ) if part
+                )
+            )
+            selected = " selected" if option.get("default") else ""
+            option_markup += f'<option value="{value}"{selected}>{label}</option>'
+        disabled = " disabled" if component.get("disabled") else ""
+        multiple = " multiple" if int(component.get("max_values", 1)) > 1 else ""
+        return (
+            f'<select class="select" aria-label="{placeholder}"{disabled}{multiple}>'
+            f"{option_markup}</select>"
+        )
     return ""
 
 

@@ -544,6 +544,81 @@ async def test_discord_playback_watchdog_stops_missing_callback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("speech_seconds", "active_cap", "should_complete"),
+    [(1.0, 21_600.0, False), (120.0, 21_600.0, True), (120.0, 35.0, False)],
+)
+async def test_playback_watchdog_allows_bounded_speech_past_music_end(
+    monkeypatch: pytest.MonkeyPatch,
+    speech_seconds: float,
+    active_cap: float,
+    should_complete: bool,
+) -> None:
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _: None), 1)
+    completed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    overlay_started = asyncio.Event()
+    release_overlay = asyncio.Event()
+    simulated_seconds = 0.0
+
+    def simulated_clock() -> float:
+        nonlocal simulated_seconds
+        simulated_seconds += 10.0
+        if simulated_seconds >= 80.0 and not completed.done():
+            completed.set_result(None)
+        return simulated_seconds
+
+    async def hold_overlay(_speech: AudioItem) -> bool:
+        overlay_started.set()
+        await release_overlay.wait()
+        return True
+
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio.monotonic", simulated_clock
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_WATCHDOG_INTERVAL_SECONDS", 0.001
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_MAX_ACTIVE_SECONDS", active_cap
+    )
+    monkeypatch.setattr(output, "_try_live_speech_overlay", hold_overlay)
+    voice = SimpleNamespace(
+        is_connected=lambda: True, is_playing=lambda: True, is_paused=lambda: False
+    )
+    music = AudioItem("music", "Music", "local://music", duration_seconds=1.0)
+    speech = AudioItem(
+        "speech", "Speech", "local://speech",
+        kind=AudioKind.SPEECH, duration_seconds=speech_seconds,
+    )
+    overlay = asyncio.create_task(output.overlay_speech(music, speech, position_seconds=1.0))
+    try:
+        await asyncio.wait_for(overlay_started.wait(), 1.0)
+        if should_complete:
+            # Music's 31-second budget expires while valid speech is still playing.
+            await output._await_playback_completion(
+                completed, voice=voice, expected_seconds=music.duration_seconds
+            )
+            assert completed.done()
+        else:
+            # Stalled speech and the absolute playback cap remain bounded.
+            with pytest.raises(ProviderError, match="bounded completion"):
+                await output._await_playback_completion(
+                    completed, voice=voice, expected_seconds=music.duration_seconds
+                )
+    finally:
+        if should_complete:
+            release_overlay.set()
+            await overlay
+        else:
+            overlay.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await overlay
+        if not completed.done():
+            completed.cancel()
+    assert output._speech_overlay_deadline is None
+
+
+@pytest.mark.asyncio
 async def test_audio_source_preflight_timeout_cleans_and_joins_reader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

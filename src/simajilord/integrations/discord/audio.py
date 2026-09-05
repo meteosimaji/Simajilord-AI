@@ -395,6 +395,7 @@ class DiscordAudioOutput:
         self._preflight_poisoned = False
         self._live_mixing_disabled = False
         self._music_stream_continuous_after_overlay = False
+        self._speech_overlay_deadline: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -563,7 +564,13 @@ class DiscordAudioOutput:
                         ) from None
                 else:
                     stopped_since = None
-                if active_seconds >= maximum_active_seconds:
+                overlay_in_window = (
+                    self._speech_overlay_deadline is not None
+                    and now < self._speech_overlay_deadline
+                )
+                if active_seconds >= _PLAYBACK_MAX_ACTIVE_SECONDS or (
+                    active_seconds >= maximum_active_seconds and not overlay_in_window
+                ):
                     raise ProviderError(
                         "Discord audio playback exceeded its bounded completion window."
                     ) from None
@@ -577,27 +584,38 @@ class DiscordAudioOutput:
     ) -> None:
         """Mix speech without ending the active Discord music player."""
 
-        if await self._try_live_speech_overlay(speech):
-            if speech.speech_stream is not None:
-                speech.speech_stream.check_error()
-            return
-
-        if speech.speech_stream is not None:
-            # The legacy two-input FFmpeg graph opens a path, so it must see
-            # a complete file. The live mixer above consumes the stream early.
-            await asyncio.to_thread(speech.speech_stream.wait_finished)
-        self._music_stream_continuous_after_overlay = False
-        overlay = replace(
-            music,
-            start_seconds=position_seconds,
-            speech_overlay_source=speech.source,
-            speech_overlay_owned_file=None,
-            speech_overlay_duration_seconds=speech.duration_seconds,
-            speech_overlay_volume=speech.volume,
-            resume_after_overlay=False,
+        # Music EOF is deliberately held while speech drains. Its watchdog must
+        # allow this utterance to finish, while retaining a deadline for stalled
+        # speech and the overall active-playback cap. The service serializes
+        # overlay calls through its transport lock.
+        speech_seconds = max(0.0, speech.duration_seconds)
+        self._speech_overlay_deadline = monotonic() + speech_seconds + max(
+            _PLAYBACK_COMPLETION_GRACE_SECONDS, speech_seconds * 0.2
         )
-        await self._swap_music_source(overlay)
-        await asyncio.sleep(max(0.0, speech.duration_seconds) + 0.15)
+        try:
+            if await self._try_live_speech_overlay(speech):
+                if speech.speech_stream is not None:
+                    speech.speech_stream.check_error()
+                return
+
+            if speech.speech_stream is not None:
+                # The legacy two-input FFmpeg graph opens a path, so it must see
+                # a complete file. The live mixer above consumes the stream early.
+                await asyncio.to_thread(speech.speech_stream.wait_finished)
+            self._music_stream_continuous_after_overlay = False
+            overlay = replace(
+                music,
+                start_seconds=position_seconds,
+                speech_overlay_source=speech.source,
+                speech_overlay_owned_file=None,
+                speech_overlay_duration_seconds=speech.duration_seconds,
+                speech_overlay_volume=speech.volume,
+                resume_after_overlay=False,
+            )
+            await self._swap_music_source(overlay)
+            await asyncio.sleep(speech_seconds + 0.15)
+        finally:
+            self._speech_overlay_deadline = None
 
     async def update_music(
         self,
