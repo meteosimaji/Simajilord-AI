@@ -143,6 +143,7 @@ class AudioQueueResponse:
     autoplay_enabled: bool = False
     autoplay_next: AudioQueueItem | None = None
     mix_seed_references: tuple[str, ...] = ()
+    speech_only: bool = False
     voice_activation_required: bool = False
     connected: bool = False
 
@@ -994,6 +995,7 @@ def audio_queue_response(snapshot: QueueSnapshot) -> AudioQueueResponse:
             _queue_item(snapshot.autoplay_next) if snapshot.autoplay_next is not None else None
         ),
         mix_seed_references=snapshot.mix_seed_references,
+        speech_only=snapshot.speech_only,
         voice_activation_required=snapshot.voice_activation_required,
         connected=snapshot.connected,
     )

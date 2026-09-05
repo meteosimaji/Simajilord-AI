@@ -2397,3 +2397,36 @@ async def test_unban_is_idempotent_when_member_is_already_unbanned() -> None:
 
     assert response.action == "unban"
     assert response.changed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_speech_only", [False, True])
+async def test_read_aloud_connect_applies_mode_even_in_same_voice(
+    already_speech_only: bool,
+) -> None:
+    client = Mock(spec=discord.Client)
+    runtime = Mock(spec=SimajilordRuntime)
+    guild = Mock(spec=discord.Guild)
+    guild.id = 10
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.id = 40
+    guild.get_channel.return_value = channel
+    guild.get_member.return_value = SimpleNamespace(
+        id=7, bot=False, voice=SimpleNamespace(channel=channel)
+    )
+    client.get_guild.return_value = guild
+    runtime.audio.get_or_create.return_value = SimpleNamespace(
+        output=SimpleNamespace(connected=True),
+        destination_id="40",
+        speech_only=already_speech_only,
+        current=None,
+    )
+    runtime.audio.connect = AsyncMock()
+    endpoints = {item.descriptor.name: item for item in build_discord_endpoints(client, runtime)}
+    await endpoints["discord.connect_voice"].invoke(
+        DiscordConnectVoiceRequest(channel_id="40", speech_only=True), _agent_context()
+    )
+    if already_speech_only:
+        runtime.audio.connect.assert_not_awaited()
+    else:
+        runtime.audio.connect.assert_awaited_once_with("10", "40", speech_only=True)

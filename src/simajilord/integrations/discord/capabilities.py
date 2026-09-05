@@ -1701,6 +1701,7 @@ class DiscordPollResponse:
 @dataclass(frozen=True, slots=True)
 class DiscordConnectVoiceRequest:
     channel_id: str
+    speech_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -5243,7 +5244,11 @@ def build_discord_endpoints(
             workspace_id,
             lambda: DiscordAudioOutput(client, guild.id),
         )
-        if session.output.connected and session.destination_id == str(channel.id):
+        if (
+            session.output.connected
+            and session.destination_id == str(channel.id)
+            and session.speech_only == request.speech_only
+        ):
             await context.complete_external_effect_without_dispatch()
             return DiscordConnectVoiceResponse(
                 channel_id=str(channel.id),
@@ -5254,7 +5259,9 @@ def build_discord_endpoints(
             if isinstance(output, DiscordAudioOutput) and output.destination_id != channel.id:
                 raise UserError("audio.other_voice_active")
         await context.dispatch_external_effect()
-        await runtime.audio.connect(workspace_id, str(channel.id))
+        await runtime.audio.connect(
+            workspace_id, str(channel.id), speech_only=request.speech_only
+        )
         return DiscordConnectVoiceResponse(channel_id=str(channel.id), connected=True)
 
     async def play_audio(
@@ -7602,7 +7609,10 @@ def build_discord_endpoints(
         endpoint(
             CapabilityDescriptor(
                 name="discord.connect_voice",
-                summary="Connect Simajilord's audio output to a Discord voice channel.",
+                summary=(
+                    "Connect to voice. Set speech_only=true for read-aloud without music "
+                    "or Radio; false explicitly enables music playback."
+                ),
                 risk=RiskLevel.WRITE,
                 approval=ApprovalMode.WHEN_REQUESTED,
                 keywords=(

@@ -254,6 +254,7 @@ class AudioSession:
         self._paused_seconds = 0.0
         self._speed = 1.0
         self._pitch = 1.0
+        self._speech_only = False
         self._music_volume = 1.0
         self._speech_volume = 1.0
 
@@ -283,8 +284,26 @@ class AudioSession:
 
         return self._voice_activation_required
 
-    async def connect(self, destination_id: str) -> None:
+    @property
+    def speech_only(self) -> bool:
+        return self._speech_only
+
+    async def connect(self, destination_id: str, *, speech_only: bool | None = None) -> None:
         await self.output.connect(destination_id)
+        if speech_only is not None:
+            async with self._transport_lock:
+                self._speech_only = speech_only
+                current = self._current
+                if speech_only and current is not None and current.kind is AudioKind.MUSIC:
+                    current.start_seconds = self._position_seconds()
+                    self._restart_requested = True
+                    self.output.stop()
+                    await self._wait_for_current(current)
+        log.info(
+            "Audio voice connected workspace=%s speech_only=%s",
+            self.workspace_id,
+            self._speech_only,
+        )
         self.destination_id = destination_id
         self._waiting_actor_ids.clear()
         self._suspended = False
@@ -328,6 +347,7 @@ class AudioSession:
                 self._autoplay.append(item)
                 position = len(self._autoplay)
             else:
+                self._speech_only = False
                 self._remember_mix_seed(item)
                 self._invalidate_autoplay_locked()
                 self._music.append(item)
@@ -448,6 +468,7 @@ class AudioSession:
         if (
             current is not None
             and current.kind is AudioKind.MUSIC
+            and not self._speech_only
             and self._current_playback_started
             and self._overlay_task is None
         ):
@@ -476,6 +497,7 @@ class AudioSession:
             self._current_playback_started = True
             if (
                 item.kind is AudioKind.MUSIC
+                and not self._speech_only
                 and self._overlay_task is None
                 and self._speech
             ):
@@ -537,6 +559,7 @@ class AudioSession:
                             pending.cleanup()
                         raise UserError("audio.duplicate_limit")
 
+            self._speech_only = False
             first_position = len(self._music) + 1
             for item in items:
                 item.queue_lane = AudioQueueLane.REQUEST
@@ -677,6 +700,7 @@ class AudioSession:
             self._mix_seed_references.extend(prospective_seeds)
             if replace_loop:
                 self._loop_mode = LoopMode.NONE
+            self._speech_only = False
             self._autoplay_enabled = True
             self._invalidate_autoplay_locked()
             self._autoplay_retry_at = 0.0
@@ -875,9 +899,7 @@ class AudioSession:
                 await before_mutation()
             current = self._current
             restart_music = (
-                music is not None
-                and current is not None
-                and current.kind is AudioKind.MUSIC
+                music is not None and current is not None and current.kind is AudioKind.MUSIC
             )
             if restart_music and current is not None:
                 current.start_seconds = self._position_seconds()
@@ -1185,6 +1207,7 @@ class AudioSession:
                 autoplay_enabled=self._autoplay_enabled,
                 autoplay_next=self._autoplay[0] if self._autoplay else None,
                 mix_seed_references=tuple(self._mix_seed_references),
+                speech_only=self._speech_only,
                 voice_activation_required=self._voice_activation_required,
                 connected=self.output.connected,
             )
@@ -1205,6 +1228,7 @@ class AudioSession:
         self.auto_leave = state.auto_leave
         self._speed = state.speed
         self._pitch = state.pitch
+        self._speech_only = state.speech_only
         self._music_volume = state.music_volume
         self._speech_volume = state.speech_volume
         # Older state may contain the invalid combination that used to let a
@@ -1283,6 +1307,8 @@ class AudioSession:
                 if item.kind is AudioKind.MUSIC
             ]
             items.extend(self._music)
+            if self._speech_only:
+                items.extend(self._autoplay)
             destination_id = self.destination_id
             stored_items_list: list[StoredAudioItem] = []
             for item in items:
@@ -1348,6 +1374,7 @@ class AudioSession:
                 voice_activation_required=(
                     self._voice_activation_required and not self._restart_recovery_pending
                 ),
+                speech_only=self._speech_only,
                 resume_on_restart=(
                     self._restart_recovery_pending
                     or (
@@ -1407,7 +1434,8 @@ class AudioSession:
         """Start one bounded background refill when the automatic lane is empty."""
 
         if (
-            not self._autoplay_enabled
+            self._speech_only
+            or not self._autoplay_enabled
             or self._autoplay_supplier is None
             or not self._mix_seed_references
             or self._manual_music_start_reservations
@@ -1584,6 +1612,8 @@ class AudioSession:
         async with self._lock:
             if self._speech:
                 return self._speech.popleft()
+            if self._speech_only:
+                return None
             item = self._pop_ready_music(self._music)
             if item is not None:
                 return item
@@ -1606,6 +1636,8 @@ class AudioSession:
         async with self._lock:
             if self._speech:
                 return 0.0
+            if self._speech_only:
+                return None
             retry_times = tuple(item.retry_after for item in (*self._music, *self._autoplay))
             if retry_times:
                 return max(0.0, min(retry_times) - monotonic())
@@ -2398,7 +2430,9 @@ class AudioSessionManager:
         if active_other_sessions >= self.max_active:
             raise UserError("audio.capacity_reached")
 
-    async def connect(self, workspace_id: str, destination_id: str) -> None:
+    async def connect(
+        self, workspace_id: str, destination_id: str, *, speech_only: bool | None = None
+    ) -> None:
         """Reserve global capacity briefly, then connect without blocking other guilds."""
 
         requested_at = monotonic()
@@ -2426,7 +2460,7 @@ class AudioSessionManager:
                             raise UserError("audio.capacity_reached")
                         self._connection_reservations.add(workspace_id)
                         reserved = True
-                await session.connect(destination_id)
+                await session.connect(destination_id, speech_only=speech_only)
             except Exception:
                 outcome = "failed"
                 raise

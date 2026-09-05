@@ -1328,7 +1328,11 @@ def music_queue_embed(
             ),
         ]
 
-    if response.voice_activation_required:
+    if response.speech_only:
+        description_lines.append(
+            "**Read aloud only** · Music and Radio are held. **Start** enables music."
+        )
+    elif response.voice_activation_required:
         description_lines.append("**Ready to resume** · Join the VC and press **Start**.")
     elif response.waiting_for_voice:
         description_lines.append("**Queued** · Playback starts when the requester joins the VC.")
@@ -2009,6 +2013,7 @@ def _music_dashboard_fingerprint(
         response.auto_leave,
         response.waiting_for_voice,
         response.voice_activation_required,
+        response.speech_only,
         response.connected,
         response.music_volume_percent,
         response.speech_volume_percent,
@@ -2483,7 +2488,9 @@ class MusicControlsView(SafeView):
             return
         active = response.current is not None
         has_manual_queue = any(item.kind == AudioKind.MUSIC.value for item in response.pending)
-        can_start = response.waiting_for_voice or response.voice_activation_required
+        can_start = (
+            response.waiting_for_voice or response.voice_activation_required or response.speech_only
+        )
         if not can_start:
             self.remove_item(self.start_button)
         if not active:
@@ -4857,7 +4864,10 @@ def _read_aloud_ready_embed(
 ) -> discord.Embed:
     return command_embed(
         "Read aloud is ready",
-        description="New messages from the selected channels will be spoken automatically.",
+        description=(
+            "New messages from the selected channels will be spoken automatically. "
+            "Music and Radio are held until you explicitly start music."
+        ),
         fields=(
             EmbedField(
                 "Reading from",
@@ -5028,7 +5038,7 @@ class ReadAloudReconnectView(SafeView):
             await interaction.response.defer()
             await self.runtime.registry.invoke(
                 "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=str(self.destination_id)),
+                DiscordConnectVoiceRequest(channel_id=str(self.destination_id), speech_only=True),
                 invocation_context(interaction),
             )
             await interaction.edit_original_response(
@@ -5201,7 +5211,7 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
         try:
             await self.runtime.registry.invoke(
                 "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=str(self.destination_id)),
+                DiscordConnectVoiceRequest(channel_id=str(self.destination_id), speech_only=True),
                 invocation_context(interaction),
             )
         except Exception as exc:
@@ -7004,10 +7014,7 @@ class ReadAloudCog(commands.Cog):
             return
         output = cast(DiscordAudioOutput, session.output)
         try:
-            if (
-                output.connected
-                and output.destination_id != int(route.audio_destination_id)
-            ):
+            if output.connected and output.destination_id != int(route.audio_destination_id):
                 return
             voice_tuning = self.runtime.read_aloud.voice_tuning_for(
                 workspace_id=workspace_id,

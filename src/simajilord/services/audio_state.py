@@ -54,6 +54,7 @@ class StoredAudioSession:
     mix_seed_references: tuple[str, ...] = ()
     voice_activation_required: bool = False
     resume_on_restart: bool = False
+    speech_only: bool = False
 
 
 class AudioStateStore:
@@ -273,6 +274,7 @@ def _decode_session(value: object) -> StoredAudioSession | None:
                 )
             ),
             resume_on_restart=value.get("resume_on_restart") is True,
+            speech_only=value.get("speech_only") is True,
         )
     except (KeyError, TypeError, ValueError):
         return None

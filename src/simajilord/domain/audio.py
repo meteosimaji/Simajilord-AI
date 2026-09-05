@@ -154,5 +154,6 @@ class QueueSnapshot:
     autoplay_enabled: bool = False
     autoplay_next: AudioItem | None = None
     mix_seed_references: tuple[str, ...] = ()
+    speech_only: bool = False
     voice_activation_required: bool = False
     connected: bool = False

@@ -3969,6 +3969,7 @@ async def test_join_selection_is_staged_until_start_is_pressed() -> None:
     interaction.response.defer.assert_awaited_once()
     interaction.edit_original_response.assert_awaited_once()
     embed = interaction.edit_original_response.await_args.kwargs["embed"]
+    assert runtime.registry.invoke.await_args_list[-1].args[1].speech_only is True
     assert embed.title == "Read aloud is ready"
     assert any(field.name == "Connection" and field.value == "Ready" for field in embed.fields)
     audience_field = next(field for field in embed.fields if field.name == "Audience preflight")
@@ -4288,7 +4289,7 @@ async def test_read_aloud_reconnect_failure_then_success_is_target_bound() -> No
         "discord.connect_voice",
     ]
     for call in runtime.registry.invoke.await_args_list:
-        assert call.args[1] == DiscordConnectVoiceRequest(channel_id="55")
+        assert call.args[1] == DiscordConnectVoiceRequest(channel_id="55", speech_only=True)
 
 
 @pytest.mark.asyncio
@@ -5314,3 +5315,27 @@ def test_agent_write_scope_allows_authorized_channel_in_origin_guild() -> None:
     _assert_agent_update_scope(context, "60")
     with pytest.raises(UserError, match=r"discord\.agent_read_channel_forbidden"):
         _assert_agent_update_scope(context, "70")
+
+
+@pytest.mark.asyncio
+async def test_speech_only_music_controls_offer_explicit_start() -> None:
+    runtime = Mock(spec=SimajilordRuntime)
+    runtime.settings = SimpleNamespace(activity_enabled=False)
+    response = AudioQueueResponse(
+        current=None,
+        pending=(),
+        speech_only=True,
+        connected=True,
+        paused=False,
+        loop_mode="none",
+        destination_id="55",
+        auto_leave=True,
+        position_seconds=0.0,
+        speed=1.0,
+        pitch=1.0,
+        waiting_for_voice=False,
+    )
+    view = MusicControlsView(runtime, response=response)
+    assert any(
+        isinstance(item, discord.ui.Button) and item.label == "Start" for item in view.children
+    )

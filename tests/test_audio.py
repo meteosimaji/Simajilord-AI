@@ -2543,3 +2543,120 @@ async def test_manager_persists_repaired_legacy_activation_hold(tmp_path: Path) 
     assert len(persisted) == 1
     assert persisted[0].voice_activation_required is True
     await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("music_volume", [0.0, 1.0])
+async def test_read_aloud_connection_holds_music_and_sends_only_speech(
+    music_volume: float,
+) -> None:
+    output = FakeOutput()
+    session = AudioSession("speech-only", output, max_pending_speech=3)
+    try:
+        await session.set_volume(music=music_volume, speech=2.0)
+        await session.enqueue(AudioItem("music", "music", "https://example.com/music"))
+        for _ in range(50):
+            if output.played:
+                break
+            await asyncio.sleep(0)
+        assert output.played == ["music"]
+        await session.connect("voice", speech_only=True)
+        assert session.current is None
+        assert session.speech_only
+        speech = AudioItem("speech", "speech", "", kind=AudioKind.SPEECH)
+        await session.enqueue(speech)
+        for _ in range(50):
+            if "speech" in output.played:
+                break
+            await asyncio.sleep(0)
+        assert output.played == ["music", "speech"]
+        assert output.overlays == []
+        assert output.played_items[-1].volume == 2.0
+        output.release.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert session.current is None
+        assert output.played == ["music", "speech"]
+        assert len((await session.snapshot()).pending) == 1
+        await session.connect("voice", speech_only=False)
+        for _ in range(50):
+            if len(output.played) == 3:
+                break
+            await asyncio.sleep(0)
+        assert output.played == ["music", "speech", "music"]
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_only_survives_restart_and_holds_radio(tmp_path: Path) -> None:
+    state_path = tmp_path / "audio.json"
+    manager = AudioSessionManager(
+        max_active=2, max_pending_speech=3, state_store=AudioStateStore(state_path)
+    )
+    output = FakeOutput()
+    session = manager.get_or_create("guild", lambda: output)
+    await session.connect("voice", speech_only=True)
+    await session.enqueue(
+        AudioItem("radio", "radio", "https://example.com/radio", queue_lane=AudioQueueLane.AUTOPLAY)
+    )
+    await manager.close()
+    restored_manager = AudioSessionManager(
+        max_active=2, max_pending_speech=3, state_store=AudioStateStore(state_path)
+    )
+    restored_output = FakeOutput()
+    restored_output.connected = False
+    try:
+        restored = restored_manager.restore(lambda _: restored_output)[0]
+        assert restored.speech_only
+        await restored.connect("voice")
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert restored_output.played == []
+        radio = (await restored.snapshot()).autoplay_next
+        assert radio is not None and radio.title == "radio"
+        # Manual music requests leave speech-only mode.
+        await restored.enqueue(AudioItem("manual", "manual", "https://example.com/manual"))
+        for _ in range(50):
+            if restored_output.played:
+                break
+            await asyncio.sleep(0)
+        assert not restored.speech_only
+        assert restored_output.played == ["manual"]
+    finally:
+        await restored_manager.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_only_blocks_radio_refill_and_retry_wakeup() -> None:
+    calls = 0
+
+    async def supplier(seeds: tuple[str, ...]) -> tuple[AudioItem, ...]:
+        nonlocal calls
+        calls += 1
+        return ()
+
+    output = FakeOutput()
+    session = AudioSession("radio-held", output, max_pending_speech=3, autoplay_supplier=supplier)
+    try:
+        state = replace(
+            await session.persisted_state(),
+            speech_only=True,
+            autoplay_enabled=True,
+            mix_seed_references=("https://example.com/seed",),
+        )
+        session.restore(state)
+        await session.connect("voice")
+        await session.enqueue(AudioItem("speech", "speech", "", kind=AudioKind.SPEECH))
+        for _ in range(50):
+            if output.played:
+                break
+            await asyncio.sleep(0)
+        output.release.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert calls == 0
+        assert output.played == ["speech"]
+        assert session.current is None
+    finally:
+        await session.close()

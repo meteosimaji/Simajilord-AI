@@ -120,3 +120,13 @@ the existing completion grace, even after the music's completion window expires.
 Expired speech allowances, missing callbacks, disconnections, and the overall
 active-playback cap still terminate stuck playback. Completion or cancellation
 clears the overlay allowance before subsequent playback.
+
+### Read-aloud without music
+
+Read-aloud Start and Reconnect select a durable speech-only mode. This holds the
+music queue and Radio supply without changing either volume. An active music
+player stops, speech plays on its own, and the voice output becomes idle when
+speech finishes. Pending music, including a held Radio track, survives restart.
+Explicit music Start, a new music request, or enabling Radio leaves this mode.
+Automatic transport recovery preserves it. A music volume of zero alone remains
+a gain setting; it does not select speech-only mode.
