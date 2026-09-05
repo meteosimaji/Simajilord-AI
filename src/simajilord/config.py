@@ -220,6 +220,8 @@ class Settings:
     voicevox_auto_start: bool
     voicevox_timeout_seconds: float
     voicevox_readiness_ttl_seconds: float
+    voicevox_cpu_num_threads: int
+    voicevox_streaming_enabled: bool
     read_aloud_chunk_characters: int
     read_aloud_audience_mode: ReadAloudAudienceMode
     max_pending_speech: int
@@ -1012,6 +1014,10 @@ def load_settings(
             "VOICEVOX_PRESET_NARRATOR_ID", 13, minimum=0, maximum=65_535
         ),
         voicevox_engine_path=voicevox_engine_path,
+        voicevox_cpu_num_threads=_bounded_int(
+            "VOICEVOX_CPU_NUM_THREADS", 4, minimum=0, maximum=64
+        ),
+        voicevox_streaming_enabled=_boolean("VOICEVOX_STREAMING_ENABLED", False),
         voicevox_auto_start=voicevox_auto_start,
         voicevox_timeout_seconds=_positive_float("VOICEVOX_TIMEOUT_SECONDS", 30.0, maximum=120.0),
         voicevox_readiness_ttl_seconds=_positive_float(

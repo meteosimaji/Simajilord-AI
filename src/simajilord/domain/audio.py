@@ -8,6 +8,8 @@ from enum import StrEnum
 from pathlib import Path
 from time import monotonic
 
+from simajilord.domain.speech_stream import SpeechStream
+
 log = logging.getLogger(__name__)
 
 
@@ -42,6 +44,7 @@ class AudioItem:
     resolver_reference: str | None = None
     resolved_at: float = field(default_factory=monotonic)
     owned_file: Path | None = None
+    speech_stream: SpeechStream | None = None
     failure_count: int = 0
     retry_after: float = 0.0
     start_seconds: float = 0.0
@@ -71,6 +74,7 @@ class AudioItem:
         return replace(
             self,
             owned_file=None,
+            speech_stream=None,
             start_seconds=0.0,
             retry_after=0.0,
             played_at_epoch=None,
@@ -91,6 +95,7 @@ class AudioItem:
             http_headers=None,
             resolved_at=0.0,
             owned_file=None,
+            speech_stream=None,
             failure_count=self.failure_count if failure_count is None else failure_count,
             retry_after=0.0,
             speech_overlay_source=None,
@@ -103,6 +108,9 @@ class AudioItem:
         """Remove a temporary source owned by this item."""
 
         self.cleanup_speech_overlay()
+        if self.speech_stream is not None:
+            self.speech_stream.close()
+            self.speech_stream = None
         owned_file = self.owned_file
         if owned_file is None:
             return

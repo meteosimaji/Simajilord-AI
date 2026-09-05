@@ -21,6 +21,7 @@ import discord
 
 from simajilord.core.errors import EarlyPlaybackEnd, ProviderError, UserError
 from simajilord.domain.audio import AudioItem, AudioKind
+from simajilord.domain.speech_stream import SpeechStreamReader
 
 log = logging.getLogger(__name__)
 _SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
@@ -38,14 +39,29 @@ _OPUS_LOAD_ATTEMPTED = False
 class _ManagedFFmpegOpusAudio(discord.FFmpegOpusAudio):
     """Close discord.py's child pipes even when FFmpeg already reached EOF."""
 
+    stream_reader: SpeechStreamReader | None = None
+    stream_reference: str | None = None
+    _stream_first_packet = False
+
+    def read(self) -> bytes:
+        packet = super().read()
+        if (
+            self.stream_reference is not None
+            and not self._stream_first_packet
+            and packet
+            and not packet.startswith((b"OpusHead", b"OpusTags"))
+        ):
+            self._stream_first_packet = True
+            log.info("Streaming speech first Opus packet ready %s", self.stream_reference)
+        return packet
+
     def cleanup(self) -> None:
         if getattr(self, "_simajilord_cleaned", False):
             return
         self._simajilord_cleaned = True
-        streams = tuple(
-            getattr(self, name, None)
-            for name in ("_stdout", "_stdin", "_stderr")
-        )
+        if self.stream_reader is not None:
+            self.stream_reader.close()
+        streams = tuple(getattr(self, name, None) for name in ("_stdout", "_stdin", "_stderr"))
         super().cleanup()
         for stream in streams:
             close = getattr(stream, "close", None)
@@ -187,6 +203,9 @@ class _LiveSpeechMixer(discord.AudioSource):
             expected_packet_loss=0.15,
         )
         self._speech_finished = False
+        self._speech_packet_count = 0
+        self._speech_max_read_ms = 0.0
+        self._speech_slow_reads = 0
         self._completion_signalled = False
         self._completion_lock = ThreadLock()
         self._cleanup_lock = ThreadLock()
@@ -201,11 +220,22 @@ class _LiveSpeechMixer(discord.AudioSource):
         music_packet = _read_opus_audio_packet(self._music_source)
         if self._speech_finished:
             return music_packet
+        speech_read_started = monotonic()
         speech_packet = _read_opus_audio_packet(self._speech_source)
+        speech_read_ms = (monotonic() - speech_read_started) * 1_000
+        self._speech_max_read_ms = max(self._speech_max_read_ms, speech_read_ms)
+        self._speech_slow_reads += int(speech_read_ms > 20.0)
         if not speech_packet:
+            log.info(
+                "Live speech stream consumed packets=%s max_read_ms=%.3f reads_over_20ms=%s",
+                self._speech_packet_count,
+                self._speech_max_read_ms,
+                self._speech_slow_reads,
+            )
             self._speech_finished = True
             self._signal_completion(None)
             return music_packet
+        self._speech_packet_count += 1
         try:
             speech_pcm = self._speech_decoder.decode(speech_packet, fec=False)
             music_pcm = (
@@ -441,6 +471,8 @@ class DiscordAudioOutput:
                 )
         finally:
             source.cleanup()
+        if item.speech_stream is not None:
+            item.speech_stream.check_error()
 
     async def _await_playback_completion(
         self,
@@ -504,8 +536,14 @@ class DiscordAudioOutput:
         """Mix speech without ending the active Discord music player."""
 
         if await self._try_live_speech_overlay(speech):
+            if speech.speech_stream is not None:
+                speech.speech_stream.check_error()
             return
 
+        if speech.speech_stream is not None:
+            # The legacy two-input FFmpeg graph opens a path, so it must see
+            # a complete file. The live mixer above consumes the stream early.
+            await asyncio.to_thread(speech.speech_stream.wait_finished)
         self._music_stream_continuous_after_overlay = False
         overlay = replace(
             music,
@@ -611,8 +649,7 @@ class DiscordAudioOutput:
                 mixer.cleanup()
                 raise
             log.info(
-                "Live speech overlay source ready guild=%s request=%s "
-                "preparation_ms=%.1f",
+                "Live speech overlay source ready guild=%s request=%s preparation_ms=%.1f",
                 self.guild_id,
                 speech.request_id or "untracked",
                 max(0.0, (monotonic() - preparation_started) * 1_000),
@@ -625,11 +662,7 @@ class DiscordAudioOutput:
                 raise
             finally:
                 try:
-                    if (
-                        voice.is_connected()
-                        and voice.is_playing()
-                        and voice.source is mixer
-                    ):
+                    if voice.is_connected() and voice.is_playing() and voice.source is mixer:
                         voice.source = mixer.music_source
                         mixer.detach_music()
                         restored = True
@@ -823,6 +856,27 @@ def build_discord_audio_source(item: AudioItem) -> discord.FFmpegOpusAudio:
         options = ["-vn"]
         if filters:
             options.extend(("-filter:a", ",".join(filters)))
+    if item.speech_stream is not None:
+        before_parts.extend(("-f", "wav", "-probesize", "32", "-analyzeduration", "0"))
+        # Ogg defaults to one-second pages. Flush each Discord-sized packet;
+        # this changes delivery timing, not the encoded audio or its filters.
+        options.extend(("-page_duration", "20000", "-flush_packets", "1"))
+        reader = item.speech_stream.open_reader()
+        try:
+            streaming_source = _ManagedFFmpegOpusAudio(
+                reader,
+                pipe=True,
+                before_options=shlex.join(before_parts),
+                options=shlex.join(options),
+            )
+        except BaseException:
+            reader.close()
+            raise
+        streaming_source.stream_reader = reader
+        streaming_source.stream_reference = (
+            f"request={item.request_id or 'untracked'} file={Path(item.source).name}"
+        )
+        return streaming_source
     return _ManagedFFmpegOpusAudio(
         item.source,
         before_options=shlex.join(before_parts),

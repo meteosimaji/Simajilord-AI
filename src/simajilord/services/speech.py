@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import re
 import shutil
@@ -11,7 +12,7 @@ import struct
 import uuid
 import wave
 from collections import deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -21,7 +22,10 @@ from typing import Protocol, TypeVar, runtime_checkable
 
 from simajilord.core.errors import UserError
 from simajilord.domain.audio import AudioItem, AudioKind
+from simajilord.domain.speech_stream import SpeechStream
 from simajilord.services.metrics import ServiceMetricHook, ServiceOperationMetric
+
+log = logging.getLogger(__name__)
 
 
 class SpeechProvider(Protocol):
@@ -62,6 +66,22 @@ class WarmableSpeechProvider(Protocol):
     """Optional provider extension for removing first-use startup latency."""
 
     async def warm_up(self) -> None: ...
+
+
+@runtime_checkable
+class StreamingSpeechProvider(Protocol):
+    """Optional provider extension yielding a single PCM WAV during synthesis."""
+
+    async def supports_streaming(self, voice_id: int | None) -> bool: ...
+
+    def stream_voice(
+        self,
+        text: str,
+        *,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> AsyncIterator[bytes]: ...
 
 
 class SpeechSegmentKind(StrEnum):
@@ -263,6 +283,7 @@ class SpeechService:
         self._cache_dir = output_dir / "cache"
         self._cache_locks: dict[str, asyncio.Lock] = {}
         self._voice_presets = dict(voice_presets or {})
+        self._stream_jobs: set[asyncio.Task[None]] = set()
         self.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -324,6 +345,18 @@ class SpeechService:
         if before_synthesis is not None:
             await before_synthesis()
 
+        if isinstance(
+            self.provider, StreamingSpeechProvider
+        ) and await self.provider.supports_streaming(voice_id):
+            return await self._start_stream(
+                prepared,
+                title=title,
+                workspace_id=workspace_id,
+                voice_id=voice_id,
+                speed_scale=speed_scale,
+                pitch_scale=pitch_scale,
+                provider=self.provider,
+            )
         return await self._scheduler.run(
             workspace_id,
             lambda: self._synthesize_job(
@@ -334,6 +367,164 @@ class SpeechService:
                 pitch_scale=pitch_scale,
             ),
         )
+
+    async def _start_stream(
+        self,
+        prepared: tuple[SpeechSegment, ...],
+        *,
+        title: str,
+        workspace_id: str,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+        provider: StreamingSpeechProvider,
+    ) -> AudioItem:
+        ready: asyncio.Future[AudioItem] = asyncio.get_running_loop().create_future()
+
+        async def scheduled() -> None:
+            producer = asyncio.create_task(
+                self._produce_stream(
+                    provider,
+                    prepared,
+                    ready,
+                    title=title,
+                    voice_id=voice_id,
+                    speed_scale=speed_scale,
+                    pitch_scale=pitch_scale,
+                )
+            )
+            try:
+                await producer
+            except asyncio.CancelledError:
+                # Consumer cancellation stops this producer, not a shared TTS worker.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+
+        async def run() -> None:
+            try:
+                await self._scheduler.run(workspace_id, scheduled)
+            except BaseException as exc:
+                if not ready.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        ready.cancel()
+                    else:
+                        ready.set_exception(exc)
+
+        task = asyncio.create_task(run(), name=f"simajilord-speech-stream-{workspace_id}")
+        self._stream_jobs.add(task)
+        task.add_done_callback(self._stream_jobs.discard)
+        try:
+            return await ready
+        except BaseException:
+            task.cancel()
+            raise
+
+    async def _produce_stream(
+        self,
+        provider: StreamingSpeechProvider,
+        prepared: tuple[SpeechSegment, ...],
+        ready: asyncio.Future[AudioItem],
+        *,
+        title: str,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> None:
+        destination = self.output_dir / f"speech-{uuid.uuid4().hex}.wav"
+        stream = SpeechStream(destination)
+        item = AudioItem(
+            source=str(destination),
+            title=title,
+            page_url="local://speech",
+            kind=AudioKind.SPEECH,
+            owned_file=destination,
+            speech_stream=stream,
+        )
+        loop = asyncio.get_running_loop()
+        producer = asyncio.current_task()
+        assert producer is not None
+
+        def cancel() -> None:
+            if not producer.done():
+                loop.call_soon_threadsafe(producer.cancel)
+
+        stream.cancel_production = cancel
+        # One complete input preserves sentence-spanning prosody and author order.
+        text = "".join(
+            segment.text
+            + (
+                "。"
+                if index < len(prepared) - 1 and segment.text[-1] not in "。\uff01\uff1f!?"
+                else ""
+            )
+            for index, segment in enumerate(prepared)
+        )
+        header = bytearray()
+        received = 0
+        expected = 0
+        byte_rate = 0
+        synthesis_started = monotonic()
+        try:
+            async with self._provider_limit:
+                async for chunk in provider.stream_voice(
+                    text,
+                    voice_id=voice_id,
+                    speed_scale=speed_scale,
+                    pitch_scale=pitch_scale,
+                ):
+                    if ready.cancelled():
+                        raise asyncio.CancelledError
+                    if len(header) < 44:
+                        header.extend(chunk[: 44 - len(header)])
+                        if len(header) == 44:
+                            expected, byte_rate = _stream_wave_format(bytes(header))
+                            item.duration_seconds = (expected - 44) / byte_rate
+                    received += len(chunk)
+                    if expected and received > expected:
+                        raise RuntimeError("Streaming WAV exceeds its declared length.")
+                    await asyncio.to_thread(stream.append, chunk)
+                    if expected and received > 44:
+                        now = monotonic()
+                        buffered_seconds = (received - 44) / byte_rate
+                        elapsed = now - synthesis_started
+                        remaining_seconds = (expected - received) / byte_rate
+                        # Start with a cushion; if generation is slower than real
+                        # time, accumulate enough for the estimated remaining deficit.
+                        rate = elapsed / max(buffered_seconds, 0.001)
+                        cushion = 1.0 + max(0.0, rate * 1.25 - 1.0) * remaining_seconds
+                        if not ready.done() and buffered_seconds >= cushion:
+                            log.info(
+                                "Speech stream ready file=%s preparation_ms=%.1f "
+                                "buffered_seconds=%.3f duration_seconds=%.3f",
+                                destination.name,
+                                (now - synthesis_started) * 1_000,
+                                buffered_seconds,
+                                item.duration_seconds,
+                            )
+                            ready.set_result(item)
+            if not expected or received != expected:
+                raise RuntimeError("Streaming WAV ended before its declared length.")
+            stream.finish()
+            log.info(
+                "Speech stream synthesis completed file=%s synthesis_ms=%.1f bytes=%s",
+                destination.name,
+                (monotonic() - synthesis_started) * 1_000,
+                received,
+            )
+            if not ready.done():
+                ready.set_result(item)
+        except BaseException as exc:
+            stream.finish(exc)
+            if not ready.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    ready.cancel()
+                else:
+                    ready.set_exception(exc)
+                item.cleanup()
+            elif ready.cancelled():
+                item.cleanup()
+            raise
 
     async def _synthesize_job(
         self,
@@ -422,6 +613,7 @@ class SpeechService:
 
     async def close(self) -> None:
         await self._scheduler.close()
+        await asyncio.gather(*tuple(self._stream_jobs), return_exceptions=True)
         await self.provider.close()
 
     async def warm_up(self) -> bool:
@@ -457,11 +649,7 @@ class SpeechService:
     ) -> tuple[int, int]:
         orphan_count = 0
         for path in self.output_dir.glob("speech-*"):
-            if (
-                path.is_file()
-                and not path.is_symlink()
-                and path.stat().st_mtime < cutoff_epoch
-            ):
+            if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff_epoch:
                 path.unlink(missing_ok=True)
                 orphan_count += 1
 
@@ -742,9 +930,46 @@ async def _concatenate_audio(
     destination.chmod(0o600)
 
 
+def _stream_wave_format(header: bytes) -> tuple[int, int]:
+    """Validate the official streaming API's fixed PCM16 WAV header."""
+
+    if (
+        len(header) != 44
+        or header[:4] != b"RIFF"
+        or header[8:16] != b"WAVEfmt "
+        or header[36:40] != b"data"
+    ):
+        raise RuntimeError("Invalid streaming WAV header.")
+    fmt_size, encoding, channels, rate, byte_rate, alignment, bits = struct.unpack(
+        "<IHHIIHH", header[16:36]
+    )
+    size = int.from_bytes(header[40:44], "little")
+    if (
+        fmt_size != 16
+        or encoding != 1
+        or channels not in {1, 2}
+        or bits != 16
+        or not 8_000 <= rate <= 192_000
+        or alignment != channels * 2
+        or byte_rate != rate * alignment
+        or size <= 0
+        or size % alignment
+        or size + 44 > 50_000_000
+        or int.from_bytes(header[4:8], "little") != size + 36
+    ):
+        raise RuntimeError("Unsupported streaming WAV format or size.")
+    return size + 44, byte_rate
+
+
 async def _audio_duration_seconds(path: Path) -> float:
     """Probe a generated speech file so music ducking ends at the right moment."""
 
+    # Providers generate PCM WAV/AIFF. Read their exact frame count first;
+    # spawning ffprobe for every utterance adds avoidable startup latency.
+    try:
+        return await asyncio.to_thread(_header_duration_seconds, path)
+    except RuntimeError:
+        pass
     executable = shutil.which("ffprobe")
     if executable is None:
         return await asyncio.to_thread(_header_duration_seconds, path)
@@ -809,10 +1034,15 @@ def _aiff_duration_seconds(path: Path) -> float:
     try:
         with path.open("rb") as stream:
             header = stream.read(12)
-            if len(header) != 12 or header[:4] != b"FORM" or header[8:12] not in {
-                b"AIFF",
-                b"AIFC",
-            }:
+            if (
+                len(header) != 12
+                or header[:4] != b"FORM"
+                or header[8:12]
+                not in {
+                    b"AIFF",
+                    b"AIFC",
+                }
+            ):
                 return 0.0
             while True:
                 chunk_header = stream.read(8)

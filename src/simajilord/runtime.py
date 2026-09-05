@@ -327,6 +327,8 @@ class SimajilordRuntime:
                 timeout_seconds=settings.voicevox_timeout_seconds,
                 engine_path=settings.voicevox_engine_path,
                 auto_start=settings.voicevox_auto_start,
+                cpu_num_threads=settings.voicevox_cpu_num_threads,
+                streaming_enabled=settings.voicevox_streaming_enabled,
                 readiness_ttl_seconds=settings.voicevox_readiness_ttl_seconds,
                 preload_voice_ids=(settings.voicevox_preset_clear_id,),
             )

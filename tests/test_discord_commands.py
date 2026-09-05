@@ -5045,16 +5045,19 @@ async def test_bot_unloads_cogs_before_closing_runtime(
     async def close_runtime() -> None:
         order.append("runtime")
 
+    async def close_audio() -> None:
+        order.append("audio")
+
     bot = object.__new__(SimajilordDiscordBot)
     bot.activity_server = SimpleNamespace(close=close_activity)
     bot.operator_server = SimpleNamespace(close=close_operator)
     bot._simajilord_music_dashboard = SimpleNamespace(close=close_dashboard)
-    bot.runtime = SimpleNamespace(close=close_runtime)
+    bot.runtime = SimpleNamespace(close=close_runtime, audio=SimpleNamespace(close=close_audio))
     monkeypatch.setattr(commands.Bot, "close", close_discord)
 
     await SimajilordDiscordBot.close(bot)
 
-    assert order == ["operator", "dashboard", "activity", "discord", "runtime"]
+    assert order == ["operator", "dashboard", "activity", "audio", "discord", "runtime"]
 
 
 def test_agent_response_chunks_prefer_readable_boundaries() -> None:

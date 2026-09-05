@@ -1015,3 +1015,66 @@ def _wave_bytes() -> bytes:
         writer.setframerate(24_000)
         writer.writeframes(b"\0" * 2_400)
     return output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_voicevox_streams_before_eof_and_preserves_full_query_and_tuning() -> None:
+    release = asyncio.Event()
+    calls = []
+
+    async def version(request):
+        return web.json_response("development")
+
+    async def speakers(request):
+        return web.json_response(
+            [{"styles": [{"id": 3, "type": "streaming_talk"}, {"id": 8, "type": "talk"}]}]
+        )
+
+    async def query(request):
+        calls.append(request.query["text"])
+        return web.json_response({"accent_phrases": []})
+
+    async def stream(request):
+        assert request.query == {"speaker": "3", "segment_length": "0.5"}
+        assert await request.json() == {"accent_phrases": [], "speedScale": 1.3, "pitchScale": 0.07}
+        response = web.StreamResponse(headers={"Content-Type": "audio/wav"})
+        await response.prepare(request)
+        await response.write(_wave_bytes()[:44])
+        await release.wait()
+        await response.write(_wave_bytes()[44:])
+        return response
+
+    app = web.Application()
+    app.router.add_get("/version", version)
+    app.router.add_get("/speakers", speakers)
+    app.router.add_post("/audio_query", query)
+    app.router.add_post("/streaming_synthesis", stream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    provider = VoicevoxSpeechProvider(
+        base_url=f"http://127.0.0.1:{port}",
+        speaker_id=3,
+        timeout_seconds=5,
+        engine_path=None,
+        auto_start=False,
+        streaming_enabled=True,
+    )
+    try:
+        assert await provider.supports_streaming(None)
+        assert not await provider.supports_streaming(8)
+        iterator = provider.stream_voice(
+            "第一文。第二文。", voice_id=None, speed_scale=1.3, pitch_scale=0.07
+        )
+        first = await asyncio.wait_for(anext(iterator), 1)
+        assert first == _wave_bytes()[:44]
+        release.set()
+        tail = b"".join([chunk async for chunk in iterator])
+        assert first + tail == _wave_bytes()
+        assert calls == ["第一文。第二文。"]
+    finally:
+        release.set()
+        await provider.close()
+        await runner.cleanup()

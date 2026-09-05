@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 from pathlib import Path
 from time import monotonic
@@ -36,6 +36,8 @@ class VoicevoxSpeechProvider:
         auto_start: bool,
         readiness_ttl_seconds: float = 5.0,
         preload_voice_ids: tuple[int, ...] = (),
+        cpu_num_threads: int = 4,
+        streaming_enabled: bool = False,
     ) -> None:
         normalized_url = base_url.rstrip("/")
         parsed = urlsplit(normalized_url)
@@ -63,6 +65,8 @@ class VoicevoxSpeechProvider:
             raise ValueError("VOICEVOX engine path must be an executable file.")
         if any(not 0 <= voice_id <= 65_535 for voice_id in preload_voice_ids):
             raise ValueError("VOICEVOX preload voice ID is out of range.")
+        if isinstance(cpu_num_threads, bool) or not 0 <= cpu_num_threads <= 64:
+            raise ValueError("VOICEVOX CPU threads must be between 0 and 64.")
 
         self.base_url = normalized_url
         self.host = host
@@ -73,6 +77,9 @@ class VoicevoxSpeechProvider:
         self.auto_start = auto_start
         self.readiness_ttl_seconds = readiness_ttl_seconds
         self.preload_voice_ids = tuple(dict.fromkeys(preload_voice_ids))
+        self.cpu_num_threads = cpu_num_threads
+        self.streaming_enabled = streaming_enabled
+        self._streaming_voice_ids: set[int] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._process: asyncio.subprocess.Process | None = None
         self._start_lock = asyncio.Lock()
@@ -173,6 +180,7 @@ class VoicevoxSpeechProvider:
         session = self._session
         self._session = None
         self._ready_until = 0.0
+        self._streaming_voice_ids = None
         if session is not None:
             await session.close()
 
@@ -189,11 +197,7 @@ class VoicevoxSpeechProvider:
 
     async def _ensure_ready(self) -> None:
         process = self._process
-        if (
-            self._ready_until > 0.0
-            and process is not None
-            and process.returncode is None
-        ):
+        if self._ready_until > 0.0 and process is not None and process.returncode is None:
             # A successfully verified engine owned by this provider remains
             # usable until its child process exits or an HTTP operation fails.
             # Avoid a /version round trip before ordinary spoken messages.
@@ -226,6 +230,8 @@ class VoicevoxSpeechProvider:
                         str(self.port),
                         "--cors_policy_mode",
                         "localapps",
+                        "--cpu_num_threads",
+                        str(self.cpu_num_threads),
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
@@ -249,6 +255,75 @@ class VoicevoxSpeechProvider:
                     )
                 await asyncio.sleep(0.2)
             raise ProviderError("VOICEVOX Engine startup timed out.")
+
+    async def supports_streaming(self, voice_id: int | None) -> bool:
+        """Use the official style type, never guess support from an engine version."""
+
+        if not self.streaming_enabled:
+            return False
+        await self._ensure_ready()
+        if self._streaming_voice_ids is None:
+            try:
+                async with self._client().get(f"{self.base_url}/speakers") as response:
+                    body = await _read_bounded(response, maximum=_MAX_QUERY_BYTES)
+                    if response.status != 200:
+                        return False
+                payload = json.loads(body)
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                return False
+            if not isinstance(payload, list):
+                return False
+            self._streaming_voice_ids = {
+                style["id"]
+                for speaker in payload
+                if isinstance(speaker, dict)
+                for style in speaker.get("styles", [])
+                if isinstance(style, dict)
+                if style.get("type") == "streaming_talk" and isinstance(style.get("id"), int)
+            }
+        return (self.speaker_id if voice_id is None else voice_id) in self._streaming_voice_ids
+
+    async def stream_voice(
+        self,
+        text: str,
+        *,
+        voice_id: int | None,
+        speed_scale: float,
+        pitch_scale: float,
+    ) -> AsyncIterator[bytes]:
+        """Yield one continuous official WAV response, never split the input text."""
+
+        selected_voice = self.speaker_id if voice_id is None else voice_id
+        if not await self.supports_streaming(selected_voice):
+            raise ProviderError("VOICEVOX voice does not support streaming synthesis.")
+        query = await self._audio_query(text, voice_id=selected_voice)
+        query["speedScale"] = speed_scale
+        query["pitchScale"] = pitch_scale
+        try:
+            async with self._client().post(
+                f"{self.base_url}/streaming_synthesis",
+                params={"speaker": str(selected_voice), "segment_length": "0.5"},
+                json=query,
+                headers={"Accept": "audio/wav"},
+            ) as response:
+                if response.status != 200:
+                    body = await _read_bounded(response, maximum=_MAX_QUERY_BYTES)
+                    raise ProviderError(_voicevox_http_error("streaming synthesis", response, body))
+                if (
+                    response.content_length is not None
+                    and response.content_length > _MAX_WAVE_BYTES
+                ):
+                    raise ProviderError("VOICEVOX response is too large.")
+                total = 0
+                async for chunk in response.content.iter_chunked(64 * 1_024):
+                    total += len(chunk)
+                    if total > _MAX_WAVE_BYTES:
+                        raise ProviderError("VOICEVOX response is too large.")
+                    yield bytes(chunk)
+                self._mark_ready()
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            self._ready_until = 0.0
+            raise ProviderError("VOICEVOX streaming synthesis failed.") from exc
 
     def _mark_ready(self) -> None:
         self._ready_until = monotonic() + self.readiness_ttl_seconds

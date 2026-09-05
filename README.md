@@ -606,6 +606,8 @@ Set `TTS_PROVIDER=voicevox`, `VOICEVOX_SPEAKER_ID` to a VOICEVOX style ID, and
 `VOICEVOX_ENGINE_PATH` to the local engine executable. The provider only accepts a loopback
 HTTP endpoint. With `VOICEVOX_AUTO_START=true`, the BOT starts the engine on first speech and
 stops only the process it owns during clean shutdown.
+For official streaming synthesis, measured launchd configuration, and music restart
+recovery, see [VOICEVOX streaming](docs/voicevox-streaming.md).
 
 For on-device macOS translation, a source checkout can build
 `native/macos/TranslationHelper` lazily with Swift. The platform wheel deliberately remains

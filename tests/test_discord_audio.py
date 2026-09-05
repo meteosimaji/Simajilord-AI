@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import wave
 from array import array
@@ -37,9 +38,7 @@ def test_discord_source_is_preencoded_opus(tmp_path) -> None:
         output.setframerate(48_000)
         output.writeframes(b"\0" * (48_000 // 10))
 
-    source = build_discord_audio_source(
-        AudioItem(str(path), "Silence", path.as_uri(), volume=0.75)
-    )
+    source = build_discord_audio_source(AudioItem(str(path), "Silence", path.as_uri(), volume=0.75))
     stdout = source._stdout
     try:
         assert source.is_opus()
@@ -70,9 +69,7 @@ def test_managed_discord_source_cleanup_is_idempotent(
         original_cleanup(source)
 
     monkeypatch.setattr(discord.FFmpegOpusAudio, "cleanup", counted_cleanup)
-    source = build_discord_audio_source(
-        AudioItem(str(path), "Silence", path.as_uri())
-    )
+    source = build_discord_audio_source(AudioItem(str(path), "Silence", path.as_uri()))
 
     source.cleanup()
     source.cleanup()
@@ -440,10 +437,7 @@ def test_discord_source_keeps_music_at_a_stable_duck_level_during_speech(
         assert "amix=" in arguments
         assert "duration=longest" in arguments
         assert "[1:a]volume=0.600000,volume=0.250000[ducked]" in arguments
-        assert (
-            "aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11,"
-            "volume=1.250000"
-        ) in arguments
+        assert ("aresample=48000,loudnorm=I=-16:TP=-1.5:LRA=11,volume=1.250000") in arguments
         assert "[mixed]" in arguments
         assert str(speech) in arguments
         packets = 0
@@ -478,10 +472,7 @@ def test_standalone_speech_is_loudness_normalized_before_user_volume(
     )
     try:
         arguments = " ".join(str(value) for value in source._process.args)
-        assert (
-            "loudnorm=I=-16:TP=-1.5:LRA=11,volume=1.250000"
-            in arguments
-        )
+        assert "loudnorm=I=-16:TP=-1.5:LRA=11,volume=1.250000" in arguments
     finally:
         source.cleanup()
 
@@ -645,9 +636,7 @@ async def test_audio_source_preflight_cancellation_joins_reader(
         lambda _item: replacement,
     )
     task = asyncio.create_task(
-        output._swap_music_source(
-            AudioItem("source", "Replacement", "https://example.test/audio")
-        )
+        output._swap_music_source(AudioItem("source", "Replacement", "https://example.test/audio"))
     )
     assert await asyncio.to_thread(read_started.wait, 1)
 
@@ -659,3 +648,59 @@ async def test_audio_source_preflight_cancellation_joins_reader(
     assert replacement.cleaned >= 1
     assert output._preflight_poisoned is False
     await output.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_streaming_opus_starts_before_tail_without_changing_audio(tmp_path):
+    import io
+    import math
+
+    from simajilord.domain.speech_stream import SpeechStream
+    from simajilord.integrations.discord.audio import _read_opus_audio_packet
+
+    samples = array(
+        "h", (int(4000 * math.sin(i * math.tau * 220 / 24000)) for i in range(24000 * 8))
+    )
+    if sys.byteorder != "little":
+        samples.byteswap()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(24000)
+        writer.writeframes(samples.tobytes())
+    data = buffer.getvalue()
+    stream = SpeechStream(tmp_path / "growing.wav")
+    split = 44 + 24000 * 2 * 4
+    stream.append(data[:split])
+    item = AudioItem(
+        str(stream.path), "Speech", "local://speech", kind=AudioKind.SPEECH, speech_stream=stream
+    )
+    source = build_discord_audio_source(item)
+
+    def drain(audio):
+        packets = []
+        while packet := _read_opus_audio_packet(audio):
+            packets.append(packet)
+        return packets
+
+    try:
+        first = await asyncio.wait_for(asyncio.to_thread(_read_opus_audio_packet, source), 2)
+        assert first  # Four seconds are available, but the eight-second tail is not.
+        assert stream.path.stat().st_size < len(data)
+        stream.append(data[split:])
+        stream.finish()
+        streamed_packets = [first, *await asyncio.to_thread(drain, source)]
+    finally:
+        source.cleanup()
+        stream.close()
+    complete = tmp_path / "complete.wav"
+    complete.write_bytes(data)
+    ordinary = build_discord_audio_source(
+        AudioItem(str(complete), "Speech", "local://speech", kind=AudioKind.SPEECH)
+    )
+    try:
+        assert streamed_packets == await asyncio.to_thread(drain, ordinary)
+        assert len(streamed_packets) == 401
+    finally:
+        ordinary.cleanup()

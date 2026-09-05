@@ -244,6 +244,7 @@ class AudioSession:
         self._restart_requested = False
         self._suspended = False
         self._voice_activation_required = False
+        self._restart_recovery_pending = False
         self._closed = False
         self._lock = asyncio.Lock()
         self._speech_reservation_changed = asyncio.Condition(self._lock)
@@ -288,6 +289,7 @@ class AudioSession:
         self._waiting_actor_ids.clear()
         self._suspended = False
         self._voice_activation_required = False
+        self._restart_recovery_pending = False
         self._wake.set()
         self._ensure_worker()
         await self._state_changed()
@@ -1078,6 +1080,7 @@ class AudioSession:
             if self.output.connected:
                 await self.output.disconnect()
             self.destination_id = None
+            self._restart_recovery_pending = False
             await self._state_changed()
         elif not cleared and on_noop is not None:
             await on_noop()
@@ -1086,6 +1089,7 @@ class AudioSession:
         """Leave voice and hold the audio route until a listener explicitly resumes it."""
 
         async with self._transport_lock:
+            self._restart_recovery_pending = False
             self._suspended = True
             self._voice_activation_required = True
             self._suspend_requested = True
@@ -1191,6 +1195,11 @@ class AudioSession:
         if state.workspace_id != self.workspace_id:
             raise ValueError("Stored audio workspace does not match the session.")
         self.destination_id = state.destination_id
+        self._restart_recovery_pending = (
+            state.resume_on_restart
+            and not state.voice_activation_required
+            and state.destination_id is not None
+        )
         self._waiting_actor_ids = set(state.waiting_actor_ids)
         self._loop_mode = state.loop_mode
         self.auto_leave = state.auto_leave
@@ -1259,6 +1268,12 @@ class AudioSession:
             self._voice_activation_required = True
         elif self._voice_activation_required and not self.output.connected:
             self._suspended = True
+
+    @property
+    def restart_recovery_pending(self) -> bool:
+        """A previously active connection may be resumed by the startup adapter."""
+
+        return self._restart_recovery_pending
 
     async def persisted_state(self) -> StoredAudioSession:
         async with self._lock:
@@ -1330,7 +1345,18 @@ class AudioSession:
                 speech_volume=self._speech_volume,
                 autoplay_enabled=self._autoplay_enabled,
                 mix_seed_references=tuple(self._mix_seed_references),
-                voice_activation_required=self._voice_activation_required,
+                voice_activation_required=(
+                    self._voice_activation_required and not self._restart_recovery_pending
+                ),
+                resume_on_restart=(
+                    self._restart_recovery_pending
+                    or (
+                        self.output.connected
+                        and not self.output.paused
+                        and not self._suspended
+                        and not self._voice_activation_required
+                    )
+                ),
             )
 
     def _assert_music_queue_capacity(self, item: AudioItem) -> None:
@@ -2215,7 +2241,9 @@ def _resume_copy(item: AudioItem) -> AudioItem:
     resumed.fade_in_seconds = item.fade_in_seconds
     resumed.fade_out_seconds = 0.0
     resumed.owned_file = item.owned_file
+    resumed.speech_stream = item.speech_stream
     item.owned_file = None
+    item.speech_stream = None
     return resumed
 
 

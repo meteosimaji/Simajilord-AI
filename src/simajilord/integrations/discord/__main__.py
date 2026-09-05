@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import signal
+import sys
+from contextlib import suppress
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -20,7 +24,26 @@ def main() -> None:
     for warning in security_policy_warnings(settings):
         log.critical("SECURITY WARNING: %s", warning)
     bot = SimajilordDiscordBot(SimajilordRuntime.build(settings))
-    bot.run(settings.token, log_handler=None)
+    with suppress(KeyboardInterrupt):
+        asyncio.run(_run_bot(bot, settings.token))
+
+
+async def _run_bot(bot: SimajilordDiscordBot, token: str) -> None:
+    """Let service-manager termination reach the same graceful close as Ctrl-C."""
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    assert task is not None
+    if sys.platform != "win32":
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        async with bot:
+            await bot.start(token)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if sys.platform != "win32":
+            loop.remove_signal_handler(signal.SIGTERM)
 
 
 def _configure_logging(settings: Settings) -> None:

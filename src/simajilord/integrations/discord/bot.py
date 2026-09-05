@@ -344,7 +344,7 @@ class SimajilordDiscordBot(commands.Bot):
         return f"application:{application_id}:{suffix}"
 
     async def _restore_audio_sessions(self) -> None:
-        """Restore durable state without turning process startup into a voice action."""
+        """Resume previously active destinations; leave manually held routes alone."""
 
         sessions = self.runtime.audio.restore(
             lambda workspace_id: DiscordAudioOutput(self, int(workspace_id))
@@ -354,6 +354,23 @@ class SimajilordDiscordBot(commands.Bot):
             guild = self.get_guild(int(session.workspace_id))
             if guild is None:
                 continue
+            if session.restart_recovery_pending and session.destination_id is not None:
+                channel = guild.get_channel(int(session.destination_id))
+                if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+                    try:
+                        await self.runtime.audio.connect(
+                            session.workspace_id, session.destination_id
+                        )
+                    except Exception:
+                        log.exception(
+                            "Audio restart recovery failed workspace=%s; saved job retained",
+                            session.workspace_id,
+                        )
+                    else:
+                        log.info(
+                            "Audio restart recovery connected workspace=%s", session.workspace_id
+                        )
+                        continue
             log.info(
                 "Audio session %s restored in standby; an explicit Start, play, "
                 "join, or approved agent action is required",
@@ -361,7 +378,7 @@ class SimajilordDiscordBot(commands.Bot):
             )
 
     async def _prepare_read_aloud_presence(self) -> None:
-        """Keep persisted read-aloud routes passive until an explicit voice action."""
+        """Check saved read-aloud destinations without activating held routes."""
 
         for guild in self.guilds:
             workspace_id = str(guild.id)
@@ -377,7 +394,7 @@ class SimajilordDiscordBot(commands.Bot):
                 )
                 continue
             log.info(
-                "Read-aloud route %s restored in standby for voice channel %s",
+                "Read-aloud route %s available for voice channel %s",
                 workspace_id,
                 route.audio_destination_id,
             )
@@ -542,6 +559,9 @@ class SimajilordDiscordBot(commands.Bot):
         if callable(close_dashboard):
             await close_dashboard()
         await self.activity_server.close()
+        # Snapshot playback position and active/held state before discord.py
+        # disconnects voice transports. Runtime.close() is idempotent for audio.
+        await self.runtime.audio.close()
         await super().close()
         await self.runtime.close()
 
