@@ -86,6 +86,7 @@ from simajilord.capabilities.audio import (
     AudioAction,
     AudioAutoLeaveRequest,
     AudioControlResponse,
+    AudioHistoryItem,
     AudioHistoryRequest,
     AudioHistoryResponse,
     AudioLoopRequest,
@@ -1110,6 +1111,8 @@ def _requester(name: str | None, actor_id: str | None = None) -> str:
 
 
 def _queue_requester(item: object) -> str:
+    if getattr(item, "kind", None) == AudioKind.SPEECH.value:
+        return "Read aloud"
     lane = getattr(item, "queue_lane", "request")
     if lane == "autoplay":
         return "Radio"
@@ -1294,7 +1297,7 @@ def music_queue_embed(
         title = "Audio · Now playing"
         current = response.current
         elapsed = min(response.position_seconds, current.duration_seconds)
-        uploader = discord.utils.escape_markdown(current.uploader or "Unknown uploader")
+        uploader = discord.utils.escape_markdown(current.uploader or "")
         if response.paused:
             timing = f"Paused at `{_duration(elapsed)}`"
         elif current.duration_seconds <= 0:
@@ -1323,8 +1326,12 @@ def music_queue_embed(
             ),
             timing,
             (
-                f"{_compact_panel_text(uploader, maximum=54)} · "
-                f"requested\u00a0by\u00a0{_queue_requester(current)}"
+                "Read aloud"
+                if current.kind == AudioKind.SPEECH.value
+                else (
+                    (f"{_compact_panel_text(uploader, maximum=54)} · " if uploader else "")
+                    + f"requested\u00a0by\u00a0{_queue_requester(current)}"
+                )
             ),
         ]
 
@@ -1378,13 +1385,29 @@ def music_queue_embed(
             f"`{_duration(item.duration_seconds)}` · {_queue_requester(item)}"
             for index, item in enumerate(visible, start=start + 1)
         ]
-        fields.append(
-            EmbedField(
-                f"Up Next · {selected_page}/{page_count}",
-                "\n".join(lines),
-                inline=False,
+        # Discord caps each field at 1,024 characters. Keep complete rows
+        # together, and drop unusually long link targets from the display only.
+        queue_chunks: list[str] = []
+        for item, line in zip(visible, lines, strict=True):
+            if len(line) > 400:
+                line = _compact_panel_text(
+                    f"{line.split(' ', 1)[0]} {item.title} · "
+                    f"{_duration(item.duration_seconds)} · {_queue_requester(item)}",
+                    maximum=400,
+                )
+            if queue_chunks and len(queue_chunks[-1]) + 1 + len(line) <= 1_024:
+                queue_chunks[-1] += "\n" + line
+            else:
+                queue_chunks.append(line)
+        for chunk_index, queue_chunk in enumerate(queue_chunks):
+            fields.append(
+                EmbedField(
+                    f"Up Next · {selected_page}/{page_count}"
+                    + (" · continued" if chunk_index else ""),
+                    queue_chunk,
+                    inline=False,
+                )
             )
-        )
     if response.autoplay_enabled:
         if response.autoplay_next is not None:
             autoplay_text = _media_title_link(
@@ -1992,6 +2015,10 @@ def _music_dashboard_fingerprint(
             current.uploader,
             current.thumbnail_url,
             current.duration_seconds,
+            current.kind,
+            current.requested_by_id,
+            current.requested_by_name,
+            current.queue_lane,
         ),
         tuple(
             (
@@ -2001,6 +2028,7 @@ def _music_dashboard_fingerprint(
                 item.thumbnail_url,
                 item.duration_seconds,
                 item.requested_by_name,
+                item.requested_by_id,
                 item.queue_lane,
             )
             for item in response.pending
@@ -2100,20 +2128,28 @@ def music_search_embed(response: AudioSearchResponse) -> discord.Embed:
     return embed
 
 
+
+def _audio_history_row(index: int, item: AudioHistoryItem) -> str:
+    # The API permits 25 rows; 150 characters each stays below the 4,096
+    # character description limit without dropping history entries.
+    requester = _compact_panel_text(_queue_requester(item), maximum=50)
+    when = f" · <t:{item.played_at_epoch}:R>" if item.played_at_epoch else ""
+    prefix = f"`{index:02d}` "
+    suffix = f" · `{_duration(item.duration_seconds)}` · {requester}{when}"
+    title_budget = max(1, 150 - len(prefix) - len(suffix))
+    title = _media_title_link(item.title, item.page_url, maximum=80)
+    if len(title) > title_budget:
+        title = _compact_panel_text(discord.utils.escape_markdown(item.title), maximum=title_budget)
+    return prefix + title + suffix
+
+
 def music_history_embed(response: AudioHistoryResponse) -> discord.Embed:
     if not response.items:
         return command_embed(
             "Playback history",
             description="No tracks have been played yet.",
         )
-    lines = []
-    for index, item in enumerate(response.items, start=1):
-        when = f" · <t:{item.played_at_epoch}:R>" if item.played_at_epoch else ""
-        lines.append(
-            f"`{index:02d}` {_media_title_link(item.title, item.page_url, maximum=80)} · "
-            f"`{_duration(item.duration_seconds)}` · "
-            f"{_requester(item.requested_by_name, item.requested_by_id)}{when}"
-        )
+    lines = [_audio_history_row(index, item) for index, item in enumerate(response.items, start=1)]
     return command_embed("Playback history", description="\n".join(lines))
 
 

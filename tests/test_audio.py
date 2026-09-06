@@ -2660,3 +2660,32 @@ async def test_speech_only_blocks_radio_refill_and_retry_wakeup() -> None:
         assert session.current is None
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_history_api_preserves_radio_lane_across_persistence(tmp_path: Path) -> None:
+    state_path = tmp_path / "history.json"
+    manager = AudioSessionManager(max_active=2, max_pending_speech=3,
+                                  state_store=AudioStateStore(state_path))
+    session = manager.get_or_create("guild", FakeOutput)
+    session._history.extend((
+        AudioItem("", "Radio track", "https://example.com/radio",
+                  queue_lane=AudioQueueLane.AUTOPLAY),
+        AudioItem("", "Manual track", "https://example.com/manual",
+                  requested_by_id="123", requested_by_name="Alice"),
+    ))
+    await manager.close()
+    restored = AudioSessionManager(max_active=2, max_pending_speech=3,
+                                   state_store=AudioStateStore(state_path))
+    restored.restore(lambda _: FakeOutput())
+    endpoints = build_audio_endpoints(cast(MediaService, None), restored)
+    endpoint = next(item for item in endpoints if item.descriptor.name == "audio.history")
+    result = await endpoint.invoke(AudioHistoryRequest(),
+                                   InvocationContext("123", "guild", "test", "history"))
+    assert isinstance(result, AudioHistoryResponse)
+    by_title = {item.title: item for item in result.items}
+    assert by_title["Radio track"].queue_lane == "autoplay"
+    assert by_title["Radio track"].requested_by_id is None
+    assert by_title["Manual track"].queue_lane == "request"
+    assert by_title["Manual track"].requested_by_id == "123"
+    await restored.close()

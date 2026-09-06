@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from simajilord.agent import AGENT_FINAL_DELIVERED_CONTENT, AGENT_NO_ACTION_CONTENT
 from simajilord.capabilities.audio import (
     AudioHistoryItem,
@@ -34,6 +38,7 @@ from simajilord.integrations.discord.capabilities import (
 )
 from simajilord.integrations.discord.cogs import (
     _agent_response_uses_host_delivery,
+    _music_dashboard_fingerprint,
     async_progress_embed,
     music_added_embed,
     music_history_embed,
@@ -644,3 +649,93 @@ def test_web_fetch_embed_preserves_continuation_offset() -> None:
     assert embed.title == "Opened page"
     assert fields["Next offset"] == "213"
     assert "213 / 900 characters" in fields["Text"]
+
+
+@pytest.mark.parametrize("url_length", [30, 2000])
+def test_music_queue_fields_fit_discord_limits_without_losing_rows(url_length: int) -> None:
+    pending = tuple(
+        AudioQueueItem(
+            title=f"Track {index} " + "長い曲名" * 40,
+            page_url="https://example.com/" + "a" * url_length,
+            kind="music",
+            duration_seconds=180,
+            requested_by_name="Listener" * 20,
+        )
+        for index in range(10)
+    )
+    embed = music_queue_embed(AudioQueueResponse(
+        current=None, pending=pending, paused=False, loop_mode="none",
+        destination_id=None, auto_leave=True, position_seconds=0, speed=1,
+        pitch=1, waiting_for_voice=False,
+    ))
+    queue_fields = [field for field in embed.fields if field.name.startswith("Up Next")]
+    assert len(queue_fields) > 1
+    assert all(len(field.value) <= 1024 for field in embed.fields)
+    assert len(embed) <= 6000
+    rendered = "\n".join(field.value for field in queue_fields)
+    for index in range(10):
+        assert f"`{index + 1:02d}`" in rendered
+        assert f"Track {index}" in rendered
+
+
+@pytest.mark.parametrize("kind", ["speech", "music"])
+def test_audio_panel_does_not_invent_unknown_uploader(kind: str) -> None:
+    item = AudioQueueItem(
+        title="Audio", page_url="local://speech" if kind == "speech" else "https://example.com",
+        kind=kind, duration_seconds=5, requested_by_name=None,
+        queue_lane="autoplay" if kind == "music" else "request",
+    )
+    embed = music_queue_embed(AudioQueueResponse(
+        current=item, pending=(), paused=False, loop_mode="none", destination_id="123",
+        auto_leave=True, position_seconds=0, speed=1, pitch=1, waiting_for_voice=False,
+    ))
+    assert "Unknown" not in (embed.description or "")
+    assert ("Read aloud" if kind == "speech" else "Radio") in (embed.description or "")
+
+
+def test_music_dashboard_refreshes_when_request_attribution_changes() -> None:
+    response = AudioQueueResponse(
+        current=AudioQueueItem(title="Track", page_url="https://example.com", kind="music",
+                               duration_seconds=180, requested_by_name=None),
+        pending=(), paused=True, loop_mode="none", destination_id="123", auto_leave=True,
+        position_seconds=0, speed=1, pitch=1, waiting_for_voice=False,
+    )
+    assert response.current is not None
+    for changed in (
+        replace(response.current, requested_by_id="123"),
+        replace(response.current, requested_by_name="Listener"),
+        replace(response.current, queue_lane="autoplay"),
+        replace(response.current, kind="speech"),
+    ):
+        assert _music_dashboard_fingerprint(response) != _music_dashboard_fingerprint(
+            replace(response, current=changed)
+        )
+
+
+def test_music_history_distinguishes_radio_and_manual_requesters() -> None:
+    base = AudioHistoryItem("Radio track", "https://example.com", 120, None, None,
+                            queue_lane="autoplay")
+    embed = music_history_embed(AudioHistoryResponse(items=(
+        base,
+        replace(base, title="Manual track", queue_lane="request", requested_by_id="123"),
+        replace(base, title="Named track", queue_lane="request", requested_by_name="Alice"),
+    )))
+    lines = (embed.description or "").splitlines()
+    assert "Radio" in lines[0] and "Unknown" not in lines[0]
+    assert "<@123>" in lines[1]
+    assert "Alice" in lines[2]
+
+
+def test_full_history_with_long_titles_and_urls_fits_description_limit() -> None:
+    response = AudioHistoryResponse(items=tuple(
+        AudioHistoryItem(f"Track {index} " + "title" * 100, "https://example.com/" + "a" * 2000,
+                         180, "Listener" * 30, 1_800_000_000, queue_lane="request")
+        for index in range(25)
+    ))
+    embed = music_history_embed(response)
+    description = embed.description or ""
+    assert len(description) <= 4096
+    assert len(description.splitlines()) == 25
+    for index in range(25):
+        assert f"`{index + 1:02d}`" in description
+        assert f"Track {index}" in description

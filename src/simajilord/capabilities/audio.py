@@ -26,6 +26,7 @@ from simajilord.core.errors import UserError
 from simajilord.domain.audio import (
     AudioItem,
     AudioKind,
+    AudioQueueLane,
     LoopMode,
     QueueSnapshot,
 )
@@ -161,6 +162,7 @@ class AudioHistoryItem:
     requested_by_name: str | None
     played_at_epoch: int | None
     requested_by_id: str | None = None
+    queue_lane: str = AudioQueueLane.REQUEST.value
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,6 +408,7 @@ def build_audio_endpoints(
                     requested_by_name=item.requested_by_name,
                     played_at_epoch=item.played_at_epoch,
                     requested_by_id=item.requested_by_id,
+                    queue_lane=item.queue_lane.value,
                 )
                 for item in snapshot.history[: request.limit]
                 if item.kind is AudioKind.MUSIC
