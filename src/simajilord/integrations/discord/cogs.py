@@ -662,13 +662,16 @@ _ERROR_MESSAGES = {
     "audio.mix_unavailable": "Radio is unavailable in this environment.",
     "audio.not_paused": "Playback is not paused.",
     "audio.nothing_playing": "No track is playing.",
-    "audio.navigation_changed": "接続先が変わりました。/audio を開き直してください。",
-    "audio.follow_start_required": "このVCで音声を開始してから追従を有効にしてください。",
-    "audio.follow_owned": "別の人に追従中です。その人が追従を解除してから設定してください。",
-    "audio.move_occupied_forbidden": (
-        "元のVCに人がいます。移動にはメンバー移動またはサーバー管理権限が必要です。"
+    "audio.navigation_changed": "The voice channel changed. Open /audio again.",
+    "audio.follow_start_required": "Start audio in your voice channel before turning on Follow me.",
+    "audio.follow_owned": (
+        "The bot is following someone else. They need to select Stop following first."
     ),
-    "audio.move_speech_busy": "読み上げ中です。読み終わってからもう一度移動してください。",
+    "audio.move_occupied_forbidden": (
+        "People are still listening. "
+        "You need Move Members or Manage Server permission to move audio."
+    ),
+    "audio.move_speech_busy": "Wait for read aloud to finish, then try Move here again.",
     "audio.output_disconnected": "The BOT is not connected to voice.",
     "audio.other_voice_active": "Audio is already playing in another voice channel.",
     "audio.queue_position_invalid": "Choose a valid position shown in the queue.",
@@ -2769,7 +2772,7 @@ class MusicControlsView(SafeView):
                 emoji="🔊",
             ),
             discord.SelectOption(
-                label="接続・読み上げ・設定",
+                label="Audio setup",
                 value="read_aloud",
                 description="Choose conversation channels",
                 emoji="🗣️",
@@ -2910,7 +2913,7 @@ class MusicControlsView(SafeView):
             await send_error(interaction, exc)
 
     @discord.ui.button(
-        label="音楽を再開",
+        label="Resume music",
         style=discord.ButtonStyle.success,
         custom_id="simajilord:music:start",
         row=0,
@@ -3045,7 +3048,7 @@ class MusicControlsView(SafeView):
         )
 
     @discord.ui.button(
-        label="接続・読み上げ・設定",
+        label="Audio setup",
         style=discord.ButtonStyle.secondary,
         custom_id="simajilord:audio:read-aloud",
         row=2,
@@ -3169,7 +3172,7 @@ class AudioLevelsModal(SafeModal, title="Mix levels"):
             music_percent = _bounded_percent(str(self.music), label="Music")
             speech_percent = _bounded_percent(
                 str(self.read_aloud),
-                label="接続・読み上げ・設定",
+                label="Audio setup",
             )
             workspace_id = str(interaction.guild_id or "")
             session = self.runtime.audio.require(workspace_id)
@@ -3460,7 +3463,7 @@ async def send_error(interaction: discord.Interaction, error: Exception) -> None
             from .audio_hub import AudioHubOpenButton
 
             repair = SafeView(timeout=300)
-            repair.add_item(AudioHubOpenButton(dashboard.runtime, label="今いるVCで使う"))
+            repair.add_item(AudioHubOpenButton(dashboard.runtime, label="Use audio here"))
             options["view"] = repair
     if interaction.response.is_done():
         await interaction.followup.send(**options)
@@ -5390,7 +5393,7 @@ class ReadAloudLengthSelect(discord.ui.Select[discord.ui.View]):
             discord.SelectOption(
                 label=f"{limit} characters",
                 value=str(limit),
-                description=("Say 以下略 after this point when abbreviation is enabled"),
+                description=("Stop reading at this limit when shortening is enabled"),
                 default=limit == current_limit,
             )
             for limit in limits
@@ -5536,7 +5539,7 @@ class ReadAloudDictionaryModal(SafeModal, title="Add a pronunciation"):
     )
     reading: discord.ui.TextInput[ReadAloudDictionaryModal] = discord.ui.TextInput(
         label="How it should be read",
-        placeholder="ディスコード",
+        placeholder="Enter how to pronounce the word",
         min_length=1,
         max_length=200,
     )
@@ -5687,7 +5690,7 @@ class ReadAloudChannelSelectView(SafeView):
                 self.add_item(control)
         else:
             self.add_item(self.selector)
-            self.start.label = "保存して読み上げ"
+            self.start.label = "Save & start reading"
             self.add_item(self.start)
         self.add_item(AudioSettingsSelect(self.runtime))
         self.add_item(AudioHubOpenButton(self.runtime))
@@ -5696,33 +5699,38 @@ class ReadAloudChannelSelectView(SafeView):
         section = getattr(self, "section", "all")
         if section == "personal":
             return command_embed(
-                "自分の声・速度",
-                description=("変更は自動で保存されます。声を試すときは /audio の「声を試す」へ。"),
+                "My voice & speed",
+                description=(
+                    "Changes save automatically. Select Test my voice in /audio to hear a preview."
+                ),
                 fields=(
                     EmbedField(
-                        "声",
+                        "Voice",
                         self.personal_voice_preset.value
                         if self.personal_voice_preset
-                        else "サーバーの標準",
+                        else "Server default",
                     ),
                     EmbedField(
-                        "速度・高さ",
+                        "Speed & pitch",
                         f"{self.personal_voice_speed:.2f}x · {self.personal_voice_pitch:+.2f}",
                     ),
                 ),
             )
         if section == "shared":
             return command_embed(
-                "共通の読み方・辞書",
-                description=("サーバー全体に適用されます。変更は管理者のみ行えます。"),
+                "Server reading settings",
+                description=(
+                    "These settings apply to everyone in this server. "
+                    "Only server managers can change them."
+                ),
                 fields=(
                     EmbedField(
-                        "長文",
-                        f"{self.message_character_limit}文字で省略"
+                        "Long messages",
+                        f"Stop after {self.message_character_limit} characters"
                         if self.abbreviate_long_messages
-                        else "全文を読む",
+                        else "Read the full message",
                     ),
-                    EmbedField("辞書", f"{self.dictionary_size}件"),
+                    EmbedField("Dictionary", f"{self.dictionary_size} entries"),
                 ),
             )
         personal_voice = (
@@ -5743,7 +5751,8 @@ class ReadAloudChannelSelectView(SafeView):
         )
         if self.abbreviate_long_messages:
             long_message_mode = (
-                f"After **{self.message_character_limit} characters**, say **以下略**"
+                f"After **{self.message_character_limit} characters**, "
+                "announce that the rest was skipped"
             )
         else:
             long_message_mode = (
@@ -5796,7 +5805,7 @@ class ReadAloudChannelSelectView(SafeView):
             self.abbreviation_button.label = "Read full text"
             self.abbreviation_button.style = discord.ButtonStyle.secondary
         else:
-            self.abbreviation_button.label = "Enable 以下略"
+            self.abbreviation_button.label = "Shorten long messages"
             self.abbreviation_button.style = discord.ButtonStyle.primary
 
     @staticmethod
@@ -5970,7 +5979,7 @@ class ReadAloudChannelSelectView(SafeView):
         )
 
     @discord.ui.button(
-        label="Enable 以下略",
+        label="Shorten long messages",
         style=discord.ButtonStyle.primary,
         custom_id="simajilord:readaloud:abbreviation",
         row=2,
@@ -6084,7 +6093,7 @@ def _read_aloud_setup(
         default_values=tuple(defaults[:25]),
         mode=route.mode if route is not None else ReadAloudMode.QUEUE,
         source_mention=source.mention,
-        destination_mention=destination.mention if destination is not None else "未接続",
+        destination_mention=destination.mention if destination is not None else "Not connected",
         engine_label=_speech_voice_label(runtime),
         personal_voice_preset=dict(policy.user_voice_presets).get(str(member.id)),
         personal_voice_speed=personal_tuning.speed_scale,
@@ -6367,7 +6376,7 @@ class ReadAloudCog(commands.Cog):
                             "Long messages",
                             (
                                 f"Abbreviate after {policy.message_character_limit} "
-                                "characters, then say 「以下略」"
+                                "characters, then announce that the rest was skipped"
                                 if policy.abbreviate_long_messages
                                 else "Read the full text"
                             ),
@@ -6786,7 +6795,7 @@ class ReadAloudCog(commands.Cog):
                         EmbedField(
                             "Mode",
                             (
-                                "Abbreviate and say 「以下略」"
+                                "Shorten and announce that the rest was skipped"
                                 if policy.abbreviate_long_messages
                                 else "Read the full text"
                             ),
@@ -7325,7 +7334,7 @@ class ReadAloudCog(commands.Cog):
             "speech.speak",
             SpeechSpeakRequest(
                 text=spoken_text,
-                title="VCの入退室通知",
+                title="Voice channel announcement",
                 segments=(
                     SpeechSegment(
                         SpeechSegmentKind.EVENT,

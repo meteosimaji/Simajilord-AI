@@ -1061,7 +1061,7 @@ async def test_join_announcement_uses_shared_speech_api_when_already_connected(
     capability, request, context = runtime.registry.invoke.await_args.args
     assert capability == "speech.speak"
     assert request.text == "アリスさんがボイスチャンネルに参加しました"
-    assert request.title == "VCの入退室通知"
+    assert request.title == "Voice channel announcement"
     assert context.workspace_id == "1"
 
 

@@ -2582,7 +2582,7 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         "Skip",
         "Stop",
         "Add music",
-        "接続・読み上げ・設定",
+        "Audio setup",
     ]
     assert all(button.row == 0 for button in buttons[:-1])
     assert buttons[-1].row == 2
@@ -2712,7 +2712,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         response=response,
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
-    assert labels == ["音楽を再開", "Add music", "接続・読み上げ・設定"]
+    assert labels == ["Resume music", "Add music", "Audio setup"]
     assert any(
         isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
@@ -2742,7 +2742,7 @@ async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() 
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
-    assert labels == ["Add music", "接続・読み上げ・設定"]
+    assert labels == ["Add music", "Audio setup"]
     assert any(
         isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
@@ -2771,7 +2771,7 @@ def test_disconnected_requester_radio_panel_exposes_start() -> None:
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
-    assert labels == ["音楽を再開", "Add music", "接続・読み上げ・設定"]
+    assert labels == ["Resume music", "Add music", "Audio setup"]
 
 
 @pytest.mark.asyncio
@@ -3476,7 +3476,9 @@ async def test_read_aloud_length_command_persists_optional_abbreviation() -> Non
     assert parameters["max_characters"].min_value == 20
     assert parameters["max_characters"].max_value == 400
     embed = interaction.response.send_message.await_args.kwargs["embed"]
-    assert any(field.name == "Mode" and "以下略" in field.value for field in embed.fields)
+    assert any(
+        field.name == "Mode" and "the rest was skipped" in field.value for field in embed.fields
+    )
 
 
 def test_join_channel_selector_supports_one_to_twenty_five_conversations() -> None:
@@ -3638,7 +3640,7 @@ async def test_read_aloud_panel_updates_abbreviation_and_limit_with_conflict_gua
     )
     assert view.abbreviation_button.label == "Read full text"
     assert (
-        "以下略"
+        "the rest was skipped"
         in next(
             field
             for field in toggle.edit_original_response.await_args.kwargs["embed"].fields
@@ -5339,5 +5341,6 @@ async def test_speech_only_music_controls_offer_explicit_start() -> None:
     )
     view = MusicControlsView(runtime, response=response)
     assert any(
-        isinstance(item, discord.ui.Button) and item.label == "音楽を再開" for item in view.children
+        isinstance(item, discord.ui.Button) and item.label == "Resume music"
+        for item in view.children
     )

@@ -32,24 +32,37 @@ def audio_hub_embed(
     route = runtime.read_aloud.resume_route(workspace, destination) if destination else None
     route = route or runtime.read_aloud.get(workspace)
     lines = [
-        "VCに参加して、使いたい音声を選んでください。"
+        "Join a voice channel, then choose what to start."
         if destination is None
-        else f"あなたのVC:<#{destination}>"
+        else f"Your voice channel: <#{destination}>"
     ]
     if session is not None and session.output.connected:
         lines.append(
-            f"BOT:<#{session.destination_id}> · "
-            + ("読み上げのみ" if session.speech_only else "音楽・読み上げ")
+            f"BOT: <#{session.destination_id}> · "
+            + ("Read aloud only" if session.speech_only else "Music & read aloud")
         )
     else:
-        lines.append("BOTは待機中です。保存した設定で再開できます。")
+        lines.append("The bot is idle. Start with your saved settings.")
     if route is not None:
-        lines.append("読み上げ元:" + "・".join(f"<#{value}>" for value in route.text_channel_ids))
+        lines.append(
+            "Read messages from: " + ", ".join(f"<#{value}>" for value in route.text_channel_ids)
+        )
     else:
-        lines.append("初めての読み上げは、この会話チャンネルから始めます。")
+        lines.append("First start reads messages from this conversation.")
     if runtime.audio.follow_actors.get(workspace):
-        lines.append(f"VC追従:<@{runtime.audio.follow_actors[workspace]}> · 今回の接続中のみ")
-    return command_embed("音楽・読み上げ", description="\n".join(lines))
+        lines.append(
+            f"Following: <@{runtime.audio.follow_actors[workspace]}> · this connection only"
+        )
+    lines.extend(
+        (
+            "",
+            "**Read aloud here** starts reading and pauses music.",
+            "**Resume music** also plays your saved queue.",
+            "**Move here** keeps your current audio mode.",
+            "**Follow me** moves audio with you when the old channel is empty.",
+        )
+    )
+    return command_embed("Music & read aloud", description="\n".join(lines))
 
 
 class AudioHubView(SafeView):
@@ -81,16 +94,16 @@ class AudioHubView(SafeView):
             or self.expected != destination
         )
         if runtime.audio.follow_actors.get(workspace) == str(requester_id):
-            self.follow.label = "追従を解除"
+            self.follow.label = "Stop following"
         self.add_item(AudioSettingsSelect(runtime))
         if destination is None:
-            self.add_item(AudioHubOpenButton(runtime, label="VC参加後に更新"))
+            self.add_item(AudioHubOpenButton(runtime, label="Refresh after joining"))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.requester_id:
             return True
         await interaction.response.send_message(
-            "自分の /audio パネルを開いてください。", ephemeral=True
+            "Open your own /audio panel to use these controls.", ephemeral=True
         )
         return False
 
@@ -102,7 +115,7 @@ class AudioHubView(SafeView):
         confirm: bool = False,
     ) -> None:
         if self.destination is None:
-            await interaction.response.send_message("先にVCへ参加してください。", ephemeral=True)
+            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
             return
         try:
             await interaction.response.defer()
@@ -140,10 +153,11 @@ class AudioHubView(SafeView):
             if exc.code == "audio.move_confirmation_required":
                 await interaction.edit_original_response(
                     embed=command_embed(
-                        "元のVCにまだ人がいます",
+                        "People are still in the other voice channel",
                         description=(
-                            "音楽のキューと読み上げ先をこちらへ移動します。\n"
-                            "移動権限を持つ人だけが実行できます。元のVCでは音声が止まります。"
+                            "Move the music queue and read aloud to your voice channel.\n"
+                            "Audio will stop in the other channel. "
+                            "You need Move Members or Manage Server permission."
                         ),
                     ),
                     view=AudioMoveConfirmation(self, mode),
@@ -153,25 +167,25 @@ class AudioHubView(SafeView):
         except Exception as exc:
             await send_error(interaction, exc)
 
-    @discord.ui.button(label="ここで読み上げ", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Read aloud here", style=discord.ButtonStyle.primary, row=0)
     async def speech(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
         await self.run(interaction, "speech")
 
-    @discord.ui.button(label="音楽も再開", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="Resume music", style=discord.ButtonStyle.success, row=0)
     async def both(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
         await self.run(interaction, "both")
 
-    @discord.ui.button(label="このVCへ移動", row=0)
+    @discord.ui.button(label="Move here", row=0)
     async def move(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
         await self.run(interaction, "preserve")
 
-    @discord.ui.button(label="自分のVC移動に追従", row=1)
+    @discord.ui.button(label="Follow me", row=1)
     async def follow(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
@@ -182,7 +196,7 @@ class AudioHubView(SafeView):
         )
         await self.run(interaction, "unfollow" if mode == "unfollow" else "follow")
 
-    @discord.ui.button(label="曲を追加", row=1)
+    @discord.ui.button(label="Add music", row=1)
     async def add_music(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
@@ -193,7 +207,7 @@ class AudioHubView(SafeView):
             )
         )
 
-    @discord.ui.button(label="声を試す", row=1)
+    @discord.ui.button(label="Test my voice", row=1)
     async def preview(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioHubView]
     ) -> None:
@@ -206,7 +220,7 @@ class AudioHubView(SafeView):
                 "discord.speak",
                 SpeechSpeakRequest(
                     text="こんにちは。この声と速さで読み上げます。",
-                    title="読み上げの試聴",
+                    title="Voice preview",
                     voice_preset=self.runtime.read_aloud.voice_preset_for(
                         workspace_id=self.workspace, user_id=str(self.requester_id)
                     ).value,
@@ -215,7 +229,7 @@ class AudioHubView(SafeView):
                 ),
                 invocation_context(interaction),
             )
-            await interaction.followup.send("試聴を追加しました。", ephemeral=True)
+            await interaction.followup.send("Voice preview added to the queue.", ephemeral=True)
         except Exception as exc:
             await send_error(interaction, exc)
 
@@ -231,14 +245,14 @@ class AudioMoveConfirmation(SafeView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return await self.hub.interaction_check(interaction)
 
-    @discord.ui.button(label="このVCへ移動する", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Move audio here", style=discord.ButtonStyle.primary)
     async def confirm(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioMoveConfirmation]
     ) -> None:
         await self.hub.run(interaction, self.mode, confirm=True)
         self.stop()
 
-    @discord.ui.button(label="移動しない")
+    @discord.ui.button(label="Cancel")
     async def cancel(
         self, interaction: discord.Interaction, _: discord.ui.Button[AudioMoveConfirmation]
     ) -> None:
@@ -250,8 +264,8 @@ class AudioMoveConfirmation(SafeView):
 
 
 class AudioHubOpenButton(discord.ui.Button[discord.ui.View]):
-    def __init__(self, runtime: SimajilordRuntime, *, label: str = "音声パネルへ") -> None:
-        super().__init__(label=label, row=2)
+    def __init__(self, runtime: SimajilordRuntime, *, label: str = "Back to audio") -> None:
+        super().__init__(label=label, row=4)
         self.runtime = runtime
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -261,12 +275,12 @@ class AudioHubOpenButton(discord.ui.Button[discord.ui.View]):
 class AudioSettingsSelect(discord.ui.Select[discord.ui.View]):
     def __init__(self, runtime: SimajilordRuntime) -> None:
         super().__init__(
-            placeholder="設定を変更…",
+            placeholder="Settings…",
             row=3,
             options=[
-                discord.SelectOption(label="自分の声・速度", value="personal"),
-                discord.SelectOption(label="読み上げるチャンネル", value="sources"),
-                discord.SelectOption(label="共通の読み方・辞書", value="shared"),
+                discord.SelectOption(label="My voice & speed", value="personal"),
+                discord.SelectOption(label="Reading channels", value="sources"),
+                discord.SelectOption(label="Server reading settings", value="shared"),
             ],
         )
         self.runtime = runtime
@@ -277,7 +291,7 @@ class AudioSettingsSelect(discord.ui.Select[discord.ui.View]):
 
 async def send_audio_hub(interaction: discord.Interaction, runtime: SimajilordRuntime) -> None:
     if interaction.guild_id is None:
-        await interaction.response.send_message("サーバー内で開いてください。", ephemeral=True)
+        await interaction.response.send_message("Open this panel in a server.", ephemeral=True)
         return
     member = interaction.user
     destination = (

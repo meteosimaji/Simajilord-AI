@@ -47,11 +47,11 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         for component in row["components"]
         if component.get("type") == 2
     )
-    assert idle_labels == ("Add music", "接続・読み上げ・設定")
+    assert idle_labels == ("Add music", "Audio setup")
     assert waiting_labels == (
-        "音楽を再開",
+        "Resume music",
         "Add music",
-        "接続・読み上げ・設定",
+        "Audio setup",
     )
     assert "Pause" in active_labels
     assert "Skip" in active_labels
@@ -138,8 +138,8 @@ def test_preview_select_preserves_disabled_options_and_defaults() -> None:
         options=[discord.SelectOption(label="Play <music>", value="play", default=True)],
     )
     rendered = _render_component(control.to_component_dict())
-    assert '<select ' in rendered
-    assert ' disabled' in rendered
+    assert "<select " in rendered
+    assert " disabled" in rendered
     assert '<option value="play" selected>Play &lt;music&gt;</option>' in rendered
     assert 'aria-label="Choose a command"' in rendered
 

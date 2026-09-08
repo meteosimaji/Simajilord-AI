@@ -172,7 +172,7 @@ async def test_hub_without_vc_exposes_settings_without_connecting(tmp_path: Path
     assert view.speech.disabled and view.both.disabled and view.move.disabled
     assert view.follow.disabled and view.preview.disabled
     assert any(isinstance(item, discord.ui.Select) for item in view.children)
-    assert "VCに参加" in (audio_hub_embed(runtime, "1", None).description or "")
+    assert "Join a voice channel" in (audio_hub_embed(runtime, "1", None).description or "")
     runtime.audio.connect.assert_not_awaited()
     view.to_components()
 
