@@ -866,9 +866,18 @@ class DiscordAudioOutput:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def _adopt_voice_client(self) -> discord.VoiceClient | None:
-        if self._voice is not None:
-            return self._voice
         guild = self.bot.get_guild(self.guild_id)
+        if self._voice is not None:
+            if (
+                self._voice.is_connected()
+                or guild is None
+                or guild.voice_client is self._voice
+            ):
+                return self._voice
+            # Discord already removed this disconnected protocol from its
+            # registry. Disconnecting it again waits for a second leave event
+            # that will never arrive (the full 20-second connection timeout).
+            self._voice = None
         if guild is None or guild.voice_client is None:
             return None
         if isinstance(guild.voice_client, discord.VoiceClient):

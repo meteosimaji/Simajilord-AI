@@ -855,3 +855,44 @@ async def test_music_eof_waits_for_all_queued_speech_before_stopping(monkeypatch
     assert voice.stops == 1
     assert music_source.cleaned == 1
     assert [source.cleaned for source in speech_sources] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_does_not_disconnect_an_already_removed_voice_client() -> None:
+    stale = Mock(spec=discord.VoiceClient)
+    stale.is_connected.return_value = False
+    stale.disconnect = AsyncMock(side_effect=AssertionError("duplicate disconnect"))
+    replacement = Mock(spec=discord.VoiceClient)
+    replacement.is_connected.return_value = True
+    replacement.disconnect = AsyncMock()
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.id = 123
+    channel.connect = AsyncMock(return_value=replacement)
+    guild = SimpleNamespace(voice_client=None, get_channel=lambda _: channel)
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _: guild), 1)
+    output._voice = stale
+    await asyncio.wait_for(output.connect("123"), timeout=1)
+    stale.disconnect.assert_not_awaited()
+    channel.connect.assert_awaited_once()
+    assert output._voice is replacement
+    assert output.destination_id == 123
+    await output.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_registered_disconnected_voice_client_still_gets_cleanup() -> None:
+    stale = Mock(spec=discord.VoiceClient)
+    stale.is_connected.return_value = False
+    stale.disconnect = AsyncMock()
+    replacement = Mock(spec=discord.VoiceClient)
+    replacement.is_connected.return_value = True
+    replacement.disconnect = AsyncMock()
+    channel = Mock(spec=discord.VoiceChannel)
+    channel.id = 123
+    channel.connect = AsyncMock(return_value=replacement)
+    guild = SimpleNamespace(voice_client=stale, get_channel=lambda _: channel)
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _: guild), 1)
+    output._voice = stale
+    await output.connect("123")
+    stale.disconnect.assert_awaited_once_with(force=True)
+    await output.disconnect()

@@ -2689,3 +2689,17 @@ async def test_history_api_preserves_radio_lane_across_persistence(tmp_path: Pat
     assert by_title["Manual track"].queue_lane == "request"
     assert by_title["Manual track"].requested_by_id == "123"
     await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_local_file_does_not_replace_saved_radio_seed() -> None:
+    session = AudioSession("guild", FakeOutput(), max_pending_speech=3)
+    seed = "https://www.youtube.com/watch?v=seed"
+    session._mix_seed_references.append(seed)
+    session._current = AudioItem("/tmp/audio.mp3", "Attachment", "https://discord.com/channels/1/2/3",
+                                 resolver_reference="local-media://" + "a" * 64)
+    assert session._radio_seed_sample(0) == (seed,)
+    session._mix_seed_references.clear()
+    assert session._radio_seed_sample(0) == ()
+    session._current = None
+    await session.close()

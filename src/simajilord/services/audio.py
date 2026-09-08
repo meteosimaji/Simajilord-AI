@@ -1554,6 +1554,7 @@ class AudioSession:
                 if item.kind is AudioKind.MUSIC
                 and item.queue_lane is AudioQueueLane.REQUEST
                 and (reference := item.resolver_reference or item.page_url)
+                and reference.startswith("https://")
             )
         )
         if active_references:
