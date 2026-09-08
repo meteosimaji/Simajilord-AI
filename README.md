@@ -667,11 +667,23 @@ for URL Mapping and production-hosting requirements.
 
 - `/help`, `/status`
 - `/feedback` opens a private Modal and saves the report locally without asking for a triage kind
-- `/audio` opens the shared music and read-aloud control panel
+- `/audio` opens a private hub to resume read aloud, resume music too, move the current
+  session to your VC, or edit settings. The shared music panel links back to this hub.
 - `/tempvc` creates creator lobbies for administrators, retries automatic room creation while the
   member remains in a lobby, or opens owner controls inside a managed TempVC
 - `/play` adds a track and `/radio` starts or stops continuous related playback
-- `/join` selects up to 25 conversations to read in the current VC
+- `/join` opens the same hub. First start reads the current conversation; subsequent starts
+  restore the target VC profile (up to 25 sources). Moving preserves shared text sources and
+  maps the old VC conversation to the new VC when no target profile exists.
+- The hub separates personal voice/speed/pitch from shared reading rules and source selection.
+  Personal settings work outside VC; a voice preview is an explicit action.
+- VC following is opt-in for the current connection only. It stops when the owner leaves
+  voice or a move cannot proceed. It never takes audio away from other human listeners
+  automatically. An explicit occupied-VC move requires confirmation and Move Members or
+  Manage Server permission. One voice connection is used per server.
+- Already queued speech must finish before relocation; in-flight synthesis for the old
+  destination is invalidated. Music queue, playback offset, Radio, and voice preferences
+  are retained. Reconnecting after an idle disconnect remains an explicit action.
 - `/timer` creates a persistent Focus Timer
 - `/system ping`, `/system uptime`, `/system about`, `/system capabilities`
 - `/readaloud ...` manages advanced routes, voices, dictionaries, exclusions, and the optional

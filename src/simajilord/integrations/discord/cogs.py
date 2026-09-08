@@ -18,7 +18,7 @@ from collections.abc import Awaitable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import ClassVar, Literal, TypeAlias, TypeVar, cast
+from typing import Any, ClassVar, Literal, TypeAlias, TypeVar, cast
 from urllib.parse import urlparse
 
 import discord
@@ -662,6 +662,13 @@ _ERROR_MESSAGES = {
     "audio.mix_unavailable": "Radio is unavailable in this environment.",
     "audio.not_paused": "Playback is not paused.",
     "audio.nothing_playing": "No track is playing.",
+    "audio.navigation_changed": "接続先が変わりました。/audio を開き直してください。",
+    "audio.follow_start_required": "このVCで音声を開始してから追従を有効にしてください。",
+    "audio.follow_owned": "別の人に追従中です。その人が追従を解除してから設定してください。",
+    "audio.move_occupied_forbidden": (
+        "元のVCに人がいます。移動にはメンバー移動またはサーバー管理権限が必要です。"
+    ),
+    "audio.move_speech_busy": "読み上げ中です。読み終わってからもう一度移動してください。",
     "audio.output_disconnected": "The BOT is not connected to voice.",
     "audio.other_voice_active": "Audio is already playing in another voice channel.",
     "audio.queue_position_invalid": "Choose a valid position shown in the queue.",
@@ -2128,7 +2135,6 @@ def music_search_embed(response: AudioSearchResponse) -> discord.Embed:
     return embed
 
 
-
 def _audio_history_row(index: int, item: AudioHistoryItem) -> str:
     # The API permits 25 rows; 150 characters each stays below the 4,096
     # character description limit without dropping history entries.
@@ -2543,7 +2549,6 @@ class MusicControlsView(SafeView):
         # registered in the persistent callback view but are never rendered.
         self.remove_item(self.loop_button)
         self.remove_item(self.mix_button)
-        self.remove_item(self.read_aloud_button)
         self.remove_item(self.leave_button)
         if not (active or has_manual_queue):
             self.remove_item(self.stop_button)
@@ -2764,7 +2769,7 @@ class MusicControlsView(SafeView):
                 emoji="🔊",
             ),
             discord.SelectOption(
-                label="Read aloud",
+                label="接続・読み上げ・設定",
                 value="read_aloud",
                 description="Choose conversation channels",
                 emoji="🗣️",
@@ -2808,7 +2813,9 @@ class MusicControlsView(SafeView):
             await self._toggle_loop(interaction)
             return
         if action == "read_aloud":
-            await _send_read_aloud_setup(interaction, self.runtime)
+            from .audio_hub import send_audio_hub
+
+            await send_audio_hub(interaction, self.runtime)
             return
         if action == "levels":
             await interaction.response.send_modal(
@@ -2903,7 +2910,7 @@ class MusicControlsView(SafeView):
             await send_error(interaction, exc)
 
     @discord.ui.button(
-        label="Start",
+        label="音楽を再開",
         style=discord.ButtonStyle.success,
         custom_id="simajilord:music:start",
         row=0,
@@ -2925,9 +2932,11 @@ class MusicControlsView(SafeView):
             elif not session.can_start_for(str(interaction.user.id)):
                 raise UserError("audio.waiting_queue_restricted")
             await interaction.response.defer()
+            from .audio_navigation import AudioNavigateRequest
+
             await self.runtime.registry.invoke(
-                "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=str(channel.id)),
+                "discord.navigate_audio",
+                AudioNavigateRequest(str(channel.id), session.destination_id, "music"),
                 invocation_context(interaction),
             )
             response = cast(
@@ -3036,7 +3045,7 @@ class MusicControlsView(SafeView):
         )
 
     @discord.ui.button(
-        label="Read aloud",
+        label="接続・読み上げ・設定",
         style=discord.ButtonStyle.secondary,
         custom_id="simajilord:audio:read-aloud",
         row=2,
@@ -3046,7 +3055,9 @@ class MusicControlsView(SafeView):
         interaction: discord.Interaction,
         _: discord.ui.Button[MusicControlsView],
     ) -> None:
-        await _send_read_aloud_setup(interaction, self.runtime)
+        from .audio_hub import send_audio_hub
+
+        await send_audio_hub(interaction, self.runtime)
 
     @discord.ui.button(
         label="Leave",
@@ -3158,7 +3169,7 @@ class AudioLevelsModal(SafeModal, title="Mix levels"):
             music_percent = _bounded_percent(str(self.music), label="Music")
             speech_percent = _bounded_percent(
                 str(self.read_aloud),
-                label="Read aloud",
+                label="接続・読み上げ・設定",
             )
             workspace_id = str(interaction.guild_id or "")
             session = self.runtime.audio.require(workspace_id)
@@ -3436,10 +3447,25 @@ async def send_error(interaction: discord.Interaction, error: Exception) -> None
         description=error_message(error, request_id=str(interaction.id)),
         tone=EmbedTone.ERROR,
     )
+    options: dict[str, Any] = {"embed": embed, "ephemeral": True}
+    if isinstance(error, UserError) and error.code in {
+        "audio.same_voice_required",
+        "audio.navigation_changed",
+        "audio.output_disconnected",
+        "discord.voice_join_required",
+        "audio.move_speech_busy",
+    }:
+        dashboard = getattr(interaction.client, _MUSIC_DASHBOARD_ATTRIBUTE, None)
+        if isinstance(dashboard, MusicDashboardManager):
+            from .audio_hub import AudioHubOpenButton
+
+            repair = SafeView(timeout=300)
+            repair.add_item(AudioHubOpenButton(dashboard.runtime, label="今いるVCで使う"))
+            options["view"] = repair
     if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(**options)
     else:
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(**options)
 
 
 async def edit_deferred_error(
@@ -4486,7 +4512,9 @@ class MusicCog(commands.Cog):
         description="Open music controls and read-aloud setup in one panel.",
     )
     async def audio(self, interaction: discord.Interaction) -> None:
-        await self._send_queue(interaction)
+        from .audio_hub import send_audio_hub
+
+        await send_audio_hub(interaction, self.runtime)
 
     async def _send_history(self, interaction: discord.Interaction, limit: int) -> None:
         try:
@@ -5174,6 +5202,20 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
             ):
                 raise UserError("audio.same_voice_required")
             existing_route = _active_read_aloud_route(self.runtime, str(guild.id))
+            editing_sources = getattr(self.view, "section", "all") == "sources"
+            session = self.runtime.audio.find(str(guild.id)) if editing_sources else None
+            if editing_sources and (
+                (
+                    session is not None
+                    and session.output.connected
+                    and session.destination_id != str(self.destination_id)
+                )
+                or (
+                    existing_route is not None
+                    and existing_route.audio_destination_id != str(self.destination_id)
+                )
+            ):
+                raise UserError("audio.same_voice_required")
             can_replace_route = permission_enabled(
                 member.guild_permissions,
                 "administrator",
@@ -5247,7 +5289,10 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
         try:
             await self.runtime.registry.invoke(
                 "discord.connect_voice",
-                DiscordConnectVoiceRequest(channel_id=str(self.destination_id), speech_only=True),
+                DiscordConnectVoiceRequest(
+                    channel_id=str(self.destination_id),
+                    speech_only=session.speech_only if session is not None else True,
+                ),
                 invocation_context(interaction),
             )
         except Exception as exc:
@@ -5281,14 +5326,28 @@ class ReadAloudChannelSelect(discord.ui.ChannelSelect[discord.ui.View]):
                 reconnect_view.message = response_message
             return
 
-        await interaction.edit_original_response(
-            embed=_read_aloud_ready_embed(
-                self.runtime,
-                configured,
-                audience_preflight=audience_preflight,
-            ),
-            view=None,
-        )
+        if editing_sources:
+            from .audio_hub import AudioHubView, audio_hub_embed
+
+            await interaction.edit_original_response(
+                embed=audio_hub_embed(self.runtime, str(guild.id), str(self.destination_id)),
+                view=AudioHubView(
+                    self.runtime,
+                    requester_id=self.requester_id,
+                    workspace=str(guild.id),
+                    destination=str(self.destination_id),
+                    source_id=str(interaction.channel_id),
+                ),
+            )
+        else:
+            await interaction.edit_original_response(
+                embed=_read_aloud_ready_embed(
+                    self.runtime,
+                    configured,
+                    audience_preflight=audience_preflight,
+                ),
+                view=None,
+            )
         dashboard = getattr(
             interaction.client,
             _MUSIC_DASHBOARD_ATTRIBUTE,
@@ -5607,7 +5666,65 @@ class ReadAloudChannelSelectView(SafeView):
         )
         return False
 
+    def configure_section(self, section: str) -> None:
+        from .audio_hub import AudioHubOpenButton, AudioSettingsSelect
+
+        self.section = section
+        self.clear_items()
+        if section == "personal":
+            self.voice_selector.row = 0
+            self.add_item(self.voice_selector)
+            self.add_item(self.tuning_button)
+        elif section == "shared":
+            self.length_selector.row = 0
+            self.behavior_selector.row = 1
+            for control in (
+                self.length_selector,
+                self.behavior_selector,
+                self.abbreviation_button,
+                self.dictionary_button,
+            ):
+                self.add_item(control)
+        else:
+            self.add_item(self.selector)
+            self.start.label = "保存して読み上げ"
+            self.add_item(self.start)
+        self.add_item(AudioSettingsSelect(self.runtime))
+        self.add_item(AudioHubOpenButton(self.runtime))
+
     def setup_embed(self) -> discord.Embed:
+        section = getattr(self, "section", "all")
+        if section == "personal":
+            return command_embed(
+                "自分の声・速度",
+                description=("変更は自動で保存されます。声を試すときは /audio の「声を試す」へ。"),
+                fields=(
+                    EmbedField(
+                        "声",
+                        self.personal_voice_preset.value
+                        if self.personal_voice_preset
+                        else "サーバーの標準",
+                    ),
+                    EmbedField(
+                        "速度・高さ",
+                        f"{self.personal_voice_speed:.2f}x · {self.personal_voice_pitch:+.2f}",
+                    ),
+                ),
+            )
+        if section == "shared":
+            return command_embed(
+                "共通の読み方・辞書",
+                description=("サーバー全体に適用されます。変更は管理者のみ行えます。"),
+                fields=(
+                    EmbedField(
+                        "長文",
+                        f"{self.message_character_limit}文字で省略"
+                        if self.abbreviate_long_messages
+                        else "全文を読む",
+                    ),
+                    EmbedField("辞書", f"{self.dictionary_size}件"),
+                ),
+            )
         personal_voice = (
             "Server default"
             if self.personal_voice_preset is None
@@ -5918,6 +6035,8 @@ class ReadAloudChannelSelectView(SafeView):
 def _read_aloud_setup(
     interaction: discord.Interaction,
     runtime: SimajilordRuntime,
+    *,
+    allow_disconnected: bool = False,
 ) -> tuple[discord.Embed, ReadAloudChannelSelectView]:
     member = interaction.user
     source = interaction.channel
@@ -5935,15 +6054,15 @@ def _read_aloud_setup(
         raise UserError("discord.message_channel_unavailable")
     destination = member.voice.channel if member.voice is not None else None
     if not isinstance(destination, (discord.VoiceChannel, discord.StageChannel)):
-        raise UserError("discord.voice_join_required")
+        if not allow_disconnected:
+            raise UserError("discord.voice_join_required")
+        destination = None
 
     defaults: list[discord.abc.GuildChannel | discord.Thread] = []
     route = _active_read_aloud_route(runtime, str(member.guild.id))
-    candidate_ids = (
-        (*route.text_channel_ids, str(source.id))
-        if route is not None and route.audio_destination_id == str(destination.id)
-        else (str(source.id),)
-    )
+    if destination is not None:
+        route = runtime.read_aloud.resume_route(str(member.guild.id), str(destination.id)) or route
+    candidate_ids = route.text_channel_ids if route is not None else (str(source.id),)
     for channel_id in dict.fromkeys(candidate_ids):
         selected = member.guild.get_channel_or_thread(int(channel_id))
         if selected is not None:
@@ -5961,11 +6080,11 @@ def _read_aloud_setup(
     view = ReadAloudChannelSelectView(
         runtime,
         requester_id=member.id,
-        destination_id=destination.id,
+        destination_id=destination.id if destination is not None else 0,
         default_values=tuple(defaults[:25]),
         mode=route.mode if route is not None else ReadAloudMode.QUEUE,
         source_mention=source.mention,
-        destination_mention=destination.mention,
+        destination_mention=destination.mention if destination is not None else "未接続",
         engine_label=_speech_voice_label(runtime),
         personal_voice_preset=dict(policy.user_voice_presets).get(str(member.id)),
         personal_voice_speed=personal_tuning.speed_scale,
@@ -5985,9 +6104,16 @@ def _read_aloud_setup(
 async def _send_read_aloud_setup(
     interaction: discord.Interaction,
     runtime: SimajilordRuntime,
+    *,
+    section: str = "all",
 ) -> None:
     try:
-        embed, view = _read_aloud_setup(interaction, runtime)
+        embed, view = _read_aloud_setup(
+            interaction, runtime, allow_disconnected=section in {"personal", "shared"}
+        )
+        if section != "all":
+            view.configure_section(section)
+            embed = view.setup_embed()
         await interaction.response.send_message(
             embed=embed,
             view=view,
@@ -6053,7 +6179,9 @@ class ReadAloudCog(commands.Cog):
         description="Choose conversation channels to read in your current VC.",
     )
     async def join(self, interaction: discord.Interaction) -> None:
-        await _send_read_aloud_setup(interaction, self.runtime)
+        from .audio_hub import send_audio_hub
+
+        await send_audio_hub(interaction, self.runtime)
 
     @readaloud.command(
         name="setup",
@@ -7238,8 +7366,40 @@ class VoiceLifecycleCog(commands.Cog):
         after: discord.VoiceState,
     ) -> None:
         if member.bot:
+            bot_user = getattr(self.bot, "user", None)
+            if bot_user is not None and member.id == bot_user.id and after.channel is None:
+                self.runtime.audio.follow_actors.pop(str(member.guild.id), None)
             return
         workspace_id = str(member.guild.id)
+        if self.runtime.audio.follow_actors.get(workspace_id) == str(member.id):
+            if after.channel is None:
+                self.runtime.audio.follow_actors.pop(workspace_id, None)
+            elif before.channel is not None and before.channel != after.channel:
+                from .audio_navigation import AudioNavigateRequest
+
+                followed_session = self.runtime.audio.find(workspace_id)
+                if followed_session is not None and followed_session.destination_id == str(
+                    before.channel.id
+                ):
+                    try:
+                        await self.runtime.registry.invoke(
+                            "discord.navigate_audio",
+                            AudioNavigateRequest(str(after.channel.id), str(before.channel.id)),
+                            InvocationContext(
+                                str(member.id),
+                                workspace_id,
+                                "discord",
+                                f"audio-follow:{member.id}:{time.time_ns()}",
+                            ),
+                        )
+                        self.runtime.audio.follow_actors[workspace_id] = str(member.id)
+                    except Exception:
+                        # Never pull the bot away from listeners automatically.
+                        self.runtime.audio.follow_actors.pop(workspace_id, None)
+                        log.info(
+                            "Audio follow stopped; explicit relocation required guild=%s",
+                            workspace_id,
+                        )
         route = self.runtime.read_aloud.get(workspace_id)
         joined_read_aloud_destination = (
             route is not None

@@ -863,6 +863,7 @@ NON_UNDOABLE_ACTION_CAPABILITIES = frozenset(
         "discord.read_aloud_dictionary_remove",
         "discord.read_aloud_exclusion_set",
         "discord.manage_read_aloud",
+        "discord.navigate_audio",
         "discord.remove_thread_member",
     }
 )

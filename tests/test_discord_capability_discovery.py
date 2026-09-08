@@ -23,6 +23,7 @@ INTERNAL_DISCORD_CAPABILITIES = frozenset(
         "discord.delete_own_messages",
         "discord.control_audio",
         "discord.manage_read_aloud",
+        "discord.navigate_audio",
     }
 )
 
@@ -513,10 +514,10 @@ def _contains_japanese(value: str) -> bool:
     )
 
 
-def test_all_113_discord_transport_capabilities_have_discovery_classification() -> None:
+def test_all_114_discord_transport_capabilities_have_discovery_classification() -> None:
     registry, names = _discord_registry()
 
-    assert len(names) == 113
+    assert len(names) == 114
     assert len(names) == len(set(names))
     assert set(names) == set(DISCOVERY_CASES) | INTERNAL_DISCORD_CAPABILITIES
     assert not set(DISCOVERY_CASES) & INTERNAL_DISCORD_CAPABILITIES

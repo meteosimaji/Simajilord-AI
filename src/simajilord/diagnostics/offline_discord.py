@@ -12,12 +12,14 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import discord
 
 from simajilord.capabilities.audio import AudioQueueItem, AudioQueueResponse
 from simajilord.domain.audio import AudioKind
+from simajilord.integrations.discord.audio_hub import AudioHubView, audio_hub_embed
 from simajilord.integrations.discord.capabilities import (
     DiscordServerResponse,
     DiscordUserResponse,
@@ -26,6 +28,7 @@ from simajilord.integrations.discord.cogs import (
     HelpView,
     MusicControlsView,
     QuoteComposerView,
+    ReadAloudChannelSelectView,
     _help_entry_embed,
     _help_overview_embed,
     music_queue_embed,
@@ -35,6 +38,7 @@ from simajilord.integrations.discord.cogs import (
 from simajilord.integrations.discord.help_catalog import HELP_ENTRIES_BY_TOPIC
 from simajilord.providers.speech import MacOSSayProvider
 from simajilord.runtime import SimajilordRuntime
+from simajilord.services.read_aloud import ReadAloudMode, ReadAloudRoute
 from simajilord.services.speech import SpeechService
 
 _MARKDOWN_LINK = re.compile(r"\[([^\]]+)]\((https?://[^)\s]+)\)")
@@ -836,6 +840,39 @@ def _sample_panels() -> tuple[PreviewPanel, ...]:
             ),
         )
     )
+    route = ReadAloudRoute("1", "11", "20", ReadAloudMode.QUEUE)
+    hub_runtime = cast(
+        SimajilordRuntime,
+        SimpleNamespace(
+            audio=SimpleNamespace(find=lambda workspace: None, follow_actors={}),
+            read_aloud=SimpleNamespace(
+                get=lambda workspace: route, resume_route=lambda workspace, destination: route
+            ),
+        ),
+    )
+    for name, destination in (("Audio hub · ready", "20"), ("Audio hub · outside VC", None)):
+        hub = AudioHubView(
+            hub_runtime, requester_id=7, workspace="1", destination=destination, source_id="11"
+        )
+        panels.append(
+            PreviewPanel(
+                name,
+                cast(dict[str, Any], audio_hub_embed(hub_runtime, "1", destination).to_dict()),
+                serialize_view(hub),
+            )
+        )
+    for section in ("personal", "shared", "sources"):
+        settings_view = ReadAloudChannelSelectView(
+            hub_runtime, requester_id=7, destination_id=20, default_values=()
+        )
+        settings_view.configure_section(section)
+        panels.append(
+            PreviewPanel(
+                f"Audio settings · {section}",
+                cast(dict[str, Any], settings_view.setup_embed().to_dict()),
+                serialize_view(settings_view),
+            )
+        )
     return tuple(panels)
 
 
@@ -902,9 +939,7 @@ async def _build_ducked_audio(output_dir: Path, speech_path: Path) -> Path:
         "2",
         str(music_path),
     )
-    volume_expression = (
-        f"if(lt(t,0.85),1,if(lt(t,{speech_end + 0.15:.3f}),0.22,1))"
-    )
+    volume_expression = f"if(lt(t,0.85),1,if(lt(t,{speech_end + 0.15:.3f}),0.22,1))"
     await _run_process(
         "ffmpeg",
         "-hide_banner",
@@ -987,9 +1022,7 @@ def _render_panel(panel: PreviewPanel) -> str:
     thumbnail = embed.get("thumbnail")
     has_thumbnail = isinstance(thumbnail, dict) and bool(thumbnail.get("url"))
     thumbnail_markup = (
-        '<div class="embed-thumbnail" aria-label="Embed thumbnail">S</div>'
-        if has_thumbnail
-        else ""
+        '<div class="embed-thumbnail" aria-label="Embed thumbnail">S</div>' if has_thumbnail else ""
     )
     return f"""<section class="case" data-case-name="{html.escape(panel.name)}">
   <div class="message">
@@ -1002,10 +1035,10 @@ def _render_panel(panel: PreviewPanel) -> str:
       <div class="embed-container">
         <div class="embed" style="--embed-color:{colour}">
           <div class="embed-grid{" has-thumbnail" if has_thumbnail else ""}">
-        {f'<div class="embed-title">{title}</div>' if title else ''}
-        {f'<div class="description">{description}</div>' if description else ''}
-        {f'<div class="fields">{field_markup}</div>' if field_markup else ''}
-        {f'<div class="timestamp">{timestamp}</div>' if timestamp else ''}
+        {f'<div class="embed-title">{title}</div>' if title else ""}
+        {f'<div class="description">{description}</div>' if description else ""}
+        {f'<div class="fields">{field_markup}</div>' if field_markup else ""}
+        {f'<div class="timestamp">{timestamp}</div>' if timestamp else ""}
         {thumbnail_markup}
           </div>
         </div>
@@ -1039,16 +1072,14 @@ def _render_component(component: dict[str, Any]) -> str:
         }.get(int(component.get("style", 0)), "")
         label = html.escape(
             " ".join(
-                part for part in (
-                    _component_emoji_text(component), str(component.get("label") or "")
-                ) if part
-            ) or "Button"
+                part
+                for part in (_component_emoji_text(component), str(component.get("label") or ""))
+                if part
+            )
+            or "Button"
         )
         disabled = " disabled" if component.get("disabled") else ""
-        return (
-            f'<button class="component-button {style}" type="button"{disabled}>'
-            f"{label}</button>"
-        )
+        return f'<button class="component-button {style}" type="button"{disabled}>{label}</button>'
     if component_type in {
         int(discord.ComponentType.select.value),
         int(discord.ComponentType.user_select.value),
@@ -1066,9 +1097,9 @@ def _render_component(component: dict[str, Any]) -> str:
             value = html.escape(str(option.get("value", "")), quote=True)
             label = html.escape(
                 " ".join(
-                    part for part in (
-                        _component_emoji_text(option), str(option.get("label", ""))
-                    ) if part
+                    part
+                    for part in (_component_emoji_text(option), str(option.get("label", "")))
+                    if part
                 )
             )
             selected = " selected" if option.get("default") else ""
@@ -1095,10 +1126,7 @@ def _discord_markdown(value: str) -> str:
     escaped = _CHANNEL.sub(r'<span class="channel">#voice-\1</span>', escaped)
     escaped = _TIMESTAMP.sub(_render_discord_timestamp_tag, escaped)
     for index, (label, url) in enumerate(links):
-        anchor = (
-            f'<a href="{html.escape(url, quote=True)}">'
-            f"{html.escape(label)}</a>"
-        )
+        anchor = f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
         escaped = escaped.replace(
             html.escape(_LINK_PLACEHOLDER.format(index=index)),
             anchor,

@@ -23,6 +23,11 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         "Help · /play",
         "Server info · populated",
         "User info · populated",
+        "Audio hub · ready",
+        "Audio hub · outside VC",
+        "Audio settings · personal",
+        "Audio settings · shared",
+        "Audio settings · sources",
     ]
     idle_labels = tuple(
         str(component.get("label"))
@@ -42,10 +47,11 @@ def test_offline_preview_uses_exact_embed_and_adaptive_components() -> None:
         for component in row["components"]
         if component.get("type") == 2
     )
-    assert idle_labels == ("Add music",)
+    assert idle_labels == ("Add music", "接続・読み上げ・設定")
     assert waiting_labels == (
-        "Start",
+        "音楽を再開",
         "Add music",
+        "接続・読み上げ・設定",
     )
     assert "Pause" in active_labels
     assert "Skip" in active_labels

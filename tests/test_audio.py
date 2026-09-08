@@ -2665,23 +2665,34 @@ async def test_speech_only_blocks_radio_refill_and_retry_wakeup() -> None:
 @pytest.mark.asyncio
 async def test_history_api_preserves_radio_lane_across_persistence(tmp_path: Path) -> None:
     state_path = tmp_path / "history.json"
-    manager = AudioSessionManager(max_active=2, max_pending_speech=3,
-                                  state_store=AudioStateStore(state_path))
+    manager = AudioSessionManager(
+        max_active=2, max_pending_speech=3, state_store=AudioStateStore(state_path)
+    )
     session = manager.get_or_create("guild", FakeOutput)
-    session._history.extend((
-        AudioItem("", "Radio track", "https://example.com/radio",
-                  queue_lane=AudioQueueLane.AUTOPLAY),
-        AudioItem("", "Manual track", "https://example.com/manual",
-                  requested_by_id="123", requested_by_name="Alice"),
-    ))
+    session._history.extend(
+        (
+            AudioItem(
+                "", "Radio track", "https://example.com/radio", queue_lane=AudioQueueLane.AUTOPLAY
+            ),
+            AudioItem(
+                "",
+                "Manual track",
+                "https://example.com/manual",
+                requested_by_id="123",
+                requested_by_name="Alice",
+            ),
+        )
+    )
     await manager.close()
-    restored = AudioSessionManager(max_active=2, max_pending_speech=3,
-                                   state_store=AudioStateStore(state_path))
+    restored = AudioSessionManager(
+        max_active=2, max_pending_speech=3, state_store=AudioStateStore(state_path)
+    )
     restored.restore(lambda _: FakeOutput())
     endpoints = build_audio_endpoints(cast(MediaService, None), restored)
     endpoint = next(item for item in endpoints if item.descriptor.name == "audio.history")
-    result = await endpoint.invoke(AudioHistoryRequest(),
-                                   InvocationContext("123", "guild", "test", "history"))
+    result = await endpoint.invoke(
+        AudioHistoryRequest(), InvocationContext("123", "guild", "test", "history")
+    )
     assert isinstance(result, AudioHistoryResponse)
     by_title = {item.title: item for item in result.items}
     assert by_title["Radio track"].queue_lane == "autoplay"
@@ -2696,10 +2707,57 @@ async def test_local_file_does_not_replace_saved_radio_seed() -> None:
     session = AudioSession("guild", FakeOutput(), max_pending_speech=3)
     seed = "https://www.youtube.com/watch?v=seed"
     session._mix_seed_references.append(seed)
-    session._current = AudioItem("/tmp/audio.mp3", "Attachment", "https://discord.com/channels/1/2/3",
-                                 resolver_reference="local-media://" + "a" * 64)
+    session._current = AudioItem(
+        "/tmp/audio.mp3",
+        "Attachment",
+        "https://discord.com/channels/1/2/3",
+        resolver_reference="local-media://" + "a" * 64,
+    )
     assert session._radio_seed_sample(0) == (seed,)
     session._mix_seed_references.clear()
     assert session._radio_seed_sample(0) == ()
     session._current = None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_relocation_invalidates_old_speech_but_retains_music(tmp_path: Path) -> None:
+    output = FakeOutput()
+    output.connected = False
+    session = AudioSession("relocation", output, max_pending_speech=3)
+    await session.enqueue(AudioItem("music", "Held music", "https://example.com/music"))
+    queued_file = tmp_path / "queued.wav"
+    queued_file.write_bytes(b"speech")
+    await session.enqueue(
+        AudioItem(
+            str(queued_file),
+            "Queued speech",
+            "local://queued",
+            kind=AudioKind.SPEECH,
+            owned_file=queued_file,
+        )
+    )
+    first = await session.reserve_speech()
+    second = await session.reserve_speech()
+    waiting_file = tmp_path / "waiting.wav"
+    waiting_file.write_bytes(b"speech")
+    commit = asyncio.create_task(
+        second.commit(
+            AudioItem(
+                str(waiting_file),
+                "Waiting speech",
+                "local://waiting",
+                kind=AudioKind.SPEECH,
+                owned_file=waiting_file,
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    assert not commit.done()
+    await session.discard_relocation_speech()
+    with pytest.raises(UserError, match=r"speech\.reservation_cancelled"):
+        await asyncio.wait_for(commit, timeout=1)
+    assert not queued_file.exists() and not waiting_file.exists()
+    assert [item.title for item in (await session.snapshot()).pending] == ["Held music"]
+    await first.release()
     await session.close()

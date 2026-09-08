@@ -5829,7 +5829,10 @@ def build_discord_endpoints(
         )
         return cast(ReadAloudPolicyResponse, response)
 
+    from .audio_navigation import build_audio_navigation_endpoints
+
     endpoints = (
+        *build_audio_navigation_endpoints(client, runtime),
         endpoint(
             CapabilityDescriptor(
                 name="discord.list_servers",

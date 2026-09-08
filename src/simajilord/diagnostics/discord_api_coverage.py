@@ -52,6 +52,7 @@ INTERNAL_CAPABILITIES = frozenset(
         "discord.delete_own_messages",
         "discord.expand_message",
         "discord.manage_read_aloud",
+        "discord.navigate_audio",
     }
 )
 _ROUTE_PATTERN = re.compile(r'<Route\s+method="([A-Z]+)">(.*?)</Route>')

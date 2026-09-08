@@ -62,9 +62,7 @@ class ReadAloudRoute:
     def text_channel_ids(self) -> tuple[str, ...]:
         """Return the stable, de-duplicated set of message sources."""
 
-        return tuple(
-            dict.fromkeys((self.text_channel_id, *self.additional_text_channel_ids))
-        )
+        return tuple(dict.fromkeys((self.text_channel_id, *self.additional_text_channel_ids)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +125,41 @@ class ReadAloudService:
         self.state_file = state_file
         self._routes: dict[str, ReadAloudRoute] = {}
         self._policies: dict[str, ReadAloudPolicy] = {}
+        self._route_profiles: dict[tuple[str, str], ReadAloudRoute] = {}
         self._lock = asyncio.Lock()
         self._load()
 
     def get(self, workspace_id: str) -> ReadAloudRoute | None:
         route = self._routes.get(workspace_id)
         return route if route and route.enabled else None
+
+    def saved_route(self, workspace_id: str, destination_id: str) -> ReadAloudRoute | None:
+        current = self.get(workspace_id)
+        if current is not None and current.audio_destination_id == destination_id:
+            return current
+        return self._route_profiles.get((workspace_id, destination_id))
+
+    def resume_route(self, workspace_id: str, destination_id: str) -> ReadAloudRoute | None:
+        """Preview the same saved route that an explicit start or move will activate."""
+
+        saved = self.saved_route(workspace_id, destination_id)
+        if saved is not None:
+            return saved
+        current = self.get(workspace_id)
+        if current is None:
+            return None
+        source_ids = tuple(
+            dict.fromkeys(
+                destination_id if value == current.audio_destination_id else value
+                for value in current.text_channel_ids
+            )
+        )
+        return replace(
+            current,
+            text_channel_id=source_ids[0],
+            additional_text_channel_ids=source_ids[1:],
+            audio_destination_id=destination_id,
+        )
 
     def policy(self, workspace_id: str) -> ReadAloudPolicy:
         """Return a stored policy or a non-persisted default policy."""
@@ -179,9 +206,7 @@ class ReadAloudService:
             else:
                 if current.audio_destination_id != audio_destination_id:
                     raise ValueError("read_aloud.destination_conflict")
-                combined_ids = tuple(
-                    dict.fromkeys((*current.text_channel_ids, *channel_ids))
-                )
+                combined_ids = tuple(dict.fromkeys((*current.text_channel_ids, *channel_ids)))
                 route_mode = current.mode
             route = ReadAloudRoute(
                 workspace_id=workspace_id,
@@ -334,9 +359,7 @@ class ReadAloudService:
         async with self._lock:
             current = self.policy(workspace_id)
             entries = tuple(
-                entry
-                for entry in current.dictionary
-                if entry.surface != normalized_surface
+                entry for entry in current.dictionary if entry.surface != normalized_surface
             )
             updated = replace(
                 current,
@@ -376,9 +399,7 @@ class ReadAloudService:
         async with self._lock:
             current = self.policy(workspace_id)
             entries = tuple(
-                entry
-                for entry in current.dictionary
-                if entry.surface != normalized_surface
+                entry for entry in current.dictionary if entry.surface != normalized_surface
             )
             removed = len(entries) != len(current.dictionary)
             if not removed:
@@ -504,14 +525,9 @@ class ReadAloudService:
                     await on_noop()
                 return current, current
             if (
-                expected_join is not None
-                and current.announce_join != expected_join
-            ) or (
-                expected_leave is not None
-                and current.announce_leave != expected_leave
-            ) or (
-                expected_move is not None
-                and current.announce_move != expected_move
+                (expected_join is not None and current.announce_join != expected_join)
+                or (expected_leave is not None and current.announce_leave != expected_leave)
+                or (expected_move is not None and current.announce_move != expected_move)
             ):
                 raise UserError("action.undo_conflict")
             if before_mutation is not None:
@@ -637,17 +653,22 @@ class ReadAloudService:
                     await on_noop()
                 return current
             if (
-                expected_read_messages is not None
-                and current.read_messages != expected_read_messages
-            ) or (
-                expected_announce_join is not None
-                and current.announce_join != expected_announce_join
-            ) or (
-                expected_announce_leave is not None
-                and current.announce_leave != expected_announce_leave
-            ) or (
-                expected_announce_move is not None
-                and current.announce_move != expected_announce_move
+                (
+                    expected_read_messages is not None
+                    and current.read_messages != expected_read_messages
+                )
+                or (
+                    expected_announce_join is not None
+                    and current.announce_join != expected_announce_join
+                )
+                or (
+                    expected_announce_leave is not None
+                    and current.announce_leave != expected_announce_leave
+                )
+                or (
+                    expected_announce_move is not None
+                    and current.announce_move != expected_announce_move
+                )
             ):
                 raise UserError("action.undo_conflict")
             if before_mutation is not None:
@@ -739,10 +760,7 @@ class ReadAloudService:
         )
         async with self._lock:
             current = self.policy(workspace_id)
-            tunings = {
-                tuning.user_id: tuning
-                for tuning in current.user_voice_tunings
-            }
+            tunings = {tuning.user_id: tuning for tuning in current.user_voice_tunings}
             if normalized_speed == 1.0 and normalized_pitch == 0.0:
                 tunings.pop(normalized_id, None)
             else:
@@ -753,10 +771,7 @@ class ReadAloudService:
                 )
             updated = replace(
                 current,
-                user_voice_tunings=tuple(
-                    tunings[user_id]
-                    for user_id in sorted(tunings)
-                ),
+                user_voice_tunings=tuple(tunings[user_id] for user_id in sorted(tunings)),
             )
             if updated == current:
                 if on_noop is not None:
@@ -859,20 +874,12 @@ class ReadAloudService:
             updated = replace(
                 current,
                 read_author_names=(
-                    current.read_author_names
-                    if author_names is None
-                    else author_names
+                    current.read_author_names if author_names is None else author_names
                 ),
                 read_replies=current.read_replies if replies is None else replies,
-                read_attachments=(
-                    current.read_attachments
-                    if attachments is None
-                    else attachments
-                ),
+                read_attachments=(current.read_attachments if attachments is None else attachments),
                 vc_members_only=(
-                    current.vc_members_only
-                    if vc_members_only is None
-                    else vc_members_only
+                    current.vc_members_only if vc_members_only is None else vc_members_only
                 ),
                 abbreviate_long_messages=(
                     current.abbreviate_long_messages
@@ -890,25 +897,28 @@ class ReadAloudService:
                     await on_noop()
                 return current, current
             if (
-                expected_author_names is not None
-                and current.read_author_names != expected_author_names
-            ) or (
-                expected_replies is not None
-                and current.read_replies != expected_replies
-            ) or (
-                expected_attachments is not None
-                and current.read_attachments != expected_attachments
-            ) or (
-                expected_vc_members_only is not None
-                and current.vc_members_only != expected_vc_members_only
-            ) or (
-                expected_abbreviate_long_messages is not None
-                and current.abbreviate_long_messages
-                != expected_abbreviate_long_messages
-            ) or (
-                expected_message_character_limit is not None
-                and current.message_character_limit
-                != self._message_character_limit(expected_message_character_limit)
+                (
+                    expected_author_names is not None
+                    and current.read_author_names != expected_author_names
+                )
+                or (expected_replies is not None and current.read_replies != expected_replies)
+                or (
+                    expected_attachments is not None
+                    and current.read_attachments != expected_attachments
+                )
+                or (
+                    expected_vc_members_only is not None
+                    and current.vc_members_only != expected_vc_members_only
+                )
+                or (
+                    expected_abbreviate_long_messages is not None
+                    and current.abbreviate_long_messages != expected_abbreviate_long_messages
+                )
+                or (
+                    expected_message_character_limit is not None
+                    and current.message_character_limit
+                    != self._message_character_limit(expected_message_character_limit)
+                )
             ):
                 raise UserError("action.undo_conflict")
             if before_mutation is not None:
@@ -964,13 +974,17 @@ class ReadAloudService:
                     raise ValueError("unsupported state version")
                 route_items = raw.get("routes", [])
                 policy_items = raw.get("policies", [])
-                if not isinstance(route_items, list) or not isinstance(
-                    policy_items, list
-                ):
+                if not isinstance(route_items, list) or not isinstance(policy_items, list):
                     raise ValueError("routes and policies must be lists")
             else:
                 raise ValueError("expected a list or versioned object")
-            for item in route_items:
+            profile_items = raw.get("route_profiles", []) if isinstance(raw, dict) else []
+            if not isinstance(profile_items, list):
+                raise ValueError("route_profiles must be a list")
+            for is_current, item in [
+                *((False, item) for item in profile_items),
+                *((True, item) for item in route_items),
+            ]:
                 if not isinstance(item, dict):
                     raise ValueError("route must be an object")
                 route = ReadAloudRoute(
@@ -980,11 +994,13 @@ class ReadAloudService:
                     mode=ReadAloudMode(str(item["mode"])),
                     enabled=bool(item.get("enabled", True)),
                     additional_text_channel_ids=tuple(
-                        str(value)
-                        for value in item.get("additional_text_channel_ids", ())
+                        str(value) for value in item.get("additional_text_channel_ids", ())
                     ),
                 )
-                self._routes[route.workspace_id] = route
+                if route.enabled:
+                    self._route_profiles[(route.workspace_id, route.audio_destination_id)] = route
+                if is_current:
+                    self._routes[route.workspace_id] = route
             for item in policy_items:
                 if not isinstance(item, dict):
                     raise ValueError("policy must be an object")
@@ -996,15 +1012,20 @@ class ReadAloudService:
     def _save(self) -> None:
         self.state_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = self.state_file.with_suffix(".tmp")
+        for route in self._routes.values():
+            if route.enabled:
+                self._route_profiles[(route.workspace_id, route.audio_destination_id)] = route
         payload = {
             "version": 2,
+            "route_profiles": [
+                {**asdict(route), "mode": route.mode.value}
+                for route in self._route_profiles.values()
+            ],
             "routes": [
                 {
                     **asdict(route),
                     "mode": route.mode.value,
-                    "additional_text_channel_ids": list(
-                        route.additional_text_channel_ids
-                    ),
+                    "additional_text_channel_ids": list(route.additional_text_channel_ids),
                 }
                 for route in sorted(
                     self._routes.values(),
@@ -1153,9 +1174,7 @@ class ReadAloudService:
             read_replies=bool(item.get("read_replies", True)),
             read_attachments=bool(item.get("read_attachments", True)),
             vc_members_only=bool(item.get("vc_members_only", False)),
-            abbreviate_long_messages=bool(
-                item.get("abbreviate_long_messages", False)
-            ),
+            abbreviate_long_messages=bool(item.get("abbreviate_long_messages", False)),
             message_character_limit=ReadAloudService._message_character_limit(
                 item.get(
                     "message_character_limit",
@@ -1174,14 +1193,10 @@ class ReadAloudService:
                         ),
                         ReadAloudVoicePreset(str(preset)),
                     )
-                    for user_id, preset in dict(
-                        item.get("user_voice_presets", {})
-                    ).items()
+                    for user_id, preset in dict(item.get("user_voice_presets", {})).items()
                 )
             ),
-            user_voice_tunings=tuple(
-                sorted(voice_tunings, key=lambda tuning: tuning.user_id)
-            ),
+            user_voice_tunings=tuple(sorted(voice_tunings, key=lambda tuning: tuning.user_id)),
             ignore_bots=bool(item.get("ignore_bots", True)),
             ignore_webhooks=bool(item.get("ignore_webhooks", True)),
         )
@@ -1205,8 +1220,7 @@ class ReadAloudService:
             "message_character_limit": policy.message_character_limit,
             "default_voice_preset": policy.default_voice_preset.value,
             "user_voice_presets": {
-                user_id: preset.value
-                for user_id, preset in policy.user_voice_presets
+                user_id: preset.value for user_id, preset in policy.user_voice_presets
             },
             "user_voice_tunings": {
                 tuning.user_id: {

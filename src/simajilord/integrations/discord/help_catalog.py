@@ -148,13 +148,13 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
     _entry(
         "audio",
         "Audio",
-        "Open the single music and read-aloud control panel.",
+        "Resume here, move audio to your VC, or change personal and shared settings.",
         "/audio",
         "/audio",
         prefix_name="audio",
         notes=(
-            "Primary controls stay visible; secondary actions are under More actions.",
-            "The panel is silent and updates only when meaningful state changes.",
+            "Choose read-aloud only, resume music too, or move the saved session here.",
+            "Settings are separate: your voice, reading sources, and shared preferences.",
         ),
     ),
     _entry(
@@ -203,14 +203,14 @@ PUBLIC_COMMAND_SPECS: tuple[PublicCommandSpec, ...] = (
     _entry(
         "join",
         "Audio",
-        "Connect to your VC and select up to 25 text, thread, or VC-chat sources.",
+        "Open the audio hub and start with saved read-aloud settings.",
         "/join",
         "/join",
         notes=(
-            "A private channel picker appears after the command.",
-            "The selected sources are read into the VC you currently occupy.",
+            "A private audio hub appears; opening it does not connect or change settings.",
+            "Source selection is available under settings; previous VC profiles are remembered.",
         ),
-        side_effects=("Creates or updates the server read-aloud route and activates voice.",),
+        side_effects=("Only explicit start or move actions activate voice or update the route.",),
     ),
     _entry(
         "timer",

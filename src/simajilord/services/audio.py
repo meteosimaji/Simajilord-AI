@@ -1124,6 +1124,16 @@ class AudioSession:
             await self.output.disconnect()
         await self._state_changed()
 
+    async def discard_relocation_speech(self) -> None:
+        """Invalidate speech admitted for the old destination after suspending."""
+
+        async with self._lock:
+            for item in self._speech:
+                item.cleanup()
+            self._speech.clear()
+            self._speech_reservations.clear()
+            self._speech_reservation_changed.notify_all()
+
     async def remap_suspended_destination(
         self,
         *,
@@ -2308,6 +2318,8 @@ class AudioSessionManager:
         self._state_store = state_store
         self._metric_hook = metric_hook
         self._sessions: dict[str, AudioSession] = {}
+        # Follow consent is session-local and never revived by a process restart.
+        self.follow_actors: dict[str, str] = {}
         self._connection_lock = asyncio.Lock()
         self._connection_locks: dict[str, asyncio.Lock] = {}
         self._connection_reservations: set[str] = set()

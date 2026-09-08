@@ -2582,8 +2582,10 @@ async def test_music_buttons_are_concise_grouped_and_uniquely_addressable() -> N
         "Skip",
         "Stop",
         "Add music",
+        "接続・読み上げ・設定",
     ]
-    assert all(button.row == 0 for button in buttons)
+    assert all(button.row == 0 for button in buttons[:-1])
+    assert buttons[-1].row == 2
     selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
     assert len(selects) == 1
     assert selects[0].placeholder == "More actions"
@@ -2710,7 +2712,7 @@ async def test_music_resume_confirmation_uses_start_without_pause_resume_control
         response=response,
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
-    assert labels == ["Start", "Add music"]
+    assert labels == ["音楽を再開", "Add music", "接続・読み上げ・設定"]
     assert any(
         isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
@@ -2740,7 +2742,7 @@ async def test_disconnected_idle_radio_panel_only_shows_relevant_entry_points() 
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
-    assert labels == ["Add music"]
+    assert labels == ["Add music", "接続・読み上げ・設定"]
     assert any(
         isinstance(child, discord.ui.Select) and child.placeholder == "More actions"
         for child in view.children
@@ -2769,7 +2771,7 @@ def test_disconnected_requester_radio_panel_exposes_start() -> None:
     )
     labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
-    assert labels == ["Start", "Add music"]
+    assert labels == ["音楽を再開", "Add music", "接続・読み上げ・設定"]
 
 
 @pytest.mark.asyncio
@@ -5337,5 +5339,5 @@ async def test_speech_only_music_controls_offer_explicit_start() -> None:
     )
     view = MusicControlsView(runtime, response=response)
     assert any(
-        isinstance(item, discord.ui.Button) and item.label == "Start" for item in view.children
+        isinstance(item, discord.ui.Button) and item.label == "音楽を再開" for item in view.children
     )
