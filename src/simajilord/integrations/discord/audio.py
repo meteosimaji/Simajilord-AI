@@ -30,6 +30,7 @@ _SOURCE_PREFLIGHT_TIMEOUT_SECONDS = 8.0
 _SOURCE_PREFLIGHT_CLEANUP_SECONDS = 2.0
 _PLAYBACK_WATCHDOG_INTERVAL_SECONDS = 1.0
 _PLAYBACK_STOPPED_GRACE_SECONDS = 2.0
+_PLAYBACK_RECONNECT_GRACE_SECONDS = 30.0
 _PLAYBACK_COMPLETION_GRACE_SECONDS = 30.0
 _PLAYBACK_MAX_ACTIVE_SECONDS = 6 * 60 * 60
 _EARLY_EOF_MINIMUM_EXPECTED_SECONDS = 15.0
@@ -529,6 +530,7 @@ class DiscordAudioOutput:
         active_seconds = 0.0
         last_checked = monotonic()
         stopped_since: float | None = None
+        disconnected_since: float | None = None
         maximum_active_seconds = min(
             _PLAYBACK_MAX_ACTIVE_SECONDS,
             (
@@ -550,11 +552,25 @@ class DiscordAudioOutput:
                 return
             except TimeoutError:
                 now = monotonic()
-                if not voice.is_paused():
+                connected = voice.is_connected()
+                if connected and disconnected_since is None and not voice.is_paused():
                     active_seconds += max(0.0, now - last_checked)
                 last_checked = now
-                if not voice.is_connected():
-                    raise UserError("audio.output_disconnected") from None
+                if not connected:
+                    # discord.py's player waits for its voice connection to recover.
+                    # Do not destroy that player during a transient gateway reconnect.
+                    if disconnected_since is None:
+                        disconnected_since = now
+                        log.info(
+                            "Audio playback waiting for voice reconnect guild=%s", self.guild_id
+                        )
+                    if now - disconnected_since >= _PLAYBACK_RECONNECT_GRACE_SECONDS:
+                        raise UserError("audio.output_disconnected") from None
+                    stopped_since = None
+                    continue
+                if disconnected_since is not None:
+                    log.info("Audio playback voice connection recovered guild=%s", self.guild_id)
+                    disconnected_since = None
                 if not voice.is_playing() and not voice.is_paused():
                     if stopped_since is None:
                         stopped_since = now

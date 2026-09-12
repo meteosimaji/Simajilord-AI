@@ -64,7 +64,9 @@ with Discord's generic “interaction failed” banner.
   genuinely ambiguous same-name tracks. A selection disables and updates the same visible
   result message while the track is being added
 - Automatic stream re-resolution/retry, restart recovery, listener-aware reconnect, and
-  queue-preserving auto-leave
+  queue-preserving auto-leave. During active playback, transient voice reconnects have a
+  bounded 30-second grace period so the watchdog does not kill the waiting FFmpeg player;
+  a connection that does not recover still preserves the track for explicit resume
 - Restart-safe TempVC rooms with one contextual `/tempvc` command. Administrators create one or
   more permanent creator lobbies; joining one creates a room and moves the member automatically.
   New hubs use the explicit `Join to create` label, while `/tempvc` in a creator lobby provides a
@@ -188,9 +190,14 @@ with Discord's generic “interaction failed” banner.
 - On macOS 26 or newer, `/translate` and `Apps` → `Translate` use Apple's on-device
   Natural Language and Translation frameworks through a small local Swift helper. Message
   text is not sent to a cloud translation API
-- Custom emoji and sticker metadata stays text-only by default. The agent can request one
-  selected asset as a preview, full GIF/APNG animation, or exact animation frame only when
-  visual inspection is actually needed
+- Custom emoji and sticker metadata stays text-only by default. For visual questions about
+  appearance, color, or motion, the agent fetches only the selected asset, including external
+  server emoji from a readable message without membership in the origin server. Message reads
+  never attach emoji images automatically. Animated previews fetch the original animation
+  and attach a static Vision PNG with up to 12 chronological frames,
+  labeled with frame indices and timestamps. This makes later colors and motion visible
+  without relying on a model to decode GIF/APNG. Sampling can miss brief transitions; use
+  an exact frame for closer inspection. The original GIF/APNG remains available on request
 - The `Quote` message action renders locally without an external image API. Static output is
   the default; animated custom emoji or stickers can be preserved as GIF on request. A known
   Discord CDN asset ID can be rendered even when the BOT is not a member of the asset's

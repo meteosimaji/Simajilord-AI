@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 
 import discord
 from discord.http import Route
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from simajilord.agent import HumanCapabilityExecutor
 from simajilord.capabilities.audio import (
@@ -2903,7 +2903,7 @@ def build_discord_endpoints(
             raise UserError("discord.custom_emoji_not_animated")
         if request.mode != "frame" and request.frame_index != 0:
             raise UserError("discord.custom_emoji_frame_mode_required")
-        extension = "gif" if selected.animated and request.mode in {"animation", "frame"} else "png"
+        extension = "gif" if selected.animated else "png"
         emoji_url = (
             f"https://cdn.discordapp.com/emojis/{selected.emoji_id}.{extension}"
             "?size=128&quality=lossless"
@@ -6312,14 +6312,21 @@ def build_discord_endpoints(
             CapabilityDescriptor(
                 name="discord.view_custom_emoji",
                 summary=(
-                    "Inspect one selected custom emoji from a Discord message as an image, "
-                    "including its full animation or a requested frame when available."
+                    "See the appearance and color of one custom emoji, including external "
+                    "server emojis, from a readable message. Preview attaches a Vision PNG "
+                    "with sampled animation frames; frame selects an exact frame. "
+                    "Animation returns the original animated file."
                 ),
                 risk=RiskLevel.READ,
                 disclosure_class=DisclosureClass.GUILD_PUBLIC_METADATA,
                 keywords=(
                     "discord",
                     "custom emoji",
+                    "external emoji",
+                    "emoji color",
+                    "emoji vision",
+                    "外部絵文字",
+                    "絵文字の色",
                     "animated emoji",
                     "emoji animation",
                     "emoji frame",
@@ -10091,18 +10098,48 @@ def _prepare_discord_animated_media(
     mode: Literal["preview", "animation", "frame"],
     frame_index: int,
 ) -> _DiscordAnimatedMedia:
-    """Validate model media and optionally extract an exact animation frame."""
+    """Validate media and expose animation previews as a bounded Vision contact sheet."""
 
     try:
         with Image.open(io.BytesIO(content)) as image:
             image_format = image.format
             frame_count = getattr(image, "n_frames", 1)
+            if frame_count > 500 or image.width * image.height > 4_000_000:
+                raise ValueError("discord.custom_emoji_invalid")
             durations: list[int] = []
             for index in range(frame_count):
                 image.seek(index)
                 raw_duration = image.info.get("duration")
                 durations.append(int(raw_duration) if isinstance(raw_duration, (int, float)) else 0)
             duration_ms = sum(durations) or None
+            if mode == "preview" and frame_count > 1:
+                count = min(frame_count, 12)
+                indices = [index * (frame_count - 1) // (count - 1) for index in range(count)]
+                columns = min(count, 4)
+                sheet = Image.new(
+                    "RGB", (columns * 192, ((count + columns - 1) // columns) * 216), "#eeeeee"
+                )
+                draw = ImageDraw.Draw(sheet)
+                for slot, index in enumerate(indices):
+                    image.seek(index)
+                    frame = ImageOps.contain(image.convert("RGBA"), (176, 176))
+                    x, y = (slot % columns) * 192, (slot // columns) * 216
+                    sheet.paste(frame, (x + (192 - frame.width) // 2, y + 8), frame)
+                    draw.text(
+                        (x + 8, y + 192),
+                        f"Frame {index} / {sum(durations[:index])} ms",
+                        fill="black",
+                    )
+                output = io.BytesIO()
+                sheet.save(output, format="PNG")
+                return _DiscordAnimatedMedia(
+                    content=output.getvalue(),
+                    content_type="image/png",
+                    preview_kind="sampled_animation_frames",
+                    frame_index=None,
+                    frame_count=frame_count,
+                    duration_ms=duration_ms,
+                )
             if mode == "animation":
                 if image_format == "GIF":
                     content_type = "image/gif"

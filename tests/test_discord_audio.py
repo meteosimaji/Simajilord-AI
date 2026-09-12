@@ -896,3 +896,45 @@ async def test_registered_disconnected_voice_client_still_gets_cleanup() -> None
     await output.connect("123")
     stale.disconnect.assert_awaited_once_with(force=True)
     await output.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_playback_watchdog_waits_for_transient_voice_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    recovers: bool,
+) -> None:
+    from simajilord.core.errors import UserError
+
+    output = DiscordAudioOutput(SimpleNamespace(get_guild=lambda _: None), 1)
+    completed = asyncio.get_running_loop().create_future()
+    ticks = 0
+
+    def clock() -> float:
+        nonlocal ticks
+        ticks += 1
+        if recovers and ticks == 6:
+            completed.set_result(None)
+        return float(ticks)
+
+    monkeypatch.setattr("simajilord.integrations.discord.audio.monotonic", clock)
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_WATCHDOG_INTERVAL_SECONDS", 0.001
+    )
+    monkeypatch.setattr(
+        "simajilord.integrations.discord.audio._PLAYBACK_RECONNECT_GRACE_SECONDS", 3.0
+    )
+    voice = SimpleNamespace(
+        is_connected=lambda: recovers and ticks >= 4,
+        is_playing=lambda: True,
+        is_paused=lambda: False,
+    )
+    if recovers:
+        await output._await_playback_completion(completed, voice=voice, expected_seconds=1)
+        assert completed.done()
+    else:
+        with pytest.raises(UserError) as raised:
+            await output._await_playback_completion(completed, voice=voice, expected_seconds=1)
+        assert raised.value.code == "audio.output_disconnected"
+        assert not completed.done()
+        completed.cancel()

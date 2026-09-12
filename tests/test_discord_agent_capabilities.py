@@ -2430,3 +2430,23 @@ async def test_read_aloud_connect_applies_mode_even_in_same_voice(
         runtime.audio.connect.assert_not_awaited()
     else:
         runtime.audio.connect.assert_awaited_once_with("10", "40", speech_only=True)
+
+
+@pytest.mark.asyncio
+async def test_get_message_keeps_custom_emoji_metadata_without_fetching_images() -> None:
+    client = Mock(spec=discord.Client)
+    guild, channel, _, _ = _visibility_guild(10, 20)
+    message = _fetched_message(channel)
+    message.content = "What color? <a:alert:1400797670489981049>"
+    channel.fetch_message = AsyncMock(return_value=message)
+    client.get_guild.return_value = guild
+    client.http = Mock()
+    client.http.get_from_cdn = AsyncMock(side_effect=AssertionError("unexpected image fetch"))
+    response = await _endpoint_map(cast(discord.Client, client))["discord.get_message"].invoke(
+        DiscordGetMessageRequest(channel_id="20", message_id="31", include_reply_context=False),
+        _agent_context(),
+    )
+    assert response.custom_emojis[0].emoji_id == "1400797670489981049"
+    assert response.custom_emojis[0].animated is True
+    assert not hasattr(response, "image_data_url")
+    client.http.get_from_cdn.assert_not_awaited()

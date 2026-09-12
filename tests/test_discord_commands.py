@@ -4861,17 +4861,25 @@ def test_animated_media_preserves_apng_when_full_animation_is_requested() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("animated", [False, True])
 async def test_custom_emoji_tool_fetches_only_selected_message_emoji(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, animated: bool,
 ) -> None:
     image = io.BytesIO()
-    Image.new("RGBA", (4, 4), "purple").save(image, format="PNG")
+    Image.new("RGBA", (4, 4), "purple").save(
+        image, format="GIF" if animated else "PNG", save_all=animated,
+        append_images=[Image.new("RGBA", (4, 4), "red")] if animated else [],
+        duration=50,
+    )
     client = Mock(spec=discord.Client)
     client.http = Mock()
     client.http.get_from_cdn = AsyncMock(return_value=image.getvalue())
     guild = Mock(spec=discord.Guild)
     message = Mock(spec=discord.Message)
-    message.content = "<:first:111111111111111111> <:second:222222222222222222>"
+    message.content = (
+        "<:first:111111111111111111> "
+        + ("<a:second:222222222222222222>" if animated else "<:second:222222222222222222>")
+    )
     message.stickers = []
     channel = Mock(spec=discord.TextChannel)
     monkeypatch.setattr(
@@ -4910,11 +4918,14 @@ async def test_custom_emoji_tool_fetches_only_selected_message_emoji(
     assert response.emoji_id == "222222222222222222"
     assert response.name == "second"
     assert response.content_type == "image/png"
-    assert response.frame_count == 1
+    assert response.frame_count == (2 if animated else 1)
     assert response.image_data_url.startswith("data:image/png;base64,")
+    extension = "gif" if animated else "png"
     client.http.get_from_cdn.assert_awaited_once_with(
-        "https://cdn.discordapp.com/emojis/222222222222222222.png?size=128&quality=lossless"
+        f"https://cdn.discordapp.com/emojis/222222222222222222.{extension}?size=128&quality=lossless"
     )
+    # External assets work without looking up membership in their origin guild.
+    guild.get_emoji.assert_not_called()
     fetch.assert_awaited_once()
 
 
@@ -5344,3 +5355,34 @@ async def test_speech_only_music_controls_offer_explicit_start() -> None:
         isinstance(item, discord.ui.Button) and item.label == "Resume music"
         for item in view.children
     )
+
+
+def test_animation_preview_exposes_later_colors_as_static_vision_png() -> None:
+    frames = [Image.new("RGBA", (4, 4), color) for color in ("red", "lime", "blue")]
+    source = io.BytesIO()
+    frames[0].save(
+        source, format="GIF", save_all=True, append_images=frames[1:], duration=(40, 50, 60), loop=0
+    )
+    media = _prepare_discord_animated_media(source.getvalue(), mode="preview", frame_index=0)
+    assert media.content_type == "image/png"
+    assert media.preview_kind == "sampled_animation_frames"
+    assert media.frame_count == 3
+    assert media.frame_index is None
+    assert media.duration_ms == 150
+    with Image.open(io.BytesIO(media.content)) as image:
+        assert getattr(image, "n_frames", 1) == 1
+        assert image.size == (576, 216)
+        assert image.getpixel((96, 10)) == (255, 0, 0)
+        assert image.getpixel((288, 10)) == (0, 255, 0)
+        assert image.getpixel((480, 10)) == (0, 0, 255)
+
+
+def test_animation_preview_bounds_the_number_of_sampled_frames() -> None:
+    frames = [Image.new("RGB", (4, 4), (index * 8, 0, 0)) for index in range(20)]
+    source = io.BytesIO()
+    frames[0].save(source, format="GIF", save_all=True, append_images=frames[1:], duration=40)
+    media = _prepare_discord_animated_media(source.getvalue(), mode="preview", frame_index=0)
+    assert media.frame_count == 20
+    with Image.open(io.BytesIO(media.content)) as image:
+        assert image.size == (768, 648)
+        assert image.getpixel((672, 442)) == (152, 0, 0)
