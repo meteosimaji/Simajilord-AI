@@ -14,6 +14,7 @@ from simajilord.core.errors import UserError
 from simajilord.services.read_aloud import ReadAloudMode, ReadAloudRoute
 
 from .audio import DiscordAudioOutput
+from .channel_lifecycle import reconcile_read_aloud_channels
 
 if TYPE_CHECKING:
     from simajilord.runtime import SimajilordRuntime
@@ -114,6 +115,7 @@ def build_audio_navigation_endpoints(
                     or _permission_enabled(member.guild_permissions, "administrator")
                 ):
                     raise UserError("audio.move_occupied_forbidden")
+            resolved_channels = await reconcile_read_aloud_channels(guild, runtime.read_aloud)
             current_route = runtime.read_aloud.get(workspace)
             route = runtime.read_aloud.resume_route(workspace, request.destination_id)
             if request.mode in {"preserve", "music"} and current_route is None:
@@ -125,7 +127,19 @@ def build_audio_navigation_endpoints(
                     workspace, request.source_id, request.destination_id, ReadAloudMode.QUEUE
                 )
             if route is not None:
-                sources = tuple(_message_channel(guild, value) for value in route.text_channel_ids)
+                sources = []
+                for value in route.text_channel_ids:
+                    source = resolved_channels.get(int(value))
+                    if source is None:
+                        if guild.get_channel_or_thread(int(value)) is None:
+                            raise UserError("discord.message_channel_unavailable")
+                        source = _message_channel(guild, value)
+                    if not isinstance(source, (
+                        discord.TextChannel, discord.Thread,
+                        discord.VoiceChannel, discord.StageChannel,
+                    )):
+                        raise UserError("discord.message_destination_invalid")
+                    sources.append(source)
                 for source in sources:
                     if (
                         not _can_read_messages(source, member)
@@ -133,7 +147,9 @@ def build_audio_navigation_endpoints(
                         or not _can_read_messages(source, guild.me)
                     ):
                         raise UserError("discord.message_channel_unavailable")
-                _enforce_read_aloud_route_audience(runtime, context, guild, sources, destination)
+                _enforce_read_aloud_route_audience(
+                    runtime, context, guild, tuple(sources), destination
+                )
                 route = replace(route, audio_destination_id=request.destination_id)
             speech_only = (
                 session.speech_only if request.mode == "preserve" else request.mode == "speech"

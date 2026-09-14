@@ -10,6 +10,7 @@ from simajilord.capabilities.speech import SpeechSpeakRequest
 from simajilord.core.errors import UserError
 
 from .audio_navigation import AudioNavigateRequest, AudioNavigateResponse
+from .channel_lifecycle import reconcile_read_aloud_channels
 from .cogs import (
     _MUSIC_DASHBOARD_ATTRIBUTE,
     MusicAddModal,
@@ -300,7 +301,10 @@ async def send_audio_hub(interaction: discord.Interaction, runtime: SimajilordRu
         else None
     )
     workspace = str(interaction.guild_id)
-    await interaction.response.send_message(
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    if interaction.guild is not None:
+        await reconcile_read_aloud_channels(interaction.guild, runtime.read_aloud)
+    await interaction.edit_original_response(
         embed=audio_hub_embed(runtime, workspace, destination),
         view=AudioHubView(
             runtime,
@@ -309,5 +313,4 @@ async def send_audio_hub(interaction: discord.Interaction, runtime: SimajilordRu
             destination=destination,
             source_id=str(interaction.channel_id) if interaction.channel_id else None,
         ),
-        ephemeral=True,
     )

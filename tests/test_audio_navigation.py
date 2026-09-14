@@ -70,6 +70,7 @@ def navigation_fixture(tmp_path: Path):
     member.voice = SimpleNamespace(channel=destination)
     guild = Mock(spec=discord.Guild)
     guild.id = 1
+    member.guild = guild
     guild.get_member.return_value = member
     guild.get_channel.side_effect = {10: origin, 20: destination, 11: source}.get
     guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
@@ -250,3 +251,73 @@ async def test_move_or_music_start_does_not_reenable_disabled_reading(tmp_path: 
     await endpoint.invoke(AudioNavigateRequest("20", "10", mode), context)
     assert runtime.read_aloud.get("1") is None
     runtime.audio.connect.assert_awaited_once_with("1", "20", speech_only=False)
+
+
+@pytest.mark.asyncio
+async def test_start_repairs_deleted_saved_source_and_preserves_valid_source(tmp_path):
+    runtime, _, member, _, endpoint, context = navigation_fixture(tmp_path)
+    member.guild.fetch_channel = AsyncMock(side_effect=discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"),
+        {"code": 10003, "message": "Unknown Channel"},
+    ))
+    await runtime.read_aloud.configure(ReadAloudRoute(
+        "1", "11", "10", ReadAloudMode.QUEUE, additional_text_channel_ids=("99",)
+    ))
+    result = await endpoint.invoke(AudioNavigateRequest("20", "10", mode="speech"), context)
+    assert result.reading_sources == ("11",)
+    runtime.audio.connect.assert_awaited_once_with("1", "20", speech_only=True)
+    saved = ReadAloudService(runtime.read_aloud.state_file).saved_route("1", "10")
+    assert saved.text_channel_ids == ("11",)
+
+
+@pytest.mark.asyncio
+async def test_start_preserves_permission_denied_source_and_does_not_connect(tmp_path):
+    runtime, _, member, _, endpoint, context = navigation_fixture(tmp_path)
+    member.guild.fetch_channel = AsyncMock(side_effect=discord.Forbidden(
+        SimpleNamespace(status=403, reason="Forbidden"),
+        {"code": 50001, "message": "Missing Access"},
+    ))
+    route = ReadAloudRoute("1", "99", "10", ReadAloudMode.QUEUE)
+    await runtime.read_aloud.configure(route)
+    with pytest.raises(UserError, match=r"discord\.message_channel_unavailable"):
+        await endpoint.invoke(AudioNavigateRequest("20", "10", mode="speech"), context)
+    assert runtime.read_aloud.get("1") == route
+    runtime.audio.connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_after_all_saved_sources_deleted_uses_explicit_conversation(tmp_path):
+    runtime, _, member, _, endpoint, context = navigation_fixture(tmp_path)
+    member.guild.fetch_channel = AsyncMock(side_effect=discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"),
+        {"code": 10003, "message": "Unknown Channel"},
+    ))
+    await runtime.read_aloud.configure(ReadAloudRoute("1", "99", "10", ReadAloudMode.QUEUE))
+    result = await endpoint.invoke(
+        AudioNavigateRequest("20", "10", mode="speech", source_id="11"), context
+    )
+    assert result.reading_sources == ("11",)
+    runtime.audio.connect.assert_awaited_once_with("1", "20", speech_only=True)
+
+
+@pytest.mark.asyncio
+async def test_open_hub_repairs_missing_references_before_rendering(tmp_path):
+    from simajilord.integrations.discord.audio_hub import send_audio_hub
+
+    runtime, _, member, _, _, _ = navigation_fixture(tmp_path)
+    member.guild.fetch_channel = AsyncMock(side_effect=discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"),
+        {"code": 10003, "message": "Unknown Channel"},
+    ))
+    await runtime.read_aloud.configure(ReadAloudRoute(
+        "1", "11", "10", ReadAloudMode.QUEUE, additional_text_channel_ids=("99",)
+    ))
+    interaction = SimpleNamespace(
+        guild_id=1, guild=member.guild, user=member, channel_id=11,
+        response=SimpleNamespace(defer=AsyncMock()), edit_original_response=AsyncMock(),
+    )
+    await send_audio_hub(interaction, runtime)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    rendered = interaction.edit_original_response.await_args.kwargs["embed"].description
+    assert "<#99>" not in rendered
+    assert "<#11>" in rendered

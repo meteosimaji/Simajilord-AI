@@ -554,3 +554,35 @@ async def test_read_aloud_content_modes_are_durable_and_guild_scoped(
     assert off.announce_join is False
     assert off.announce_leave is False
     assert off.announce_move is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_source_is_removed_from_active_and_saved_profiles(tmp_path) -> None:
+    service = ReadAloudService(tmp_path / "routes.json")
+    await service.configure(ReadAloudRoute(
+        "1", "deleted", "10", ReadAloudMode.QUEUE,
+        additional_text_channel_ids=("keep",),
+    ))
+    await service.configure(ReadAloudRoute(
+        "1", "deleted", "20", ReadAloudMode.QUEUE,
+        additional_text_channel_ids=("other",),
+    ))
+    await service.configure(ReadAloudRoute("2", "deleted", "30", ReadAloudMode.QUEUE))
+    assert await service.forget_channel("1", "deleted")
+    reloaded = ReadAloudService(service.state_file)
+    assert reloaded.get("1").text_channel_ids == ("other",)
+    assert reloaded.saved_route("1", "10").text_channel_ids == ("keep",)
+    assert reloaded.get("2").text_channel_ids == ("deleted",)
+    assert not await service.forget_channel("1", "deleted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted", ["source", "voice"])
+async def test_deleted_last_source_or_destination_cannot_resume(tmp_path, deleted) -> None:
+    service = ReadAloudService(tmp_path / "routes.json")
+    await service.configure(ReadAloudRoute("1", "source", "voice", ReadAloudMode.QUEUE))
+    await service.disable("1")
+    assert await service.forget_channel("1", deleted)
+    reloaded = ReadAloudService(service.state_file)
+    assert reloaded.saved_route("1", "voice") is None
+    assert reloaded.resume_route("1", "voice") is None

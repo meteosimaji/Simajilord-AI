@@ -166,6 +166,48 @@ class ReadAloudService:
 
         return self._policies.get(workspace_id, ReadAloudPolicy(workspace_id))
 
+    def referenced_channel_ids(self, workspace_id: str) -> frozenset[str]:
+        """Include inactive profiles so a later resume cannot revive deleted IDs."""
+
+        routes = (*self._routes.values(), *self._route_profiles.values())
+        return frozenset(
+            channel_id
+            for route in routes
+            if route.workspace_id == workspace_id
+            for channel_id in (*route.text_channel_ids, route.audio_destination_id)
+        )
+
+    async def forget_channel(self, workspace_id: str, channel_id: str) -> bool:
+        """Remove a confirmed deleted channel from current and saved routes atomically."""
+
+        def repaired(route: ReadAloudRoute) -> ReadAloudRoute | None:
+            if route.workspace_id != workspace_id:
+                return route
+            sources = tuple(value for value in route.text_channel_ids if value != channel_id)
+            if route.audio_destination_id == channel_id or not sources:
+                return None
+            return replace(
+                route, text_channel_id=sources[0], additional_text_channel_ids=sources[1:]
+            )
+
+        async with self._lock:
+            routes = {
+                key: updated
+                for key, route in self._routes.items()
+                if (updated := repaired(route)) is not None
+            }
+            profiles = {
+                key: updated
+                for key, route in self._route_profiles.items()
+                if (updated := repaired(route)) is not None
+            }
+            if routes == self._routes and profiles == self._route_profiles:
+                return False
+            self._routes = routes
+            self._route_profiles = profiles
+            await asyncio.to_thread(self._save)
+            return True
+
     async def configure(
         self,
         route: ReadAloudRoute,

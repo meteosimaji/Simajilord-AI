@@ -20,6 +20,7 @@ from .agent_ui import agent_delivery_nonce
 from .application_emojis import ApplicationEmojiCatalog
 from .audio import DiscordAudioOutput, verify_ffmpeg_opus
 from .capabilities import DiscordMessageChannel, build_discord_endpoints
+from .channel_lifecycle import reconcile_read_aloud_channels
 from .cogs import error_message, handle_interaction_error, setup_cogs
 from .command_sync import (
     CommandManifestStore,
@@ -205,6 +206,8 @@ class SimajilordDiscordBot(commands.Bot):
                 self.runtime.settings.agent_escalation_model,
                 self.runtime.settings.agent_reasoning_effort,
             )
+        for guild in self.guilds:
+            await reconcile_read_aloud_channels(guild, self.runtime.read_aloud)
         if not self._audio_restored:
             await self._restore_audio_sessions()
             await self._prepare_read_aloud_presence()

@@ -3394,6 +3394,10 @@ def error_message(
             "Could not complete the media analysis.",
         )
     if isinstance(error, UserError):
+        log.warning(
+            "Discord request rejected request_id=%s code=%s",
+            request_id or "unavailable", error.code,
+        )
         return _ERROR_MESSAGES.get(error.code, error.code)
     reference_id = request_id or secrets.token_hex(8)
     log.error(
@@ -6170,6 +6174,29 @@ class ReadAloudCog(commands.Cog):
         ] = {}
         self._recent_message_ids: set[int] = set()
         self._recent_message_order: deque[int] = deque()
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        await self._forget_deleted_channel(channel.guild.id, channel.id)
+
+    @commands.Cog.listener()
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        await self._forget_deleted_channel(payload.guild_id, payload.thread_id)
+
+    async def _forget_deleted_channel(self, guild_id: int, channel_id: int) -> None:
+        workspace_id = str(guild_id)
+        changed = await self.runtime.read_aloud.forget_channel(workspace_id, str(channel_id))
+        dashboard = getattr(self.bot, _MUSIC_DASHBOARD_ATTRIBUTE, None)
+        if isinstance(dashboard, MusicDashboardManager):
+            await dashboard.forget_channel(workspace_id, channel_id)
+            session = self.runtime.audio.find(workspace_id)
+            if changed and session is not None:
+                await dashboard.on_audio_state_changed(session)
+        if changed:
+            log.info(
+                "Removed deleted channel from read-aloud routes guild=%s channel=%s",
+                guild_id, channel_id,
+            )
 
     async def cog_unload(self) -> None:
         for task in self._announcement_tasks.values():
