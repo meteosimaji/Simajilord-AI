@@ -532,8 +532,8 @@ explicitly select `legacy` or zero runs to restore earlier behavior. Its native 
 browser control, model-facing Apps, plugin MCP servers, internal shell execution, personal-file
 access, remote plugin installation, sub-agents, and automatic browser-cookie extraction disabled.
 Optional host-brokered shell and design connector grants are independent of those native paths and
-are never given to autonomous turns. The default runtime profile is `gpt-5.6-luna` with `high`
-reasoning. Codex keeps one durable
+are never given to autonomous turns. The default runtime profile is `gpt-6-luna` with `low`
+reasoning, escalating to `gpt-6-sol` with `low` reasoning. Codex keeps one durable
 provider thread per task in its stable `legacy` history mode and compacts retained context natively; the
 host automatically resets it only when the saved thread is genuinely unavailable. An explicit
 `AGENT_CONVERSATION_COMPATIBILITY_EPOCH` is persisted with the local store; operators bump it

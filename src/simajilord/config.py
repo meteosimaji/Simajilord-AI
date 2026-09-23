@@ -1177,10 +1177,10 @@ def load_settings(
         ),
         agent_curated_skills_enabled=_boolean("AGENT_CURATED_SKILLS_ENABLED", False),
         agent_provider=agent_provider,
-        agent_model=_text("AGENT_MODEL", "gpt-5.6-luna"),
+        agent_model=_text("AGENT_MODEL", "gpt-6-luna"),
         agent_escalation_model=_text(
             "AGENT_ESCALATION_MODEL",
-            "gpt-5.6-terra",
+            "gpt-6-sol",
         ),
         codex_executable=_text("CODEX_EXECUTABLE", "codex"),
         codex_expected_version_prefix=_text(
@@ -1193,7 +1193,7 @@ def load_settings(
             600.0,
             maximum=1_800.0,
         ),
-        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "high"),
+        agent_reasoning_effort=_text("AGENT_REASONING_EFFORT", "low"),
         agent_per_user_requests=_positive_int(
             "AGENT_PER_USER_REQUESTS",
             3,

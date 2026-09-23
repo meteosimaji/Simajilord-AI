@@ -140,9 +140,9 @@ def test_checked_in_env_example_loads_without_optional_voicevox_path(
 
     assert settings.tts_provider == "macos"
     assert settings.voicevox_auto_start is False
-    assert settings.agent_model == "gpt-5.6-luna"
-    assert settings.agent_escalation_model == "gpt-5.6-terra"
-    assert settings.agent_reasoning_effort == "high"
+    assert settings.agent_model == "gpt-6-luna"
+    assert settings.agent_escalation_model == "gpt-6-sol"
+    assert settings.agent_reasoning_effort == "low"
     assert settings.agent_idle_timeout_seconds == 600
     assert settings.agent_max_response_characters == 7_600
     assert settings.agent_max_active_turns == 4
