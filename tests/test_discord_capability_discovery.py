@@ -104,6 +104,10 @@ DISCOVERY_CASES: dict[str, tuple[str, str]] = {
         "この添付画像を実際に見て内容を確認して",
         "inspect this attached image with model vision",
     ),
+    "discord.view_user_avatar": (
+        "このユーザーのアイコンの色を実際に見て教えて",
+        "look at this user's avatar image and describe its colors",
+    ),
     "discord.add_reaction": (
         "このメッセージに絵文字でリアクションを付けて",
         "add an emoji reaction to this message",
@@ -514,10 +518,10 @@ def _contains_japanese(value: str) -> bool:
     )
 
 
-def test_all_114_discord_transport_capabilities_have_discovery_classification() -> None:
+def test_all_115_discord_transport_capabilities_have_discovery_classification() -> None:
     registry, names = _discord_registry()
 
-    assert len(names) == 114
+    assert len(names) == 115
     assert len(names) == len(set(names))
     assert set(names) == set(DISCOVERY_CASES) | INTERNAL_DISCORD_CAPABILITIES
     assert not set(DISCOVERY_CASES) & INTERNAL_DISCORD_CAPABILITIES

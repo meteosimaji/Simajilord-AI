@@ -54,7 +54,7 @@ from simajilord.integrations.discord.platform_capabilities import (
 )
 from simajilord.runtime import SimajilordRuntime
 
-EXPECTED_DISCORD_CAPABILITIES = 114
+EXPECTED_DISCORD_CAPABILITIES = 115
 _PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
     "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="

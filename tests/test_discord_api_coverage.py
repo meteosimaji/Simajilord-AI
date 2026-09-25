@@ -100,10 +100,10 @@ def test_all_discord_capabilities_have_unique_typed_implementation_evidence() ->
     inventory = capability_inventory(repo_root)
     names = [str(item["name"]) for item in inventory]
 
-    assert len(inventory) == 114
+    assert len(inventory) == 115
     assert len(names) == len(set(names))
     assert set(names) > INTERNAL_CAPABILITIES
-    assert sum(item["model_facing"] is True for item in inventory) == 107
+    assert sum(item["model_facing"] is True for item in inventory) == 108
     for item in inventory:
         implementation = item["implementation"]
         request = item["request"]

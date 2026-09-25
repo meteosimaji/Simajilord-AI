@@ -522,6 +522,7 @@ class SimajilordRuntime:
                 "discord.create_quote_image",
                 "discord.view_custom_emoji",
                 "discord.view_image_attachment",
+                "discord.view_user_avatar",
                 "discord.view_sticker",
                 "timer.create",
                 "timer.list",
@@ -633,6 +634,7 @@ class SimajilordRuntime:
                 "discord.post_expanded_message": AGENT_REPOST_GRANT,
                 "discord.create_quote_image": AGENT_QUOTE_GRANT,
                 "discord.view_image_attachment": AGENT_MESSAGE_GRANT,
+                "discord.view_user_avatar": AGENT_MESSAGE_GRANT,
                 "timer.create": AGENT_MESSAGE_GRANT,
                 "timer.list": AGENT_MESSAGE_GRANT,
                 "timer.cancel": AGENT_MESSAGE_GRANT,
@@ -856,6 +858,7 @@ class SimajilordRuntime:
                 image_output_capabilities=(
                     "discord.view_custom_emoji",
                     "discord.view_image_attachment",
+                    "discord.view_user_avatar",
                     "discord.view_sticker",
                     *(("image.generate",) if "image.generate" in agent_capabilities else ()),
                 ),

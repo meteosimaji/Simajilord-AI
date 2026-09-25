@@ -1162,6 +1162,20 @@ class DiscordViewImageAttachmentResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscordViewUserAvatarRequest:
+    user_id: str
+    guild_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DiscordViewUserAvatarResponse:
+    user_id: str
+    content_type: str
+    size_bytes: int
+    image_data_url: str
+
+
+@dataclass(frozen=True, slots=True)
 class DiscordSendFileRequest:
     channel_id: str
     path: str = dataclass_field(
@@ -3137,6 +3151,48 @@ def build_discord_endpoints(
             content_type=media_type,
             size_bytes=len(content),
             image_data_url=f"data:{media_type};base64,{encoded}",
+        )
+
+    async def view_user_avatar(
+        request: DiscordViewUserAvatarRequest,
+        context: InvocationContext,
+    ) -> DiscordViewUserAvatarResponse:
+        guild = _requested_guild(client, context, request.guild_id)
+        if context.transport == "agent":
+            await _require_common_guild(guild, context)
+        try:
+            user_id = int(request.user_id)
+        except ValueError as exc:
+            raise UserError("discord.user_id_invalid") from exc
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                member = None
+            except discord.DiscordException as exc:
+                raise UserError("discord.member_lookup_failed") from exc
+        user = member or client.get_user(user_id)
+        if user is None:
+            try:
+                user = await client.fetch_user(user_id)
+            except discord.DiscordException as exc:
+                raise UserError("discord.user_not_found") from exc
+        asset = (member or user).display_avatar.with_static_format("png").with_size(512)
+        try:
+            content = await client.http.get_from_cdn(str(asset))
+        except discord.DiscordException as exc:
+            raise UserError("discord.avatar_unavailable") from exc
+        if not content or len(content) > 8 * 1024 * 1024:
+            raise UserError("discord.avatar_unavailable")
+        media_type = _image_media_type(content)
+        if media_type is None:
+            raise UserError("discord.avatar_unavailable")
+        return DiscordViewUserAvatarResponse(
+            user_id=str(user.id),
+            content_type=media_type,
+            size_bytes=len(content),
+            image_data_url=f"data:{media_type};base64,{base64.b64encode(content).decode('ascii')}",
         )
 
     async def send_message(
@@ -6489,6 +6545,7 @@ def build_discord_endpoints(
                     "添付画像を見る",
                     "画像を確認",
                     "画像を読んで",
+                    "この添付画像を実際に見て内容を確認して",
                 ),
                 requires_workspace=True,
                 expected_errors=(
@@ -6506,6 +6563,31 @@ def build_discord_endpoints(
             DiscordViewImageAttachmentRequest,
             DiscordViewImageAttachmentResponse,
             view_image_attachment,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="discord.view_user_avatar",
+                summary="View a shared server user's displayed avatar as model vision input.",
+                risk=RiskLevel.READ,
+                disclosure_class=DisclosureClass.GUILD_MEMBER_METADATA,
+                approval=ApprovalMode.NEVER,
+                keywords=(
+                    "avatar", "profile image", "user icon", "アイコン", "アバター",
+                    "このユーザーのアイコンの色を実際に見て教えて",
+                    "look at this user's avatar image and describe its colors",
+                ),
+                requires_workspace=True,
+                expected_errors=(
+                    "discord.user_id_invalid",
+                    "discord.user_not_found",
+                    "discord.member_lookup_failed",
+                    "discord.avatar_unavailable",
+                ),
+                timeout_seconds=30,
+            ),
+            DiscordViewUserAvatarRequest,
+            DiscordViewUserAvatarResponse,
+            view_user_avatar,
         ),
         endpoint(
             CapabilityDescriptor(
