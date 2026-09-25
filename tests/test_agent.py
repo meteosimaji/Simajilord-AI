@@ -6,7 +6,8 @@ import sqlite3
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -4249,6 +4250,77 @@ async def test_generated_image_tool_result_is_visible_to_model_without_inline_ba
     assert '"image_data_url":"[attached to this tool result]"' in output.text
     assert "aGVsbG8=" not in output.text
     assert '"path":"generated/quiz.png"' in output.text
+
+
+@pytest.mark.asyncio
+async def test_image_tool_pixels_are_steered_before_text_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = CodexAppServerProvider(
+        executable="codex",
+        model="test",
+        workspace_dir=tmp_path / "image-steer",
+        idle_timeout_seconds=10,
+        reasoning_effort="low",
+        tools=AgentToolCatalog(CapabilityRegistry(), ()),
+    )
+    events: list[str] = []
+
+    async def request(method: str, params: dict[str, object]) -> object:
+        assert method == "turn/steer"
+        assert params["threadId"] == "thread"
+        assert params["expectedTurnId"] == "turn"
+        assert params["clientUserMessageId"] == "request:image:call"
+        image_input = cast(list[dict[str, str]], params["input"])[1]
+        assert image_input == {"type": "image", "url": "data:image/png;base64,aGVsbG8="}
+        events.append("image")
+        return {"turnId": "turn"}
+
+    async def tool_response(*args: object, **kwargs: object) -> None:
+        assert kwargs["success"] is True
+        events.append("result")
+
+    monkeypatch.setattr(provider, "_request", request)
+    monkeypatch.setattr(provider, "_tool_response", tool_response)
+    trace = SimpleNamespace(
+        provider_thread_id="thread",
+        provider_turn_id="turn",
+        provider_request_id="request",
+        call_id="call",
+        resolved_capability="discord.view_image_attachment",
+        budget=None,
+        action_receipt_id=None,
+    )
+    await provider._traced_tool_response(
+        1,
+        cast(Any, trace),
+        success=True,
+        text='{"image_data_url":"[attached to this tool result]"}',
+        image_url="data:image/png;base64,aGVsbG8=",
+        outcome="succeeded",
+        error_code=None,
+    )
+    assert events == ["image", "result"]
+
+    async def rejected_steer(method: str, params: dict[str, object]) -> object:
+        raise ValueError("turn unavailable")
+
+    failed_response = AsyncMock()
+    monkeypatch.setattr(provider, "_request", rejected_steer)
+    monkeypatch.setattr(provider, "_tool_response", failed_response)
+    await provider._traced_tool_response(
+        2,
+        cast(Any, trace),
+        success=True,
+        text='{"image_data_url":"[attached to this tool result]"}',
+        image_url="data:image/png;base64,aGVsbG8=",
+        outcome="succeeded",
+        error_code=None,
+    )
+    assert failed_response.await_args.kwargs["success"] is False
+    assert failed_response.await_args.kwargs["image_url"] is None
+    assert trace.error_code == "agent.image_delivery_failed"
 
 
 def test_agent_tool_catalog_rejects_duplicate_allowlist_entries() -> None:
