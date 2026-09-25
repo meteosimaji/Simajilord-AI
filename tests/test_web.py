@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 from dataclasses import replace
 
 import pytest
+from PIL import Image
 
 from simajilord.capabilities.web import (
     WebFetchRequest,
@@ -13,6 +15,8 @@ from simajilord.capabilities.web import (
     WebSearchResponse,
     WebStatusRequest,
     WebStatusResponse,
+    WebViewImageUrlRequest,
+    WebViewImageUrlResponse,
     build_web_endpoints,
 )
 from simajilord.core import CapabilityRegistry, InvocationContext
@@ -250,9 +254,44 @@ async def test_web_capability_endpoints_share_one_typed_service_boundary() -> No
     assert {item.descriptor.name for item in registry.all()} == {
         "web.search",
         "web.fetch",
+        "web.view_image_url",
         "web.find",
         "web.status",
     }
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_view_image_url_fetches_public_image_as_model_media() -> None:
+    image_bytes = io.BytesIO()
+    Image.new("RGB", (3, 2), "blue").save(image_bytes, format="PNG")
+
+    class ImageFetcher(FakePageFetcher):
+        async def fetch(self, url: str, *, max_bytes: int) -> FetchedWebResource:
+            assert max_bytes == 8 * 1024 * 1024
+            self.calls.append(url)
+            return FetchedWebResource(url, "text/plain", None, image_bytes.getvalue())
+
+    fetcher = ImageFetcher()
+    service = WebService(
+        search_provider=FakeSearchProvider(), page_fetcher=fetcher, max_fetch_bytes=2_000_000
+    )
+    registry = CapabilityRegistry()
+    for capability in build_web_endpoints(service):
+        registry.register(capability)
+    context = InvocationContext("actor", "workspace", "test", "request")
+    result = await registry.invoke(
+        "web.view_image_url", WebViewImageUrlRequest("https://example.com/image"), context
+    )
+    assert isinstance(result, WebViewImageUrlResponse)
+    assert (result.width, result.height, result.content_type) == (3, 2, "image/png")
+    assert result.image_data_url.startswith("data:image/png;base64,")
+    assert fetcher.calls == ["https://example.com/image"]
+    with pytest.raises(WebError):
+        await registry.invoke(
+            "web.view_image_url", WebViewImageUrlRequest("http://127.0.0.1/image"), context
+        )
+    assert len(fetcher.calls) == 1
     await service.close()
 
 

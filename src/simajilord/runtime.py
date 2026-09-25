@@ -547,6 +547,7 @@ class SimajilordRuntime:
                 "utility.roll",
                 "web.search",
                 "web.fetch",
+                "web.view_image_url",
                 "web.find",
                 "web.status",
                 "authority.request",
@@ -640,6 +641,7 @@ class SimajilordRuntime:
                 "timer.cancel": AGENT_MESSAGE_GRANT,
                 "web.search": AGENT_WEB_GRANT,
                 "web.fetch": AGENT_WEB_GRANT,
+                "web.view_image_url": AGENT_WEB_GRANT,
                 "web.find": AGENT_WEB_GRANT,
             }
             if settings.agent_isolated_shell_access is not AgentFeatureAccess.DISABLED:
@@ -856,6 +858,7 @@ class SimajilordRuntime:
                     ),
                 ),
                 image_output_capabilities=(
+                    "web.view_image_url",
                     "discord.view_custom_emoji",
                     "discord.view_image_attachment",
                     "discord.view_user_avatar",

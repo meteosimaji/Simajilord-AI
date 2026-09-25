@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import io
 from dataclasses import dataclass
+
+from PIL import Image, UnidentifiedImageError
 
 from simajilord.core.capabilities import (
     CapabilityDescriptor,
@@ -17,6 +21,7 @@ from simajilord.core.capabilities import (
 )
 from simajilord.core.errors import UserError
 from simajilord.domain.web import SearchDepth, WebSource, WebTextMatch
+from simajilord.providers.web.http import normalize_public_web_url
 from simajilord.services.web import WebService
 
 
@@ -66,6 +71,20 @@ class WebFetchResponse:
     links: tuple[str, ...]
     complete: bool
     source_truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WebViewImageUrlRequest:
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class WebViewImageUrlResponse:
+    content_type: str
+    size_bytes: int
+    width: int
+    height: int
+    image_data_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +169,38 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             links=page.links[:20] if request.include_links else (),
             complete=next_offset is None and not page.source_truncated,
             source_truncated=page.source_truncated,
+        )
+
+    async def view_image_url(
+        request: WebViewImageUrlRequest,
+        _: InvocationContext,
+    ) -> WebViewImageUrlResponse:
+        resource = await web.page_fetcher.fetch(
+            normalize_public_web_url(request.url), max_bytes=8 * 1024 * 1024
+        )
+        try:
+            with Image.open(io.BytesIO(resource.body)) as image:
+                image_format = image.format
+                width, height = image.size
+                if image_format not in {"PNG", "JPEG", "GIF", "WEBP"}:
+                    raise UserError("web.image_type_unsupported")
+                if width < 1 or height < 1 or width * height > 40_000_000:
+                    raise UserError("web.image_dimensions_invalid")
+                image.verify()
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise UserError("web.image_invalid") from exc
+        media_type = {
+            "PNG": "image/png",
+            "JPEG": "image/jpeg",
+            "GIF": "image/gif",
+            "WEBP": "image/webp",
+        }[image_format]
+        return WebViewImageUrlResponse(
+            content_type=media_type,
+            size_bytes=len(resource.body),
+            width=width,
+            height=height,
+            image_data_url=f"data:{media_type};base64,{base64.b64encode(resource.body).decode('ascii')}",
         )
 
     async def find(
@@ -244,6 +295,32 @@ def build_web_endpoints(web: WebService) -> tuple[CapabilityEndpoint, ...]:
             WebFetchRequest,
             WebFetchResponse,
             fetch,
+        ),
+        endpoint(
+            CapabilityDescriptor(
+                name="web.view_image_url",
+                summary="Fetch one public image URL and expose its pixels to model vision.",
+                risk=RiskLevel.EXTERNAL,
+                disclosure_class=DisclosureClass.EXTERNAL_PUBLIC,
+                keywords=("view image URL", "open image link", "画像URLを見る", "画像リンクを確認"),
+                side_effects=("Fetches one public HTTP or HTTPS resource.",),
+                audit_payload="metadata",
+                egress=EgressDescriptor(
+                    provider="public_web",
+                    field_kinds=(EgressFieldKind.URL,),
+                    request_fields=("url",),
+                    sink_audience=EgressSinkAudience.EXTERNAL_PUBLIC,
+                ),
+                expected_errors=(
+                    "web.image_type_unsupported",
+                    "web.image_dimensions_invalid",
+                    "web.image_invalid",
+                ),
+                timeout_seconds=45,
+            ),
+            WebViewImageUrlRequest,
+            WebViewImageUrlResponse,
+            view_image_url,
         ),
         endpoint(
             CapabilityDescriptor(
